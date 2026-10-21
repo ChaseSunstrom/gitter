@@ -8,7 +8,7 @@ scope: []
 depends_on: [T-0001]
 source: user
 created: 2026-10-21T17:01:42Z
-updated: 2026-10-21T20:54:11Z
+updated: 2026-10-21T20:54:12Z
 base: 892891bd8cfacdadb674873f8e294eb13f0af9d1
 base_tree: 72eecc5274d15d2b94f8117e33d3140dceee8a5b
 plan0_at: 2026-10-21T18:13:22Z
@@ -82,6 +82,7 @@ README self-hosting section rewritten (.env, upgrade, stdio backup/verify/restor
 - 2026-10-21T20:45:42Z other work changed the same lines while it was paused: its diff still includes that work
 - 2026-10-21T20:45:42Z focused
 - 2026-10-21T20:54:11Z done
+- 2026-10-21T20:54:12Z committed 47eb5b7 (32 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

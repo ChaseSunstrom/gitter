@@ -86,7 +86,9 @@ fn vendored(path: &str) -> bool {
 
 /// Bytes per language at `rev`, largest first.
 pub async fn stats(st: &AppState, path: &Path, rev: &str) -> Vec<(String, String, u64)> {
-    let Ok(out) = st.git.ok(path, &["ls-tree", "-r", "-l", "-z", rev]).await else {
+    // ponytail: past 32 MB of listing (~300k files) the stats cover only the first files; fine for a bar.
+    let args = ["ls-tree", "-r", "-l", "-z", rev];
+    let Ok(out) = st.git.run_records(path, &args, 32 << 20, 0).await else {
         return vec![];
     };
     let mut m: HashMap<&'static str, (&'static str, u64)> = HashMap::new();

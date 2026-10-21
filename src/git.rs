@@ -284,18 +284,15 @@ impl Git {
 
     pub async fn refs(&self, repo: &Path) -> R<Vec<Ref>> {
         let fmt = "%(refname)%00%(objectname)%00%(*objectname)%00%(creatordate:unix)%00%(contents:subject)%00%(authorname)%00%(*authorname)";
-        let out = self
-            .ok(
-                repo,
-                &[
-                    "for-each-ref",
-                    "--sort=-creatordate",
-                    &format!("--format={fmt}"),
-                    "refs/heads",
-                    "refs/tags",
-                ],
-            )
-            .await?;
+        let args = [
+            "for-each-ref",
+            "--sort=-creatordate",
+            &format!("--format={fmt}"),
+            "refs/heads",
+            "refs/tags",
+        ];
+        // ponytail: a repo with refs past 8 MB lists only the newest ones; paginate if that bites.
+        let out = self.run_records(repo, &args, 8 << 20, b'\n').await?;
         Ok(parse_refs(&String::from_utf8_lossy(&out)))
     }
 
@@ -470,10 +467,19 @@ impl Git {
             .map_err(AppError::internal)?;
         if cut {
             let _ = child.kill().await;
-        } else {
-            let _ = child.wait().await;
+        } else if !child.wait().await.map_err(AppError::internal)?.success() {
+            return Err(AppError::internal(format!("git {args:?} failed")));
         }
         Ok((buf, cut))
+    }
+
+    /// `run_capped`, cut back to the last whole record when the cap is hit.
+    pub async fn run_records(&self, repo: &Path, args: &[&str], cap: usize, sep: u8) -> R<Vec<u8>> {
+        let (mut out, cut) = self.run_capped(repo, args, cap).await?;
+        if cut {
+            out.truncate(out.iter().rposition(|b| *b == sep).map_or(0, |i| i + 1));
+        }
+        Ok(out)
     }
 
     pub async fn blame(&self, repo: &Path, sha: &str, path: &str) -> R<Vec<u8>> {
@@ -882,6 +888,28 @@ pub fn parse_blame(out: &str) -> Vec<BlameChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capped_reads_keep_whole_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Git::new(dir.path().join("r"), dir.path().to_path_buf(), 4);
+        let repo = g.root.join("1.git");
+        std::fs::create_dir_all(&g.root).unwrap();
+        g.init_bare(&repo, "main", 1 << 20).await.unwrap();
+        let c = g.commit_tree(&repo, EMPTY_TREE, &[], "init", ("a", "a@b.c")).await.unwrap();
+        for b in ["aaaa", "bbbb", "cccc"] {
+            g.update_ref(&repo, &format!("refs/heads/{b}"), &c, None).await.unwrap();
+        }
+        assert_eq!(g.refs(&repo).await.unwrap().len(), 3);
+        let args = ["for-each-ref", "--format=%(refname)"];
+        let full = g.run_records(&repo, &args, 1 << 20, b'\n').await.unwrap();
+        assert_eq!(full, b"refs/heads/aaaa\nrefs/heads/bbbb\nrefs/heads/cccc\n");
+        // A cap in the middle of the second line keeps only the first.
+        let cut = g.run_records(&repo, &args, 20, b'\n').await.unwrap();
+        assert_eq!(cut, b"refs/heads/aaaa\n");
+        // A git failure is still an error, not an empty list.
+        assert!(g.refs(&dir.path().join("missing.git")).await.is_err());
+    }
 
     #[test]
     fn log_parsing() {

@@ -655,3 +655,45 @@ async fn the_last_admin_cannot_be_removed() {
     let (_, me) = app.req(&root, "GET", "/api/me", None).await;
     assert_eq!(me["user"]["is_admin"], false);
 }
+
+#[tokio::test]
+async fn merge_rolls_back_when_it_cannot_be_recorded() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "m", "readme": true })))
+        .await;
+    let (s, _) = app
+        .req(&alice, "POST", "/api/repos/alice/m/contents", Some(json!({
+            "branch": "main", "new_branch": "feature", "message": "Add",
+            "changes": [{ "path": "a.txt", "content": "a\n" }]
+        })))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, pr) = app
+        .req(&alice, "POST", "/api/repos/alice/m/pulls", Some(json!({
+            "title": "Add a", "head": "feature", "base": "main"
+        })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{pr}");
+    let n = pr["number"].as_i64().unwrap();
+    let main_before = app.state.git.resolve(&app.state.git.repo_path(1), "refs/heads/main").await.unwrap();
+    app.state
+        .db
+        .call(|c| {
+            Ok(c.execute_batch(
+                "CREATE TRIGGER no_merge BEFORE UPDATE ON pulls BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+            )?)
+        })
+        .await
+        .unwrap();
+    for method in ["squash", "merge", "ff"] {
+        let (s, _) = app
+            .req(&alice, "POST", &format!("/api/repos/alice/m/pulls/{n}/merge"), Some(json!({ "method": method })))
+            .await;
+        assert!(!s.is_success(), "{method}: merge must fail, got {s}");
+        let main_after = app.state.git.resolve(&app.state.git.repo_path(1), "refs/heads/main").await.unwrap();
+        assert_eq!(main_before, main_after, "{method}: main must not move when the merge isn't recorded");
+    }
+    let (_, issue) = app.req(&alice, "GET", &format!("/api/repos/alice/m/issues/{n}"), None).await;
+    assert_eq!(issue["issue"]["state"], "open");
+}

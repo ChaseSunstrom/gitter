@@ -876,33 +876,45 @@ pub async fn merge_pull(
         }
         _ => return Err(AppError::bad("Unknown merge method")),
     };
-    st.git
-        .update_ref(
-            &r.path,
-            &format!("refs/heads/{base_b}"),
-            &new_sha,
-            Some(&base),
-        )
-        .await?;
+    // Move the branch and record the merge in a task of its own, so a client
+    // that disconnects halfway can't leave the branch moved and the PR open.
+    let (st2, path, full) = (st.clone(), r.path.clone(), r.full_name());
     let (iid, uid) = (issue.id, u.id);
     let (hs, bs, ms) = (head.clone(), base.clone(), new_sha.clone());
-    st.db
-        .call(move |c| {
-            let tx = c.transaction()?;
-            let t = now();
-            tx.execute(
-                "UPDATE pulls SET merged_sha = ?1, merged_by = ?2, merged_at = ?3, head_sha = ?4, base_sha = ?5 WHERE issue_id = ?6",
-                rusqlite::params![ms, uid, t, hs, bs, iid],
-            )?;
-            tx.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid])?;
-            tx.execute(
-                "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at) VALUES (?1, ?2, 'merged', ?3, ?4, ?4)",
-                rusqlite::params![iid, uid, ms, t],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await?;
+    let base_ref = format!("refs/heads/{base_b}");
+    tokio::spawn(async move {
+        st2.git.update_ref(&path, &base_ref, &ms, Some(&bs)).await?;
+        let (hs, bs2, ms2) = (hs, bs.clone(), ms.clone());
+        let recorded = st2
+            .db
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let t = now();
+                tx.execute(
+                    "UPDATE pulls SET merged_sha = ?1, merged_by = ?2, merged_at = ?3, head_sha = ?4, base_sha = ?5 WHERE issue_id = ?6",
+                    rusqlite::params![ms2, uid, t, hs, bs2, iid],
+                )?;
+                tx.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid])?;
+                tx.execute(
+                    "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at) VALUES (?1, ?2, 'merged', ?3, ?4, ?4)",
+                    rusqlite::params![iid, uid, ms2, t],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await;
+        if let Err(e) = recorded {
+            // Put the branch back so the PR stays open and nothing merged silently.
+            // Expecting `ms` means a push that landed meanwhile is never undone.
+            if st2.git.update_ref(&path, &base_ref, &bs, Some(&ms)).await.is_err() {
+                eprintln!("merge of {full}#{num}: not recorded and {base_ref} moved on; left as is");
+            }
+            return Err(e);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(AppError::internal)??;
     touch(&st.db, r.id, true).await?;
     record_event(
         &st.db,
