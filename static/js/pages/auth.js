@@ -51,16 +51,22 @@ function loginView(ctx) {
 }
 
 function signupView(ctx) {
-  if (!state.signup) {
+  const setup = ctx.query.get('setup') || '';
+  if (state.instance?.needs_setup && !setup) {
+    return card(html`<h1>Finish setting up Gitter</h1><p class="muted">This server has no accounts yet. To create the admin account, open the setup link printed in the server log
+      (with Docker: <code>docker compose logs gitter</code>).</p>`);
+  }
+  if (!state.signup && !state.instance?.needs_setup) {
     return card(html`<h1>Sign-ups are closed</h1><p class="muted">This Gitter instance isn't accepting new accounts right now. Ask the person who runs it for an invite.</p>
       <a class="btn lg" href="/login${ctx.url.search}">Sign in instead</a>`);
   }
-  return card(html`<h1>Create your account</h1>
+  return card(html`<h1>${setup ? 'Create the admin account' : 'Create your account'}</h1>
+    ${setup ? html`<p class="muted">This first account runs the server: it can manage accounts and settings.</p>` : ''}
     <form id="auth-form" class="stack" novalidate>
       <div class="field"><label for="username">Username</label><input class="input" id="username" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" autofocus required>
         <span class="hint" id="username-msg">Letters, numbers, '-', '_' or '.'. This is your public URL.</span></div>
       <div class="field"><label for="email">Email</label><input class="input" id="email" name="email" type="email" autocomplete="email" required>
-        <span class="hint">Used for commits you make on the web. Never shown publicly.</span></div>
+        <span class="hint">For signing in and account recovery. Never shown publicly.</span></div>
       <div class="field"><label for="password">Password</label><input class="input" id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
         <div class="pw-meter" aria-hidden="true"><i></i><i></i><i></i><i></i></div><span class="hint" id="pw-msg">At least 8 characters.</span></div>
       <p class="field-err" id="form-err" role="alert" hidden></p>
@@ -108,7 +114,7 @@ export default async function (ctx) {
           if (ue) { user.focus(); return showErr(ue); }
           if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(f.email.trim())) return showErr('Enter a valid email address');
           if (f.password.length < 8) { pw.focus(); return showErr('Use at least 8 characters for your password'); }
-          try { res = await send('POST', '/auth/signup', { username: f.username.trim(), email: f.email.trim(), password: f.password }); }
+          try { res = await send('POST', '/auth/signup', { username: f.username.trim(), email: f.email.trim(), password: f.password, setup: ctx.query.get('setup') || '' }); }
           catch (e) { return showErr(e.message); }
         } else {
           if (!f.login.trim() || !f.password) return showErr('Enter your username and password');

@@ -142,8 +142,12 @@ async fn serve_inner(
     };
 
     let permit = st.git.permit_stream().await?;
+    let max_push = st.settings.get().max_push_bytes();
     let mut cmd = st.git.command(None);
-    cmd.arg("http-backend")
+    // The current push limit overrides whatever was stored when the repo was created.
+    cmd.arg("-c")
+        .arg(format!("receive.maxInputSize={max_push}"))
+        .arg("http-backend")
         .env("GIT_PROJECT_ROOT", &st.git.root)
         .env("GIT_HTTP_EXPORT_ALL", "1")
         .env("PATH_INFO", format!("/{}.git/{}", repo.id, service_path))
@@ -169,7 +173,7 @@ async fn serve_inner(
     // Feed the request body to git, enforcing a size cap.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let cap = if push {
-        st.cfg.max_push_bytes + 1024 * 1024
+        max_push + 1024 * 1024
     } else {
         FETCH_BODY_CAP
     };

@@ -1,0 +1,834 @@
+# Ideas by round (deduplicated titles; details in the lens files; "near T-…" names a finished task that shares most of an idea's words)
+Ideas: 543 distinct (the bullets under Round, Deepened and Cross-bred; the tallies below are counts, not ideas)
+
+## Round 1
+- One-file compose with zero-config first run
+- Bundle the runner in the same compose file
+- Pipelines defined in the repo with live log streaming
+- Commit and PR status checks with merge gating
+- Instant-feeling pages (performance budget enforced in tests)
+- Low-RAM guarantee, with a published number
+- Public-site abuse protection built in
+- Sandboxed CI for untrusted code
+- One-command backup, restore and upgrade
+- Import from GitHub/GitLab
+- Built-in HTTPS via automatic certificates
+- Wild: Warm CI with snapshot caching
+- Wild: Run the pipeline locally with `gitter ci run`
+- Wild: "Time-travel" repo page
+- Wild: Instance-in-a-box demo mode
+- Ship a first-run bootstrap that makes the compose file actually one-command
+- Auto-register the bundled runner with a generated token
+- Sandbox CI runners without exposing the host Docker socket
+- Add one-command backup and restore, including a scheduled snapshot
+- Add abuse controls for a public site (rate limits, signup gating, quotas)
+- Publish a measured speed benchmark against GitLab/Gitea on the same box
+- Provide a zero-downtime upgrade path with automatic migrations and a pre-upgrade snapshot
+- Support SSH clone alongside HTTPS
+- Add import from GitHub/GitLab (repos, issues, PRs)
+- Wild: Make a "push to deploy preview" URL for every branch/PR
+- Wild: Run the whole site read-only from a git-clone-able "mirror mode" for offline/LAN use
+- Wild: Offer a `gitter` CLI that talks to the instance like `gh` (PRs, issues, CI logs in the terminal)
+- Add a CI cache and artifact store with automatic expiry
+- Show a live "push-to-green" toast in the terminal
+- Stream CI logs with ANSI color and step folding
+- Boot the whole stack with one command and a friendly first-run wizard
+- Animate commit graph and diffs with view transitions
+- Add instant-feel navigation with a visible speed budget
+- Make the command palette do everything
+- Generate a unique identicon and a minimal animated logo mark
+- Show CI status as a heartbeat strip on commit lists
+- Offer a one-click "Edit in browser then open PR" flow
+- Replay any CI run as a scrubbable timeline
+- Let the repo page play its own history as a time-lapse
+- Add a tiny pet mascot that reacts to build state
+- Ship a status badge and embeddable README card generator
+- Make themes follow time of day with a smooth crossfade
+- Ship one-file compose with runner sidecar
+- Add Actions-style workflow YAML with matrix and cache
+- Register runners by token with labels and autoscale
+- Stream CI logs live with secrets masking
+- Gate merges on required checks and branch protection
+- Add code review: inline comments, suggestions, approvals
+- Provide packages and container registry
+- Add webhooks, OAuth apps and a REST API with OpenAPI
+- Add orgs, teams, permissions and SSO (OIDC)
+- Add abuse controls: rate limits, quotas, spam, captcha
+- Sandbox CI jobs with resource limits and no network by default
+- Back up and restore with one command, plus Litestream-style replication
+- Add pages and releases with asset uploads
+- Git LFS support
+- Wild: Run CI as local-first "preview environments" per PR
+- Wild: Add a built-in AI-free "explain this diff" via local LLM hook
+- Wild: Federate repos and PRs between Gitter instances
+- Wild: Offer a zero-config `gitter ci run` that executes the same workflow locally
+- Add built-in code search across repos with trigram index
+- Add a project board, milestones and issue templates
+- Ship one binary that is both server and runner
+- Use a pull-based runner protocol over long-poll or WebSocket
+- Define pipelines in a small YAML subset, not a GitLab/Actions clone
+- Run jobs through the Docker socket first, with a rootless/Podman option later
+- Make CI opt-in per repo and quota-limited on public instances
+- Store logs and artifacts as append-only files, with the SQLite row holding only an offset
+- Offer Postgres as an optional swap behind the same storage trait
+- Add a one-command backup and restore that snapshots SQLite and repos together
+- Wild: Make each push build and preview in an ephemeral sandbox, with a URL
+- Wild: Let runners be browser tabs using WASM-sandboxed jobs
+- Wild: Use git itself as the CI queue, with pipelines as refs
+- Reuse Actions-compatible workflow files by running `act` inside the runner
+- Ship a single-container "all-in-one" mode that runs CI jobs as subprocesses
+- Crash-safe git writes via atomic ref transactions
+- Add startup self-check and repair command
+- Make CI jobs survive restarts
+- Lease-based runner heartbeats and job requeue
+- Enforce resource limits on every job container
+- Add per-user and per-IP rate limits and quotas
+- Serve health, readiness and metrics endpoints with compose healthchecks
+- Run schema migrations with automatic pre-upgrade snapshot
+- Cap git subprocess concurrency and time
+- Wild: Run a chaos mode that randomly kills things
+- Wild: Keep a live hot-standby replica via Litestream-style streaming
+- Wild: Make repos self-healing via content-addressed shadow mirror
+- Add a status page and an in-app incident banner
+- One-binary, one-volume compose
+- Embed the runner inside the server binary
+- Zero-config first boot
+- Pipeline file as minimal as a shell script
+- Runner auto-registration via shared volume/socket
+- Built-in backup and restore command
+- Drop the external dependencies: no Redis, no Postgres, no job queue service
+- Single `gitter doctor` self-check
+- Settings in the UI, not in env files
+- Wild: Tiny `curl | sh` that writes the compose file and starts it
+- Wild: Built-in automatic HTTPS via ACME
+- Wild: Warm-start "zero-install" runner jobs using the server's own container as the sandbox
+- Single-page "why it's fast" benchmark in the repo
+- Ship one binary that is also the runner
+- Auto-bootstrap everything on first boot
+- Make push-to-green under 3 seconds
+- Publish a head-to-head benchmark page
+- Add Firecracker-or-gVisor sandbox for public runners
+- Stream logs and status over one SSE/WebSocket channel
+- Wild: Make every repo a live, forkable preview environment
+- Wild: Run the whole forge in the browser via WASM for offline editing
+- Wild: Let a built-in AI agent pick up issues and open PRs, checked by CI
+- Wild: Federate instances so a PR can cross servers
+- Import from GitHub/GitLab in one click, with CI translation
+- Read GitHub Actions workflow syntax natively
+- Enforce abuse limits and quotas out of the box
+- Zero-downtime upgrade with automatic migration rollback
+- Keep warm `git cat-file --batch` processes per repo
+- Cache immutable content by OID with permanent ETags
+- Ship a CI-enforced performance budget and a benchmark harness
+- Precompress and fingerprint embedded assets
+- Split SQLite into one writer and a read-connection pool
+- Render first paint on the server, then hydrate
+- Run background maintenance: commit-graph, multi-pack-index and scheduled repack
+- Pre-warm CI workspaces and runners for sub-second job start
+- Stream logs over SSE with a ring buffer and virtualized rendering
+- Virtualize large diffs and compute them lazily
+- Wild: Replace hot-path git CLI reads with in-process gitoxide, falling back to the CLI
+- Wild: Speculative navigation that predicts the next click
+- Wild: Copy-on-write CI sandboxes with snapshot-restore microVMs
+- Wild: Hot-repo packfile cache that serves popular clones from RAM or tmpfs
+- Sandbox CI jobs with rootless, no-socket runners
+- Gate CI on untrusted pushes and forks
+- Ship a hardened one-file compose by default
+- Serve user content from an isolated origin
+- Add abuse controls: rate limits, quotas, and signup friction
+- Defend git endpoints against bombs and slow attacks
+- Scope tokens and add passkeys/2FA
+- Block SSRF in webhooks and mirrors
+- Write a tamper-evident audit log
+- Scan pushes for secrets and block them
+- Run one-command encrypted backup and restore with verification
+- Wild: Make CI jobs run in disposable microVMs
+- Wild: Add a "reproducible build attestation" badge
+- Wild: Ship a self-pentest command with a live security score
+- Wild: Quarantine suspicious new accounts' repos automatically
+
+## Round 2
+- Add a "Why is my build red?" failure digest
+- Add a "Re-run only failed jobs" and "Re-run with debug" button
+- Ship pipeline templates picked by repo detection
+- Add a pipeline linter and dry-run validator in the web editor
+- Auto-merge when checks pass
+- Add a merge queue that tests the combined result
+- Provide a notification inbox with email-free digests
+- Add optional SMTP with a single settings form and test button
+- Add repo-level "what changed since I last looked" summary
+- Wild: Make a "fork and fix" flow from any failed CI log line
+- Wild: Add a read-only "guest pass" link for private repos with expiry
+- Wild: Publish a per-instance "project health" page from existing data
+- Detect and flag flaky tests across runs
+- Add repo import by URL on the "New repo" page, with mirroring
+- Ship a "doctor for the first hour" onboarding checklist
+- Send transactional email without an SMTP server
+- Add a notifications inbox with per-repo watch levels
+- Make CI failures actionable in the diff view
+- Provide a one-click "rerun / rerun failed / rerun with debug shell" control
+- Add disk-usage accounting with reclaim suggestions
+- Detect and warn on unsafe public exposure
+- Offer a "private by default, publish later" repo lifecycle
+- Keep a human-readable activity and "what changed since I left" digest
+- Wild: Let the instance explain its own slowness
+- Wild: Offer an "undo" for destructive actions on a timer
+- Wild: Ship a "gitter pair" read-only live session link
+- Wild: Generate a repo "contributor onboarding" page automatically
+- Document the product with a self-hosted docs site inside the instance
+- Show a push-progress ribbon in the browser
+- Make the diff view hover-explain moved code
+- Add keyboard-first everything with a visible hint layer
+- Render empty repos as a guided first-push card
+- Add a per-repo "README as landing page" reading mode
+- Give every CI step a satisfying finish animation and sound-off haptics
+- Add a contributor "wall" with real commit-derived stats
+- Let the logo react to the instance's state
+- Wild: Turn the commit graph into a navigable 3D-ish "river" you can scrub with the mouse wheel
+- Wild: Add "ghost cursors" in the web editor for people viewing the same file
+- Wild: Let a PR page play a short "what changed" replay of the branch's commits
+- Add celebratory but skippable micro-moments for milestones
+- Preview links unfurl into beautiful share cards
+- Add CODEOWNERS and auto-reviewer assignment
+- Add a merge queue with speculative batching
+- Add scheduled and manual pipeline triggers
+- Add secrets and variables at repo, org and environment scope
+- Add deployments, environments and approval gates
+- Add a security dashboard with dependency and SAST scanning
+- Add automated dependency update PRs
+- Add a built-in wiki and discussions per repo
+- Add notifications with email, a web inbox and digest rules
+- Add signed commits and tag verification
+- Wild: Make the merge queue a git ref that anyone can `git fetch`
+- Wild: Add a repo "health score" that fixes itself via PRs
+- Wild: Add a flaky-test detector that quarantines tests across runs
+- Wild: Add a read-only public API explorer with live "try it" on the user's own token
+- Run CI in bubblewrap/Landlock sandboxes, with no Docker daemon
+- Skip jobs by input hash with a content-addressed task cache
+- Expose a Gitea/GitHub-compatible REST subset
+- Dogfood: Gitter hosts and builds itself from milestone one
+- Use Compose profiles so core is one service and CI is opt-in
+- Pre-render public pages into an OID-keyed static cache
+- Store instance settings as a git repo (GitOps config)
+- Run read-only pull-through replicas for scaling
+- Wild: Store repos as a single file, Fossil-style
+- Wild: Write pipelines as Starlark or WASM components instead of YAML
+- Wild: Let volunteers join runners over a mesh network
+- Wild: Make the forge's own state a live git repo
+- Ship a conformance suite that runs real git clients against every release
+- Verify every backup by restoring it in a throwaway container
+- Reconcile DB and bare repos on boot and nightly
+- Make pushes two-phase: quarantine, verify, then commit refs and DB together
+- Use a transactional outbox for webhooks, CI triggers and notifications
+- Add disk-full and quota guardrails with graceful read-only degradation
+- Run a fault-injection test suite in CI (kill, ENOSPC, slow disk, clock jump)
+- Fence CI jobs with lease epochs so zombie runners can't overwrite results
+- Make merges idempotent and conflict-safe with compare-and-swap on refs
+- Ship a reversible-migration rehearsal that runs against a copy of your real data
+- Wild: Keep a shadow read-only instance that replays the write log and compares answers
+- Wild: Add a "black box recorder" that dumps the last 60 seconds of state on crash or panic
+- Wild: Let the instance continuously fsck itself with a slow-drip scrubber that heals from a peer
+- Add graceful shutdown with drain: finish pushes, stop accepting, checkpoint WAL
+- Make the runner resilient to server outages by buffering logs locally and resuming
+- Cap the compose file at one service and five env vars
+- Derive every setting from a single `GITTER_URL`
+- Make the server binary the only image, with runner as `gitter runner` subcommand
+- Keep all state under one `/data` volume with a manifest
+- Default to the simplest CI config: a `.gitter/ci.sh` file
+- Fail loudly at boot with a one-line fix for every misconfiguration
+- Hide advanced features behind feature flags that default to off
+- Wild: Print a QR code in the first-run log that logs you in as admin on your phone
+- Wild: Ship `gitter` as a self-updating compose file via `docker compose pull` only
+- Wild: Make the whole admin panel a single page of plain-language toggles with no jargon
+- Wild: Let the instance run with zero Docker by using the host sandbox it already runs in
+- Count and publish the "moving parts" number in `gitter doctor`
+- Auto-shard CI to a time budget
+- Skip CI jobs by input hash
+- Review across force-pushes with interdiffs
+- Support native stacked PRs
+- Run a pull-through package proxy for npm, crates and PyPI
+- Detect and quarantine flaky tests
+- Add AST-aware diffs with moved-code detection
+- Bisect in parallel on the runner pool
+- Store issues and PRs as git refs
+- Let volunteers donate laptops as runners
+- Edit together in a multiplayer web editor
+- Run README snippets in the sandbox
+- Tier cold repos to object storage
+- Precompute a per-repo "browse index" on push
+- Serve clones from a negotiated-pack cache
+- Build a dependency-aware incremental diff and blame cache
+- Add a CI job-start latency budget with per-phase tracing
+- Checkout CI workspaces via git worktree plus reflink/overlay
+- Coalesce and debounce live updates through one fan-out hub
+- Run the SQLite write path through a group-commit queue
+- Ship a built-in profiler endpoint and slow-request log
+- Paginate and stream huge listings with keyset cursors
+- Wild: Predictive prefetch trained on the user's own click paths
+- Wild: Compile the hot read-only pages into static snapshots served by sendfile
+- Wild: Use io_uring and a custom pack-object reader for the hottest endpoints
+- Wild: Speed-regression bisect bot on every PR to Gitter itself
+- Mint short-lived OIDC identity tokens per CI job
+- Require approval for permission changes in workflow files
+- Run jobs on single-use just-in-time runners
+- Route CI egress through an allowlist proxy with a connection log
+- Verify signed commits and enforce signing per branch
+- Add private security advisories with a temporary private fork
+- Scan lockfiles against an offline vulnerability database
+- Provide a trash and undo for deletes and force-pushes
+- Add a report-and-moderate workflow with a blob hash blocklist
+- Detect transformed secret leaks in CI logs
+- Manage sessions and alert on suspicious logins
+- Plant canary secrets in CI to catch exfiltration
+- Fuzz the instance's own git and HTTP endpoints nightly
+- Restore the whole instance to a point in time after an incident
+
+## Round 3
+- Ship a "migrate in 10 minutes" wizard with a parity report
+- Add a "my work" home dashboard
+- Provide per-repo "contribute in 60 seconds" flow for newcomers
+- Write a "migrating from GitLab CI/Actions" translator with explain-output
+- Offer a hosted-free "try before install" public sandbox with expiring accounts
+- Show a cost/capacity forecast in admin ("this box fits ~N users, M builds/hr")
+- Add repo "release train" automation: tag push builds, signs, uploads assets, writes changelog
+- Add a unified cross-repo "everything I follow" feed with mute rules
+- Wild: Let a failed CI run open a pre-filled issue/PR draft with the log excerpt and suspect commit
+- Wild: Build a "sponsor a runner minute" flow where visitors donate CI capacity to a public project
+- Wild: Add a "bus factor and bit-rot" report for each repo
+- Add per-repo size and clone-speed hints with one-click shallow/partial clone commands
+- Add a changelog "what's new in Gitter" in-app note after each upgrade, plus a rollback hint
+- Ship a "stuck?" self-diagnosing first-push flow
+- Provide a one-page "what is this instance doing right now" admin view
+- Let the instance upgrade itself behind one admin button
+- Explain every permission as a sentence on the page where it applies
+- Warn before a push or a setting leaks something
+- Keep a "recently visited" and "pick up where I left off" home
+- Ship an in-product "same box, same repo" speed comparison on demand
+- Offer a phone-friendly review and approve mode
+- Wild: Let the instance email you a weekly "state of the forge" as plain text
+- Wild: Add a "bus factor" panic switch that exports everything to a plain folder
+- Wild: Make a "demo me" button that seeds a believable sample org with history and a red-then-green build
+- Wild: Let a CI run's failure open a pre-filled issue assigned to the pusher
+- Show disk and RAM headroom as a visible budget in the footer for admins
+- Apply every action optimistically, with an animated rollback
+- Linkify stack traces to the exact line at that commit
+- Scrub a file through its history
+- Mark files as viewed in a diff, with a progress ring
+- Autosave every draft and restore it across devices
+- Peek at any reference on hover
+- Guided three-way conflict resolver
+- Drag a folder onto a repo page to commit it
+- Let the owner theme the instance
+- Wild: Generate a private "Gitter Wrapped" recap
+- Wild: Record in-repo code tours that play as an animated walkthrough
+- Wild: Render the repo as a walkable treemap city
+- Reserve layout space so nothing ever jumps
+- Add symbol-aware code navigation
+- Serve partial clone and bundle-uri
+- Add Web Push and an installable PWA
+- Expose an MCP server and agent-scoped tokens
+- Enforce push rulesets
+- Support issue graph features
+- Ship native runners for macOS, Windows and ARM
+- Offer account data export and deletion
+- Generate SBOMs and detect licenses
+- Wild: Offer an SSH TUI
+- Wild: Add a dev-container workspace on the runner pool
+- Wild: Ingest patches by email
+- Wild: Add a snapshot of the instance as a shareable "template"
+- Add repo rename and transfer with permanent redirects
+- Build on a Forgejo fork behind a fast front layer
+- Ship CI as a status API plus a reference runner first
+- Define a pluggable executor protocol for runners
+- Use cross-document view transitions and speculation rules instead of an SPA router
+- Open an existing Forgejo/Gitea data directory in place
+- Use the repo's Dockerfile or devcontainer.json as the CI environment
+- Run agentless runners over SSH
+- Generate server routes, CLI, docs and the JS client from one OpenAPI spec
+- Compile pipelines to BuildKit graphs
+- Wild: Let pushers' machines run CI and submit signed attestations
+- Wild: Have the instance edit its own compose file
+- Wild: Make the whole instance a git-pushable deployment
+- Add a decision matrix doc and a spike benchmark per approach
+- Add a git-aware crash-consistency test harness
+- Give every background job an idempotency key and dead-letter view
+- Bound every queue and apply backpressure with clear 429/503s
+- Split health into liveness, readiness and "degraded" with reasons
+- Make git subprocess failures self-diagnosing
+- Run a startup "poison repo" quarantine
+- Version and checksum the runner↔server protocol with a compatibility window
+- Detect and survive clock jumps in leases and sessions
+- Wild: Add a "replay the crash" bundle
+- Wild: Canary self-test user that continuously pushes, opens PRs and runs CI on the instance
+- Wild: Keep a tiny append-only "intent log" so DB and repos can be rebuilt from each other
+- Wild: Make the compose file self-heal with a watchdog sidecar contract
+- Enforce a per-request timeout and cancellation budget across all handlers
+- Surface SQLite WAL and busy-lock health to operators
+- Generate the compose file from one question
+- Fold the runner into the server process by default
+- Auto-detect the pipeline with no config file
+- Show one settings page with a plain-language effect preview
+- Make every error carry its own fix command
+- Cut the feature set into three named tiers
+- Use the same URL scheme for everything
+- Delete rarely used knobs by choosing defaults
+- Wild: Make the compose file self-documenting with a live `gitter explain`
+- Wild: Make the instance upgrade itself from a git tag in its own repo
+- Wild: Offer a phone-first "pocket mode" setup over a QR-paired session
+- Show one status screen for the whole instance
+- Ship a "Gitter Cloud-in-a-Compose" pooled-runner marketplace
+- Make the repo the unit of deployment: `gitter serve <repo>` on any host
+- Add a "zero-state instance" declarative `gitter.toml` that reconverges
+- Enforce an executable "simpler than GitLab" budget in CI
+- Add per-PR ephemeral full-stack preview via compose profiles
+- Build a deterministic replay of any CI job from its recorded inputs
+- Offer a "fork-the-instance" snapshot sharing
+- Add a built-in agent lane with scoped identity and budget
+- Wild: Make the forge answer questions with a local-only "ask this repo" index
+- Wild: Turn the merge queue into a visible, playable "train" view
+- Wild: Let an instance "sleep" to zero and wake on first request
+- Add an in-product "migrate me off" exit guarantee
+- Adopt a signed, reproducible release with a one-line verify
+- Add a per-endpoint latency SLO gate with flamegraph artifact
+- Serve smart-HTTP fetches from a have/want negotiation cache
+- Make runner checkouts shallow-by-default with server-side partial-clone filters
+- Bound memory with a hard RSS governor that sheds load by priority
+- Generate zip/tar archives incrementally and cache by tree OID
+- Index file names and symbol outlines on push for the fuzzy finder
+- Ship a deterministic load generator `gitter bench` bundled in the binary
+- Adaptive CI scheduling that packs jobs by measured CPU/memory history
+- Wild: Keep the entire hot working set mmap'd in a single shared pack-index sidecar
+- Wild: Speculative CI — start jobs on push before the pipeline finishes parsing, from the last known graph
+- Wild: Browser-side diff and syntax highlight in a WASM worker with shared cache
+- Cap and coalesce CI log writes with a per-job ring and batched fsync
+- Add a startup warm-up that pre-touches hot repos and assets
+- Close the first-run admin claim race
+- Partition CI caches by trust tier
+- Harden server-side git against hostile repositories
+- Give tokens a scannable format and auto-revoke leaks
+- Scope runner identities with mTLS and a blast-radius view
+- Redact credentials centrally in logs, errors and metrics
+- Add an incident lockdown switch
+- Warn on bidi, invisible and confusable Unicode
+- Sign outbound webhooks with timestamps and key rotation
+- Ship a signed, pinned release with SBOM and dependency policy
+- Wild: Plant honeypot repos and endpoints that auto-ban scanners
+- Wild: Add a dead-man's switch that tightens an unattended instance
+- Wild: Support client-side encrypted private repos
+- Wild: Require two admins to approve destructive instance actions
+
+## Round 4
+- Ship a local-only telemetry-free guarantee with an egress ledger
+- Add per-repo visibility audiences (public, signed-in, link, people)
+- Make the first-run admin screen produce a working compose in under 60 seconds, timed
+- Provide a "fork a PR into my own namespace" contribution path without write access
+- Add per-user data portability bundle (repos, issues, PRs, tokens metadata) as a single archive
+- Add a repo-level "CI cost preview" before enabling pipelines
+- Offer read-only anonymous browsing that never sets cookies
+- Add a plain-English "who can see this?" preview on every repo and setting
+- Wild: Make the instance publish itself as a static read-only mirror to any dumb host
+- Wild: Let a repo owner "seal" a release with a timestamped, offline-verifiable bundle
+- Wild: Add a "what will this push change for others" dry-run on the CLI
+- Add an admin "retention policy" for logs, artifacts, deleted repos and audit data
+- Add IP and user-agent minimization: hash or truncate stored IPs by default
+- Make the instance silent by default (zero phone-home)
+- Show an outbound-traffic ledger in admin
+- Self-host avatars, fonts, and syntax assets with no third-party requests
+- Hide emails by default with a per-commit privacy alias
+- Strip metadata from uploads and rendered content
+- Add private-repo access logs the owner can read
+- Give analytics counts without storing visitor identity
+- Offer a "delete me completely" that also scrubs git history identity
+- Encrypt secrets and backups with a key the owner holds
+- Wild: Add a "paranoid mode" toggle that turns the box into a Tor onion service
+- Wild: Support per-repo end-to-end-encrypted issues and comments
+- Wild: Add a "redaction rehearsal" that scans your public repos for what a scraper would learn
+- Make CI logs and artifacts private by default, with explicit public toggles
+- Honor a "do not index" setting and serve robots/headers consistently
+- Show a "your data stays here" badge with live egress ledger
+- Animate a push as a visible object travelling into the repo
+- Make the empty-state first-push card detect the user's actual OS and remote
+- Give each CI step a tactile "click" with reduced-motion parity
+- Offer a "quiet mode" that mutes all celebration at once
+- Show diff stats as a tiny sparkline beside every commit and PR
+- Let hovering a CI step's duration show where its time went
+- Wild: Offer a "tour guide" ghost that walks a newcomer through the instance using real clicks
+- Wild: Play the commit history as generative ambient audio, off by default
+- Wild: Print the instance's first-run log as a styled ASCII welcome with the admin link and logo
+- Make local-only features show a lock icon explaining nothing leaves the box
+- Tint the browser tab icon with live CI status
+- Show a gentle "you're caught up" end-of-inbox state with a tiny illustration
+- Prove zero phone-home with an egress audit
+- Hide author emails with noreply addresses and a push warning
+- Show cookieless repo traffic stats
+- Trigger pipelines by path filters for monorepos
+- Parse JUnit and coverage reports into PR annotations
+- Share pipeline components across repos
+- Push-mirror to external remotes
+- Add deploy keys and repo-scoped read-only tokens
+- Add rich file viewers
+- Add snippets (gists)
+- Revert and cherry-pick from the web
+- Wild: Mirror encrypted backups to a friend's instance
+- Wild: Publish a machine-signed warrant canary page
+- Wild: Build an air-gapped install bundle
+- Wild: Carry pre-push CI results in a signed git note
+- Seal CI secrets to the runner's public key
+- Test the compose file on every runtime
+- Key every cache by viewer permission
+- Ship zero-egress by default
+- Encrypt the data volume at rest
+- Minimize logs and IP retention by default
+- Add break-glass admin access to private repos
+- Show a private-repo access log to owners
+- Wild: Ingest signed git bundles for air-gapped sync
+- Wild: Offer a built-in Tor onion address
+- Wild: Browse any remote git URL without importing
+- Run the migration parity check on real data
+- Scrub metadata from uploads and unfurl cards
+- Pin every repo to a generation counter and detect torn state
+- Make CI trigger idempotent per (repo, ref, sha, workflow)
+- Run an automatic runner-capacity admission check before accepting a job
+- Classify every failed run as infra vs code failure and auto-retry infra ones
+- Ship a restore-drill that runs on a schedule and reports RPO/RTO
+- Add per-repo write-ahead journal for web-editor and merge commits
+- Degrade by feature, not by instance
+- Bound and test the upgrade matrix (N-1 runner, N server)
+- Wild: Self-verifying release canary that rolls back on its own
+- Wild: Deterministic "time machine" test mode that replays recorded production traffic against a candidate build
+- Wild: Runner "lifeboat" mode that finishes in-flight jobs offline and syncs results later
+- Wild: Instance "heartbeat contract" file others can poll to know it's trustworthy
+- Enforce a clock-independent monotonic ordering for events and logs
+- Make the e2e suite a permanent post-deploy smoke test
+- Enforce a one-service, one-volume, one-port compose lint in CI
+- Merge `gitter doctor` and `gitter explain` into one `gitter status` that prints effective config
+- Collapse all permissions to three roles: read, write, admin
+- Make the data directory the only config: settings stored in SQLite, env only for `GITTER_URL`
+- Ship a "defaults ledger" that justifies every setting that exists
+- Unify issues, PRs and CI runs into one "thread" model with one timeline component
+- Run CI jobs as plain subprocesses by default and make containers an opt-in per-job `image:` line
+- Generate the README's quickstart from the e2e script so docs cannot drift
+- Wild: Ship the whole forge as a single static binary that also works with no Docker at all (`./gitter`)
+- Wild: Add a "delete a feature" admin switch that truly removes tables, routes and UI for what you don't use
+- Wild: Make `docker compose up` print the one URL and one password, then nothing else
+- Cap the codebase's direct dependency count and fail the build above it
+- Use one identifier scheme: every object has a short human slug that works in URL, CLI, API and commit messages
+- Ship a local-only privacy mode that proves nothing leaves the box
+- Make the instance a federated mesh of single-file "pods"
+- Add a first-class `gitter.toml` reconciler with dry-run diff
+- Offer per-repo encrypted-at-rest storage with user-held keys
+- Strip telemetry and metadata from every outbound surface
+- Add runner "trust receipts" for every CI job
+- Build a "migrate off and back" round-trip test suite
+- Provide a single-binary "gitter appliance" image for tiny hardware
+- Wild: Let the instance run entirely from a USB stick as a portable forge
+- Wild: Add an "air-gapped bundle" that carries repos, runners and images across a gap
+- Wild: Let users revoke a past clone by rotating a repo's history-encryption epoch
+- Wild: Run a "pre-mortem" command that simulates your instance's worst day
+- Add a compose-file linter that rejects unsafe exposure before boot
+- Isolate latency with priority lanes
+- Collapse duplicate expensive requests into one
+- Key every cache on a per-repo generation counter
+- Make per-file "last commit" instant with changed-path Bloom filters
+- Highlight on the server with tree-sitter, cached by blob OID and language
+- Add local-only real-user monitoring
+- Pull-through registry cache for CI base images
+- Store CI logs as seekable zstd chunks with a tail index
+- Dedupe artifacts and caches with content-defined chunking
+- Guarantee boot in under 300 ms with 100k repos
+- Wild: Auto-tune the instance to its hardware at idle
+- Wild: Patch live pages instead of reloading them
+- Wild: Cut cold start with a persisted "warm set" snapshot
+- Isolate fork object stores and hide internal refs
+- Add a purge-sensitive-data workflow
+- Resolve every user-supplied path beneath a root with symlink-safe opens
+- Encrypt stored secrets at rest with a key kept off the data volume
+- Hide private-resource existence and enumeration
+- Keep a minimal-PII log policy with IP truncation and expiry
+- Run a pre-publish privacy lint when a repo goes public
+- Pin CI images by digest and enforce an image allowlist
+- Require step-up re-authentication for dangerous actions
+- Add a cooldown quarantine for newly published packages in the pull-through proxy
+- Wild: Publish a transparency log with an external witness for releases and admin actions
+- Wild: Add a duress login that opens a decoy workspace
+
+## New ideas per lens
+- user value: 55
+- unspoken needs: 54
+- delight: 53
+- capability map: 63
+- approaches: 52
+- reliability: 55
+- simplicity: 50
+- bold bets: 53
+- performance: 53
+- security and safety: 55
+
+## Coverage (ideas per category)
+- privacy 39
+- ci 25
+- onboarding 16
+- operations 10
+- runners 8
+- ops 7
+- ci speed 7
+- supply chain 7
+- reliability 6
+- simplicity 6
+- upgrades 6
+- safety 5
+- migration 5
+- delight 5
+- ci ux 5
+- observability 5
+- collaboration 5
+- trust 5
+- portability 5
+- speed 4
+- ci safety 4
+- prs 4
+- review 4
+- storage 4
+- ci isolation 4
+- consistency 4
+- simplicity budget 4
+- deployment 3
+- resilience 3
+- ci ui 3
+- branding 3
+- visualization 3
+- sharing 3
+- deploy 3
+- federation 3
+- architecture 3
+- backup 3
+- agents 3
+- database 3
+- ci trust 3
+- notifications 3
+- wild 3
+- docs 3
+- polish 3
+- code review 3
+- verification 3
+- testing 3
+- ci correctness 3
+- ci security 3
+- self-hosting 2
+- abuse 2
+- ci delight 2
+- motion 2
+- integrations 2
+- access 2
+- integrity 2
+- abuse safety 2
+- transparency 2
+- configuration 2
+- performance 2
+- realtime 2
+- local-first 2
+- caching 2
+- benchmarking 2
+- git engine 2
+- audit 2
+- recovery 2
+- developer experience 2
+- discovery 2
+- ci insight 2
+- user value 2
+- automation 2
+- scale 2
+- git writes 2
+- diagnostics 2
+- config 2
+- ci simplicity 2
+- workflow 2
+- read path 2
+- navigation 2
+- devices 2
+- frontend 2
+- wild ops 2
+- dx 2
+- ci-startup 2
+- logs 2
+- permissions 2
+- privacy delight 2
+- viewer 2
+- dev loop 1
+- proof of speed 1
+- git protocol 1
+- cli 1
+- keyboard ux 1
+- editor 1
+- playful 1
+- theming 1
+- registry 1
+- publishing 1
+- search 1
+- planning 1
+- abuse control 1
+- scaling 1
+- previews 1
+- reuse 1
+- data integrity 1
+- ci durability 1
+- stability 1
+- proof 1
+- ci compat 1
+- public hosting 1
+- git i/o 1
+- frontend delivery 1
+- first paint 1
+- git maintenance 1
+- ci latency 1
+- ci logs 1
+- diff view 1
+- perceived speed 1
+- clone and fetch 1
+- secure defaults 1
+- xss containment 1
+- git hardening 1
+- authn 1
+- ssrf 1
+- secret scanning 1
+- self-audit 1
+- trust and safety 1
+- setup 1
+- email 1
+- repos 1
+- feedback 1
+- diff ui 1
+- keyboard 1
+- reading 1
+- ci feedback 1
+- social 1
+- ci/merge 1
+- ci/security 1
+- cd 1
+- security 1
+- git-native 1
+- ci sandbox 1
+- ecosystem reuse 1
+- pipeline language 1
+- events 1
+- lifecycle 1
+- packaging 1
+- storage layout 1
+- error messages 1
+- progressive disclosure 1
+- first run 1
+- admin ux 1
+- runner 1
+- simplicity metric 1
+- ci cache 1
+- ci reliability 1
+- ci debugging 1
+- git transport 1
+- scalability 1
+- dev workflow 1
+- runner trust 1
+- network 1
+- disclosure 1
+- recoverability 1
+- moderation 1
+- account safety 1
+- adoption 1
+- daily use 1
+- contributors 1
+- ci adoption 1
+- evaluation 1
+- releases 1
+- ci workflow 1
+- community 1
+- insight 1
+- git ux 1
+- clarity 1
+- responsiveness 1
+- code viewing 1
+- web editor 1
+- code browsing 1
+- clone speed 1
+- mobile 1
+- policy 1
+- tracking 1
+- compliance 1
+- web ide 1
+- workflows 1
+- repo lifecycle 1
+- approaches 1
+- do-less 1
+- ci architecture 1
+- api design 1
+- ci caching 1
+- wild ci 1
+- process 1
+- jobs 1
+- overload 1
+- isolation 1
+- time 1
+- debugging 1
+- synthetic monitoring 1
+- supervision 1
+- latency 1
+- admin 1
+- scope 1
+- api 1
+- ecosystem 1
+- efficiency 1
+- supply-chain 1
+- perf-testing 1
+- git-transport 1
+- low-ram 1
+- downloads 1
+- instant-ui 1
+- cold-start 1
+- bootstrap 1
+- ci supply chain 1
+- git safety 1
+- credentials 1
+- leak prevention 1
+- incident response 1
+- impersonation 1
+- deception 1
+- neglect safety 1
+- zero-knowledge 1
+- dual control 1
+- accessibility motion 1
+- information density 1
+- ambient feedback 1
+- empty states 1
+- analytics 1
+- mirroring 1
+- content 1
+- git workflow 1
+- encryption 1
+- offline 1
+- scheduling 1
+- crash safety 1
+- graceful degradation 1
+- runner resilience 1
+- operability 1
+- access model 1
+- data model 1
+- distribution 1
+- modularity 1
+- first-run polish 1
+- footprint 1
+- tail latency 1
+- herd protection 1
+- cache correctness 1
+- repo browsing 1
+- payload and cpu 1
+- perf and privacy 1
+- ci start time 1
+- storage and transfer 1
+- startup 1
+- self-tuning 1
+- live ui 1
+- warm cache 1
+- data isolation 1
+- path safety 1
+- secrets 1
+- authentication 1
+- personal safety 1
+Thin (0-1 ideas): none

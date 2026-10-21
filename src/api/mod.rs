@@ -1,4 +1,5 @@
 pub mod account;
+pub mod admin;
 pub mod code;
 pub mod issues;
 pub mod repos;
@@ -39,6 +40,16 @@ pub fn router() -> Router<AppState> {
         .route("/feed", get(account::feed))
         .route("/explore", get(account::explore))
         .route("/search", get(account::search))
+        .route("/admin/overview", get(admin::overview))
+        .route("/admin/users", get(admin::users))
+        .route(
+            "/admin/users/{user}",
+            patch(admin::update_user).delete(admin::delete_user),
+        )
+        .route(
+            "/admin/settings",
+            get(admin::get_settings).put(admin::put_settings),
+        )
         .route("/repos", post(repos::create))
         .route(
             repo,

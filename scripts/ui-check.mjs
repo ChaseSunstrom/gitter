@@ -77,6 +77,9 @@ const pages = [
   ['/settings', []],
   ['/settings/tokens', ['cli']],
   ['/settings/appearance', []],
+  ['/admin', ['Site administration', 'Storage']],
+  ['/admin/users', ['alice', 'bob']],
+  ['/admin/settings', ['Instance name']],
 ];
 for (const [p, e] of pages) await visit(ctx, p, e);
 await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });

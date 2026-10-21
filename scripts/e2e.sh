@@ -18,6 +18,13 @@ GITTER_DATA="$TMP/data" GITTER_ADDR="127.0.0.1:$PORT" GITTER_URL="$BASE" ./targe
 PID=$!
 trap 'kill $PID 2>/dev/null; rm -rf "$TMP"' EXIT
 for _ in $(seq 50); do curl -sf "$BASE/robots.txt" >/dev/null && break; sleep 0.1; done
+SETUP=$(grep -o 'setup=[A-Za-z0-9_-]*' "$LOG" | head -1 | cut -d= -f2)
+[ -n "$SETUP" ] || fail "first boot should print a setup link"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Origin: $BASE" -H 'Content-Type: application/json' -X POST "$BASE/api/auth/signup" --data '{"username":"mallory","email":"m@example.com","password":"correct horse"}')
+[ "$code" = 403 ] || fail "first account without the setup code should be refused, got $code"
+ok "first admin account needs the one-time setup link"
+curl -sf "$BASE/healthz" | grep -q '"ok":true' || fail "healthz"
+ok "healthz"
 
 api() { # method path [json] -> body; fails on HTTP >= 400 unless EXPECT is set
   local m=$1 p=$2 d=${3:-}
@@ -36,7 +43,7 @@ api() { # method path [json] -> body; fails on HTTP >= 400 unless EXPECT is set
 jq_() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" <<<"$BODY"; }
 
 # --- accounts
-api POST /auth/signup '{"username":"alice","email":"alice@example.com","password":"correct horse"}'
+api POST /auth/signup "{\"username\":\"alice\",\"email\":\"alice@example.com\",\"password\":\"correct horse\",\"setup\":\"$SETUP\"}"
 [ "$(jq_ 'd["user"]["is_admin"]')" = "True" ] || fail "first user should be admin"
 ok "signup (first user is admin)"
 api GET /me
@@ -160,6 +167,12 @@ JAR="$JAR_A"
 git clone -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/secret.git" "$TMP/secret" || fail "owner clones private"  # pragma: allowlist secret
 ok "owner clones private repo with token"
 
+api GET /admin/overview
+[ "$(jq_ 'd["users"]')" = 2 ] || fail "admin overview"
+JAR_KEEP="$JAR"; JAR="$TMP/jar2"
+EXPECT=403 api GET /admin/overview
+JAR="$JAR_KEEP"
+ok "admin overview for admins only"
 api GET /users/alice
 [ "$(jq_ 'len(d["repos"])')" = 2 ] || fail "profile repos"
 api GET /feed

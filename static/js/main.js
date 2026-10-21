@@ -7,6 +7,7 @@ import { initPalette, openPalette } from './palette.js';
 const ROUTES = [
   ['/', 'home'], ['/login', 'auth', { mode: 'login' }], ['/signup', 'auth', { mode: 'signup' }], ['/new', 'newrepo'],
   ['/explore', 'explore'], ['/settings', 'settings'], ['/settings/:tab', 'settings'],
+  ['/admin', 'admin'], ['/admin/:tab', 'admin'],
   ['/:user', 'profile'],
   ['/:owner/:repo', 'repo', { view: 'tree' }],
   ['/:owner/:repo/tree/*', 'repo', { view: 'tree' }],
@@ -115,7 +116,8 @@ export async function navigate(url, { replace = false, scroll = true, pop = fals
     const nextRepo = el.querySelector('.repo-head')?.dataset.repo;
     el.className = 'page-root' + (replace ? '' : prevRepo && prevRepo === nextRepo ? ' enter-body' : ' enter');
     pageEl().replaceChildren(el);
-    document.title = view.title ? `${view.title} · Gitter` : 'Gitter';
+    const site = state.instance?.name || 'Gitter';
+    document.title = view.title ? `${view.title} · ${site}` : site;
     current = view;
     view.mount?.(el, ctx);
     paintNav(ctx);
@@ -235,7 +237,7 @@ export function cycleTheme() {
 function topbar() {
   const me = state.me;
   return html`<div class="in">
-    <a class="brand" href="/" aria-label="Gitter home">${logo(28)}<span class="hide-sm">gitter</span></a>
+    <a class="brand" href="/" aria-label="Gitter home">${logo(28)}<span class="hide-sm">${(state.instance?.name || 'Gitter').toLowerCase() === 'gitter' ? 'gitter' : state.instance.name}</span></a>
     <button class="jump" id="jump" aria-label="Search or jump to">${icon('search', 'sm')}<span>Search or jump to…</span><kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button>
     <nav class="topnav">
       <a class="nav hide-sm" href="/explore" data-nav="explore">Explore</a>
@@ -250,9 +252,18 @@ function paintNav(ctx) {
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === ctx.page));
 }
 
+function renderAnnouncement() {
+  let el = $('.announce');
+  const text = state.instance?.announcement;
+  if (!text) { el?.remove(); return; }
+  if (!el) { el = document.createElement('div'); el.className = 'announce'; el.setAttribute('role', 'status'); $('.topbar').after(el); }
+  el.innerHTML = html`<span class="announce-in">${icon('bell', 'sm')}<span>${text}</span></span>`.s;
+}
+
 export function renderTopbar() {
   const tb = $('.topbar');
   tb.innerHTML = topbar().s;
+  renderAnnouncement();
   $('#jump').addEventListener('click', () => openPalette());
   $('#new-menu')?.addEventListener('click', (e) => {
     const r = state.repo;
@@ -275,6 +286,7 @@ export function renderTopbar() {
       <div class="menu-sep"></div>
       <button class="menu-item" data-theme-toggle>${icon('moon')} Toggle theme <span class="grow"></span><kbd>⇧T</kbd></button>
       <a class="menu-item" href="/settings">${icon('settings')} Settings</a>
+      ${me.is_admin ? html`<a class="menu-item" href="/admin">${icon('shield')} Site administration</a>` : ''}
       <button class="menu-item" data-shortcuts>${icon('keyboard')} Keyboard shortcuts <span class="grow"></span><kbd>?</kbd></button>
       <div class="menu-sep"></div>
       <button class="menu-item" data-logout>${icon('logout')} Sign out</button>`,
@@ -306,6 +318,7 @@ async function boot() {
     const me = await get('/me', { fresh: true });
     state.me = me.user;
     state.signup = me.signup;
+    state.instance = me.instance;
   } catch { state.me = null; }
   renderTopbar();
   const f = $('footer.site');

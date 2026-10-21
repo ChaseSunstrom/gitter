@@ -490,3 +490,168 @@ async fn non_utf8_files_are_not_editable() {
     assert_eq!(dos["editable"], true);
     assert_eq!(dos["eol"], "crlf");
 }
+
+#[tokio::test]
+async fn healthz_reports_ok() {
+    let app = App::new();
+    let (s, v) = app.req(&Client::default(), "GET", "/healthz", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+}
+
+#[tokio::test]
+async fn admin_controls_settings_and_accounts() {
+    let app = App::new();
+    let admin = app.signup("root").await;
+    let bob = app.signup("bob").await;
+    assert_eq!(
+        app.req(&bob, "GET", "/api/admin/overview", None).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let (s, o) = app.req(&admin, "GET", "/api/admin/overview", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(o["users"], 2);
+
+    // Closing sign-up in the UI takes effect immediately.
+    let (_, mut cur) = app.req(&admin, "GET", "/api/admin/settings", None).await;
+    cur["signup"] = json!("closed");
+    cur["instance_name"] = json!("Acme Git");
+    assert_eq!(
+        app.req(&admin, "PUT", "/api/admin/settings", Some(cur))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let body =
+        json!({ "username": "eve", "email": "eve@example.com", "password": "correct horse" });
+    assert_eq!(
+        app.req(&Client::default(), "POST", "/api/auth/signup", Some(body))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.req(&Client::default(), "GET", "/api/me", None).await.1["instance"]["name"],
+        "Acme Git"
+    );
+
+    // Suspending signs the person out and blocks new sign-ins.
+    assert_eq!(
+        app.req(
+            &admin,
+            "PATCH",
+            "/api/admin/users/bob",
+            Some(json!({ "suspended": true }))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(app.req(&bob, "GET", "/api/me", None).await.1["user"].is_null());
+    let login = json!({ "login": "bob", "password": "correct horse" });
+    assert_eq!(
+        app.req(&Client::default(), "POST", "/api/auth/login", Some(login))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    // Admins can't lock themselves out.
+    assert_eq!(
+        app.req(
+            &admin,
+            "PATCH",
+            "/api/admin/users/root",
+            Some(json!({ "is_admin": false }))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn first_account_needs_the_setup_code() {
+    let app = App::new();
+    *app.state.setup_code.lock().unwrap() = Some("s3tup-code".into());
+    let mut body =
+        json!({ "username": "root", "email": "root@example.com", "password": "correct horse" });
+    assert_eq!(
+        app.req(
+            &Client::default(),
+            "POST",
+            "/api/auth/signup",
+            Some(body.clone())
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    body["setup"] = json!("wrong-code");
+    assert_eq!(
+        app.req(
+            &Client::default(),
+            "POST",
+            "/api/auth/signup",
+            Some(body.clone())
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    body["setup"] = json!("s3tup-code");
+    let (s, v) = app
+        .req(&Client::default(), "POST", "/api/auth/signup", Some(body))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["user"]["is_admin"], true);
+    assert!(
+        app.state.setup_code.lock().unwrap().is_none(),
+        "the code works once"
+    );
+    // Everyone after the admin signs up normally.
+    app.signup("bob").await;
+}
+
+#[tokio::test]
+async fn the_last_admin_cannot_be_removed() {
+    let app = App::new();
+    let root = app.signup("root").await;
+    let ops = app.signup("ops").await;
+    assert_eq!(
+        app.req(
+            &root,
+            "PATCH",
+            "/api/admin/users/ops",
+            Some(json!({ "is_admin": true }))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // ops demotes root: fine, ops is still an admin.
+    assert_eq!(
+        app.req(
+            &ops,
+            "PATCH",
+            "/api/admin/users/root",
+            Some(json!({ "is_admin": false }))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // Nobody else can now remove ops, the last admin; and ops can't change itself.
+    assert_eq!(
+        app.req(
+            &ops,
+            "PATCH",
+            "/api/admin/users/ops",
+            Some(json!({ "is_admin": false }))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, me) = app.req(&root, "GET", "/api/me", None).await;
+    assert_eq!(me["user"]["is_admin"], false);
+}

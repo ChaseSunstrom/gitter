@@ -40,16 +40,91 @@ fn config() -> Config {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+const HELP: &str = "gitter — fast, simple git hosting
+
+usage:
+  gitter                       start the server (same as `gitter serve`)
+  gitter backup <file.tar.gz>  back up accounts, issues and repositories (safe while running)
+  gitter restore <file> [--force]
+                               restore a backup into GITTER_DATA (--force moves existing data aside)
+  gitter doctor [--fsck]       check git, storage, database and repositories
+  gitter --version
+
+Settings come from environment variables; see the README.";
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first().map(String::as_str).unwrap_or("serve");
     let cfg = config();
+    match cmd {
+        "serve" => serve(cfg),
+        "backup" => {
+            let out = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: gitter backup <file.tar.gz>"))?;
+            gitter::ops::backup(&cfg, std::path::Path::new(out))
+        }
+        "restore" => {
+            let file = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: gitter restore <file.tar.gz> [--force]"))?;
+            gitter::ops::restore(
+                &cfg,
+                std::path::Path::new(file),
+                args.iter().any(|a| a == "--force"),
+            )
+        }
+        "doctor" => {
+            let problems = gitter::ops::check(&cfg, args.iter().any(|a| a == "--fsck"))?;
+            if problems > 0 {
+                std::process::exit(1);
+            }
+            println!("All good.");
+            Ok(())
+        }
+        "--version" | "-V" | "version" => {
+            println!("gitter {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        "--help" | "-h" | "help" => {
+            println!("{HELP}");
+            Ok(())
+        }
+        other => {
+            eprintln!("unknown command {other:?}\n\n{HELP}");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[tokio::main]
+async fn serve(cfg: gitter::Config) -> anyhow::Result<()> {
     for d in ["repos", "home"] {
         std::fs::create_dir_all(cfg.data_dir.join(d))?;
     }
+    gitter::ops::reconcile(&cfg)?;
     let db = Db::open(&cfg.data_dir.join("gitter.db"))?;
     let addr = cfg.addr.clone();
     let url = cfg.url.clone();
     let st = AppState::new(cfg, db);
+    st.settings
+        .load(&st.db)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.msg))?;
+    let users: i64 = st
+        .db
+        .call(|c| Ok(c.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?))
+        .await
+        .map_err(|e| anyhow::anyhow!(e.msg))?;
+    if users == 0 {
+        let (code, _) = gitter::auth::new_secret("");
+        let code = code[..16].to_string();
+        println!(
+            "\n  Welcome to Gitter. Create the admin account here (the link works once):\n\n    {}/signup?setup={code}\n",
+            url
+        );
+        *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
+    }
     let app = gitter::router(st);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(

@@ -1,0 +1,24 @@
+# Gitter: one service, one volume.
+#   Start:   docker compose up -d
+#   Then:    docker compose logs gitter   (open the one-time setup link to create the admin)
+#   Backup:  docker compose exec gitter gitter backup /data/backup.tar.gz
+services:
+  gitter:
+    build: .
+    image: gitter
+    restart: unless-stopped
+    ports:
+      - "${GITTER_PORT:-3000}:3000"
+    environment:
+      # The address people use to reach this server (https://... behind a proxy).
+      GITTER_URL: ${GITTER_URL:-http://localhost:3000}
+    volumes:
+      - gitter-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+
+volumes:
+  gitter-data:

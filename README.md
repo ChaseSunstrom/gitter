@@ -9,13 +9,39 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 - **Command palette:** press `Ctrl K` or `/` to jump to any repository, file, branch or action. Press `?` for every shortcut.
 - **Themes:** Aurora (the default), Forge, Ultraviolet and Daylight, each in light and dark. Pick one in Settings → Appearance or from the palette.
 
-## Run it
+## Self-host it (one file)
 
-Needs `git` 2.38 or newer on the server (for server-side merges).
+```sh
+git clone <this repository> gitter && cd gitter
+GITTER_URL=https://git.example.com docker compose up -d   # builds a ~15 MB image the first time
+docker compose logs gitter                       # open the one-time setup link it prints
+```
+
+That's the whole install: one service, one volume, one setting (`GITTER_PORT` changes the host port if 3000 is taken). The first link creates the admin account. After that, everything else lives in **Site administration** in the web UI: sign-up open/closed, repository and push limits, an announcement banner, and account management.
+
+| Task | Command |
+|---|---|
+| Back up (safe while running) | `docker compose exec gitter gitter backup /data/backup-$(date +%F).tar.gz` |
+| Copy the backup out | `docker compose cp gitter:/data/backup-2026-10-21.tar.gz .` |
+| Restore | `docker compose cp backup.tar.gz gitter:/data/restore.tar.gz`, then `docker compose stop gitter && docker compose run --rm gitter restore /data/restore.tar.gz --force && docker compose start gitter` (the old data is kept in `/data/before-restore-…`) |
+| Health check | `docker compose exec gitter gitter doctor` (add `--fsck` to verify every repository) |
+| Upgrade | `docker compose pull && docker compose up -d` (data migrates automatically) |
+
+Behind a reverse proxy, point it at port 3000 and set `GITTER_URL` to the public `https://` address. Caddy example:
+
+```
+git.example.com {
+    reverse_proxy localhost:3000
+}
+```
+
+## Run it without Docker
+
+Needs `git` 2.38 or newer (for server-side merges).
 
 ```sh
 cargo run --release
-# open http://localhost:3000. The first account you create is the admin.
+# open the setup link printed on first start
 ```
 
 Clone and push work like on any other host:
@@ -25,16 +51,18 @@ git clone http://localhost:3000/alice/project.git
 git push   # username + password, or username + an access token from Settings → Access tokens
 ```
 
+The same binary has the operator commands: `gitter backup <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`.
+
 ## Configuration
 
-Everything is optional. The defaults are tuned for a single small server.
+Everything is optional. The defaults are tuned for a single small server, and the sign-up mode and limits can be changed later in Site administration (the UI value wins over the variable).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `GITTER_URL` | `http://localhost:3000` | Public address, used in clone URLs. `https://` also turns on secure cookies. |
 | `GITTER_ADDR` | `0.0.0.0:3000` | Address to listen on. |
 | `GITTER_DATA` | `./data` | Where the database and repositories live. Back this folder up. |
-| `GITTER_SIGNUP` | `open` | `closed` stops new sign-ups (the very first account can always be created). |
+| `GITTER_SIGNUP` | `open` | `closed` stops new sign-ups. The first (admin) account is always created through the setup link. |
 | `GITTER_MAX_PUSH_MB` | `500` | Largest single push. |
 | `GITTER_MAX_REPOS` | `200` | Repositories per user (admins are exempt). |
 | `GITTER_TRUST_PROXY` | `false` | Behind a reverse proxy, set this so rate limits use the client address from `X-Forwarded-For` (the last hop, which your proxy adds). |

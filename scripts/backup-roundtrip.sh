@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Back up a running instance, restore it into an empty data dir, boot the
+# restore and check that accounts, repositories and git history all survived.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cargo build -q
+BIN=./target/debug/gitter
+TMP=$(mktemp -d)
+PORT=$((20000 + RANDOM % 20000)); PORT2=$((PORT + 1))
+B="http://127.0.0.1:$PORT"; B2="http://127.0.0.1:$PORT2"
+cleanup() { kill "${P1:-}" "${P2:-}" 2>/dev/null || true; rm -rf "$TMP"; }
+trap cleanup EXIT
+fail() { echo "✗ $*"; exit 1; }
+wait_up() { for _ in $(seq 50); do curl -sf "$1/healthz" >/dev/null && return 0; sleep 0.1; done; fail "server at $1 did not start"; }
+
+GITTER_DATA=$TMP/a GITTER_ADDR=127.0.0.1:$PORT GITTER_URL=$B $BIN >"$TMP/a.log" 2>&1 & P1=$!
+wait_up "$B"
+SETUP=$(grep -o 'setup=[A-Za-z0-9_-]*' "$TMP/a.log" | head -1 | cut -d= -f2)
+c() { curl -sf -b "$TMP/jar" -c "$TMP/jar" -H "Origin: $B" -H 'Content-Type: application/json' "$@"; }
+c -X POST "$B/api/auth/signup" --data "{\"username\":\"alice\",\"email\":\"a@example.com\",\"password\":\"correct horse\",\"setup\":\"$SETUP\"}" >/dev/null
+c -X POST "$B/api/repos" --data '{"name":"keep","readme":true}' >/dev/null
+c -X POST "$B/api/repos/alice/keep/issues" --data '{"title":"Remember me"}' >/dev/null
+SHA=$(curl -sf "$B/api/repos/alice/keep/commits" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commits"][0]["sha"])')
+
+GITTER_DATA=$TMP/a $BIN backup "$TMP/backup.tar.gz" || fail "backup"
+[ -s "$TMP/backup.tar.gz" ] || fail "backup file is empty"
+echo "✓ backup of a running server"
+
+if GITTER_DATA=$TMP/a $BIN restore "$TMP/backup.tar.gz" 2>/dev/null; then fail "restore must refuse to overwrite existing data"; fi
+echo "✓ restore refuses a non-empty data dir"
+
+cp "$TMP/backup.tar.gz" "$TMP/a/restore.tar.gz"
+kill "$P1"; wait "$P1" 2>/dev/null || true
+GITTER_DATA=$TMP/a $BIN restore "$TMP/a/restore.tar.gz" --force >/dev/null || fail "restore --force in place"
+ls -d "$TMP"/a/before-restore-* >/dev/null 2>&1 || fail "--force should keep the old data in before-restore-*"
+GITTER_DATA=$TMP/a $BIN doctor >/dev/null || fail "doctor after in-place restore"
+echo "✓ restore --force in place keeps the old data aside"
+
+GITTER_DATA=$TMP/b $BIN restore "$TMP/backup.tar.gz" || fail "restore"
+GITTER_DATA=$TMP/b $BIN doctor || fail "doctor on restored data"
+echo "✓ restore + doctor"
+
+GITTER_DATA=$TMP/b GITTER_ADDR=127.0.0.1:$PORT2 GITTER_URL=$B2 $BIN >"$TMP/b.log" 2>&1 & P2=$!
+wait_up "$B2"
+[ "$(curl -sf "$B2/api/repos/alice/keep/commits" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commits"][0]["sha"])')" = "$SHA" ] || fail "history differs after restore"
+curl -sf "$B2/api/repos/alice/keep/issues/1" | grep -q "Remember me" || fail "issue missing after restore"
+git clone -q "$B2/alice/keep.git" "$TMP/clone" && [ -f "$TMP/clone/README.md" ] || fail "clone from restored server"
+curl -sf -H "Origin: $B2" -H 'Content-Type: application/json' -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct horse"}' >/dev/null || fail "login after restore"  # pragma: allowlist secret
+echo "✓ restored server has the same history, issues, logins and clones"
+echo "Backup round-trip passed."

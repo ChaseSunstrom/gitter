@@ -175,3 +175,14 @@
   .repo-title { flex: 1 1 100%; flex-wrap: wrap; font-size: 17px; }
   .repo-actions { width: 100%; }
 }
+
+/* ---------- announcement + admin ---------- */
+.announce { background: var(--accent-soft); border-bottom: 1px solid var(--accent-line); color: var(--ink); font-size: 13px; }
+.announce-in { max-width: 1320px; margin: 0 auto; padding: 8px 20px; display: flex; gap: 8px; align-items: center; }
+.announce .ico { color: var(--accent); }
+.admin-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.admin-stat { display: grid; gap: 4px; }
+.admin-stat b { font-size: 28px; line-height: 1.1; }
+.disk-bar { height: 10px; border-radius: 99px; background: var(--hover); overflow: hidden; }
+.disk-bar span { display: block; height: 100%; background: var(--grad); border-radius: 99px; transition: width .6s var(--ease); }
+.admin-user { flex-wrap: wrap; }

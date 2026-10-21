@@ -77,6 +77,15 @@ pub async fn verify_password(pw: String, hash: String) -> bool {
     .unwrap_or(false)
 }
 
+/// Compare secrets without leaking where they differ through timing.
+pub fn constant_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
 pub fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
@@ -139,7 +148,7 @@ async fn user_by_session(db: &Db, raw: &str) -> R<Option<User>> {
     db.call(move |c| {
         Ok(c.query_row(
             &format!(
-                "SELECT {} FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.token_hash = ?1 AND s.expires_at > ?2",
+                "SELECT {} FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.suspended = 0",
                 USER_COLS.split(", ").map(|c| format!("u.{c}")).collect::<Vec<_>>().join(", ")
             ),
             rusqlite::params![hash, now()],
@@ -159,7 +168,7 @@ pub async fn user_by_token(db: &Db, raw: &str) -> R<Option<User>> {
         let u = c
             .query_row(
                 "SELECT u.id, u.username, u.display_name, u.email, u.is_admin FROM users u
-                 JOIN tokens t ON t.user_id = u.id WHERE t.token_hash = ?1",
+                 JOIN tokens t ON t.user_id = u.id WHERE t.token_hash = ?1 AND u.suspended = 0",
                 [&hash],
                 User::from_row,
             )
@@ -228,7 +237,7 @@ pub async fn password_login(db: &Db, name: &str, pw: &str) -> R<Option<User>> {
     let row = db
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT id, username, display_name, email, is_admin, pass_hash FROM users WHERE username = ?1 OR (email = ?1 AND email != '')",
+                "SELECT id, username, display_name, email, is_admin, pass_hash FROM users WHERE (username = ?1 OR (email = ?1 AND email != '')) AND suspended = 0",
                 [&n],
                 |r| Ok((User::from_row(r)?, r.get::<_, String>("pass_hash")?)),
             )

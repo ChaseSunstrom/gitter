@@ -14,13 +14,16 @@ use crate::auth::{
 };
 use crate::db::now;
 use crate::error::{AppError, R};
-use crate::{AppState, SignupMode, validate};
+use crate::{AppState, validate};
 
 #[derive(Deserialize)]
 pub struct SignupReq {
     username: String,
     email: String,
     password: String,
+    /// The one-time setup code, only needed for the very first account.
+    #[serde(default)]
+    setup: String,
 }
 
 fn check_password(pw: &str) -> R<()> {
@@ -65,15 +68,28 @@ pub async fn signup(
     }
     check_password(&req.password)?;
     let hash = hash_password(req.password).await?;
-    let closed = st.cfg.signup == SignupMode::Closed;
+    let closed = !st.settings.get().signup_open();
+    let (setup, given) = (st.setup_code.clone(), req.setup.clone());
     let (u2, e2) = (username.clone(), email.clone());
     let user = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
             let count: i64 = tx.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
-            // The first account on a fresh instance becomes the admin, even when sign-up is closed.
-            if closed && count > 0 {
+            // The first account on a fresh instance becomes the admin, even when sign-up is
+            // closed, but only with the setup code from the server log, so a stranger can't claim it.
+            // Held until the commit, so the code is only used up by an account that really exists.
+            let mut code = setup.lock().unwrap_or_else(|p| p.into_inner());
+            if count == 0 {
+                if let Some(expected) = code.as_ref()
+                    && !crate::auth::constant_eq(expected, &given)
+                {
+                    return Err(AppError::new(
+                        axum::http::StatusCode::FORBIDDEN,
+                        "To create the admin account, open the setup link printed in the server log",
+                    ));
+                }
+            } else if closed {
                 return Err(AppError::forbidden());
             }
             let taken: bool = tx
@@ -90,6 +106,9 @@ pub async fn signup(
             let id = tx.last_insert_rowid();
             let u = tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), [id], User::from_row)?;
             tx.commit()?;
+            if count == 0 {
+                *code = None;
+            }
             Ok(u)
         })
         .await?;
@@ -180,7 +199,7 @@ const PROFILE_COLS: &str =
 pub async fn me(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json::Value> {
     let Some(u) = v else {
         return Ok(Json(
-            json!({ "user": null, "signup": st.cfg.signup == SignupMode::Open }),
+            json!({ "user": null, "signup": st.settings.get().signup_open(), "instance": instance_info(&st) }),
         ));
     };
     let id = u.id;
@@ -195,7 +214,7 @@ pub async fn me(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json::
         })
         .await?;
     Ok(Json(
-        json!({ "user": u, "profile": p, "signup": st.cfg.signup == SignupMode::Open }),
+        json!({ "user": u, "profile": p, "signup": st.settings.get().signup_open(), "instance": instance_info(&st) }),
     ))
 }
 
@@ -602,4 +621,10 @@ pub async fn search(
         })
         .await?;
     Ok(Json(out))
+}
+
+fn instance_info(st: &AppState) -> serde_json::Value {
+    let s = st.settings.get();
+    let needs_setup = st.setup_code.lock().map(|c| c.is_some()).unwrap_or(false);
+    json!({ "name": s.instance_name, "announcement": s.announcement, "needs_setup": needs_setup })
 }

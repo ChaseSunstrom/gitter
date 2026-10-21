@@ -85,6 +85,7 @@ function commands() {
     add('Go to', 'user', 'Your profile', '/' + me.username);
     add('Go to', 'star', 'Your stars', `/${me.username}?tab=stars`);
     add('Go to', 'settings', 'Settings', '/settings');
+    if (me.is_admin) add('Go to', 'shield', 'Site administration', '/admin');
     add('Go to', 'key', 'Access tokens', '/settings/tokens');
     add('Create', 'repo', 'New repository', '/new', 'g n');
   } else {

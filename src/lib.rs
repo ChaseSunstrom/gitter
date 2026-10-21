@@ -6,7 +6,9 @@ pub mod error;
 pub mod git;
 pub mod hooks;
 pub mod langs;
+pub mod ops;
 pub mod repo;
+pub mod settings;
 pub mod smart_http;
 pub mod validate;
 pub mod web;
@@ -45,16 +47,26 @@ pub struct AppState {
     pub git: git::Git,
     pub cfg: Arc<Config>,
     pub limiter: Arc<auth::Limiter>,
+    pub settings: Arc<settings::Live>,
+    /// Unix time the server started.
+    pub started: i64,
+    /// One-time code required to create the first (admin) account, printed at boot.
+    /// None means no code is needed (tests, or an instance that already has users).
+    pub setup_code: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl AppState {
     pub fn new(cfg: Config, db: db::Db) -> AppState {
         let git = git::Git::new(cfg.data_dir.join("repos"), cfg.data_dir.join("home"), 64);
+        let settings = Arc::new(settings::Live::new(settings::Settings::from_config(&cfg)));
         AppState {
             db,
             git,
             cfg: Arc::new(cfg),
             limiter: Arc::new(auth::Limiter::default()),
+            settings,
+            started: db::now(),
+            setup_code: Arc::default(),
         }
     }
 }
@@ -84,6 +96,7 @@ pub fn router(st: AppState) -> Router {
         .route("/favicon.svg", get(web::favicon))
         .route("/favicon.ico", get(web::favicon))
         .route("/robots.txt", get(web::robots))
+        .route("/healthz", get(api::admin::healthz))
         .fallback(get(web::index))
         .layer(CompressionLayer::new());
 

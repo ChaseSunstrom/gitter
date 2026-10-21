@@ -122,6 +122,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX events_user ON events(user_id, created_at);
     CREATE INDEX events_repo ON events(repo_id, created_at);
     "#,
+    // v2: instance settings, suspended accounts
+    r#"
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    ALTER TABLE users ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Db {

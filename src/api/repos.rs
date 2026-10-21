@@ -41,7 +41,7 @@ async fn insert_repo(
     private: bool,
     forked_from: Option<i64>,
 ) -> R<i64> {
-    let max = st.cfg.max_repos_per_user;
+    let max = st.settings.get().max_repos_per_user;
     let (oid, admin, n, d) = (
         owner.id,
         owner.is_admin,
@@ -117,7 +117,7 @@ async fn init_repo(
 ) -> R<()> {
     let path = st.git.repo_path(id);
     st.git
-        .init_bare(&path, "main", st.cfg.max_push_bytes)
+        .init_bare(&path, "main", st.settings.get().max_push_bytes())
         .await?;
     if readme {
         let body = if description.is_empty() {
@@ -395,7 +395,7 @@ pub async fn fork(
     let dst = st.git.repo_path(id);
     if let Err(e) = st
         .git
-        .clone_bare(&src.path, &dst, st.cfg.max_push_bytes)
+        .clone_bare(&src.path, &dst, st.settings.get().max_push_bytes())
         .await
     {
         drop_row(&st, id).await;

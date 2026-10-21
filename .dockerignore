@@ -1,0 +1,7 @@
+target
+data
+.git
+.foreman
+.claude
+scripts/node_modules
+*.log
