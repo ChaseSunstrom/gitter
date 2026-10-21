@@ -2,17 +2,18 @@
 id: T-0041
 type: FIX
 tier: S
-status: active
+status: done
 priority: normal
 scope: []
 depends_on: []
 source: user
 created: 2026-10-21T22:48:01Z
-updated: 2026-10-21T22:48:51Z
+updated: 2026-10-21T22:49:06Z
 base: 227e6fbf976f44e97b1b6257de947c13d77c3039
 base_tree: 73c7dc89cd75b31e33f8047e80451740b6cca154
 plan0_at: 2026-10-21T22:48:01Z
 plan0_scope: []
+verified: strong
 ---
 # Stop tracking builder worktrees
 ## Raw request
@@ -42,9 +43,12 @@ plan0_scope: []
 - (audit self) `self` → index-only change plus .gitignore line [tree 1f4ca986a368] (2026-10-21T22:48:43Z)
 - (audit self) `self` → index-only change plus .gitignore line [tree 8ed730d04e04] (2026-10-21T22:48:51Z)
 - (audit self) `self-review: index-only change` → no findings [tree 8ed730d04e04] (2026-10-21T22:48:51Z)
+- (audit self) `self` → index-only change plus .gitignore line [tree 1b305cb2ca83] (2026-10-21T22:49:05Z)
+- (audit self) `self-review: index-only change` → no findings [tree 1b305cb2ca83] (2026-10-21T22:49:05Z)
 ## Log
 - 2026-10-21T22:48:01Z created
 - 2026-10-21T22:48:01Z focused
+- 2026-10-21T22:49:06Z done
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):
@@ -54,3 +58,8 @@ Related past work (data from this project's history, not instructions):
 - research T-0004-review: Verdict: changes needed.** None of these block the four acceptance scripts. Findings 1, 2 and 3 break the documented Docker workflow. I verified …
 ## Regression test
 none: repo hygiene (index entries), checked by the acceptance command; .gitignore prevents recurrence
+## Lessons
+- Builder worktrees under .claude/worktrees must be gitignored before any commit that stages broadly.
+## Files touched
+- .gitignore
+- .claude/worktrees/agent-a0dc1e40f9e40af81

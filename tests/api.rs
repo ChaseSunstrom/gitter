@@ -1735,3 +1735,30 @@ async fn repo_limited_tokens_cannot_make_snippets_or_touch_hidden_wikis() {
     assert_eq!(app.req(&anon, "GET", "/api/repos/alice/a/wiki", None).await.0, StatusCode::NOT_FOUND);
     assert_eq!(app.req(&anon, "GET", "/api/repos/alice/a/discussions", None).await.0, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn snippets_and_wikis_count_toward_storage() {
+    let app = App::new();
+    let _admin = app.signup("root1").await;
+    let bob = app.signup("bob").await;
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "r" }))).await;
+    let (s, v) = app.req(&bob, "POST", "/api/snippets", Some(json!({ "title": "t", "files": [{ "name": "a.txt", "content": "x".repeat(600_000) }] }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    let (_, me) = app.req(&bob, "GET", "/api/me", None).await;
+    let used = me["storage"]["used"].as_u64().unwrap();
+    assert!(used > 0, "the snippet's repository counts: {me}");
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 0", [])?)).await.unwrap();
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    // About 1 MB in use now (the snippet is stored compressed, so pad the account to the limit).
+    app.state.db.call(|c| Ok(c.execute("UPDATE snippets SET size_bytes = 1000000", [])?)).await.unwrap();
+    let big = json!({ "title": "t2", "files": [{ "name": "b.txt", "content": "y".repeat(100_000) }] });
+    let (s, e) = app.req(&bob, "POST", "/api/snippets", Some(big.clone())).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
+    let (s, e) = app.req(&bob, "PUT", &format!("/api/snippets/{id}"), Some(big)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
+    let (s, e) = app.req(&bob, "POST", "/api/repos/bob/r/wiki", Some(json!({ "name": "Home", "content": "z".repeat(100_000) }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
+}

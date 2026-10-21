@@ -139,20 +139,11 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Json(req): Js
     if !st.limiter.allow(&format!("snippet:{}", u.id), 30, 3600) {
         return Err(AppError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "You're making snippets very quickly. Try again later."));
     }
+    crate::repo::need_room(&st, u.id, files.iter().map(|f| f.1.len()).sum()).await?;
     let mut b = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
     let id = hex::encode(b);
     let (id2, uid, secret, names) = (id.clone(), u.id, req.secret.unwrap_or(false), file_list(&files));
-    st.db
-        .call(move |c| {
-            let t = now();
-            c.execute(
-                "INSERT INTO snippets(id, owner_id, title, is_secret, files, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?6)",
-                rusqlite::params![id2, uid, title, secret as i64, names, t],
-            )?;
-            Ok(())
-        })
-        .await?;
     let p = path(&st, &id);
     let res = async {
         tokio::fs::create_dir_all(p.parent().unwrap_or(&p)).await.map_err(AppError::internal)?;
@@ -160,12 +151,22 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Json(req): Js
         let changes: Vec<Change> = files.iter().map(|(n, d)| Change::Write(n, d, false)).collect();
         let (an, ae) = u.signature();
         let spec = CommitSpec { branch: BRANCH, parent: None, expect_old: None, changes: &changes, message: "Create snippet", author: (&an, &ae) };
-        st.git.commit_files(&p, &spec).await
+        st.git.commit_files(&p, &spec).await?;
+        // The row comes last, so a snippet is never listed before its files exist.
+        let size = crate::repo::measure(p.clone()).await;
+        st.db
+            .call(move |c| {
+                let t = now();
+                c.execute(
+                    "INSERT INTO snippets(id, owner_id, title, is_secret, files, created_at, updated_at, size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?6,?7)",
+                    rusqlite::params![id2, uid, title, secret as i64, names, t, size],
+                )?;
+                Ok(())
+            })
+            .await
     }
     .await;
     if let Err(e) = res {
-        let id2 = id.clone();
-        let _ = st.db.call(move |c| Ok(c.execute("DELETE FROM snippets WHERE id = ?1", [id2])?)).await;
         let _ = tokio::fs::remove_dir_all(&p).await;
         return Err(e);
     }
@@ -269,6 +270,7 @@ pub async fn update(
         return Err(AppError::forbidden());
     }
     let (title, files) = check(&req)?;
+    crate::repo::need_room(&st, s.owner_id, files.iter().map(|f| f.1.len()).sum()).await?;
     let p = path(&st, &s.id);
     let h = head(&st, &p).await?;
     if req.expected_sha.as_ref().is_some_and(|e| *e != h) {
@@ -293,11 +295,12 @@ pub async fn update(
         sha = st.git.commit_files(&p, &spec).await?;
     }
     let (sid, secret, names) = (s.id.clone(), req.secret.unwrap_or(s.secret), file_list(&files));
+    let size = crate::repo::measure(p.clone()).await;
     st.db
         .call(move |c| {
             Ok(c.execute(
-                "UPDATE snippets SET title = ?1, is_secret = ?2, files = ?3, updated_at = ?4 WHERE id = ?5",
-                rusqlite::params![title, secret as i64, names, now(), sid],
+                "UPDATE snippets SET title = ?1, is_secret = ?2, files = ?3, updated_at = ?4, size_bytes = ?6 WHERE id = ?5",
+                rusqlite::params![title, secret as i64, names, now(), sid, size],
             )?)
         })
         .await?;

@@ -306,7 +306,8 @@ pub async fn comment(
 }
 
 /// A reply of this thread, and whether `uid` may change it.
-async fn own_comment(st: &AppState, r: &Repo, d: &Row, id: i64, uid: i64) -> R<()> {
+/// Check `uid` may change reply `id` (its author, or a writer moderating); returns the author.
+async fn own_comment(st: &AppState, r: &Repo, d: &Row, id: i64, uid: i64) -> R<i64> {
     let did = d.id;
     let author: i64 = st
         .db
@@ -315,7 +316,7 @@ async fn own_comment(st: &AppState, r: &Repo, d: &Row, id: i64, uid: i64) -> R<(
     if author != uid && !r.can_write {
         return Err(AppError::forbidden());
     }
-    Ok(())
+    Ok(author)
 }
 
 pub async fn edit_comment(
@@ -337,12 +338,17 @@ pub async fn edit_comment(
 pub async fn delete_comment(
     State(st): State<AppState>,
     Authed(u): Authed,
+    ip: ClientIp,
     Path((o, n, num, id)): Path<(String, String, i64, i64)>,
 ) -> J<Value> {
     let r = Repo::readable(&st, Some(&u), &o, &n).await?;
     let d = load(&st, &r, num).await?;
-    own_comment(&st, &r, &d, id, u.id).await?;
+    let author = own_comment(&st, &r, &d, id, u.id).await?;
     st.db.call(move |c| Ok(c.execute("DELETE FROM discussion_comments WHERE id = ?1", [id])?)).await?;
+    if author != u.id {
+        let detail = format!("a reply in {}#{num}", r.full_name());
+        record(&st.db, Event { actor: Some(&u), subject: Some(author), action: "discussion_reply_deleted", detail, ip: &ip.0 }).await;
+    }
     ok()
 }
 

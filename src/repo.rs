@@ -144,8 +144,10 @@ pub fn access(repo: &Repo, viewer: Option<&User>) -> (bool, bool) {
     (read, write)
 }
 
-/// Bytes account ?1 stores: its repositories plus the LFS objects they hold (each once).
-pub const STORAGE_USED: &str = "COALESCE((SELECT sum(size_bytes) FROM repos WHERE owner_id = ?1), 0)
+/// Bytes account ?1 stores: its repositories and their wikis, its snippets, and
+/// the LFS objects its repositories hold (each once).
+pub const STORAGE_USED: &str = "COALESCE((SELECT sum(size_bytes + wiki_bytes) FROM repos WHERE owner_id = ?1), 0)
+    + COALESCE((SELECT sum(size_bytes) FROM snippets WHERE owner_id = ?1), 0)
     + COALESCE((SELECT sum(size) FROM (SELECT DISTINCT l.oid, l.size FROM lfs_objects l JOIN repos r ON r.id = l.repo_id WHERE r.owner_id = ?1)), 0)";
 
 /// Bytes an account may still store across its repositories (None = no limit).
@@ -165,6 +167,21 @@ pub async fn storage_left(st: &AppState, owner_id: i64) -> R<Option<u64>> {
         return Ok(None);
     }
     Ok(Some(quota.saturating_sub(used.max(0) as u64)))
+}
+
+/// Refuse a save of `bytes` more than account `owner_id` has room for.
+pub async fn need_room(st: &AppState, owner_id: i64, bytes: usize) -> R<()> {
+    match storage_left(st, owner_id).await? {
+        Some(left) if bytes as u64 > left => Err(AppError::bad(
+            "This account is out of storage. Delete something, or ask the site admin for more space.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The disk a bare repository folder uses now (wikis and snippets record theirs after each save).
+pub async fn measure(dir: PathBuf) -> i64 {
+    tokio::task::spawn_blocking(move || crate::api::admin::dir_size(&dir) as i64).await.unwrap_or(0)
 }
 
 pub async fn record_event(

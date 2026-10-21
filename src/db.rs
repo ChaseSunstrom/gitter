@@ -260,6 +260,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX snippets_owner ON snippets(owner_id, updated_at);
     CREATE INDEX snippets_listed ON snippets(is_secret, updated_at);
     "#,
+    // v8: wiki and snippet sizes, for storage quotas
+    r#"
+    ALTER TABLE repos ADD COLUMN wiki_bytes INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE snippets ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Db {

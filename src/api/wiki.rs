@@ -156,6 +156,8 @@ async fn save(st: &AppState, u: &User, o: &str, n: &str, old: Option<&str>, req:
     if message.len() > 10_000 {
         return Err(AppError::bad("Keep the edit message under 10,000 characters"));
     }
+    // Wikis count toward the repository owner's storage.
+    crate::repo::need_room(st, r.owner_id, req.content.len()).await?;
     let p = path(st, r.id);
     if !tokio::fs::try_exists(&p).await.unwrap_or(false) {
         tokio::fs::create_dir_all(p.parent().unwrap_or(&p)).await.map_err(AppError::internal)?;
@@ -195,6 +197,10 @@ async fn save(st: &AppState, u: &User, o: &str, n: &str, old: Option<&str>, req:
     let (an, ae) = u.signature();
     let spec = CommitSpec { branch: BRANCH, parent: h.as_deref(), expect_old: h.as_deref(), changes: &changes, message: &msg, author: (&an, &ae) };
     let sha = st.git.commit_files(&p, &spec).await?;
+    let (size, id) = (crate::repo::measure(p).await, r.id);
+    st.db
+        .call(move |c| Ok(c.execute("UPDATE repos SET wiki_bytes = ?1 WHERE id = ?2", [size, id])?))
+        .await?;
     Ok(Json(json!({ "name": name, "sha": sha })))
 }
 
