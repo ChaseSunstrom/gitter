@@ -204,7 +204,7 @@ function fileToolbar(meta, rev, path, d, mode) {
   const raw = `/raw/${meta.owner}/${meta.name}/${encPath(rev)}/${encPath(path)}`;
   const isBranch = meta.branches.includes(rev);
   return html`<div class="box-head file-head">
-    <span class="muted small nowrap">${d.content != null ? html`<b>${num(d.content.split('\n').length - (d.content.endsWith('\n') ? 1 : 0))}</b> lines · ` : ''}${bytes(d.size)}${d.language ? html` · ${d.language}` : ''}</span>
+    <span class="muted small nowrap">${d.content != null ? html`<b>${num(d.content.split('\n').length - (d.content.endsWith('\n') ? 1 : 0))}</b> lines · ` : ''}${bytes(d.lfs ? d.lfs.size : d.size)}${d.lfs ? ' · Git LFS' : ''}${d.language ? html` · ${d.language}` : ''}</span>
     ${d.preview ? html`<div class="seg" style="margin-left:8px"><a href="${base}/blob/${encPath(rev)}/${encPath(path)}" class="${mode === 'blob' && !d.showCode ? 'on' : ''}" data-mode="preview">Preview</a><a href="${base}/blob/${encPath(rev)}/${encPath(path)}?plain=1" class="${d.showCode ? 'on' : ''}" data-mode="code">Code</a></div>` : ''}
     ${mode === 'blame' ? html`<div class="seg" style="margin-left:8px"><a href="${base}/blob/${encPath(rev)}/${encPath(path)}">Code</a><a class="on">Blame</a></div>` : ''}
     <span class="grow"></span>
@@ -232,10 +232,14 @@ async function blobView(meta, rev, path) {
   d.showCode = plain && d.preview;
   const lang = langOf(path);
   let content;
-  if (d.image && !d.showCode) {
+  if (d.image && !d.showCode && d.lfs?.stored !== false) {
     content = html`<div class="image-view"><img src="${raw_}" alt="${path}"></div>`;
   } else if (d.too_large) {
     content = html`<div class="empty">${icon('file', 'big')}<h3>This file is too big to show here</h3><a class="btn" href="${raw_}">View raw</a></div>`;
+  } else if (d.lfs) {
+    content = html`<div class="empty">${icon('file', 'big')}<h3>Stored with Git LFS</h3>${d.lfs.stored
+      ? html`<a class="btn" href="${raw_}" download>${icon('download', 'sm')} Download (${bytes(d.lfs.size)})</a>`
+      : html`<p class="muted">${bytes(d.lfs.size)} · not uploaded to this server</p>`}</div>`;
   } else if (d.binary) {
     content = html`<div class="empty">${icon('file', 'big')}<h3>Binary file not shown</h3><a class="btn" href="${raw_}" download>${icon('download', 'sm')} Download (${bytes(d.size)})</a></div>`;
   } else if (isMd && !plain) {

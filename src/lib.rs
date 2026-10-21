@@ -1,13 +1,13 @@
 pub mod api;
 pub mod auth;
 pub mod bench;
-pub mod ci;
 pub mod db;
 pub mod diff;
 pub mod error;
 pub mod git;
 pub mod hooks;
 pub mod langs;
+pub mod lfs;
 pub mod ops;
 pub mod repo;
 pub mod security;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use tower_http::compression::CompressionLayer;
 
 /// Settings read once at startup.
@@ -92,6 +92,13 @@ pub fn router(st: AppState) -> Router {
             "/{owner}/{repo}/git-receive-pack",
             post(smart_http::receive_pack),
         )
+        .route("/{owner}/{repo}/info/lfs/objects/batch", post(lfs::batch))
+        .route(
+            "/{owner}/{repo}/info/lfs/objects/{oid}",
+            get(lfs::download).put(lfs::upload),
+        )
+        .route("/{owner}/{repo}/info/lfs/locks", any(lfs::no_locks))
+        .route("/{owner}/{repo}/info/lfs/locks/verify", any(lfs::no_locks))
         .layer(DefaultBodyLimit::disable());
 
     let app = Router::new()

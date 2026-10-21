@@ -202,6 +202,18 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX reports_status ON reports(status, id);
     "#,
+    // v6: Git LFS objects. The files are shared by content (GITTER_DATA/lfs); a row
+    // says a repository holds one, which is what lets it be downloaded from there.
+    r#"
+    CREATE TABLE lfs_objects (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        oid TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(repo_id, oid)
+    );
+    CREATE INDEX lfs_objects_oid ON lfs_objects(oid);
+    "#,
 ];
 
 impl Db {

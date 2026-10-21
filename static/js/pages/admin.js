@@ -137,6 +137,7 @@ async function settings() {
     <div class="row wrap-ok" style="align-items:flex-start;gap:16px">
       <div class="field" style="width:220px"><label for="s-api">Requests per minute per address</label><input id="s-api" class="input" type="number" min="0" value="${s.api_rate_per_min}"><span class="hint">Slows down scrapers. 0 means no limit.</span></div>
       <div class="field" style="width:220px"><label for="s-write">Changes per minute per person</label><input id="s-write" class="input" type="number" min="0" value="${s.write_rate_per_min}"><span class="hint">Posts, edits and pushes. Admins have no limit.</span></div>
+      <div class="field" style="width:220px"><label for="s-lfs">Largest Git LFS file (MB)</label><input id="s-lfs" class="input" type="number" min="1" value="${s.max_lfs_mb}"><span class="hint">Per file, checked while uploading.</span></div>
     </div>
     <div class="field"><label for="s-ann">Announcement</label><input id="s-ann" class="input" value="${s.announcement}" maxlength="280" placeholder="e.g. Maintenance on Sunday 10:00 UTC">
       <span class="hint">Shown at the top of every page. Leave empty to hide it.</span></div>
@@ -222,6 +223,7 @@ export default async function (ctx) {
           max_storage_mb: +$('#s-storage', el).value,
           api_rate_per_min: +$('#s-api', el).value,
           write_rate_per_min: +$('#s-write', el).value,
+          max_lfs_mb: +$('#s-lfs', el).value,
           announcement: $('#s-ann', el).value.trim(),
         };
         const saved = await send('PUT', '/admin/settings', body);
