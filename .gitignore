@@ -5,3 +5,4 @@
 *.log
 .claude/scheduled_tasks.lock
 .env
+.claude/worktrees/
