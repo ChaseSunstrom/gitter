@@ -180,5 +180,27 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   await page.close();
 }
 
+// Trojan Source and look-alike letters are marked in file and diff views.
+{
+  const src = 'int ok = 1;\n/*‮ } ⁦if (admin)⁩ ⁦ */\nchar *pаypal = "a​b";\n';
+  const w = await ctx.request.post(BASE + '/api/repos/alice/hello/contents', { headers: { Origin: BASE },
+    data: { branch: 'main', new_branch: 'trojan', message: 'Trojan', changes: [{ path: 'trojan.c', content: src }] } });
+  const { sha: t } = await w.json();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const marks = async () => [await page.locator('.uni-warn').count(), await page.locator('.uni.bidi').count(), await page.locator('.uni-mix').count()];
+  await page.goto(`${BASE}/alice/hello/blob/trojan/trojan.c`, { waitUntil: 'networkidle' });
+  const blob = await marks();
+  await page.goto(`${BASE}/alice/hello/commit/${t}`, { waitUntil: 'networkidle' });
+  const diff = await marks();
+  await page.goto(`${BASE}/alice/hello/blob/main/src/main.rs`, { waitUntil: 'networkidle' });
+  const clean = await page.locator('.uni-warn, .uni, .uni-mix').count();
+  const ok = (m) => m[0] === 1 && m[1] === 4 && m[2] >= 1;
+  if (errors.length || !ok(blob) || !ok(diff) || clean) { failed++; console.log('✗ hidden Unicode marks', { blob, diff, clean, errors }); }
+  else console.log('  ok hidden and look-alike characters are marked in file and diff views');
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

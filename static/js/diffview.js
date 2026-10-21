@@ -4,6 +4,7 @@ import { html, raw, esc, encPath, num, $ } from './lib.js';
 import { icon } from './icons.js';
 import { ensureLang, highlightOne } from './hl.js';
 import { langOf } from './lib.js';
+import { scan, warning, revealHidden } from './unicode.js';
 
 const STATUS = { added: ['A', 'c-green', 'Added'], deleted: ['D', 'c-red', 'Deleted'], modified: ['M', 'c-amber', 'Modified'], renamed: ['R', 'c-purple', 'Renamed'], copied: ['C', 'c-purple', 'Copied'] };
 
@@ -68,7 +69,7 @@ function hl(text, lang) { return lang ? highlightOne(text, lang) : esc(text); }
 function lineHtml(text, lang, range) {
   let h = hl(text, lang);
   if (range && range[1] - range[0] < text.length && range[1] > range[0]) h = wrapRange(h, range[0], range[1]);
-  return h || ' ';
+  return revealHidden(h) || ' ';
 }
 
 /** Table rows for a file's hunks, produced lazily so huge files render a chunk at a time. */
@@ -213,7 +214,8 @@ export async function mountDiff(root, diff, opts = {}) {
     // Re-rendering (e.g. switching split/unified) keeps as many rows as were already shown.
     const [first, done] = take(gen, Math.max(CHUNK, body._shown || 0));
     body._shown = Math.max(CHUNK, body._shown || 0);
-    body.innerHTML = `${tableOpen(mode)}${first}</tbody></table>${done ? '' : '<div class="dmore"><span class="spin"></span></div>'}`;
+    const warn = warning(scan(files[i].hunks.map((h) => h.lines.map((l) => l[3]).join('\n')).join('\n')));
+    body.innerHTML = `${warn}${tableOpen(mode)}${first}</tbody></table>${done ? '' : '<div class="dmore"><span class="spin"></span></div>'}`;
     if (done) return;
     const tbody = body.querySelector('tbody'), more = body.querySelector('.dmore');
     const ob = new IntersectionObserver((es) => {

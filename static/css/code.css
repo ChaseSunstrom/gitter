@@ -132,3 +132,9 @@
 .markdown-body .alert-caution { border-color: var(--red); } .markdown-body .alert-caution .alert-title { color: var(--red); }
 .markdown-body details summary { cursor: pointer; font-weight: 600; }
 .dtree-item .tiny { flex: none; white-space: nowrap; }
+/* Hidden and look-alike Unicode (see unicode.js) */
+.uni { display: inline-block; vertical-align: 1px; margin: 0 1px; padding: 0 3px; border-radius: 4px; font-size: 9.5px; line-height: 14px; font-family: var(--mono, monospace); color: var(--amber, #b45309); background: color-mix(in srgb, var(--amber, #b45309) 14%, transparent); border: 1px solid color-mix(in srgb, var(--amber, #b45309) 45%, transparent); }
+.uni::before { content: attr(data-cp); }
+.uni.bidi { color: var(--red, #c0392b); background: color-mix(in srgb, var(--red, #c0392b) 14%, transparent); border-color: color-mix(in srgb, var(--red, #c0392b) 45%, transparent); }
+.uni-mix { text-decoration: wavy underline var(--amber, #b45309); text-underline-offset: 3px; }
+.uni-warn { padding: 10px 14px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--amber, #b45309) 10%, var(--surface)); font-size: 13px; }

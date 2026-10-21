@@ -3,6 +3,7 @@ import { html, raw, state, get, copy, timeEl, avatar, bytes, plural, short, encP
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, splitRev, repoPage, mountRepoHeader, refPicker, mountRefPicker, crumbs } from '../repohead.js';
 import { codeBlock, highlightInto, mountLineSelection } from '../codeview.js';
+import { scan, warning, revealHidden } from '../unicode.js';
 import { renderMarkdown, preloadLangs } from '../md.js';
 import { navigate } from '../main.js';
 
@@ -241,7 +242,7 @@ async function blobView(meta, rev, path) {
     await preloadLangs(d.content);
     content = html`<div class="markdown-body box-body">${raw(renderMarkdown(d.content, { owner: meta.owner, repo: meta.name, rev, dir: path.split('/').slice(0, -1).join('/') }))}</div>`;
   } else {
-    content = codeBlock(d.content);
+    content = html`${raw(warning(scan(d.content)))}${codeBlock(d.content)}`;
   }
   const body = html`<div class="stack">
     <div class="toolbar">${refPicker(meta, rev)}${crumbs(meta, rev, path)}</div>
@@ -291,7 +292,7 @@ async function blameView(meta, rev, path) {
       <div class="row muted tiny"><a class="sha" href="${base}/commit/${c.sha}">${short(c.sha)}</a><span>${c.author}</span><span class="grow"></span>${timeEl(c.time)}
       <a class="btn ghost sm icon" title="Blame before this change" href="${base}/blame/${c.sha}~1/${encPath(path)}" aria-label="Blame prior revision">${icon('history', 'sm')}</a></div>
     </div>
-    <div class="code blame-code" style="--digits:${String(c.start + c.lines.length).length}">${raw(c.lines.map((l, i) => `<div class="cl" id="L${c.start + i}"><a class="ln" href="#L${c.start + i}" data-ln="${c.start + i}"></a><div class="lc">${esc(l) || ' '}</div></div>`).join(''))}</div>
+    <div class="code blame-code" style="--digits:${String(c.start + c.lines.length).length}">${raw(c.lines.map((l, i) => `<div class="cl" id="L${c.start + i}"><a class="ln" href="#L${c.start + i}" data-ln="${c.start + i}"></a><div class="lc">${revealHidden(esc(l)) || ' '}</div></div>`).join(''))}</div>
   </div>`);
   const body = html`<div class="stack">
     <div class="toolbar">${refPicker(meta, rev)}${crumbs(meta, rev, path)}</div>

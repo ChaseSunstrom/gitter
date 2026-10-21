@@ -79,6 +79,7 @@ README features: account security bullet; admin page explains the log seal
 - 2026-10-21T21:34:00Z re-based: what other work changed while it was paused isn't its own change
 - 2026-10-21T21:34:00Z focused
 - 2026-10-21T21:38:28Z done
+- 2026-10-21T21:38:28Z committed d7862bb (29 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

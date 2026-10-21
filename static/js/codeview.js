@@ -1,6 +1,7 @@
 // Line-numbered code with linkable, selectable line ranges (#L10 or #L10-L20).
 import { html, raw, esc } from './lib.js';
 import { highlightLines } from './hl.js';
+import { revealHidden } from './unicode.js';
 
 export function codeBlock(text, { id = 'code' } = {}) {
   const lines = String(text).replace(/\n$/, '').split('\n');
@@ -11,7 +12,7 @@ function linesHtml(lines) {
   let out = '';
   for (let i = 0; i < lines.length; i++) {
     const n = i + 1;
-    out += `<div class="cl" id="L${n}"><a class="ln" href="#L${n}" data-ln="${n}" aria-label="Line ${n}"></a><div class="lc">${lines[i] || ' '}</div></div>`;
+    out += `<div class="cl" id="L${n}"><a class="ln" href="#L${n}" data-ln="${n}" aria-label="Line ${n}"></a><div class="lc">${revealHidden(lines[i], i === 0) || ' '}</div></div>`;
   }
   return out;
 }
