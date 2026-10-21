@@ -1,9 +1,9 @@
 // Account settings: profile, password, access tokens, appearance.
-import { html, state, get, send, $, action, toast, timeEl, confirmDialog, avatar } from '../lib.js';
+import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName } from '../lib.js';
 import { icon } from '../icons.js';
 import { refresh, renderTopbar, setTheme, getTheme, SKINS, getSkin, setSkin } from '../main.js';
 
-const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Password'], ['tokens', 'key', 'Access tokens'], ['appearance', 'sun', 'Appearance']];
+const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Password'], ['security', 'lock', 'Security'], ['tokens', 'key', 'Access tokens'], ['appearance', 'sun', 'Appearance']];
 
 function nav(tab) {
   return html`<nav class="settings-nav" aria-label="Settings">${TABS.map(([k, ic, label]) =>
@@ -54,6 +54,42 @@ function tokensTab(tokens) {
   </div>`;
 }
 
+function securityTab(sec, log) {
+  const tfa = sec.two_factor
+    ? html`<div class="box"><div class="box-body row">${icon('check', 'c-green')}<div class="grow"><b>Two-factor authentication is on</b>
+        <div class="small muted">Signing in needs your password and a code from your app. ${sec.recovery_left} of 10 recovery codes left.</div></div>
+        <button class="btn sm" data-tfa="codes">New recovery codes</button><button class="btn sm danger" data-tfa="off">Turn off</button></div></div>`
+    : html`<div class="box"><div class="box-body row">${icon('shield', 'muted')}<div class="grow"><b>Two-factor authentication is off</b>
+        <div class="small muted">Protect your account even if your password leaks: signing in will also need a code from an app like 1Password, Bitwarden, Google Authenticator or Aegis.</div></div>
+        <button class="btn primary sm" data-tfa="setup">Set up</button></div></div>`;
+  const sessions = sec.sessions.map((x) => html`<div class="list-row">
+      ${icon('globe', 'muted')}<div class="grow"><b>${deviceName(x.agent)}</b>${x.current ? html` <span class="pill">This browser</span>` : ''}
+      <div class="small muted">${x.ip || 'unknown address'} · signed in ${timeEl(x.created_at)} · active ${timeEl(x.last_seen)}</div></div>
+      ${x.current ? '' : html`<button class="btn sm" data-revoke="${x.id}">Sign out</button>`}</div>`);
+  const events = log.events.map((e) => html`<div class="list-row small">
+      <span class="grow"><b>${auditLabel(e.action)}</b>${e.detail ? html` <span class="muted">· ${e.detail}</span>` : ''}${e.actor && e.actor !== state.me.username ? html` <span class="muted">by ${e.actor}</span>` : ''}</span>
+      <span class="muted nowrap">${e.ip ? e.ip + ' · ' : ''}${timeEl(e.created_at)}</span></div>`);
+  return html`<div class="stack settings-form">
+    <h2>Two-factor authentication</h2>
+    ${tfa}<div id="tfa-flow"></div>
+    <h2>Where you're signed in</h2>
+    <div class="box list">${sessions}</div>
+    ${sec.sessions.length > 1 ? html`<div class="row"><button class="btn sm" data-revoke-others>Sign out everywhere else</button></div>` : ''}
+    <h2>Security log</h2>
+    <p class="muted small">Sign-ins and changes to your account's security, newest first.</p>
+    ${events.length ? html`<div class="box list">${events}</div>` : html`<p class="muted">Nothing yet.</p>`}
+  </div>`;
+}
+
+function codesView(codes) {
+  return html`<div class="token-reveal fade stack">
+    <div class="row">${icon('check', 'c-green')}<b>Save your recovery codes</b></div>
+    <p class="small">If you lose your phone, each of these signs you in once. Keep them somewhere safe, like a password manager. They won't be shown again.</p>
+    <pre class="setup-cmd recovery-codes">${codes.join('\n')}</pre>
+    <div class="row"><button class="btn sm" data-codes-copy>${icon('copy', 'sm')} Copy</button><a class="btn sm" data-codes-dl download="gitter-recovery-codes.txt">Download</a>
+      <span class="grow"></span><button class="btn primary sm" data-done>I've saved them</button></div></div>`;
+}
+
 function themeCard(value, label, current) {
   return html`<label class="theme-card ${value}">
     <input type="radio" name="theme" value="${value}" ${current === value ? 'checked' : ''}>
@@ -84,6 +120,10 @@ export default async function (ctx) {
   if (tab === 'profile') inner = profileTab((await get('/me', { fresh: true })).profile);
   else if (tab === 'tokens') inner = tokensTab((await get('/me/tokens', { fresh: true })).tokens);
   else if (tab === 'account') inner = accountTab();
+  else if (tab === 'security') {
+    const [sec, log] = await Promise.all([get('/me/security', { fresh: true }), get('/me/audit', { fresh: true })]);
+    inner = securityTab(sec, log);
+  }
   else inner = appearanceTab();
   const me = state.me;
   return {
@@ -150,8 +190,59 @@ export default async function (ctx) {
           refresh();
         });
       }
+      if (tab === 'security') mountSecurity(el);
       el.querySelectorAll('input[name=theme]').forEach((r) => r.addEventListener('change', () => { setTheme(r.value); toast(`Theme: ${r.closest('label').textContent.trim()}`); }));
       el.querySelectorAll('input[name=skin]').forEach((r) => r.addEventListener('change', () => { setSkin(r.value); toast(`Theme: ${SKINS.find((x) => x.id === r.value).name}`); }));
     },
   };
+}
+
+function mountSecurity(el) {
+  const flow = $('#tfa-flow', el);
+  const showCodes = (codes) => {
+    flow.innerHTML = codesView(codes).s;
+    const blob = new Blob([codes.join('\n') + '\n'], { type: 'text/plain' });
+    $('[data-codes-dl]', flow).href = URL.createObjectURL(blob);
+    $('[data-codes-copy]', flow).addEventListener('click', () => copy(codes.join('\n'), 'Recovery codes copied'));
+    $('[data-done]', flow).addEventListener('click', () => refresh());
+  };
+  $('.settings-body', el).addEventListener('click', async (e) => {
+    const t = e.target;
+    const tfa = t.closest('[data-tfa]')?.dataset.tfa;
+    try {
+      if (tfa === 'setup') {
+        const s = await send('POST', '/me/2fa/setup');
+        flow.innerHTML = html`<div class="box fade"><div class="box-body stack">
+          <b>1. Scan this with your authenticator app</b>
+          <div class="tfa-qr">${raw(s.qr)}</div>
+          <p class="small muted">Can't scan? Enter this key instead: <code class="mono">${s.secret.replace(/(.{4})/g, '$1 ').trim()}</code></p>
+          <form id="tfa-form" class="stack" novalidate><label for="tfa-code"><b>2. Enter the 6-digit code it shows</b></label>
+            <div class="row"><input class="input otp" id="tfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" required><button class="btn primary" type="submit">Turn on</button></div>
+            <p class="field-err" id="tfa-err" role="alert" hidden></p></form></div></div>`.s;
+        const form = $('#tfa-form', flow), err = $('#tfa-err', flow);
+        $('#tfa-code', flow).focus();
+        form.addEventListener('submit', action(form.querySelector('button'), async () => {
+          err.hidden = true;
+          try { showCodes((await send('POST', '/me/2fa/enable', { code: $('#tfa-code', flow).value })).recovery_codes); toast('Two-factor authentication is on'); }
+          catch (x) { err.textContent = x.message; err.hidden = false; }
+        }));
+      } else if (tfa === 'codes') {
+        if (!(await confirmDialog({ title: 'Make new recovery codes?', text: 'Your old recovery codes will stop working.', ok: 'Make new codes' }))) return;
+        showCodes((await send('POST', '/me/2fa/recovery')).recovery_codes);
+      } else if (tfa === 'off') {
+        if (!(await confirmDialog({ title: 'Turn off two-factor authentication?', text: 'Signing in will only need your password again, and your recovery codes will stop working.', ok: 'Turn off', danger: true }))) return;
+        await send('POST', '/me/2fa/disable');
+        toast('Two-factor authentication is off');
+        refresh();
+      } else if (t.closest('[data-revoke]')) {
+        await send('DELETE', `/me/sessions/${t.closest('[data-revoke]').dataset.revoke}`);
+        toast('Signed out that session');
+        refresh();
+      } else if (t.closest('[data-revoke-others]')) {
+        const r = await send('POST', '/me/sessions/revoke-others');
+        toast(`Signed out ${r.revoked} other ${r.revoked === 1 ? 'session' : 'sessions'}`);
+        refresh();
+      }
+    } catch (x) { toast(x.message, 'err'); }
+  });
 }

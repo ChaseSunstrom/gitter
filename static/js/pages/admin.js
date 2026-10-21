@@ -1,9 +1,9 @@
-// Site administration: overview, accounts and instance settings.
-import { html, state, get, send, bytes, num, timeEl, avatar, toast, action, confirmDialog, debounce, $, $$ } from '../lib.js';
+// Site administration: overview, accounts, security log and instance settings.
+import { html, state, get, send, bytes, num, timeEl, avatar, toast, action, confirmDialog, debounce, auditLabel, $, $$ } from '../lib.js';
 import { icon } from '../icons.js';
 import { navigate, refresh, renderTopbar } from '../main.js';
 
-const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['settings', 'settings', 'Settings']];
+const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['audit', 'shield', 'Security log'], ['settings', 'settings', 'Settings']];
 
 function uptime(s) {
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
@@ -48,15 +48,32 @@ async function users(q, page) {
       ${avatar(u.username, 30)}
       <div class="grow" style="display:grid;gap:2px">
         <div class="row"><a href="/${u.username}"><b>${u.username}</b></a>${u.display_name ? html`<span class="muted">${u.display_name}</span>` : ''}
-          ${u.is_admin ? html`<span class="tag-private">Admin</span>` : ''}${u.suspended ? html`<span class="pill closed">Suspended</span>` : ''}</div>
+          ${u.is_admin ? html`<span class="tag-private">Admin</span>` : ''}${u.suspended ? html`<span class="pill closed">Suspended</span>` : ''}${u.two_factor ? html`<span class="pill" title="Two-factor authentication is on">2FA</span>` : ''}</div>
         <span class="muted small">${u.email} · ${num(u.repos)} ${u.repos === 1 ? 'repository' : 'repositories'} · joined ${timeEl(u.created_at)}${u.last_active ? html` · active ${timeEl(u.last_active)}` : ''}</span>
       </div>
       ${u.username === state.me.username ? html`<span class="muted small">You</span>` : html`<div class="row">
+        ${u.two_factor ? html`<button class="btn sm" data-act="reset2fa" title="For someone who lost their phone and recovery codes">Reset 2FA</button>` : ''}
         <button class="btn sm" data-act="admin">${u.is_admin ? 'Remove admin' : 'Make admin'}</button>
         <button class="btn sm ${u.suspended ? '' : 'danger'}" data-act="suspend">${u.suspended ? 'Restore' : 'Suspend'}</button>
         <button class="btn sm icon danger" data-act="delete" aria-label="Delete ${u.username}">${icon('trash', 'sm')}</button></div>`}
     </div>`) : html`<div class="empty">${icon('users', 'big')}<h3>No accounts match</h3></div>`}</div>
     ${page > 1 || d.has_more ? html`<div class="pager">${page > 1 ? html`<a class="btn" href="/admin/users?page=${page - 1}&q=${encodeURIComponent(q)}">Newer</a>` : ''}${d.has_more ? html`<a class="btn" href="/admin/users?page=${page + 1}&q=${encodeURIComponent(q)}">Older</a>` : ''}</div>` : ''}
+  </div>`;
+}
+
+async function audit(q, page) {
+  const d = await get(`/admin/audit?q=${encodeURIComponent(q)}&page=${page}`, { fresh: true });
+  const ok = d.integrity.ok;
+  return html`<div class="stack">
+    <div class="box"><div class="box-body row">${icon(ok ? 'check' : 'x', ok ? 'c-green' : 'c-red')}<span class="grow">${ok
+      ? html`<b>The log is intact.</b> <span class="muted small">Each of its ${num(d.integrity.events)} entries is sealed to the one before, so an entry edited or removed later shows up here. The latest is #${d.integrity.head_id}, seal <code>${d.integrity.head}</code>: note it somewhere else to also catch the newest entries being removed.</span>`
+      : html`<b>The log was altered.</b> <span class="muted small">Entry #${d.integrity.altered_at} (or one just before it) was edited or removed outside Gitter.</span>`}</span></div></div>
+    <div class="search-input" style="max-width:420px">${icon('search')}<input class="input" id="aq" value="${q}" placeholder="Filter by person, action, address…" aria-label="Filter the security log"></div>
+    <div class="box list">${d.events.length ? d.events.map((e) => html`<div class="list-row small">
+      <span class="grow"><b>${auditLabel(e.action)}</b>${e.detail ? html` <span class="muted">· ${e.detail}</span>` : ''}
+        <span class="muted">${e.actor ? html` · by <a href="/${e.actor}">${e.actor}</a>` : ''}${e.subject && e.subject !== e.actor ? html` · account <a href="/${e.subject}">${e.subject}</a>` : ''}</span></span>
+      <span class="muted nowrap">${e.ip ? e.ip + ' · ' : ''}${timeEl(e.created_at)}</span></div>`) : html`<div class="empty">${icon('shield', 'big')}<h3>Nothing logged${q ? ' matches' : ' yet'}</h3></div>`}</div>
+    ${page > 1 || d.has_more ? html`<div class="pager">${page > 1 ? html`<a class="btn" href="/admin/audit?page=${page - 1}&q=${encodeURIComponent(q)}">Newer</a>` : ''}${d.has_more ? html`<a class="btn" href="/admin/audit?page=${page + 1}&q=${encodeURIComponent(q)}">Older</a>` : ''}</div>` : ''}
   </div>`;
 }
 
@@ -84,7 +101,7 @@ export default async function (ctx) {
   const tab = ctx.params.tab || '';
   const q = ctx.query.get('q') || '';
   const page = +(ctx.query.get('page') || 1);
-  const inner = tab === 'users' ? await users(q, page) : tab === 'settings' ? await settings() : await overview();
+  const inner = tab === 'users' ? await users(q, page) : tab === 'audit' ? await audit(q, page) : tab === 'settings' ? await settings() : await overview();
   return {
     title: 'Site administration',
     html: html`<div class="wrap">
@@ -96,13 +113,18 @@ export default async function (ctx) {
       (await import('../repohead.js')).placeTabBar(el);
       $('#uq', el)?.addEventListener('input', debounce((e) => navigate(`/admin/users?q=${encodeURIComponent(e.target.value.trim())}`, { replace: true, scroll: false }), 300));
       if ($('#uq', el) && q) { const i = $('#uq', el); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
+      $('#aq', el)?.addEventListener('input', debounce((e) => navigate(`/admin/audit?q=${encodeURIComponent(e.target.value.trim())}`, { replace: true, scroll: false }), 300));
+      if ($('#aq', el) && q) { const i = $('#aq', el); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
       el.addEventListener('click', async (e) => {
         const b = e.target.closest('[data-act]');
         if (!b) return;
         const name = b.closest('[data-user]').dataset.user;
         const url = `/admin/users/${encodeURIComponent(name)}`;
         await action(b, async () => {
-          if (b.dataset.act === 'admin') {
+          if (b.dataset.act === 'reset2fa') {
+            if (!(await confirmDialog({ title: `Reset ${name}'s two-factor authentication?`, text: 'Only do this after confirming who they are some other way. They can then sign in with just their password and set it up again.', ok: 'Reset 2FA', danger: true }))) return;
+            await send('PATCH', url, { reset_2fa: true });
+          } else if (b.dataset.act === 'admin') {
             const makeAdmin = b.textContent.trim() === 'Make admin';
             if (makeAdmin && !(await confirmDialog({ title: `Make ${name} an admin?`, text: 'Admins can read and change every repository and manage all accounts.', ok: 'Make admin' }))) return;
             await send('PATCH', url, { is_admin: makeAdmin });

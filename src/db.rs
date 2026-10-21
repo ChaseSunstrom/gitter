@@ -127,6 +127,38 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     ALTER TABLE users ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v3: two-factor auth, session details for the session list and re-auth, audit log
+    r#"
+    ALTER TABLE users ADD COLUMN totp_secret TEXT;
+    ALTER TABLE users ADD COLUMN totp_pending TEXT;
+    ALTER TABLE users ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE recovery_codes (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code_hash TEXT NOT NULL,
+        used_at INTEGER,
+        PRIMARY KEY(user_id, code_hash)
+    );
+    ALTER TABLE sessions ADD COLUMN ip TEXT NOT NULL DEFAULT '';
+    ALTER TABLE sessions ADD COLUMN agent TEXT NOT NULL DEFAULT '';
+    ALTER TABLE sessions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sessions ADD COLUMN verified_at INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX sessions_user ON sessions(user_id);
+    -- No foreign keys: the log outlives the accounts and repos it mentions.
+    CREATE TABLE audit (
+        id INTEGER PRIMARY KEY,
+        actor_id INTEGER,
+        actor TEXT NOT NULL DEFAULT '',
+        subject_id INTEGER,
+        subject TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        ip TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        hash TEXT NOT NULL
+    );
+    CREATE INDEX audit_subject ON audit(subject_id, id);
+    CREATE INDEX audit_actor ON audit(actor_id, id);
+    "#,
 ];
 
 impl Db {

@@ -128,13 +128,23 @@ pub fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-pub async fn create_session(db: &Db, user_id: i64) -> R<String> {
+/// Where a sign-in came from, shown in the session list.
+pub fn device(headers: &HeaderMap) -> String {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    ua.chars().take(200).collect()
+}
+
+pub async fn create_session(db: &Db, user_id: i64, ip: &str, agent: &str) -> R<String> {
     let (raw, hash) = new_secret("");
+    let (ip, agent) = (ip.to_string(), agent.to_string());
     db.call(move |c| {
         let t = now();
         c.execute(
-            "INSERT INTO sessions(token_hash, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![hash, user_id, t, t + SESSION_DAYS * 86400],
+            "INSERT INTO sessions(token_hash, user_id, created_at, expires_at, ip, agent, last_seen, verified_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?3, ?3)",
+            rusqlite::params![hash, user_id, t, t + SESSION_DAYS * 86400, ip, agent],
         )?;
         c.execute("DELETE FROM sessions WHERE expires_at < ?1", [t])?;
         Ok(())
@@ -143,18 +153,43 @@ pub async fn create_session(db: &Db, user_id: i64) -> R<String> {
     Ok(raw)
 }
 
-async fn user_by_session(db: &Db, raw: &str) -> R<Option<User>> {
+/// The signed-in browser session behind a request (absent for token auth).
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub hash: String,
+    pub verified_at: i64,
+}
+
+/// How long a password confirmation covers dangerous actions.
+pub const SUDO_SECS: i64 = 600;
+
+async fn user_by_session(db: &Db, raw: &str) -> R<Option<(User, Session)>> {
     let hash = sha256_hex(raw);
     db.call(move |c| {
-        Ok(c.query_row(
-            &format!(
-                "SELECT {} FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.suspended = 0",
-                USER_COLS.split(", ").map(|c| format!("u.{c}")).collect::<Vec<_>>().join(", ")
-            ),
-            rusqlite::params![hash, now()],
-            User::from_row,
-        )
-        .optional()?)
+        let t = now();
+        let row = c
+            .query_row(
+                &format!(
+                    "SELECT {}, s.verified_at, s.last_seen FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.suspended = 0",
+                    USER_COLS.split(", ").map(|c| format!("u.{c}")).collect::<Vec<_>>().join(", ")
+                ),
+                rusqlite::params![hash, t],
+                |r| Ok((User::from_row(r)?, r.get::<_, i64>("verified_at")?, r.get::<_, i64>("last_seen")?)),
+            )
+            .optional()?;
+        let Some((u, verified_at, last_seen)) = row else { return Ok(None) };
+        // At most one write a minute per session, for "last active" in the session list.
+        if t - last_seen > 60 {
+            c.execute("UPDATE sessions SET last_seen = ?1 WHERE token_hash = ?2", rusqlite::params![t, hash])?;
+        }
+        Ok(Some((u, Session { hash, verified_at })))
+    })
+    .await
+}
+
+pub async fn has_2fa(db: &Db, user_id: i64) -> R<bool> {
+    db.call(move |c| {
+        Ok(c.query_row("SELECT totp_secret IS NOT NULL FROM users WHERE id = ?1", [user_id], |r| r.get(0))?)
     })
     .await
 }
@@ -229,6 +264,15 @@ pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>
     if u.is_none() {
         st.limiter.fail(&key, 60);
     }
+    if let Some(u) = &u
+        && has_2fa(&st.db, u.id).await?
+    {
+        // Like GitHub: with two-factor on, git needs an access token, not the password.
+        return Err(AppError::new(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "This account uses two-factor authentication: use an access token instead of your password",
+        ));
+    }
     Ok(u)
 }
 
@@ -269,6 +313,7 @@ impl FromRequestParts<AppState> for Viewer {
             return Ok(Viewer(u.0.clone()));
         }
         let mut user = None;
+        let mut session = None;
         if let Some(v) = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -284,16 +329,68 @@ impl FromRequestParts<AppState> for Viewer {
         }
         if user.is_none()
             && let Some(raw) = cookie_value(&parts.headers, SESSION_COOKIE)
+            && let Some((u, s)) = user_by_session(&st.db, raw).await?
         {
-            user = user_by_session(&st.db, raw).await?;
+            user = Some(u);
+            session = Some(s);
         }
         parts.extensions.insert(CachedViewer(user.clone()));
+        if let Some(s) = session {
+            parts.extensions.insert(s);
+        }
         Ok(Viewer(user))
     }
 }
 
 #[derive(Clone)]
 struct CachedViewer(Option<User>);
+
+/// Whether this request may do something dangerous right now: only a browser
+/// session whose password (and 2FA) was confirmed in the last `SUDO_SECS`.
+/// Access tokens never may, so a leaked token can't turn off 2FA or delete repos.
+pub struct Fresh(pub bool);
+
+impl FromRequestParts<AppState> for Fresh {
+    type Rejection = AppError;
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> R<Self> {
+        let Viewer(v) = Viewer::from_request_parts(parts, st).await?;
+        if v.is_none() {
+            return Ok(Fresh(false));
+        }
+        Ok(Fresh(parts.extensions.get::<Session>().is_some_and(|s| now() - s.verified_at < SUDO_SECS)))
+    }
+}
+
+/// A signed-in user who confirmed their password recently (see `Fresh`).
+pub struct Sudo(pub User);
+
+impl FromRequestParts<AppState> for Sudo {
+    type Rejection = AppError;
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> R<Self> {
+        let Authed(u) = Authed::from_request_parts(parts, st).await?;
+        if parts.extensions.get::<Session>().is_none() {
+            return Err(AppError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "Access tokens can't do this. Sign in on the web instead.",
+            ));
+        }
+        if !Fresh::from_request_parts(parts, st).await?.0 {
+            return Err(AppError::reauth());
+        }
+        Ok(Sudo(u))
+    }
+}
+
+/// The current browser session, if the request has one.
+pub struct CurrentSession(pub Option<Session>);
+
+impl FromRequestParts<AppState> for CurrentSession {
+    type Rejection = AppError;
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> R<Self> {
+        Viewer::from_request_parts(parts, st).await?;
+        Ok(CurrentSession(parts.extensions.get::<Session>().cloned()))
+    }
+}
 
 impl FromRequestParts<AppState> for Authed {
     type Rejection = AppError;
@@ -335,6 +432,11 @@ impl Limiter {
     /// Count one failure (used with `blocked`, so successes are free).
     pub fn fail(&self, key: &str, window_secs: i64) {
         self.bump(key, window_secs);
+    }
+
+    /// Forget `key` (after a success, when attempts are counted up front with `allow`).
+    pub fn reset(&self, key: &str) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
     }
 
     fn bump(&self, key: &str, window_secs: i64) -> u32 {

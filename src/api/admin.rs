@@ -9,9 +9,10 @@ use rusqlite::types::Value;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{J, like, ok};
+use super::{ClientIp, J, like, ok};
 use crate::AppState;
-use crate::auth::{Authed, User};
+use crate::auth::{Authed, Sudo, User};
+use crate::security::{Event, record};
 use crate::error::{AppError, R};
 use crate::settings::Settings;
 
@@ -173,7 +174,8 @@ pub async fn users(
             let mut s = c.prepare(&format!(
                 "SELECT u.username, u.display_name, u.email, u.is_admin, u.suspended, u.created_at,
                     (SELECT count(*) FROM repos r WHERE r.owner_id = u.id),
-                    (SELECT max(e.created_at) FROM events e WHERE e.user_id = u.id)
+                    (SELECT max(e.created_at) FROM events e WHERE e.user_id = u.id),
+                    u.totp_secret IS NOT NULL
                  FROM users u WHERE {cond} ORDER BY u.id DESC LIMIT {} OFFSET {}",
                 per + 1,
                 (page - 1) * per
@@ -183,7 +185,7 @@ pub async fn users(
                     Ok(json!({
                         "username": r.get::<_, String>(0)?, "display_name": r.get::<_, String>(1)?, "email": r.get::<_, String>(2)?,
                         "is_admin": r.get::<_, i64>(3)? != 0, "suspended": r.get::<_, i64>(4)? != 0, "created_at": r.get::<_, i64>(5)?,
-                        "repos": r.get::<_, i64>(6)?, "last_active": r.get::<_, Option<i64>>(7)?,
+                        "repos": r.get::<_, i64>(6)?, "last_active": r.get::<_, Option<i64>>(7)?, "two_factor": r.get::<_, bool>(8)?,
                     }))
                 })?
                 .collect::<Result<_, _>>()?;
@@ -199,11 +201,16 @@ pub async fn users(
 pub struct UserPatch {
     is_admin: Option<bool>,
     suspended: Option<bool>,
+    /// Turn off someone's two-factor auth (they lost their phone and codes).
+    #[serde(default)]
+    reset_2fa: bool,
 }
 
 pub async fn update_user(
     State(st): State<AppState>,
     Admin(me): Admin,
+    _s: Sudo,
+    ip: ClientIp,
     Path(name): Path<String>,
     Json(p): Json<UserPatch>,
 ) -> J<serde_json::Value> {
@@ -212,6 +219,7 @@ pub async fn update_user(
             "You can't change your own admin or suspension status",
         ));
     }
+    let me2 = me.clone();
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -219,6 +227,19 @@ pub async fn update_user(
                 tx.query_row("SELECT id FROM users WHERE username = ?1", [&name], |r| {
                     r.get(0)
                 })?;
+            let log = |action: &str, detail: String| {
+                crate::security::append(&tx, &Event { actor: Some(&me2), subject: Some(id), action, detail, ip: &ip.0 })
+            };
+            if let Some(a) = p.is_admin {
+                log(if a { "admin_granted" } else { "admin_revoked" }, name.clone())?;
+            }
+            if let Some(s) = p.suspended {
+                log(if s { "user_suspended" } else { "user_unsuspended" }, name.clone())?;
+            }
+            if p.reset_2fa {
+                crate::api::security::clear_2fa(&tx, id)?;
+                log("2fa_reset", format!("{name}'s two-factor turned off by an admin"))?;
+            }
             if p.is_admin == Some(false) || p.suspended == Some(true) {
                 ensure_another_admin(&tx, id)?;
             }
@@ -252,6 +273,8 @@ pub struct DeleteUser {
 pub async fn delete_user(
     State(st): State<AppState>,
     Admin(me): Admin,
+    _s: Sudo,
+    ip: ClientIp,
     Path(name): Path<String>,
     Json(d): Json<DeleteUser>,
 ) -> J<serde_json::Value> {
@@ -275,6 +298,9 @@ pub async fn delete_user(
                 s.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?
             };
             tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
+            crate::security::forget_user(&tx, id)?;
+            let e = Event { actor: Some(&me), subject: None, action: "user_deleted", detail: format!("{name} and {} repositories", ids.len()), ip: &ip.0 };
+            crate::security::append(&tx, &e)?;
             tx.commit()?;
             Ok(ids)
         })
@@ -312,12 +338,33 @@ pub async fn get_settings(State(st): State<AppState>, _a: Admin) -> J<Settings> 
 
 pub async fn put_settings(
     State(st): State<AppState>,
-    _a: Admin,
+    Admin(me): Admin,
+    _s: Sudo,
+    ip: ClientIp,
     Json(s): Json<Settings>,
 ) -> J<Settings> {
     let mut s = s;
     s.instance_name = s.instance_name.trim().to_string();
     s.announcement = s.announcement.trim().to_string();
+    let before = st.settings.get();
+    let changed = changed_fields(&before, &s);
     st.settings.save(&st.db, s).await?;
+    if !changed.is_empty() {
+        record(&st.db, Event { actor: Some(&me), subject: None, action: "settings_changed", detail: changed, ip: &ip.0 }).await;
+    }
     Ok(Json(st.settings.get()))
+}
+
+/// "signup: open → closed, max_push_mb: 500 → 100" for the audit log.
+fn changed_fields(a: &Settings, b: &Settings) -> String {
+    let (a, b) = (serde_json::to_value(a).unwrap_or_default(), serde_json::to_value(b).unwrap_or_default());
+    let mut out = vec![];
+    if let (Some(a), Some(b)) = (a.as_object(), b.as_object()) {
+        for (k, v) in b {
+            if a.get(k) != Some(v) {
+                out.push(format!("{k}: {} → {v}", a.get(k).cloned().unwrap_or_default()));
+            }
+        }
+    }
+    out.join(", ")
 }

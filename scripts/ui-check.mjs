@@ -3,6 +3,7 @@
 import { chromium } from 'playwright-core';
 import os from 'node:os';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 const BASE = process.env.BASE;
 // Use $CHROME, else the newest Chromium that Playwright has downloaded.
@@ -76,6 +77,8 @@ const pages = [
   ['/explore?sort=stars', ['hello']],
   ['/settings', []],
   ['/settings/tokens', ['cli']],
+  ['/settings/security', ['Two-factor authentication', 'This browser', 'Security log']],
+  ['/admin/audit', ['The log is intact', 'Created the account']],
   ['/settings/appearance', []],
   ['/admin', ['Site administration', 'Storage']],
   ['/admin/users', ['alice', 'bob']],
@@ -120,6 +123,60 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   const all = await page.locator('.dfile .dtable tr.add').count();
   if (errors.length || first > 1100 || all !== 5000) { failed++; console.log(`✗ big diff: first chunk ${first} rows, ${all} added rows after scrolling`, errors); }
   else console.log(`  ok big diff loads on demand (${first} rows first, ${all} after scrolling)`);
+  await page.close();
+}
+
+// A sensitive action after the password confirmation expired asks for it, then goes through.
+{
+  // Age every session's confirmation (the server honours one for 10 minutes).
+  execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("UPDATE sessions SET verified_at = 0"); c.commit()', process.env.GITTER_DB]);
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/settings/tokens', { waitUntil: 'networkidle' });
+  await page.fill('#token-form input[name=name]', 'after-reauth');
+  await page.click('#token-form button[type=submit]');
+  await page.waitForSelector('#ra-pw');
+  await page.fill('#ra-pw', 'wrong password');
+  await page.click('.modal [data-ok]');
+  await page.waitForSelector('#ra-err:not([hidden])');
+  await page.fill('#ra-pw', 'correct horse');
+  await page.click('.modal [data-ok]');
+  await page.waitForSelector('.token-reveal', { timeout: 5000 }).catch(() => {});
+  const made = await page.locator('.token-reveal').count();
+  if (errors.length || !made) { failed++; console.log('✗ re-auth prompt did not let the token through', errors); }
+  else console.log('  ok sensitive action asks for the password, then goes through');
+  await page.close();
+}
+
+// Signing in to an account with two-factor auth asks for the code.
+{
+  const { createHmac } = await import('node:crypto');
+  const totp = (secret, step) => {
+    const bits = [...secret].map((c) => 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'.indexOf(c).toString(2).padStart(5, '0')).join('');
+    const key = Buffer.from(bits.match(/.{8}/g).map((b) => parseInt(b, 2)));
+    const msg = Buffer.alloc(8); msg.writeBigUInt64BE(BigInt(step));
+    const h = createHmac('sha1', key).update(msg).digest();
+    const o = h[19] & 15;
+    return String((h.readUInt32BE(o) & 0x7fffffff) % 1e6).padStart(6, '0');
+  };
+  const bobCtx = await browser.newContext();
+  await bobCtx.request.post(BASE + '/api/auth/login', { headers: { Origin: BASE }, data: { login: 'bob', password: 'another horse' } });
+  const { secret } = await (await bobCtx.request.post(BASE + '/api/me/2fa/setup', { headers: { Origin: BASE } })).json();
+  const step = Math.floor(Date.now() / 30000);
+  const on = await bobCtx.request.post(BASE + '/api/me/2fa/enable', { headers: { Origin: BASE }, data: { code: totp(secret, step) } });
+  const page = await (await browser.newContext()).newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/login', { waitUntil: 'networkidle' });
+  await page.fill('#login', 'bob');
+  await page.fill('#password', 'another horse');
+  await page.click('#auth-form button[type=submit]');
+  await page.waitForSelector('#otp');
+  await page.fill('#otp', totp(secret, step + 1));
+  const signedIn = await page.waitForURL(BASE + '/', { timeout: 5000 }).then(() => true, () => false);
+  if (!on.ok() || errors.length || !signedIn) { failed++; console.log('✗ two-factor sign-in', on.status(), errors); }
+  else console.log('  ok two-factor sign-in asks for the code and signs in');
   await page.close();
 }
 

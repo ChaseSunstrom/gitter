@@ -9,6 +9,7 @@ pub mod hooks;
 pub mod langs;
 pub mod ops;
 pub mod repo;
+pub mod security;
 pub mod settings;
 pub mod smart_http;
 pub mod validate;
@@ -54,6 +55,8 @@ pub struct AppState {
     /// One-time code required to create the first (admin) account, printed at boot.
     /// None means no code is needed (tests, or an instance that already has users).
     pub setup_code: Arc<std::sync::Mutex<Option<String>>>,
+    /// Sign-ins waiting for a two-factor code.
+    pub challenges: Arc<security::Challenges>,
 }
 
 impl AppState {
@@ -68,6 +71,7 @@ impl AppState {
             settings,
             started: db::now(),
             setup_code: Arc::default(),
+            challenges: Arc::default(),
         }
     }
 }

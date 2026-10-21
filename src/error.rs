@@ -9,6 +9,8 @@ use axum::{
 pub struct AppError {
     pub status: StatusCode,
     pub msg: String,
+    /// A machine-readable reason the web app acts on (e.g. "reauth").
+    pub code: Option<&'static str>,
 }
 
 pub type R<T> = Result<T, AppError>;
@@ -18,7 +20,16 @@ impl AppError {
         Self {
             status,
             msg: msg.into(),
+            code: None,
         }
+    }
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+    /// The action needs a recent password (and 2FA) confirmation.
+    pub fn reauth() -> Self {
+        Self::new(StatusCode::FORBIDDEN, "Confirm your password to continue").with_code("reauth")
     }
     pub fn bad(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, msg)
@@ -46,7 +57,11 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response()
+        let body = match self.code {
+            Some(c) => serde_json::json!({ "error": self.msg, "code": c }),
+            None => serde_json::json!({ "error": self.msg }),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 

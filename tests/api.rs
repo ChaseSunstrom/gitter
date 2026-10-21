@@ -726,3 +726,215 @@ async fn single_file_diff_loads_a_file_too_big_for_the_full_view() {
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
+
+async fn status_with(app: &App, req: Request<Body>) -> StatusCode {
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+async fn login(app: &App, body: Value) -> (StatusCode, Value, Option<String>) {
+    app.call(&Client::default(), "POST", "/api/auth/login", Some(body), Some(ORIGIN)).await
+}
+
+#[tokio::test]
+async fn two_factor_sign_in_codes_and_git() {
+    use gitter::security::{step_now, totp_code};
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "private": true, "readme": true }))).await;
+    let (s, setup) = app.req(&alice, "POST", "/api/me/2fa/setup", None).await;
+    assert_eq!(s, StatusCode::OK, "{setup}");
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    assert!(setup["qr"].as_str().unwrap().contains("<svg"));
+    assert!(setup["uri"].as_str().unwrap().starts_with("otpauth://totp/"));
+    let (s, _) = app.req(&alice, "POST", "/api/me/2fa/enable", Some(json!({ "code": "000000" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a wrong code doesn't enable 2FA");
+    let now = step_now();
+    let (s, on) = app.req(&alice, "POST", "/api/me/2fa/enable", Some(json!({ "code": totp_code(&secret, now).unwrap() }))).await;
+    assert_eq!(s, StatusCode::OK, "{on}");
+    let codes: Vec<String> = serde_json::from_value(on["recovery_codes"].clone()).unwrap();
+    assert_eq!(codes.len(), 10);
+
+    // The password alone no longer signs in.
+    let pw = json!({ "login": "alice", "password": "correct horse" });
+    let (s, step1, cookie) = login(&app, pw.clone()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(step1["two_factor"], true);
+    assert!(cookie.is_none(), "no session before the code");
+    let challenge = step1["challenge"].as_str().unwrap().to_string();
+    let two = |code: String| json!({ "challenge": challenge, "code": code });
+    let (s, _, _) = app.call(&Client::default(), "POST", "/api/auth/login/2fa", Some(two("123456".into())), Some(ORIGIN)).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // The code used to enable is spent; the next one works, once.
+    let next = totp_code(&secret, now + 1).unwrap();
+    let (s, _, cookie) = app.call(&Client::default(), "POST", "/api/auth/login/2fa", Some(two(next.clone())), Some(ORIGIN)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(cookie.is_some());
+    let (_, step1, _) = login(&app, pw.clone()).await;
+    let replay = json!({ "challenge": step1["challenge"], "code": next });
+    let (s, _, _) = app.call(&Client::default(), "POST", "/api/auth/login/2fa", Some(replay), Some(ORIGIN)).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "a code can't be replayed");
+
+    // A recovery code works exactly once.
+    for (i, expect) in [StatusCode::OK, StatusCode::UNAUTHORIZED].into_iter().enumerate() {
+        let (_, step1, _) = login(&app, pw.clone()).await;
+        let body = json!({ "challenge": step1["challenge"], "code": codes[0].to_uppercase() });
+        let (s, _, _) = app.call(&Client::default(), "POST", "/api/auth/login/2fa", Some(body), Some(ORIGIN)).await;
+        assert_eq!(s, expect, "recovery code use #{}", i + 1);
+    }
+
+    // git over HTTP: the password is refused, a token still works.
+    let basic = |secret: &str| {
+        use base64::Engine;
+        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("alice:{secret}")))
+    };
+    let git = |auth: String| {
+        Request::get("/alice/p.git/info/refs?service=git-upload-pack")
+            .header("host", "test.local")
+            .header("authorization", auth)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(status_with(&app, git(basic("correct horse"))).await, StatusCode::UNAUTHORIZED);
+    let (_, t) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "ci" }))).await;
+    assert_eq!(status_with(&app, git(basic(t["token"].as_str().unwrap()))).await, StatusCode::OK);
+
+    let (_, sec) = app.req(&alice, "GET", "/api/me/security", None).await;
+    assert_eq!(sec["two_factor"], true);
+    assert_eq!(sec["recovery_left"], 9);
+}
+
+#[tokio::test]
+async fn sessions_are_listed_and_revocable() {
+    let app = App::new();
+    let first = app.signup("alice").await;
+    let (_, _, second) = login(&app, json!({ "login": "alice", "password": "correct horse" })).await;
+    let second = Client(second);
+    let (_, sec) = app.req(&first, "GET", "/api/me/security", None).await;
+    let sessions = sec["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let other = sessions.iter().find(|s| s["current"] == false).unwrap()["id"].as_str().unwrap().to_string();
+    let (s, _) = app.req(&first, "DELETE", &format!("/api/me/sessions/{other}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(app.req(&second, "GET", "/api/me", None).await.1["user"].is_null(), "revoked session is signed out");
+    assert_eq!(app.req(&first, "GET", "/api/me", None).await.1["user"]["username"], "alice");
+    let (_, _, third) = login(&app, json!({ "login": "alice", "password": "correct horse" })).await;
+    let (_, r) = app.req(&first, "POST", "/api/me/sessions/revoke-others", None).await;
+    assert_eq!(r["revoked"], 1);
+    assert!(app.req(&Client(third), "GET", "/api/me", None).await.1["user"].is_null());
+}
+
+#[tokio::test]
+async fn step_up_is_needed_for_dangerous_actions() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r" }))).await;
+    // Pretend the password was last confirmed an hour ago.
+    app.state.db.call(|c| Ok(c.execute("UPDATE sessions SET verified_at = verified_at - 3600", [])?)).await.unwrap();
+    let (s, e) = app.req(&alice, "DELETE", "/api/repos/alice/r", Some(json!({ "confirm": "alice/r" }))).await;
+    assert_eq!((s, e["code"].as_str()), (StatusCode::FORBIDDEN, Some("reauth")));
+    let (s, _) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "x" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = app.req(&alice, "PATCH", "/api/repos/alice/r", Some(json!({ "private": true }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "changing visibility needs it too");
+    let (s, _) = app.req(&alice, "PATCH", "/api/repos/alice/r", Some(json!({ "description": "fine" }))).await;
+    assert_eq!(s, StatusCode::OK, "harmless edits don't");
+    let (s, _) = app.req(&alice, "POST", "/api/auth/reauth", Some(json!({ "password": "wrong" }))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = app.req(&alice, "POST", "/api/auth/reauth", Some(json!({ "password": "correct horse" }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = app.req(&alice, "DELETE", "/api/repos/alice/r", Some(json!({ "confirm": "alice/r" }))).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn audit_log_records_security_events_in_an_intact_chain() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r" }))).await;
+    app.req(&alice, "DELETE", "/api/repos/alice/r", Some(json!({ "confirm": "alice/r" }))).await;
+    app.req(&alice, "PATCH", "/api/admin/users/bob", Some(json!({ "suspended": true }))).await;
+    let (_, mine) = app.req(&alice, "GET", "/api/me/audit", None).await;
+    let actions: Vec<&str> = mine["events"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert!(actions.contains(&"repo_deleted") && actions.contains(&"signup"), "{actions:?}");
+    let (s, _) = app.req(&bob, "GET", "/api/admin/audit", None).await;
+    assert_ne!(s, StatusCode::OK, "only admins see everyone's log");
+    let (_, all) = app.req(&alice, "GET", "/api/admin/audit", None).await;
+    assert_eq!(all["integrity"]["ok"], true);
+    assert!(all["events"].as_array().unwrap().iter().any(|e| e["action"] == "user_suspended" && e["subject"] == "bob"));
+    app.state.db.call(|c| Ok(c.execute("UPDATE audit SET detail = 'nothing' WHERE action = 'repo_deleted'", [])?)).await.unwrap();
+    let (_, all) = app.req(&alice, "GET", "/api/admin/audit", None).await;
+    assert_eq!(all["integrity"]["ok"], false, "editing a row breaks the chain");
+}
+
+async fn bearer(app: &App, method: &str, path: &str, token: &str, body: Option<Value>) -> StatusCode {
+    let b = Request::builder().method(method).uri(path).header("host", "test.local").header("authorization", format!("Bearer {token}"));
+    let req = match body {
+        Some(v) => b.header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    };
+    status_with(app, req).await
+}
+
+#[tokio::test]
+async fn access_tokens_cannot_do_sudo_actions() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r" }))).await;
+    let (_, t) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "ci" }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    for (m, p, b) in [
+        ("POST", "/api/me/2fa/setup", None),
+        ("POST", "/api/me/2fa/disable", None),
+        ("POST", "/api/me/tokens", Some(json!({ "name": "more" }))),
+        ("DELETE", "/api/repos/alice/r", Some(json!({ "confirm": "alice/r" }))),
+        ("PATCH", "/api/repos/alice/r", Some(json!({ "private": true }))),
+        ("POST", "/api/me/password", Some(json!({ "current": "correct horse", "new": "another horse" }))),
+        ("PATCH", "/api/admin/users/alice", Some(json!({ "reset_2fa": true }))),
+    ] {
+        assert_eq!(bearer(&app, m, p, &t, b).await, StatusCode::FORBIDDEN, "{m} {p} with a token");
+    }
+    assert_eq!(bearer(&app, "PATCH", "/api/repos/alice/r", &t, Some(json!({ "description": "ok" }))).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn password_change_needs_a_fresh_confirmation_and_codes_have_a_shared_budget() {
+    use gitter::security::{step_now, totp_code};
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE sessions SET verified_at = 0", [])?)).await.unwrap();
+    let (s, e) = app.req(&alice, "POST", "/api/me/password", Some(json!({ "current": "correct horse", "new": "another horse" }))).await;
+    assert_eq!((s, e["code"].as_str()), (StatusCode::FORBIDDEN, Some("reauth")));
+    app.req(&alice, "POST", "/api/auth/reauth", Some(json!({ "password": "correct horse" }))).await;
+    let (_, setup) = app.req(&alice, "POST", "/api/me/2fa/setup", None).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    let now = step_now();
+    app.req(&alice, "POST", "/api/me/2fa/enable", Some(json!({ "code": totp_code(&secret, now).unwrap() }))).await;
+    // Five tries per sign-in, counted before checking: the sixth fails even with the right code.
+    let (_, step1, _) = login(&app, json!({ "login": "alice", "password": "correct horse" })).await;
+    for _ in 0..5 {
+        let body = json!({ "challenge": step1["challenge"], "code": "000000" });
+        app.call(&Client::default(), "POST", "/api/auth/login/2fa", Some(body), Some(ORIGIN)).await;
+    }
+    let body = json!({ "challenge": step1["challenge"], "code": totp_code(&secret, now + 1).unwrap() });
+    let (s, _, _) = app.call(&Client::default(), "POST", "/api/auth/login/2fa", Some(body), Some(ORIGIN)).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_new_account_never_inherits_a_deleted_accounts_log() {
+    let app = App::new();
+    let admin = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let (_, t) = app.req(&bob, "POST", "/api/me/tokens", Some(json!({ "name": "bobs-secret-token" }))).await;
+    assert!(t["token"].is_string());
+    let (s, _) = app.req(&admin, "DELETE", "/api/admin/users/bob", Some(json!({ "confirm": "bob" }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let carol = app.signup("carol").await; // SQLite hands carol bob's old id
+    let (_, mine) = app.req(&carol, "GET", "/api/me/audit", None).await;
+    let text = mine.to_string();
+    assert!(!text.contains("bobs-secret-token"), "{text}");
+    let (_, all) = app.req(&admin, "GET", "/api/admin/audit", None).await;
+    assert_eq!(all["integrity"]["ok"], true, "detaching ids keeps the seal");
+    assert!(all["events"].as_array().unwrap().iter().any(|e| e["action"] == "token_created" && e["subject"] == "bob"));
+}

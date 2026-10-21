@@ -34,7 +34,7 @@ export const state = { me: null, signup: true, repo: null };
 // ---------- API ----------
 const cache = new Map(); // url -> { t, p }
 const TTL = 20_000;
-export class ApiError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+export class ApiError extends Error { constructor(status, msg, code) { super(msg); this.status = status; this.code = code; } }
 
 async function request(method, url, body) {
   const opts = { method, headers: { Accept: 'application/json' }, credentials: 'same-origin' };
@@ -43,7 +43,7 @@ async function request(method, url, body) {
   try { res = await fetch('/api' + url, opts); } catch { throw new ApiError(0, "Can't reach the server. Check your connection."); }
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
-  if (!res.ok) throw new ApiError(res.status, data?.error || `Request failed (${res.status})`);
+  if (!res.ok) throw new ApiError(res.status, data?.error || `Request failed (${res.status})`, data?.code);
   return data;
 }
 
@@ -59,9 +59,48 @@ export function get(url, { fresh = false } = {}) {
 export function peek(url) { const h = cache.get(url); return h && Date.now() - h.t < TTL ? h.p : null; }
 export function invalidate(prefix = '') { for (const k of [...cache.keys()]) if (k.startsWith(prefix)) cache.delete(k); }
 export async function send(method, url, body) {
-  const r = await request(method, url, body ?? (method === 'GET' ? undefined : {}));
+  const b = body ?? (method === 'GET' ? undefined : {});
+  let r;
+  try { r = await request(method, url, b); } catch (e) {
+    // Sensitive actions ask for the password again (sudo mode), then go through as if nothing happened.
+    if (e.code !== 'reauth' || !(await reauth())) throw e;
+    r = await request(method, url, b);
+  }
   invalidate();
   return r;
+}
+
+let reauthing = null;
+/** Ask for the password (and a 2FA code when the account has one). Resolves true when confirmed. */
+function reauth() {
+  reauthing ??= modal({
+    title: 'Confirm it’s you',
+    body: html`<p class="muted">This is a sensitive action. Enter your password to continue; you won’t be asked again for a few minutes.</p>
+      <form id="ra-form" class="stack" novalidate>
+        <div class="field"><label for="ra-pw">Password</label><input class="input" id="ra-pw" type="password" autocomplete="current-password" autofocus></div>
+        <div class="field" id="ra-code-f" hidden><label for="ra-code">Authentication code</label><input class="input" id="ra-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456, or a recovery code"></div>
+        <p class="field-err" id="ra-err" role="alert" hidden></p>
+      </form>`,
+    foot: html`<button class="btn" data-close>Cancel</button><button class="btn primary" data-ok>Confirm</button>`,
+    onMount(el, close) {
+      const ok = el.querySelector('[data-ok]'), err = el.querySelector('#ra-err');
+      const submit = async (e) => {
+        e?.preventDefault();
+        busy(ok, true);
+        err.hidden = true;
+        try {
+          await request('POST', '/auth/reauth', { password: el.querySelector('#ra-pw').value, code: el.querySelector('#ra-code').value });
+          close(true);
+        } catch (x) {
+          err.textContent = x.message; err.hidden = false;
+          if (x.code === 'need_code') { el.querySelector('#ra-code-f').hidden = false; el.querySelector('#ra-code').focus(); }
+        } finally { busy(ok, false); }
+      };
+      ok.addEventListener('click', submit);
+      el.querySelector('#ra-form').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(e); });
+    },
+  }).finally(() => { reauthing = null; });
+  return reauthing;
 }
 
 // ---------- formatting ----------
@@ -233,4 +272,24 @@ export function langOf(path) {
   if (f === 'makefile' || f === 'gnumakefile') return 'makefile';
   if (f === 'cmakelists.txt') return 'cmake';
   return m[ext] || null;
+}
+
+// ---------- security log ----------
+const AUDIT = {
+  signup: 'Created the account', login: 'Signed in', password_changed: 'Changed the password',
+  '2fa_enabled': 'Turned on two-factor authentication', '2fa_disabled': 'Turned off two-factor authentication',
+  '2fa_reset': 'Two-factor authentication was reset by an admin', '2fa_failed': 'A wrong two-factor code was entered',
+  recovery_codes_replaced: 'Replaced the recovery codes', session_revoked: 'Signed out a session',
+  token_created: 'Created an access token', token_deleted: 'Deleted an access token',
+  repo_deleted: 'Deleted a repository', repo_visibility: 'Changed who can see a repository',
+  admin_granted: 'Made someone an admin', admin_revoked: 'Removed someone’s admin rights',
+  user_suspended: 'Suspended an account', user_unsuspended: 'Restored an account', user_deleted: 'Deleted an account',
+  settings_changed: 'Changed site settings',
+};
+export const auditLabel = (a) => AUDIT[a] || String(a).replace(/_/g, ' ');
+/** "Firefox on Linux" from a user agent string. */
+export function deviceName(ua) {
+  const b = [['Firefox', 'Firefox'], ['Edg', 'Edge'], ['Chrome', 'Chrome'], ['Safari', 'Safari'], ['git', 'git'], ['curl', 'curl']].find(([k]) => ua.includes(k));
+  const o = [['Windows', 'Windows'], ['Mac OS', 'macOS'], ['Android', 'Android'], ['iPhone', 'iPhone'], ['Linux', 'Linux']].find(([k]) => ua.includes(k));
+  return `${b ? b[1] : 'Unknown browser'}${o ? ' on ' + o[1] : ''}`;
 }

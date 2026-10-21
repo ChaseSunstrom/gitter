@@ -189,7 +189,7 @@ ok "app shell served with CSP"
 if [ "${SKIP_UI:-}" = 1 ]; then
   echo "· UI check skipped (SKIP_UI=1)"
 elif [ -d scripts/node_modules/playwright-core ]; then
-  BASE="$BASE" node scripts/ui-check.mjs || fail "UI check"
+  BASE="$BASE" GITTER_DB="$TMP/data/gitter.db" node scripts/ui-check.mjs || fail "UI check"
   ok "UI pages render without console errors"
 else
   fail "UI check needs Playwright: run 'cd scripts && npm install' (or SKIP_UI=1 to skip)"

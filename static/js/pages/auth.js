@@ -75,6 +75,37 @@ function signupView(ctx) {
     <p class="auth-alt muted small">Already have an account? <a class="c-accent" href="/login${ctx.url.search}">Sign in</a></p>`);
 }
 
+/** Second sign-in step for accounts with two-factor authentication. */
+function codeStep(el, challenge, ctx) {
+  const card = $('.auth-card', el);
+  card.innerHTML = html`<a href="/" class="auth-logo" aria-label="Gitter home">${logo(44)}</a>
+    <h1>Two-factor authentication</h1>
+    <p class="muted">Open your authenticator app and enter the 6-digit code for Gitter.</p>
+    <form id="code-form" class="stack" novalidate>
+      <div class="field"><label for="otp">Authentication code</label><input class="input otp" id="otp" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="20" autofocus required></div>
+      <p class="field-err" id="code-err" role="alert" hidden></p>
+      <button class="btn primary lg" type="submit">Verify</button>
+    </form>
+    <p class="auth-alt muted small">Lost your phone? Enter one of your recovery codes instead.</p>`.s;
+  const form = $('#code-form', card), err = $('#code-err', card), input = $('#otp', card);
+  input.focus();
+  // Submit as soon as six digits are in (typed or pasted).
+  input.addEventListener('input', () => { if (/^\d{6}$/.test(input.value.replace(/\s/g, ''))) form.requestSubmit(); });
+  const btn = form.querySelector('button[type=submit]');
+  form.addEventListener('submit', action(btn, async () => {
+    err.hidden = true;
+    let res;
+    try { res = await send('POST', '/auth/login/2fa', { challenge, code: input.value }); }
+    catch (e) {
+      if (e.code === 'restart') return navigate(location.pathname + location.search, { replace: true });
+      err.textContent = e.message; err.hidden = false; input.select(); return;
+    }
+    state.me = res.user;
+    renderTopbar();
+    navigate(next(ctx), { replace: true });
+  }));
+}
+
 export default async function (ctx) {
   if (state.me) return { redirect: next(ctx) };
   const signup = ctx.params.mode === 'signup';
@@ -120,6 +151,7 @@ export default async function (ctx) {
           if (!f.login.trim() || !f.password) return showErr('Enter your username and password');
           try { res = await send('POST', '/auth/login', { login: f.login.trim(), password: f.password }); }
           catch (e) { pw.select(); return showErr(e.message); }
+          if (res.two_factor) return codeStep(el, res.challenge, ctx);
         }
         state.me = res.user;
         renderTopbar();

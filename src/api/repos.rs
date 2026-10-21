@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{J, ok};
-use crate::auth::{Authed, User, Viewer};
+use crate::auth::{Authed, Fresh, Sudo, User, Viewer};
+use super::ClientIp;
+use crate::security::{Event, record};
 use crate::db::now;
 use crate::error::{AppError, R};
 use crate::git::Change;
@@ -210,10 +212,17 @@ pub struct UpdateReq {
 pub async fn update(
     State(st): State<AppState>,
     Viewer(v): Viewer,
+    Fresh(fresh): Fresh,
+    ip: ClientIp,
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<UpdateReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    let visibility = req.private.filter(|p| *p != r.private);
+    // Publishing a private repo can't be undone (people may clone it), so it needs a fresh password.
+    if visibility.is_some() && !fresh {
+        return Err(AppError::reauth());
+    }
     if let Some(n) = &req.name
         && !validate::repo_name(n)
     {
@@ -294,6 +303,10 @@ pub async fn update(
     if let Some(b) = new_head {
         st.git.set_head(&r.path, &b).await?;
     }
+    if let Some(p) = visibility {
+        let detail = format!("{} made {}", r.full_name(), if p { "private" } else { "public" });
+        record(&st.db, Event { actor: v.as_ref(), subject: Some(r.owner_id), action: "repo_visibility", detail, ip: &ip.0 }).await;
+    }
     touch(&st.db, id, false).await?;
     let n2: String = st
         .db
@@ -309,11 +322,12 @@ pub struct DeleteReq {
 
 pub async fn remove(
     State(st): State<AppState>,
-    Viewer(v): Viewer,
+    Sudo(u): Sudo,
+    ip: ClientIp,
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<DeleteReq>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
     if !req.confirm.eq_ignore_ascii_case(&r.full_name()) {
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
@@ -324,6 +338,7 @@ pub async fn remove(
     if let Err(e) = tokio::fs::remove_dir_all(&r.path).await {
         eprintln!("removing {}: {e}", r.path.display());
     }
+    record(&st.db, Event { actor: Some(&u), subject: Some(r.owner_id), action: "repo_deleted", detail: r.full_name(), ip: &ip.0 }).await;
     ok()
 }
 

@@ -9,9 +9,10 @@ use serde_json::json;
 
 use super::{ClientIp, J, VISIBLE, like, ok, page, repo_cards, visible_params};
 use crate::auth::{
-    Authed, SESSION_COOKIE, TOKEN_PREFIX, USER_COLS, User, Viewer, clear_cookie, cookie_value,
-    create_session, hash_password, new_secret, password_login, session_cookie, sha256_hex,
+    Authed, SESSION_COOKIE, Sudo, TOKEN_PREFIX, USER_COLS, User, Viewer, clear_cookie, cookie_value,
+    create_session, device, has_2fa, hash_password, new_secret, password_login, session_cookie, sha256_hex,
 };
+use crate::security::{Event, record};
 use crate::db::now;
 use crate::error::{AppError, R};
 use crate::{AppState, validate};
@@ -48,6 +49,7 @@ fn signed_in(st: &AppState, token: &str, user: User) -> Response {
 pub async fn signup(
     State(st): State<AppState>,
     ip: ClientIp,
+    headers: HeaderMap,
     Json(req): Json<SignupReq>,
 ) -> R<Response> {
     if !st.limiter.allow(&format!("signup:{}", ip.0), 5, 3600) {
@@ -112,7 +114,9 @@ pub async fn signup(
             Ok(u)
         })
         .await?;
-    let token = create_session(&st.db, user.id).await?;
+    let token = create_session(&st.db, user.id, &ip.0, &device(&headers)).await?;
+    let detail = if user.is_admin { "first account (admin)" } else { "" };
+    record(&st.db, Event { actor: Some(&user), subject: Some(user.id), action: "signup", detail: detail.into(), ip: &ip.0 }).await;
     Ok(signed_in(&st, &token, user))
 }
 
@@ -125,6 +129,7 @@ pub struct LoginReq {
 pub async fn login(
     State(st): State<AppState>,
     ip: ClientIp,
+    headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> R<Response> {
     let login = req.login.trim().to_string();
@@ -141,7 +146,13 @@ pub async fn login(
     }
     match password_login(&st.db, &login, &req.password).await? {
         Some(user) => {
-            let token = create_session(&st.db, user.id).await?;
+            if has_2fa(&st.db, user.id).await? {
+                // The password was right; the session waits for the second factor.
+                let challenge = st.challenges.issue(user.id);
+                return Ok(Json(json!({ "two_factor": true, "challenge": challenge })).into_response());
+            }
+            let token = create_session(&st.db, user.id, &ip.0, &device(&headers)).await?;
+            record(&st.db, Event { actor: Some(&user), subject: Some(user.id), action: "login", detail: "password".into(), ip: &ip.0 }).await;
             Ok(signed_in(&st, &token, user))
         }
         None => {
@@ -151,6 +162,46 @@ pub async fn login(
                 axum::http::StatusCode::UNAUTHORIZED,
                 "Incorrect username or password",
             ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TwoFactorLogin {
+    challenge: String,
+    code: String,
+}
+
+/// Second step of signing in to an account with two-factor auth.
+pub async fn login_2fa(
+    State(st): State<AppState>,
+    ip: ClientIp,
+    headers: HeaderMap,
+    Json(req): Json<TwoFactorLogin>,
+) -> R<Response> {
+    let Some(uid) = st.challenges.attempt(&req.challenge) else {
+        return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "That sign-in expired. Enter your password again.").with_code("restart"));
+    };
+    // Counted before checking, so parallel guesses share the budget.
+    let key = format!("2fa:{uid}");
+    if !st.limiter.allow(&key, 10, 900) {
+        return Err(AppError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many wrong codes. Wait 15 minutes and try again."));
+    }
+    let user = st
+        .db
+        .call(move |c| Ok(c.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1 AND suspended = 0"), [uid], User::from_row)?))
+        .await?;
+    match crate::security::use_code(&st.db, uid, &req.code).await? {
+        Some(how) => {
+            st.challenges.finish(&req.challenge);
+            st.limiter.reset(&key);
+            let token = create_session(&st.db, uid, &ip.0, &device(&headers)).await?;
+            record(&st.db, Event { actor: Some(&user), subject: Some(uid), action: "login", detail: format!("password + {how}"), ip: &ip.0 }).await;
+            Ok(signed_in(&st, &token, user))
+        }
+        None => {
+            record(&st.db, Event { actor: None, subject: Some(uid), action: "2fa_failed", detail: "wrong code at sign-in".into(), ip: &ip.0 }).await;
+            Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "That code didn't work. Codes change every 30 seconds, and each works once."))
         }
     }
 }
@@ -304,16 +355,23 @@ pub struct PasswordReq {
 
 pub async fn change_password(
     State(st): State<AppState>,
-    Authed(u): Authed,
+    Sudo(u): Sudo,
+    ip: ClientIp,
+    headers: HeaderMap,
     Json(req): Json<PasswordReq>,
 ) -> R<Response> {
     check_password(&req.new)?;
+    let key = format!("reauth:{}", u.id);
+    if !st.limiter.allow(&key, 10, 600) {
+        return Err(AppError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes."));
+    }
     if password_login(&st.db, &u.username, &req.current)
         .await?
         .is_none()
     {
         return Err(AppError::bad("Your current password is incorrect"));
     }
+    st.limiter.reset(&key);
     let hash = hash_password(req.new).await?;
     st.db
         .call(move |c| {
@@ -328,7 +386,8 @@ pub async fn change_password(
         })
         .await?;
     // Every other session is now signed out; give this browser a fresh one.
-    let token = create_session(&st.db, u.id).await?;
+    let token = create_session(&st.db, u.id, &ip.0, &device(&headers)).await?;
+    record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "password_changed", detail: "other sessions signed out".into(), ip: &ip.0 }).await;
     Ok((
         [(
             header::SET_COOKIE,
@@ -362,7 +421,8 @@ pub struct TokenReq {
 
 pub async fn create_token(
     State(st): State<AppState>,
-    Authed(u): Authed,
+    Sudo(u): Sudo,
+    ip: ClientIp,
     Json(req): Json<TokenReq>,
 ) -> J<serde_json::Value> {
     let name = req.name.trim().to_string();
@@ -370,11 +430,12 @@ pub async fn create_token(
         return Err(AppError::bad("Give the token a name (up to 80 characters)"));
     }
     let (raw, hash) = new_secret(TOKEN_PREFIX);
+    let (uid, n2) = (u.id, name.clone());
     st.db
         .call(move |c| {
             let n: i64 = c.query_row(
                 "SELECT count(*) FROM tokens WHERE user_id = ?1",
-                [u.id],
+                [uid],
                 |r| r.get(0),
             )?;
             if n >= 50 {
@@ -384,27 +445,35 @@ pub async fn create_token(
             }
             c.execute(
                 "INSERT INTO tokens(user_id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![u.id, name, hash, now()],
+                rusqlite::params![uid, n2, hash, now()],
             )?;
             Ok(())
         })
         .await?;
+    record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "token_created", detail: name, ip: &ip.0 }).await;
     Ok(Json(json!({ "token": raw })))
 }
 
 pub async fn delete_token(
     State(st): State<AppState>,
-    Authed(u): Authed,
+    Sudo(u): Sudo,
+    ip: ClientIp,
     Path(id): Path<i64>,
 ) -> J<serde_json::Value> {
-    st.db
+    let uid = u.id;
+    let name: Option<String> = st
+        .db
         .call(move |c| {
-            Ok(c.execute(
-                "DELETE FROM tokens WHERE id = ?1 AND user_id = ?2",
-                [id, u.id],
-            )?)
+            let n = c
+                .query_row("SELECT name FROM tokens WHERE id = ?1 AND user_id = ?2", [id, uid], |r| r.get(0))
+                .optional()?;
+            c.execute("DELETE FROM tokens WHERE id = ?1 AND user_id = ?2", [id, uid])?;
+            Ok(n)
         })
         .await?;
+    if let Some(name) = name {
+        record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "token_deleted", detail: name, ip: &ip.0 }).await;
+    }
     ok()
 }
 

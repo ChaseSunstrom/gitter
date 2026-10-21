@@ -3,6 +3,7 @@ pub mod admin;
 pub mod code;
 pub mod issues;
 pub mod repos;
+pub mod security;
 
 use std::net::SocketAddr;
 
@@ -28,6 +29,16 @@ pub fn router() -> Router<AppState> {
         .route("/auth/signup", post(account::signup))
         .route("/auth/login", post(account::login))
         .route("/auth/logout", post(account::logout))
+        .route("/auth/login/2fa", post(account::login_2fa))
+        .route("/auth/reauth", post(security::reauth))
+        .route("/me/security", get(security::overview))
+        .route("/me/audit", get(security::my_log))
+        .route("/me/2fa/setup", post(security::setup))
+        .route("/me/2fa/enable", post(security::enable))
+        .route("/me/2fa/disable", post(security::disable))
+        .route("/me/2fa/recovery", post(security::new_codes))
+        .route("/me/sessions/revoke-others", post(security::revoke_others))
+        .route("/me/sessions/{id}", delete(security::revoke))
         .route("/me", get(account::me).patch(account::update_me))
         .route("/me/password", post(account::change_password))
         .route(
@@ -42,6 +53,7 @@ pub fn router() -> Router<AppState> {
         .route("/search", get(account::search))
         .route("/admin/overview", get(admin::overview))
         .route("/admin/users", get(admin::users))
+        .route("/admin/audit", get(security::admin_log))
         .route(
             "/admin/users/{user}",
             patch(admin::update_user).delete(admin::delete_user),

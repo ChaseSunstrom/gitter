@@ -370,6 +370,17 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
         integrity == "ok",
         format!("database integrity: {integrity}"),
     );
+    match conn
+        .query_row("SELECT 1 FROM sqlite_master WHERE name = 'audit'", [], |_| Ok(()))
+        .map(|_| crate::security::verify(&conn))
+    {
+        Ok(Ok(Ok(h))) => report(
+            true,
+            format!("security log intact ({} events; latest #{} sealed {})", h.count, h.last_id, h.hash.get(..12).unwrap_or("-")),
+        ),
+        Ok(Ok(Err(id))) => report(false, format!("security log was altered at or before event #{id}")),
+        _ => {}
+    }
     let ids = repo_ids(&conn)?;
     let known: HashSet<String> = ids.iter().map(|i| format!("{i}.git")).collect();
     let repos = data.join("repos");
