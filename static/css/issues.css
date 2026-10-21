@@ -1,0 +1,127 @@
+/* Issues, pull requests, labels, compare, markdown editor. */
+.ico.inline { display: inline-block; vertical-align: -2px; }
+.page-h { font-size: 20px; display: flex; align-items: center; gap: 8px; }
+.lg-input { height: 40px; font-size: 15px; font-weight: 500; }
+
+/* ---------- lists ---------- */
+.issues-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.issues-toolbar .search-input { min-width: 200px; }
+.filter-chips .pill { gap: 4px; }
+.filter-chips .pill:hover { border-color: var(--accent); color: var(--accent); }
+.state-tab { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 7px; color: var(--muted); font-weight: 500; }
+.state-tab.on { color: var(--ink); font-weight: 600; }
+.state-tab:hover { color: var(--ink); background: var(--hover); }
+.issue-row { align-items: flex-start; }
+.issue-row > .ico { margin-top: 3px; }
+.issue-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.issue-title { font-weight: 600; color: var(--ink); font-size: 14.5px; }
+.issue-title:hover { color: var(--accent); }
+
+/* ---------- markdown editor ---------- */
+.mde { display: grid; gap: 8px; }
+.mde-tabs { justify-self: start; }
+.mde-input { min-height: 96px; font-size: 14px; }
+.mde-preview { border: 1px dashed var(--line-strong); border-radius: 8px; padding: 12px 14px; min-height: 96px; }
+.mde-foot { display: flex; align-items: center; gap: 4px; }
+.mde-foot kbd { height: 16px; min-width: 16px; font-size: 10px; }
+
+/* ---------- new issue / side blocks ---------- */
+.issue-side { display: grid; gap: 18px; align-content: start; }
+.side-block { padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.side-block:last-child { border-bottom: 0; }
+.side-block .section-title { display: flex; }
+.label-picks { display: grid; gap: 6px; }
+.label-pick { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.label-pick input, .label-opt input { accent-color: var(--accent); }
+
+/* ---------- issue page ---------- */
+.issue-head { padding-bottom: 16px; border-bottom: 1px solid var(--line); margin-bottom: 16px; display: grid; gap: 10px; }
+.issue-title-row { display: flex; align-items: flex-start; gap: 12px; }
+.issue-title-row h1 { flex: 1; font-size: 26px; font-weight: 600; letter-spacing: -.02em; min-width: 0; overflow-wrap: anywhere; }
+.issue-title-row form, form.issue-title-row { align-items: center; }
+form.issue-title-row .input { flex: 1; height: 38px; font-size: 16px; }
+.issue-num { color: var(--faint); font-weight: 400; }
+.issue-meta { align-items: center; }
+.issue-meta .muted { min-width: 0; }
+.branch-name { display: inline-block; vertical-align: middle; line-height: 18px; font-family: var(--mono); font-size: 12px; padding: 1px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); }
+a.branch-name:hover { text-decoration: underline; }
+.pr-tabs { border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+.issue-split { align-items: start; }
+
+/* ---------- timeline ---------- */
+.timeline { position: relative; display: grid; gap: 16px; min-width: 0; }
+.timeline::before { content: ""; position: absolute; top: 12px; bottom: 60px; left: 68px; width: 2px; background: var(--line); z-index: 0; }
+.tl-item { position: relative; z-index: 1; }
+.tl-comment, .tl-composer { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 14px; align-items: start; animation: rise .4s var(--ease) both; }
+.tl-avatar img { box-shadow: 0 0 0 3px var(--bg), 0 0 0 4px var(--line); }
+.comment-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); min-width: 0; position: relative; }
+.comment-card::before { content: ""; position: absolute; top: 13px; left: -7px; width: 12px; height: 12px; background: var(--surface-2); border-left: 1px solid var(--line); border-bottom: 1px solid var(--line); transform: rotate(45deg); }
+.comment-head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 14px; background: var(--surface-2); border-bottom: 1px solid var(--line); border-radius: var(--r) var(--r) 0 0; min-height: 42px; }
+.comment-head a.row { gap: 6px; flex: none; }
+.comment-head > .muted { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.comment-head .muted a:hover { text-decoration: underline; }
+.comment-body { padding: 14px 16px; overflow-wrap: anywhere; }
+.comment-body > .edit-form { margin: -2px; }
+.tl-comment:target .comment-card, .tl-comment:target .comment-card::before { border-color: var(--accent); }
+.tl-comment:target .comment-card { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.tl-event { margin-left: 54px; display: flex; align-items: center; gap: 10px; padding: 2px 0; }
+.tl-event .avatar { display: inline-block; vertical-align: -4px; margin-right: 2px; }
+.tl-event-icon { width: 28px; height: 28px; border-radius: 50%; background: var(--surface-2); border: 1px solid var(--line); display: grid; place-items: center; flex: none; box-shadow: 0 0 0 3px var(--bg); }
+.show-sm { display: none; }
+
+/* composer */
+.composer .comment-head { padding-left: 14px; }
+.composer-body { padding: 12px; }
+.composer-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 0 12px 12px; flex-wrap: wrap; }
+.signin-prompt .box-body { gap: 12px; }
+.danger-item { color: var(--red); }
+.danger-item:hover { background: var(--red-soft); color: var(--red); }
+.label-opt { cursor: pointer; }
+
+/* ---------- merge box ---------- */
+.tl-merge { margin-left: 50px; }
+.merge-box { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 14px 16px; display: grid; gap: 12px; }
+.merge-box.ready { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
+.merge-box.merged-box { display: flex; align-items: center; gap: 12px; border-color: color-mix(in srgb, var(--purple) 45%, var(--line)); background: color-mix(in srgb, var(--purple-soft) 55%, var(--surface)); }
+.merge-status { align-items: flex-start; gap: 12px; }
+.merge-icon { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--hover); color: var(--muted); }
+.merge-icon.ok { background: var(--green); color: #fff; }
+.merge-icon.warn { background: var(--amber-soft); color: var(--amber); }
+.merge-icon.closed { background: var(--red); color: #fff; }
+.merged-box .merge-icon { background: var(--purple); color: #fff; }
+.merge-form { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--line); }
+.merge-form .select { width: auto; min-width: 210px; }
+.merge-note { padding-top: 10px; border-top: 1px solid var(--line); }
+.conflict-list { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 2px; }
+.merged-box.celebrate { animation: merge-pulse .9s var(--ease); }
+.merged-box.celebrate .merge-icon { animation: merge-pop .6s var(--spring); }
+@keyframes merge-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--purple) 45%, transparent); } 100% { box-shadow: 0 0 0 14px transparent; } }
+@keyframes merge-pop { 0% { transform: scale(.4) rotate(-30deg); } 100% { transform: none; } }
+
+/* ---------- labels page ---------- */
+.label-form .box-body { align-items: flex-end; gap: 14px; }
+.label-form .field { min-width: 0; }
+.color-input { width: 40px; height: 34px; padding: 2px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); cursor: pointer; }
+.swatches { display: flex; gap: 4px; flex-wrap: wrap; }
+.swatch { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--surface); box-shadow: 0 0 0 1px var(--line-strong); cursor: pointer; padding: 0; transition: transform .15s var(--spring); }
+.swatch:hover { transform: scale(1.2); }
+.label-col { min-width: 180px; }
+#label-preview { display: flex; align-items: center; height: 34px; }
+
+/* ---------- compare ---------- */
+.compare-bar .box-body { padding: 10px 14px; gap: 8px; }
+.pr-form .row > .input { flex: 1; }
+
+@media (max-width: 720px) {
+  .issue-title-row { flex-direction: column; }
+  .issue-title-row h1 { font-size: 21px; }
+  .timeline::before { left: 18px; }
+  .tl-comment, .tl-composer { grid-template-columns: minmax(0, 1fr); }
+  .comment-card::before { display: none; }
+  .comment-head .tag-private { display: none; }
+  .show-sm { display: inline-flex; }
+  .tl-event { margin-left: 4px; }
+  .tl-merge { margin-left: 0; }
+  .label-col { min-width: 0; }
+  .merge-form .select { min-width: 0; width: 100%; }
+}

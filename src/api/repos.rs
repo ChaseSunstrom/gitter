@@ -1,0 +1,555 @@
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use futures_util::future::join_all;
+use rusqlite::OptionalExtension;
+use serde::Deserialize;
+use serde_json::json;
+
+use super::{J, ok};
+use crate::auth::{Authed, User, Viewer};
+use crate::db::now;
+use crate::error::{AppError, R};
+use crate::git::Change;
+use crate::repo::{Repo, record_event, touch};
+use crate::{AppState, validate};
+
+pub const DEFAULT_LABELS: &[(&str, &str)] = &[
+    ("bug", "#e5484d"),
+    ("enhancement", "#3e9ef5"),
+    ("documentation", "#0e9384"),
+    ("question", "#a35bd6"),
+    ("good first issue", "#46a758"),
+    ("help wanted", "#e5932b"),
+];
+
+#[derive(Deserialize)]
+pub struct CreateReq {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    private: bool,
+    #[serde(default)]
+    readme: bool,
+}
+
+async fn insert_repo(
+    st: &AppState,
+    owner: &User,
+    name: &str,
+    description: &str,
+    private: bool,
+    forked_from: Option<i64>,
+) -> R<i64> {
+    let max = st.cfg.max_repos_per_user;
+    let (oid, admin, n, d) = (
+        owner.id,
+        owner.is_admin,
+        name.to_string(),
+        description.to_string(),
+    );
+    st.db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let count: i64 = tx.query_row("SELECT count(*) FROM repos WHERE owner_id = ?1", [oid], |r| r.get(0))?;
+            if count >= max && !admin {
+                return Err(AppError::bad(format!("You've reached the limit of {max} repositories")));
+            }
+            let exists = tx.query_row("SELECT 1 FROM repos WHERE owner_id = ?1 AND name = ?2", rusqlite::params![oid, n], |_| Ok(())).optional()?;
+            if exists.is_some() {
+                return Err(AppError::conflict("You already have a repository with that name"));
+            }
+            let t = now();
+            tx.execute(
+                "INSERT INTO repos(owner_id, name, description, is_private, forked_from, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?6)",
+                rusqlite::params![oid, n, d, private as i64, forked_from, t],
+            )?;
+            let id = tx.last_insert_rowid();
+            for (name, color) in DEFAULT_LABELS {
+                tx.execute("INSERT INTO labels(repo_id, name, color) VALUES (?1, ?2, ?3)", rusqlite::params![id, name, color])?;
+            }
+            tx.commit()?;
+            Ok(id)
+        })
+        .await
+}
+
+async fn drop_row(st: &AppState, id: i64) {
+    let _ = st
+        .db
+        .call(move |c| Ok(c.execute("DELETE FROM repos WHERE id = ?1", [id])?))
+        .await;
+}
+
+pub async fn create(
+    State(st): State<AppState>,
+    Authed(u): Authed,
+    Json(req): Json<CreateReq>,
+) -> J<serde_json::Value> {
+    let name = req.name.trim().to_string();
+    if !validate::repo_name(&name) {
+        return Err(AppError::bad(
+            "Repository names use letters, numbers, '-', '_' or '.', and can't end in .git",
+        ));
+    }
+    let description = req.description.trim().to_string();
+    if description.chars().count() > 350 {
+        return Err(AppError::bad("Keep the description under 350 characters"));
+    }
+    let id = insert_repo(&st, &u, &name, &description, req.private, None).await?;
+    let path = st.git.repo_path(id);
+    if let Err(e) = init_repo(&st, &u, id, &name, &description, req.readme).await {
+        drop_row(&st, id).await;
+        let _ = tokio::fs::remove_dir_all(&path).await;
+        return Err(e);
+    }
+    record_event(&st.db, u.id, Some(id), "create", &name, "", 1).await?;
+    Ok(Json(json!({ "owner": u.username, "name": name })))
+}
+
+async fn init_repo(
+    st: &AppState,
+    u: &User,
+    id: i64,
+    name: &str,
+    description: &str,
+    readme: bool,
+) -> R<()> {
+    let path = st.git.repo_path(id);
+    st.git
+        .init_bare(&path, "main", st.cfg.max_push_bytes)
+        .await?;
+    if readme {
+        let body = if description.is_empty() {
+            format!("# {name}\n")
+        } else {
+            format!("# {name}\n\n{description}\n")
+        };
+        let (an, ae) = u.signature();
+        let changes = [Change::Write("README.md", body.as_bytes(), false)];
+        let spec = crate::git::CommitSpec {
+            branch: "main",
+            parent: None,
+            expect_old: None,
+            changes: &changes,
+            message: "Initial commit",
+            author: (&an, &ae),
+        };
+        st.git.commit_files(&path, &spec).await?;
+        crate::langs::refresh(st, id, &path).await;
+    }
+    Ok(())
+}
+
+pub async fn show(
+    State(st): State<AppState>,
+    Viewer(v): Viewer,
+    Path((owner, name)): Path<(String, String)>,
+) -> J<serde_json::Value> {
+    let r = Repo::readable(&st, v.as_ref(), &owner, &name).await?;
+    let refs = st.git.refs(&r.path).await?;
+    let branches: Vec<&str> = refs
+        .iter()
+        .filter(|x| x.kind == "branch")
+        .map(|x| x.name.as_str())
+        .collect();
+    let tags: Vec<&str> = refs
+        .iter()
+        .filter(|x| x.kind == "tag")
+        .map(|x| x.name.as_str())
+        .collect();
+    let (rid, vid) = (r.id, v.as_ref().map(|u| u.id).unwrap_or(-1));
+    let fork_of = r.forked_from;
+    let counts = st
+        .db
+        .call(move |c| {
+            let q = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [rid], |r| r.get(0)) };
+            let stars = q("SELECT count(*) FROM stars WHERE repo_id = ?1")?;
+            let starred = c.query_row("SELECT count(*) FROM stars WHERE repo_id = ?1 AND user_id = ?2", [rid, vid], |r| r.get::<_, i64>(0))? > 0;
+            let forks = q("SELECT count(*) FROM repos WHERE forked_from = ?1")?;
+            let issues = q("SELECT count(*) FROM issues WHERE repo_id = ?1 AND is_pr = 0 AND state = 'open'")?;
+            let pulls = q("SELECT count(*) FROM issues WHERE repo_id = ?1 AND is_pr = 1 AND state = 'open'")?;
+            let language: String = c.query_row("SELECT language FROM repos WHERE id = ?1", [rid], |r| r.get(0))?;
+            let parent: Option<(String, String, bool)> = match fork_of {
+                Some(pid) => c
+                    .query_row(
+                        "SELECT u.username, p.name, p.is_private FROM repos p JOIN users u ON u.id = p.owner_id WHERE p.id = ?1",
+                        [pid],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+                    )
+                    .optional()?,
+                None => None,
+            };
+            Ok((stars, starred, forks, issues, pulls, language, parent))
+        })
+        .await?;
+    let (stars, starred, forks, issues, pulls, language, parent) = counts;
+    let parent = parent
+        .filter(|p| !p.2)
+        .map(|p| json!({ "owner": p.0, "name": p.1 }));
+    Ok(Json(json!({
+        "owner": r.owner, "name": r.name, "description": r.description, "website": r.website,
+        "private": r.private, "default_branch": r.default_branch, "created_at": r.created_at,
+        "updated_at": r.updated_at, "pushed_at": r.pushed_at, "language": language,
+        "empty": branches.is_empty(), "branches": branches, "tags": tags,
+        "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
+        "fork_of": parent, "can_write": r.can_write, "is_owner": r.is_owner,
+        "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateReq {
+    name: Option<String>,
+    description: Option<String>,
+    website: Option<String>,
+    private: Option<bool>,
+    default_branch: Option<String>,
+}
+
+pub async fn update(
+    State(st): State<AppState>,
+    Viewer(v): Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<UpdateReq>,
+) -> J<serde_json::Value> {
+    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    if let Some(n) = &req.name
+        && !validate::repo_name(n)
+    {
+        return Err(AppError::bad("That isn't a valid repository name"));
+    }
+    if let Some(d) = &req.description
+        && d.chars().count() > 350
+    {
+        return Err(AppError::bad("Keep the description under 350 characters"));
+    }
+    if let Some(w) = &req.website
+        && !w.is_empty()
+        && !(w.starts_with("https://") || w.starts_with("http://"))
+    {
+        return Err(AppError::bad("Website must start with https:// or http://"));
+    }
+    if let Some(b) = &req.default_branch
+        && (!validate::ref_name(b)
+            || st
+                .git
+                .resolve(&r.path, &format!("refs/heads/{b}"))
+                .await?
+                .is_none())
+    {
+        return Err(AppError::bad("That branch doesn't exist"));
+    }
+    let new_head = req.default_branch.clone();
+    let (id, oid) = (r.id, r.owner_id);
+    st.db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            if let Some(n) = req.name {
+                let clash = tx
+                    .query_row(
+                        "SELECT 1 FROM repos WHERE owner_id = ?1 AND name = ?2 AND id != ?3",
+                        rusqlite::params![oid, n, id],
+                        |_| Ok(()),
+                    )
+                    .optional()?;
+                if clash.is_some() {
+                    return Err(AppError::conflict(
+                        "You already have a repository with that name",
+                    ));
+                }
+                tx.execute(
+                    "UPDATE repos SET name = ?1 WHERE id = ?2",
+                    rusqlite::params![n.trim(), id],
+                )?;
+            }
+            if let Some(d) = req.description {
+                tx.execute(
+                    "UPDATE repos SET description = ?1 WHERE id = ?2",
+                    rusqlite::params![d.trim(), id],
+                )?;
+            }
+            if let Some(w) = req.website {
+                tx.execute(
+                    "UPDATE repos SET website = ?1 WHERE id = ?2",
+                    rusqlite::params![w.trim(), id],
+                )?;
+            }
+            if let Some(p) = req.private {
+                tx.execute(
+                    "UPDATE repos SET is_private = ?1 WHERE id = ?2",
+                    rusqlite::params![p as i64, id],
+                )?;
+            }
+            if let Some(b) = req.default_branch {
+                tx.execute(
+                    "UPDATE repos SET default_branch = ?1 WHERE id = ?2",
+                    rusqlite::params![b, id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    if let Some(b) = new_head {
+        st.git.set_head(&r.path, &b).await?;
+    }
+    touch(&st.db, id, false).await?;
+    let n2: String = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT name FROM repos WHERE id = ?1", [id], |r| r.get(0))?))
+        .await?;
+    Ok(Json(json!({ "owner": r.owner, "name": n2 })))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteReq {
+    confirm: String,
+}
+
+pub async fn remove(
+    State(st): State<AppState>,
+    Viewer(v): Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<DeleteReq>,
+) -> J<serde_json::Value> {
+    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    if !req.confirm.eq_ignore_ascii_case(&r.full_name()) {
+        return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
+    }
+    let id = r.id;
+    st.db
+        .call(move |c| Ok(c.execute("DELETE FROM repos WHERE id = ?1", [id])?))
+        .await?;
+    if let Err(e) = tokio::fs::remove_dir_all(&r.path).await {
+        eprintln!("removing {}: {e}", r.path.display());
+    }
+    ok()
+}
+
+pub async fn star(
+    State(st): State<AppState>,
+    Authed(u): Authed,
+    Path((owner, name)): Path<(String, String)>,
+) -> J<serde_json::Value> {
+    let r = Repo::readable(&st, Some(&u), &owner, &name).await?;
+    let (rid, uid) = (r.id, u.id);
+    let added = st
+        .db
+        .call(move |c| {
+            Ok(c.execute(
+                "INSERT OR IGNORE INTO stars(user_id, repo_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![uid, rid, now()],
+            )?)
+        })
+        .await?;
+    if added > 0 {
+        record_event(&st.db, u.id, Some(r.id), "star", &r.name, "", 1).await?;
+    }
+    ok()
+}
+
+pub async fn unstar(
+    State(st): State<AppState>,
+    Authed(u): Authed,
+    Path((owner, name)): Path<(String, String)>,
+) -> J<serde_json::Value> {
+    let r = Repo::readable(&st, Some(&u), &owner, &name).await?;
+    let (rid, uid) = (r.id, u.id);
+    st.db
+        .call(move |c| {
+            Ok(c.execute(
+                "DELETE FROM stars WHERE user_id = ?1 AND repo_id = ?2",
+                [uid, rid],
+            )?)
+        })
+        .await?;
+    ok()
+}
+
+#[derive(Deserialize)]
+pub struct ForkReq {
+    name: Option<String>,
+}
+
+pub async fn fork(
+    State(st): State<AppState>,
+    Authed(u): Authed,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<ForkReq>,
+) -> J<serde_json::Value> {
+    let src = Repo::readable(&st, Some(&u), &owner, &name).await?;
+    let new_name = req.name.unwrap_or_else(|| src.name.clone());
+    if !validate::repo_name(&new_name) {
+        return Err(AppError::bad("That isn't a valid repository name"));
+    }
+    let id = insert_repo(
+        &st,
+        &u,
+        &new_name,
+        &src.description,
+        src.private,
+        Some(src.id),
+    )
+    .await?;
+    let dst = st.git.repo_path(id);
+    if let Err(e) = st
+        .git
+        .clone_bare(&src.path, &dst, st.cfg.max_push_bytes)
+        .await
+    {
+        drop_row(&st, id).await;
+        let _ = tokio::fs::remove_dir_all(&dst).await;
+        return Err(e);
+    }
+    let b = src.default_branch.clone();
+    st.db
+        .call(move |c| {
+            Ok(c.execute(
+                "UPDATE repos SET default_branch = ?1 WHERE id = ?2",
+                rusqlite::params![b, id],
+            )?)
+        })
+        .await?;
+    let lang_src = src.id;
+    st.db
+        .call(move |c| {
+            Ok(c.execute("UPDATE repos SET language = (SELECT language FROM repos WHERE id = ?1) WHERE id = ?2", [lang_src, id])?)
+        })
+        .await?;
+    record_event(&st.db, u.id, Some(id), "fork", &src.full_name(), "", 1).await?;
+    Ok(Json(json!({ "owner": u.username, "name": new_name })))
+}
+
+pub async fn branches(
+    State(st): State<AppState>,
+    Viewer(v): Viewer,
+    Path((owner, name)): Path<(String, String)>,
+) -> J<serde_json::Value> {
+    let r = Repo::readable(&st, v.as_ref(), &owner, &name).await?;
+    let refs = st.git.refs(&r.path).await?;
+    let def = r.default_branch.clone();
+    let list: Vec<_> = refs
+        .into_iter()
+        .filter(|x| x.kind == "branch")
+        .take(200)
+        .collect();
+    // Ahead/behind costs one git process per branch; only the 60 most recent get it.
+    let counts = join_all(list.iter().take(60).map(|b| {
+        let (st, path, def, name) = (st.clone(), r.path.clone(), def.clone(), b.name.clone());
+        async move {
+            if name == def {
+                return (0, 0);
+            }
+            let range = format!("refs/heads/{def}...refs/heads/{name}");
+            match st
+                .git
+                .run(
+                    &path,
+                    &["rev-list", "--left-right", "--count", &range, "--"],
+                    None,
+                    &[],
+                )
+                .await
+            {
+                Ok(o) if o.code == 0 => {
+                    let t = o.text();
+                    let mut it = t.split_whitespace().map(|n| n.parse::<i64>().unwrap_or(0));
+                    let behind = it.next().unwrap_or(0);
+                    let ahead = it.next().unwrap_or(0);
+                    (ahead, behind)
+                }
+                _ => (0, 0),
+            }
+        }
+    }))
+    .await;
+    let rid = r.id;
+    let open_prs: Vec<(String, i64)> = st
+        .db
+        .call(move |c| {
+            let mut s = c.prepare("SELECT p.head_branch, i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.state = 'open'")?;
+            let v = s.query_map([rid], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            Ok(v)
+        })
+        .await?;
+    let counts = counts.into_iter().chain(std::iter::repeat((0, 0)));
+    let out: Vec<_> = list
+        .iter()
+        .zip(counts)
+        .map(|(b, (ahead, behind))| {
+            let pr = open_prs.iter().find(|(h, _)| *h == b.name).map(|(_, n)| *n);
+            json!({ "name": b.name, "sha": b.sha, "date": b.date, "subject": b.subject, "author": b.author,
+                    "ahead": ahead, "behind": behind, "default": b.name == def, "pull": pr })
+        })
+        .collect();
+    Ok(Json(json!({ "branches": out, "default_branch": def })))
+}
+
+#[derive(Deserialize)]
+pub struct BranchReq {
+    name: String,
+    from: String,
+}
+
+pub async fn create_branch(
+    State(st): State<AppState>,
+    Viewer(v): Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<BranchReq>,
+) -> J<serde_json::Value> {
+    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    if !validate::ref_name(&req.name) {
+        return Err(AppError::bad("That isn't a valid branch name"));
+    }
+    if !validate::rev(&req.from) {
+        return Err(AppError::bad("Unknown starting point"));
+    }
+    let sha = st
+        .git
+        .resolve(&r.path, &req.from)
+        .await?
+        .ok_or_else(|| AppError::bad("Unknown starting point"))?;
+    st.git
+        .update_ref(&r.path, &format!("refs/heads/{}", req.name), &sha, None)
+        .await
+        .map_err(|_| AppError::conflict("A branch with that name already exists"))?;
+    touch(&st.db, r.id, false).await?;
+    Ok(Json(json!({ "name": req.name, "sha": sha })))
+}
+
+#[derive(Deserialize)]
+pub struct NameQ {
+    name: String,
+}
+
+pub async fn delete_branch(
+    State(st): State<AppState>,
+    Viewer(v): Viewer,
+    Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<NameQ>,
+) -> J<serde_json::Value> {
+    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    if !validate::ref_name(&q.name) {
+        return Err(AppError::bad("That isn't a valid branch name"));
+    }
+    if q.name == r.default_branch {
+        return Err(AppError::bad("You can't delete the default branch"));
+    }
+    st.git
+        .delete_ref(&r.path, &format!("refs/heads/{}", q.name))
+        .await?;
+    touch(&st.db, r.id, false).await?;
+    ok()
+}
+
+pub async fn tags(
+    State(st): State<AppState>,
+    Viewer(v): Viewer,
+    Path((owner, name)): Path<(String, String)>,
+) -> J<serde_json::Value> {
+    let r = Repo::readable(&st, v.as_ref(), &owner, &name).await?;
+    let refs = st.git.refs(&r.path).await?;
+    let tags: Vec<_> = refs.into_iter().filter(|x| x.kind == "tag").collect();
+    Ok(Json(json!({ "tags": tags })))
+}
