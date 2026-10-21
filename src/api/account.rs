@@ -264,6 +264,12 @@ pub async fn me(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json::
             )?)
         })
         .await?;
+    let (mut p, mut u) = (serde_json::to_value(p).map_err(AppError::internal)?, u);
+    if u.limits.is_some() {
+        // A limited token proves which account it is, not the account's private details.
+        p["email"] = json!("");
+        u.email.clear();
+    }
     Ok(Json(
         json!({ "user": u, "profile": p, "signup": st.settings.get().signup_open(), "instance": instance_info(&st) }),
     ))
@@ -402,21 +408,95 @@ pub async fn list_tokens(State(st): State<AppState>, Authed(u): Authed) -> J<ser
     let rows = st
         .db
         .call(move |c| {
-            let mut s = c.prepare("SELECT id, name, created_at, last_used FROM tokens WHERE user_id = ?1 ORDER BY id DESC")?;
-            let v = s
-                .query_map([u.id], |r| {
-                    Ok(json!({ "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?, "created_at": r.get::<_, i64>(2)?, "last_used": r.get::<_, Option<i64>>(3)? }))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(v)
+            let cond = "t.user_id = ?1";
+            token_rows(c, cond, u.id)
         })
         .await?;
     Ok(Json(json!({ "tokens": rows })))
 }
 
+/// Tokens matching `cond` (over table `t`, one integer parameter), newest first.
+pub fn token_rows(c: &rusqlite::Connection, cond: &str, param: i64) -> R<Vec<serde_json::Value>> {
+    let mut s = c.prepare(&format!(
+        "SELECT t.id, t.name, t.created_at, t.last_used, t.scope, t.expires_at, u.username,
+            (SELECT ou.username || '/' || r.name FROM repos r JOIN users ou ON ou.id = r.owner_id WHERE r.id = t.repo_id)
+         FROM tokens t JOIN users u ON u.id = t.user_id WHERE {cond} ORDER BY t.id DESC"
+    ))?;
+    let v = s
+        .query_map([param], |r| {
+            let expires: Option<i64> = r.get(5)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?, "created_at": r.get::<_, i64>(2)?,
+                "last_used": r.get::<_, Option<i64>>(3)?, "scope": r.get::<_, String>(4)?, "expires_at": expires,
+                "expired": expires.is_some_and(|e| e <= now()), "created_by": r.get::<_, String>(6)?,
+                "repo": r.get::<_, Option<String>>(7)?,
+            }))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(v)
+}
+
 #[derive(Deserialize)]
 pub struct TokenReq {
     name: String,
+    /// "read", "write" or "all" (the default, for older clients).
+    #[serde(default = "all_scope")]
+    pub scope: String,
+    /// Limit the token to one repository: "owner/name".
+    #[serde(default)]
+    pub repo: String,
+    /// Days until it stops working; none means never.
+    pub expires_days: Option<i64>,
+}
+
+fn all_scope() -> String {
+    "all".into()
+}
+
+impl TokenReq {
+    pub fn deploy(name: String, write: bool, expires_days: Option<i64>) -> TokenReq {
+        TokenReq { name, scope: if write { "write" } else { "read" }.into(), repo: String::new(), expires_days }
+    }
+}
+
+/// Make a token for `u`, optionally tied to `repo_id`. Returns the secret (shown once).
+pub async fn issue_token(st: &AppState, u: &User, ip: &str, req: TokenReq, repo: Option<(i64, String)>) -> R<String> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() || name.len() > 80 {
+        return Err(AppError::bad("Give the token a name (up to 80 characters)"));
+    }
+    let scope = crate::auth::Scope::parse(&req.scope).ok_or_else(|| AppError::bad("Access must be read, write or all"))?;
+    if let Some(d) = req.expires_days
+        && !(1..=3650).contains(&d)
+    {
+        return Err(AppError::bad("Expiry is 1 to 3650 days, or never"));
+    }
+    let expires = req.expires_days.map(|d| now() + d * 86400);
+    let (raw, hash) = new_secret(TOKEN_PREFIX);
+    let (uid, n2, rid) = (u.id, name.clone(), repo.as_ref().map(|r| r.0));
+    st.db
+        .call(move |c| {
+            let n: i64 = c.query_row("SELECT count(*) FROM tokens WHERE user_id = ?1", [uid], |r| r.get(0))?;
+            if n >= 50 {
+                return Err(AppError::bad("You have 50 tokens already. Delete some first."));
+            }
+            c.execute(
+                "INSERT INTO tokens(user_id, name, token_hash, created_at, scope, repo_id, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![uid, n2, hash, now(), scope.as_str(), rid, expires],
+            )?;
+            Ok(())
+        })
+        .await?;
+    let mut detail = format!("{name} ({} access", scope.as_str());
+    if let Some((_, full)) = &repo {
+        detail.push_str(&format!(" to {full}"));
+    }
+    if let Some(d) = req.expires_days {
+        detail.push_str(&format!(", expires in {d} days"));
+    }
+    detail.push(')');
+    record(&st.db, Event { actor: Some(u), subject: Some(u.id), action: "token_created", detail, ip }).await;
+    Ok(raw)
 }
 
 pub async fn create_token(
@@ -425,32 +505,15 @@ pub async fn create_token(
     ip: ClientIp,
     Json(req): Json<TokenReq>,
 ) -> J<serde_json::Value> {
-    let name = req.name.trim().to_string();
-    if name.is_empty() || name.len() > 80 {
-        return Err(AppError::bad("Give the token a name (up to 80 characters)"));
-    }
-    let (raw, hash) = new_secret(TOKEN_PREFIX);
-    let (uid, n2) = (u.id, name.clone());
-    st.db
-        .call(move |c| {
-            let n: i64 = c.query_row(
-                "SELECT count(*) FROM tokens WHERE user_id = ?1",
-                [uid],
-                |r| r.get(0),
-            )?;
-            if n >= 50 {
-                return Err(AppError::bad(
-                    "You have 50 tokens already. Delete some first.",
-                ));
-            }
-            c.execute(
-                "INSERT INTO tokens(user_id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![uid, n2, hash, now()],
-            )?;
-            Ok(())
-        })
-        .await?;
-    record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "token_created", detail: name, ip: &ip.0 }).await;
+    let repo = match req.repo.trim() {
+        "" => None,
+        full => {
+            let (o, n) = full.split_once('/').ok_or_else(|| AppError::bad("Write the repository as owner/name"))?;
+            let r = crate::repo::Repo::readable(&st, Some(&u), o, n).await?;
+            Some((r.id, r.full_name()))
+        }
+    };
+    let raw = issue_token(&st, &u, &ip.0, req, repo).await?;
     Ok(Json(json!({ "token": raw })))
 }
 
@@ -596,7 +659,10 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
                 )?;
                 return Ok(json!({ "events": ev, "repos": [], "trending": trending }));
             };
-            let mine = repo_cards(c, "WHERE r.owner_id = ? ORDER BY r.updated_at DESC LIMIT 100", vec![Value::Integer(u.id)])?;
+            // Through VISIBLE, so a deploy token (one repo only) doesn't list the owner's private repos.
+            let mut p = vec![Value::Integer(u.id)];
+            p.extend(visible_params(Some(&u)));
+            let mine = repo_cards(c, &format!("WHERE r.owner_id = ? AND {VISIBLE} ORDER BY r.updated_at DESC LIMIT 100"), p)?;
             let ev = events(
                 c,
                 "e.user_id = ? OR e.repo_id IN (SELECT repo_id FROM stars WHERE user_id = ?) OR e.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)",

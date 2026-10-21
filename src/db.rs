@@ -159,6 +159,13 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX audit_subject ON audit(subject_id, id);
     CREATE INDEX audit_actor ON audit(actor_id, id);
     "#,
+    // v4: token access levels, single-repository (deploy) tokens, expiry
+    r#"
+    ALTER TABLE tokens ADD COLUMN scope TEXT NOT NULL DEFAULT 'all';
+    ALTER TABLE tokens ADD COLUMN repo_id INTEGER REFERENCES repos(id) ON DELETE CASCADE;
+    ALTER TABLE tokens ADD COLUMN expires_at INTEGER;
+    CREATE INDEX tokens_repo ON tokens(repo_id);
+    "#,
 ];
 
 impl Db {

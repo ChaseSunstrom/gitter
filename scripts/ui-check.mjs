@@ -202,5 +202,22 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   await page.close();
 }
 
+// Deploy tokens: created from repository settings, listed there, work for that repo only.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/alice/hello/settings', { waitUntil: 'networkidle' });
+  await page.fill('#dt-form input[name=name]', 'build server');
+  await page.click('#dt-form button[type=submit]');
+  await page.waitForSelector('#dt-new .token-reveal', { timeout: 5000 }).catch(() => {});
+  const token = await page.locator('#dt-new input').inputValue().catch(() => '');
+  const res = await fetch(`${BASE}/alice/hello.git/info/refs?service=git-upload-pack`, { headers: { Authorization: 'Basic ' + Buffer.from('x-access-token:' + token).toString('base64') } });
+  const other = await fetch(`${BASE}/api/repos/alice/secret`, { headers: { Authorization: 'Bearer ' + token } });
+  if (errors.length || !token.startsWith('gtr_') || res.status !== 200 || other.status !== 404) { failed++; console.log('✗ deploy token', { token: !!token, clone: res.status, other: other.status, errors }); }
+  else console.log('  ok deploy token from repo settings clones that repo and nothing else');
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

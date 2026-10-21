@@ -125,9 +125,20 @@ impl Repo {
 }
 
 /// (can read, can write). Owners and admins write; everyone reads public repos.
+/// A limited token narrows that: read-only tokens never write, and a deploy
+/// token sees other repositories as if signed out.
 pub fn access(repo: &Repo, viewer: Option<&User>) -> (bool, bool) {
     let write = viewer.is_some_and(|u| u.id == repo.owner_id || u.is_admin);
-    (!repo.private || write, write)
+    let (mut read, mut write) = (!repo.private || write, write);
+    if let Some(l) = viewer.and_then(|u| u.limits.as_ref()) {
+        if l.repo_id.is_some_and(|id| id != repo.id) {
+            (read, write) = (!repo.private, false);
+        }
+        if l.scope == crate::auth::Scope::Read {
+            write = false;
+        }
+    }
+    (read, write)
 }
 
 pub async fn record_event(
@@ -200,6 +211,7 @@ mod tests {
             display_name: String::new(),
             email: String::new(),
             is_admin: admin,
+            limits: None,
         }
     }
 
@@ -217,5 +229,12 @@ mod tests {
             access(&repo(1, false), Some(&user(2, false))),
             (true, false)
         );
+        // Limited tokens.
+        let lim = |scope, repo_id| User { limits: Some(crate::auth::Limits { scope, repo_id }), ..user(1, false) };
+        use crate::auth::Scope;
+        assert_eq!(access(&repo(1, true), Some(&lim(Scope::Read, None))), (true, false));
+        assert_eq!(access(&repo(1, true), Some(&lim(Scope::Write, Some(1)))), (true, true));
+        assert_eq!(access(&repo(1, true), Some(&lim(Scope::Write, Some(7)))), (false, false));
+        assert_eq!(access(&repo(1, false), Some(&lim(Scope::All, Some(7)))), (true, false));
     }
 }

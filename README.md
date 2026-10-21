@@ -71,6 +71,14 @@ git clone http://localhost:3000/alice/project.git
 git push   # username + password, or username + an access token from Settings → Access tokens
 ```
 
+Access tokens can be read-only, read and write, or full access, can be limited to one repository, and can expire. For a CI server or deploy box, make a **deploy token** in the repository's settings: it works for that repository only (read-only unless you allow pushing), with any username:
+
+```sh
+git clone https://git.example.com/alice/project.git   # username: anything, password: the deploy token
+```
+
+Accounts with two-factor authentication need a token for git over HTTPS; the password alone is refused.
+
 The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`, `gitter bench [--check]` (`-` as the file means stdout/stdin).
 
 ## Configuration

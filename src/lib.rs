@@ -94,6 +94,7 @@ pub fn router(st: AppState) -> Router {
             "/api",
             api::router()
                 .layer(DefaultBodyLimit::max(40 * 1024 * 1024))
+                .layer(axum::middleware::from_fn_with_state(st.clone(), api::scope_guard))
                 .layer(axum::middleware::from_fn_with_state(st.clone(), web::csrf)),
         )
         .route("/raw/{owner}/{repo}/{*rest}", get(api::code::raw))

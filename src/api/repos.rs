@@ -568,3 +568,65 @@ pub async fn tags(
     let tags: Vec<_> = refs.into_iter().filter(|x| x.kind == "tag").collect();
     Ok(Json(json!({ "tags": tags })))
 }
+
+// ---------- deploy tokens: access to this one repository, for CI and servers ----------
+
+pub async fn deploy_tokens(
+    State(st): State<AppState>,
+    Authed(u): Authed,
+    Path((owner, name)): Path<(String, String)>,
+) -> J<serde_json::Value> {
+    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let rid = r.id;
+    let rows = st
+        .db
+        .call(move |c| super::account::token_rows(c, "t.repo_id = ?1", rid))
+        .await?;
+    Ok(Json(json!({ "tokens": rows })))
+}
+
+#[derive(Deserialize)]
+pub struct DeployReq {
+    name: String,
+    /// Allow pushing too (read-write), not just cloning.
+    #[serde(default)]
+    write: bool,
+    expires_days: Option<i64>,
+}
+
+pub async fn create_deploy_token(
+    State(st): State<AppState>,
+    Sudo(u): Sudo,
+    ip: ClientIp,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<DeployReq>,
+) -> J<serde_json::Value> {
+    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let t = super::account::TokenReq::deploy(req.name, req.write, req.expires_days);
+    let raw = super::account::issue_token(&st, &u, &ip.0, t, Some((r.id, r.full_name()))).await?;
+    Ok(Json(json!({ "token": raw })))
+}
+
+pub async fn delete_deploy_token(
+    State(st): State<AppState>,
+    Sudo(u): Sudo,
+    ip: ClientIp,
+    Path((owner, name, id)): Path<(String, String, i64)>,
+) -> J<serde_json::Value> {
+    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let rid = r.id;
+    let gone: Option<String> = st
+        .db
+        .call(move |c| {
+            let n = c
+                .query_row("SELECT name FROM tokens WHERE id = ?1 AND repo_id = ?2", [id, rid], |r| r.get(0))
+                .optional()?;
+            c.execute("DELETE FROM tokens WHERE id = ?1 AND repo_id = ?2", [id, rid])?;
+            Ok(n)
+        })
+        .await?;
+    let Some(n) = gone else { return Err(AppError::not_found()) };
+    let detail = format!("{n} (deploy token for {})", r.full_name());
+    record(&st.db, Event { actor: Some(&u), subject: Some(r.owner_id), action: "token_deleted", detail, ip: &ip.0 }).await;
+    ok()
+}

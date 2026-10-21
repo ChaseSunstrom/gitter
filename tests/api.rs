@@ -938,3 +938,115 @@ async fn a_new_account_never_inherits_a_deleted_accounts_log() {
     assert_eq!(all["integrity"]["ok"], true, "detaching ids keeps the seal");
     assert!(all["events"].as_array().unwrap().iter().any(|e| e["action"] == "token_created" && e["subject"] == "bob"));
 }
+
+fn git_refs(repo: &str, service: &str, token: &str) -> Request<Body> {
+    use base64::Engine;
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    Request::get(format!("/alice/{repo}.git/info/refs?service={service}"))
+        .header("host", "test.local")
+        .header("authorization", format!("Basic {auth}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn scoped_tokens_limit_what_they_can_do() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    for n in ["a", "b"] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n, "private": true, "readme": true }))).await;
+    }
+    let mk = |body: Value| {
+        let app = &app;
+        let alice = alice.clone();
+        async move { app.req(&alice, "POST", "/api/me/tokens", Some(body)).await.1["token"].as_str().unwrap().to_string() }
+    };
+    let read = mk(json!({ "name": "read", "scope": "read" })).await;
+    let only_a = mk(json!({ "name": "a-only", "scope": "write", "repo": "alice/a" })).await;
+    let expired = mk(json!({ "name": "old", "scope": "all", "expires_days": 1 })).await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE tokens SET expires_at = 1 WHERE name = 'old'", [])?)).await.unwrap();
+
+    // Read-only: clone yes, push no, API writes no, account routes no.
+    assert_eq!(status_with(&app, git_refs("a", "git-upload-pack", &read)).await, StatusCode::OK);
+    assert_eq!(status_with(&app, git_refs("a", "git-receive-pack", &read)).await, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&app, "POST", "/api/repos/alice/a/issues", &read, Some(json!({ "title": "x" }))).await, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&app, "GET", "/api/repos/alice/b", &read, None).await, StatusCode::OK);
+    assert_eq!(bearer(&app, "GET", "/api/me/tokens", &read, None).await, StatusCode::FORBIDDEN);
+
+    // One repository: works there (including writes), the other private repo doesn't exist for it.
+    assert_eq!(bearer(&app, "POST", "/api/repos/alice/a/issues", &only_a, Some(json!({ "title": "ok" }))).await, StatusCode::OK);
+    assert_eq!(status_with(&app, git_refs("a", "git-receive-pack", &only_a)).await, StatusCode::OK);
+    assert_eq!(bearer(&app, "GET", "/api/repos/alice/b", &only_a, None).await, StatusCode::NOT_FOUND);
+    assert_eq!(status_with(&app, git_refs("b", "git-upload-pack", &only_a)).await, StatusCode::NOT_FOUND);
+    assert_eq!(bearer(&app, "POST", "/api/repos", &only_a, Some(json!({ "name": "c" }))).await, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&app, "PATCH", "/api/repos/alice/a", &only_a, Some(json!({ "description": "x" }))).await, StatusCode::FORBIDDEN);
+
+    // Expired: nothing.
+    assert_eq!(bearer(&app, "GET", "/api/me", &expired, None).await, StatusCode::UNAUTHORIZED);
+    let (_, list) = app.req(&alice, "GET", "/api/me/tokens", None).await;
+    let old = list["tokens"].as_array().unwrap().iter().find(|t| t["name"] == "old").unwrap().clone();
+    assert_eq!(old["expired"], true);
+    let a = list["tokens"].as_array().unwrap().iter().find(|t| t["name"] == "a-only").unwrap().clone();
+    assert_eq!((a["scope"].as_str(), a["repo"].as_str()), (Some("write"), Some("alice/a")));
+}
+
+#[tokio::test]
+async fn deploy_tokens_belong_to_one_repository() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    for n in ["a", "b"] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n, "private": true, "readme": true }))).await;
+    }
+    let (s, _) = app.req(&bob, "POST", "/api/repos/alice/a/deploy-tokens", Some(json!({ "name": "ci" }))).await;
+    assert_ne!(s, StatusCode::OK, "only people who can write to the repo make deploy tokens");
+    let (s, t) = app.req(&alice, "POST", "/api/repos/alice/a/deploy-tokens", Some(json!({ "name": "deploy box", "expires_days": 90 }))).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let t = t["token"].as_str().unwrap().to_string();
+    let (_, list) = app.req(&alice, "GET", "/api/repos/alice/a/deploy-tokens", None).await;
+    let row = &list["tokens"][0];
+    assert_eq!((row["name"].as_str(), row["scope"].as_str()), (Some("deploy box"), Some("read")));
+    assert_eq!(status_with(&app, git_refs("a", "git-upload-pack", &t)).await, StatusCode::OK);
+    assert_eq!(status_with(&app, git_refs("a", "git-receive-pack", &t)).await, StatusCode::FORBIDDEN, "read-only unless asked");
+    assert_eq!(status_with(&app, git_refs("b", "git-upload-pack", &t)).await, StatusCode::NOT_FOUND);
+    assert_eq!(bearer(&app, "GET", "/api/repos/alice/a/deploy-tokens", &t, None).await, StatusCode::FORBIDDEN);
+    let id = row["id"].as_i64().unwrap();
+    let (s, _) = app.req(&alice, "DELETE", &format!("/api/repos/alice/a/deploy-tokens/{id}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(status_with(&app, git_refs("a", "git-upload-pack", &t)).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn deploy_tokens_cannot_act_or_peek_outside_their_repo() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "a", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "hidden-plans", "private": true }))).await;
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "pub", "readme": true }))).await;
+    let (_, t) = app.req(&alice, "POST", "/api/repos/alice/a/deploy-tokens", Some(json!({ "name": "ci", "write": true }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "POST", "/api/repos/alice/a/issues", &t, Some(json!({ "title": "ok here" }))).await, StatusCode::OK);
+    for (m, p, b) in [
+        ("POST", "/api/repos/bob/pub/issues", Some(json!({ "title": "spam as alice" }))),
+        ("POST", "/api/repos/bob/pub/star", None),
+    ] {
+        assert_eq!(bearer(&app, m, p, &t, b).await, StatusCode::FORBIDDEN, "{m} {p}");
+    }
+    let resp = app
+        .router
+        .clone()
+        .oneshot(Request::get("/api/feed").header("host", "test.local").header("authorization", format!("Bearer {t}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(!body.contains("hidden-plans"), "feed leaks private repos to a deploy token: {body}");
+    let resp = app
+        .router
+        .clone()
+        .oneshot(Request::get("/api/me").header("host", "test.local").header("authorization", format!("Bearer {t}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(!body.contains("alice@example.com"), "{body}");
+}

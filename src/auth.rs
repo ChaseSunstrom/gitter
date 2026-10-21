@@ -26,6 +26,49 @@ pub struct User {
     pub display_name: String,
     pub email: String,
     pub is_admin: bool,
+    /// Set when the request came with a limited access token.
+    #[serde(skip)]
+    pub limits: Option<Limits>,
+}
+
+/// What an access token may do: `read` (clone, view), `write` (also push and
+/// change issues, PRs and files), or `all` (everything the account can).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Read,
+    Write,
+    All,
+}
+
+impl Scope {
+    pub fn parse(s: &str) -> Option<Scope> {
+        Some(match s {
+            "read" => Scope::Read,
+            "write" => Scope::Write,
+            "all" => Scope::All,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Read => "read",
+            Scope::Write => "write",
+            Scope::All => "all",
+        }
+    }
+}
+
+/// A token's limits: its scope and, for deploy tokens, the one repository it's for.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    pub scope: Scope,
+    pub repo_id: Option<i64>,
+}
+
+impl Limits {
+    pub fn unlimited(&self) -> bool {
+        self.scope == Scope::All && self.repo_id.is_none()
+    }
 }
 
 impl User {
@@ -36,6 +79,7 @@ impl User {
             display_name: r.get("display_name")?,
             email: r.get("email")?,
             is_admin: r.get::<_, i64>("is_admin")? != 0,
+            limits: None,
         })
     }
     /// Name and email used for commits made through the web.
@@ -202,10 +246,17 @@ pub async fn user_by_token(db: &Db, raw: &str) -> R<Option<User>> {
     db.call(move |c| {
         let u = c
             .query_row(
-                "SELECT u.id, u.username, u.display_name, u.email, u.is_admin FROM users u
-                 JOIN tokens t ON t.user_id = u.id WHERE t.token_hash = ?1 AND u.suspended = 0",
-                [&hash],
-                User::from_row,
+                "SELECT u.id, u.username, u.display_name, u.email, u.is_admin, t.scope, t.repo_id FROM users u
+                 JOIN tokens t ON t.user_id = u.id
+                 WHERE t.token_hash = ?1 AND u.suspended = 0 AND (t.expires_at IS NULL OR t.expires_at > ?2)",
+                rusqlite::params![hash, now()],
+                |r| {
+                    let mut u = User::from_row(r)?;
+                    let scope = Scope::parse(&r.get::<_, String>("scope")?).unwrap_or(Scope::Read);
+                    let l = Limits { scope, repo_id: r.get("repo_id")? };
+                    u.limits = (!l.unlimited()).then_some(l);
+                    Ok(u)
+                },
             )
             .optional()?;
         if u.is_some() {

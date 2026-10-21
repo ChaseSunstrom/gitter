@@ -73,6 +73,11 @@ pub fn router() -> Router<AppState> {
         )
         .route(&format!("{repo}/fork"), post(repos::fork))
         .route(
+            &format!("{repo}/deploy-tokens"),
+            get(repos::deploy_tokens).post(repos::create_deploy_token),
+        )
+        .route(&format!("{repo}/deploy-tokens/{{id}}"), delete(repos::delete_deploy_token))
+        .route(
             &format!("{repo}/branches"),
             get(repos::branches)
                 .post(repos::create_branch)
@@ -122,6 +127,77 @@ pub fn router() -> Router<AppState> {
             post(issues::merge_pull),
         )
         .fallback(|| async { AppError::not_found() })
+}
+
+/// Limited tokens only reach what their scope allows: reads everywhere, and for
+/// `write` tokens also changes inside a repository (issues, PRs, files,
+/// branches). Account, token, security and admin routes, and creating, forking,
+/// deleting or reconfiguring repositories, need a full token or the web.
+pub async fn scope_guard(
+    axum::extract::State(st): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (mut parts, body) = req.into_parts();
+    let v = match crate::auth::Viewer::from_request_parts(&mut parts, &st).await {
+        Ok(v) => v.0,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(l) = v.as_ref().and_then(|u| u.limits.as_ref())
+        && (!token_may(l, &parts.method, parts.uri.path()) || !in_its_repo(&st, l, &parts).await)
+    {
+        let one = if l.repo_id.is_some() { " to one repository" } else { "" };
+        return AppError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            format!("This token can't do that (it has {} access{one})", l.scope.as_str()),
+        )
+        .into_response();
+    }
+    next.run(axum::extract::Request::from_parts(parts, body)).await
+}
+
+/// A deploy token's writes must target its own repository: issues, comments
+/// and stars elsewhere would be made as its owner.
+async fn in_its_repo(st: &AppState, l: &crate::auth::Limits, parts: &Parts) -> bool {
+    let Some(want) = l.repo_id else { return true };
+    if matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD) {
+        return true;
+    }
+    let segs: Vec<String> = parts.uri.path().trim_matches('/').split('/').map(String::from).collect();
+    let (Some(o), Some(n)) = (segs.get(1).cloned(), segs.get(2).cloned()) else { return false };
+    let id: Option<i64> = st
+        .db
+        .call(move |c| {
+            use rusqlite::OptionalExtension;
+            Ok(c.query_row(
+                "SELECT r.id FROM repos r JOIN users u ON u.id = r.owner_id WHERE u.username = ?1 AND r.name = ?2",
+                [o, n],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+        .unwrap_or(None);
+    id == Some(want)
+}
+
+/// Account-level routes no limited token may touch, even to read.
+const ACCOUNT_ROUTES: &[&str] = &["/admin", "/me/tokens", "/me/security", "/me/audit", "/me/2fa", "/me/sessions", "/me/password", "/auth"];
+
+fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -> bool {
+    if ACCOUNT_ROUTES.iter().any(|p| path == *p || path.starts_with(&format!("{p}/"))) {
+        return false;
+    }
+    if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
+        return true;
+    }
+    // Writes: only inside a repository (/repos/{owner}/{repo}/{thing}...), never forking it.
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    l.scope != crate::auth::Scope::Read
+        && segs.len() >= 4
+        && segs[0] == "repos"
+        && !matches!(segs[3], "fork" | "deploy-tokens")
 }
 
 /// The client's IP: the socket address, or the last X-Forwarded-For hop (added by
@@ -174,6 +250,8 @@ pub const CARD_SELECT: &str = "SELECT u.username, r.name, r.description, r.is_pr
 pub const VISIBLE: &str = "(r.is_private = 0 OR r.owner_id = ? OR EXISTS (SELECT 1 FROM users a WHERE a.id = ? AND a.is_admin = 1))";
 
 pub fn visible_params(viewer: Option<&crate::auth::User>) -> [Value; 2] {
+    // A deploy token lists repositories as if signed out (it's for one repo only).
+    let viewer = viewer.filter(|u| u.limits.as_ref().is_none_or(|l| l.repo_id.is_none()));
     let id = viewer.map(|u| u.id).unwrap_or(-1);
     [Value::Integer(id), Value::Integer(id)]
 }

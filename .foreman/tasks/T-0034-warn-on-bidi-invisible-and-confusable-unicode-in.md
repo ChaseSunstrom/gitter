@@ -58,6 +58,7 @@ README: hidden-Unicode marking in the account-security bullet
 - 2026-10-21T21:38:33Z re-based: what other work changed while it was paused isn't its own change
 - 2026-10-21T21:38:33Z focused
 - 2026-10-21T21:41:37Z done
+- 2026-10-21T21:41:37Z committed 29c8882 (10 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

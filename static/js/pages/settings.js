@@ -38,17 +38,29 @@ function accountTab() {
   </form>`;
 }
 
+const SCOPES = { read: 'Read only', write: 'Read and write', all: 'Full access' };
+
 function tokensTab(tokens) {
   return html`<div class="stack settings-form">
     <h2>Personal access tokens</h2>
     <p class="muted">Tokens work like passwords for git over HTTPS and for the API. Give each one a name so you know where it's used, and delete any you no longer need.</p>
-    <form id="token-form" class="row">
-      <input class="input" name="name" placeholder="What's this token for? e.g. laptop" maxlength="80" aria-label="Token name" required>
-      <button class="btn primary" type="submit">${icon('plus', 'sm')} Generate token</button>
-    </form>
+    <form id="token-form" class="box"><div class="box-body stack">
+      <div class="field"><label for="tk-name">Name</label><input class="input" id="tk-name" name="name" placeholder="What's this token for? e.g. laptop" maxlength="80" required></div>
+      <div class="grid-2">
+        <div class="field"><label for="tk-scope">Access</label><select class="select" id="tk-scope" name="scope">
+          <option value="write" selected>Read and write: clone, push, issues, pull requests</option>
+          <option value="read">Read only: clone and view</option>
+          <option value="all">Full access: everything your account can do</option></select></div>
+        <div class="field"><label for="tk-exp">Expires</label><select class="select" id="tk-exp" name="expires_days">
+          <option value="30">In 30 days</option><option value="90" selected>In 90 days</option><option value="365">In a year</option><option value="">Never</option></select></div>
+      </div>
+      <div class="field"><label for="tk-repo">Only for one repository <span class="muted">(optional)</span></label><input class="input" id="tk-repo" name="repo" placeholder="owner/name, or leave empty for all your repositories" autocapitalize="off" spellcheck="false"></div>
+      <div class="row"><button class="btn primary" type="submit">${icon('plus', 'sm')} Generate token</button></div>
+    </div></form>
     <div id="new-token"></div>
     ${tokens.length ? html`<div class="box list">${tokens.map((t) => html`<div class="list-row token-row">
-        ${icon('key', 'muted')}<div class="grow"><b>${t.name}</b><div class="small muted">Created ${timeEl(t.created_at)} · ${t.last_used ? html`Last used ${timeEl(t.last_used)}` : 'Never used'}</div></div>
+        ${icon('key', 'muted')}<div class="grow"><b>${t.name}</b> <span class="pill">${SCOPES[t.scope] || t.scope}</span>${t.repo ? html` <span class="pill">${t.repo}</span>` : ''}${t.expired ? html` <span class="pill closed">Expired</span>` : ''}
+          <div class="small muted">Created ${timeEl(t.created_at)} · ${t.last_used ? html`Last used ${timeEl(t.last_used)}` : 'Never used'}${t.expires_at && !t.expired ? html` · expires ${timeEl(t.expires_at)}` : ''}</div></div>
         <button class="btn sm danger" data-del="${t.id}" data-name="${t.name}">${icon('trash', 'sm')} Delete</button></div>`)}</div>`
       : html`<div class="box empty small">${icon('key', 'big')}<h3>No tokens yet</h3><p>Generate one to push from scripts or other machines.</p></div>`}
   </div>`;
@@ -166,9 +178,10 @@ export default async function (ctx) {
       if (tf) {
         const btn = tf.querySelector('[type=submit]');
         tf.addEventListener('submit', action(btn, async () => {
-          const name = new FormData(tf).get('name').trim();
+          const f = Object.fromEntries(new FormData(tf));
+          const name = f.name.trim();
           if (!name) return;
-          const r = await send('POST', '/me/tokens', { name });
+          const r = await send('POST', '/me/tokens', { name, scope: f.scope, repo: f.repo.trim(), expires_days: f.expires_days ? +f.expires_days : null });
           await refresh();
           const box = $('#new-token');
           const example = `git clone ${location.protocol}//${state.me.username}:${r.token}@${location.host}/${state.me.username}/<repo>.git`;
