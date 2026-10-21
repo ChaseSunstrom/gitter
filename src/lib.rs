@@ -98,6 +98,7 @@ pub fn router(st: AppState) -> Router {
                 .layer(axum::middleware::from_fn_with_state(st.clone(), web::csrf)),
         )
         .route("/raw/{owner}/{repo}/{*rest}", get(api::code::raw))
+        .route("/raw/snippets/{id}/{*rest}", get(api::snippets::raw))
         .route("/assets/{v}/{*path}", get(web::asset))
         .route("/favicon.svg", get(web::favicon))
         .route("/favicon.ico", get(web::favicon))

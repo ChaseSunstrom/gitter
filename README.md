@@ -4,6 +4,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 
 - **Code:** browse repositories, view files with syntax colors and linkable line ranges, blame, history, search, download archives.
 - **Collaboration:** issues, labels, pull requests with server-side merge (merge commit, squash or fast-forward), comments in markdown, stars and forks.
+- **Wikis, discussions, snippets:** every repository has a markdown wiki with page history (its own git repository, private when the repo is) and a discussions forum with General, Q&A, Ideas and Announcements categories, marked answers and upvotes. Snippets share a few files, public or secret (only the link finds it), with every edit kept as a revision.
 - **Editing:** edit, create, rename, delete and upload files in the browser, committing straight to a branch or to a new branch for a pull request.
 - **Speed:** pages prefetch on hover, the UI has no framework, and diffs render lazily, so even huge commits stay smooth.
 - **Command palette:** press `Ctrl K` or `/` to jump to any repository, file, branch or action. Press `?` for every shortcut.
@@ -89,7 +90,7 @@ Everything is optional. The defaults are tuned for a single small server, and th
 |---|---|---|
 | `GITTER_URL` | `http://localhost:3000` | Public address, used in clone URLs. `https://` also turns on secure cookies. |
 | `GITTER_ADDR` | `0.0.0.0:3000` | Address to listen on. |
-| `GITTER_DATA` | `./data` | Where the database and repositories live. Back this folder up. |
+| `GITTER_DATA` | `./data` | Where the database and the bare git repositories live (`repos/`, `wikis/`, `snippets/`). Back this folder up, or use `gitter backup`, which includes all of them. |
 | `GITTER_SIGNUP` | `open` | `closed` stops new sign-ups. The first (admin) account is always created through the setup link. |
 | `GITTER_MAX_PUSH_MB` | `500` | Largest single push. |
 | `GITTER_MAX_REPOS` | `200` | Repositories per user (admins are exempt). |
@@ -111,7 +112,7 @@ Behind nginx or Caddy, set `GITTER_URL` to the public address. Requests whose `O
 
 ## Security notes
 
-- Repository and user names are checked against a strict pattern, and repositories live on disk under their numeric id, so no user input ever becomes a path.
+- Repository and user names are checked against a strict pattern, and repositories, wikis and snippets live on disk under their numeric or random id, so no user input ever becomes a path. Secret snippets have 128-bit random ids.
 - Private repositories answer "not found" to everyone without access: through the web, the API, raw files, archives, search and git.
 - Sessions are random 256-bit tokens, stored hashed and sent as `HttpOnly; SameSite=Lax` cookies. Writes made with a session cookie must come from this site's own pages, which blocks cross-site request forgery.
 - Passwords use Argon2id. Login and sign-up are rate limited.

@@ -44,7 +44,7 @@ const HELP: &str = "gitter — fast, simple git hosting
 
 usage:
   gitter                       start the server (same as `gitter serve`)
-  gitter backup <file.tar.gz>  back up accounts, issues and repositories (safe while running; - for stdout)
+  gitter backup <file.tar.gz>  back up accounts, issues, repositories, wikis and snippets (safe while running; - for stdout)
   gitter verify <file>         check a backup end to end without restoring it (- for stdin)
   gitter restore <file> [--force]
                                restore a backup into GITTER_DATA (- for stdin; --force moves existing data aside)

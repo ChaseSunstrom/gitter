@@ -25,6 +25,7 @@ const RESERVED: &[&str] = &[
     "search",
     "settings",
     "signup",
+    "snippets",
     "static",
     "user",
     "users",

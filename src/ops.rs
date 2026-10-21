@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::Config;
 
@@ -31,13 +31,38 @@ fn run(mut c: Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Repository ids the database knows about.
-fn repo_ids(db: &Connection) -> Result<Vec<i64>> {
-    let mut s = db.prepare("SELECT id FROM repos ORDER BY id")?;
-    let ids = s
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<Vec<i64>, _>>()?;
-    Ok(ids)
+/// A folder of bare git repositories under GITTER_DATA, one `<id>.git` per row of `table`.
+struct Store {
+    dir: &'static str,
+    table: &'static str,
+    what: &'static str,
+    /// Every row has a folder (wikis are only made on the first edit).
+    required: bool,
+}
+
+const STORES: &[Store] = &[
+    Store { dir: "repos", table: "repos", what: "repositories", required: true },
+    Store { dir: "wikis", table: "repos", what: "wikis", required: false },
+    Store { dir: "snippets", table: "snippets", what: "snippets", required: true },
+];
+
+/// Folder names (`<id>.git`) the database knows for a store. A table that
+/// doesn't exist yet (a database from before it was added) knows none.
+fn folders(db: &Connection, s: &Store) -> Result<Vec<String>> {
+    let exists = db
+        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [s.table], |_| Ok(()))
+        .optional()?;
+    if exists.is_none() {
+        return Ok(vec![]);
+    }
+    let mut q = db.prepare(&format!("SELECT CAST(id AS TEXT) FROM {} ORDER BY id", s.table))?;
+    let ids = q.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<String>, _>>()?;
+    // Ids are numbers or hex; anything else (a hand-edited row) must never become a path.
+    Ok(ids
+        .into_iter()
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(|id| format!("{id}.git"))
+        .collect())
 }
 
 /// Write `<out>` (`-` for stdout): a .tar.gz holding a consistent copy of the
@@ -66,30 +91,36 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         // VACUUM INTO writes a transactionally consistent snapshot without stopping writers.
         conn.execute("VACUUM INTO ?1", [snap.to_string_lossy()])?;
-        let ids = repo_ids(&Connection::open(&snap)?)?;
+        let snap_conn = Connection::open(&snap)?;
+        let stores: Vec<Vec<String>> = STORES.iter().map(|s| folders(&snap_conn, s)).collect::<Result<_>>()?;
+        drop(snap_conn);
         let users: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
         drop(conn);
         let manifest = serde_json::json!({
             "format": FORMAT, "gitter": env!("CARGO_PKG_VERSION"), "created_at": crate::db::now(),
-            "repos": ids.len(), "users": users,
+            "repos": stores[0].len(), "snippets": stores[2].len(), "users": users,
         });
         std::fs::write(tmp.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
         tar.follow_symlinks(false);
         tar.append_path_with_name(tmp.join("manifest.json"), "manifest.json")?;
         tar.append_path_with_name(&snap, "gitter.db")?;
-        tar.append_dir("repos", &cfg.data_dir)?;
-        // Only the repositories in the snapshot, so a repo created meanwhile can't show up as an orphan.
-        for id in &ids {
-            let src = cfg.data_dir.join("repos").join(format!("{id}.git"));
-            if !src.is_dir() {
-                eprintln!("warning: repository {id} has no folder (deleted during the backup?)");
-                continue;
+        // Only the folders in the snapshot, so one created meanwhile can't show up as an orphan.
+        for (s, names) in STORES.iter().zip(&stores) {
+            tar.append_dir(s.dir, &cfg.data_dir)?;
+            for name in names {
+                let src = cfg.data_dir.join(s.dir).join(name);
+                if !src.is_dir() {
+                    if s.required {
+                        eprintln!("warning: {}/{name} is missing (deleted during the backup?)", s.dir);
+                    }
+                    continue;
+                }
+                append_repo(&mut tar, &src, &format!("{}/{name}", s.dir))?;
             }
-            append_repo(&mut tar, &src, &format!("repos/{id}.git"))?;
         }
         tar.into_inner()?.finish()?.flush()?;
-        Ok((ids.len(), users))
+        Ok((stores[0].len(), users))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     if res.is_err() && !to_stdout {
@@ -165,8 +196,7 @@ fn inspect_archive(archive: &Path) -> Result<serde_json::Value> {
         let name = path.to_string_lossy().into_owned();
         let known = name == "manifest.json"
             || name == "gitter.db"
-            || name == "repos"
-            || name.starts_with("repos/");
+            || STORES.iter().any(|s| name == s.dir || name.starts_with(&format!("{}/", s.dir)));
         // Only plain relative paths, no `..`, no absolute paths, no links that could point outside.
         let safe = path
             .components()
@@ -207,7 +237,10 @@ fn unpack(archive: &Path, stage: &Path) -> Result<serde_json::Value> {
     for e in ar.entries()? {
         e?.unpack_in(stage)?;
     }
-    std::fs::create_dir_all(stage.join("repos"))?;
+    // Backups from before wikis and snippets have no such folders.
+    for s in STORES {
+        std::fs::create_dir_all(stage.join(s.dir))?;
+    }
     let conn = Connection::open(stage.join("gitter.db"))?;
     let ok: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     if ok != "ok" {
@@ -258,7 +291,9 @@ pub fn verify(cfg: &Config, archive: &Path) -> Result<()> {
 pub fn restore(cfg: &Config, archive: &Path, force: bool) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let data = cfg.data_dir.canonicalize()?;
-    let has_repos = std::fs::read_dir(data.join("repos")).is_ok_and(|mut rd| rd.next().is_some());
+    let has_repos = STORES
+        .iter()
+        .any(|s| std::fs::read_dir(data.join(s.dir)).is_ok_and(|mut rd| rd.next().is_some()));
     let occupied = data.join("gitter.db").exists() || has_repos;
     if occupied && !force {
         bail!(
@@ -303,7 +338,7 @@ fn restore_from(cfg: &Config, data: &Path, archive: &Path, occupied: bool) -> Re
         }
         eprintln!("Moved the existing data to {}.", aside.display());
     }
-    for name in ["gitter.db", "repos"] {
+    for name in std::iter::once("gitter.db").chain(STORES.iter().map(|s| s.dir)) {
         std::fs::rename(stage.join(name), data.join(name))
             .with_context(|| format!("couldn't move the restored {name} into place"))?;
     }
@@ -381,107 +416,79 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
         Ok(Ok(Err(id))) => report(false, format!("security log was altered at or before event #{id}")),
         _ => {}
     }
-    let ids = repo_ids(&conn)?;
-    let known: HashSet<String> = ids.iter().map(|i| format!("{i}.git")).collect();
-    let repos = data.join("repos");
-    let mut missing = 0;
-    let mut broken = Vec::new();
-    for id in &ids {
-        let p = repos.join(format!("{id}.git"));
-        if !p.is_dir() {
-            missing += 1;
-            continue;
-        }
-        let gd = format!("--git-dir={}", p.display());
-        let mut args = vec![gd.as_str(), "rev-parse", "--git-dir"];
-        if fsck {
-            args = vec![
-                gd.as_str(),
-                "fsck",
-                "--connectivity-only",
-                "--no-dangling",
-                "--no-progress",
-            ];
-        }
-        if run(git(&args), "git").is_err() {
-            broken.push(*id);
-        }
-    }
-    report(
-        missing == 0,
-        format!(
-            "{} repositories on disk for {} in the database{}",
-            ids.len() - missing,
-            ids.len(),
-            if missing > 0 {
-                format!(" ({missing} missing)")
-            } else {
-                String::new()
+    for s in STORES {
+        let names = folders(&conn, s)?;
+        let root = data.join(s.dir);
+        let (mut present, mut missing, mut broken) = (0, 0, Vec::new());
+        for name in &names {
+            let p = root.join(name);
+            if !p.is_dir() {
+                missing += s.required as usize;
+                continue;
             }
-        ),
-    );
-    report(
-        broken.is_empty(),
-        if broken.is_empty() {
-            format!(
-                "repositories {}",
-                if fsck {
-                    "pass git fsck"
-                } else {
-                    "open cleanly"
-                }
-            )
-        } else {
-            format!("damaged repositories (ids): {broken:?}")
-        },
-    );
-    let orphans = std::fs::read_dir(&repos)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.ends_with(".git") && !known.contains(n))
-                })
-                .count()
-        })
-        .unwrap_or(0);
-    report(
-        orphans == 0,
-        format!("{orphans} repository folders with no database entry"),
-    );
+            present += 1;
+            let gd = format!("--git-dir={}", p.display());
+            let mut args = vec![gd.as_str(), "rev-parse", "--git-dir"];
+            if fsck {
+                args = vec![gd.as_str(), "fsck", "--connectivity-only", "--no-dangling", "--no-progress"];
+            }
+            if run(git(&args), "git").is_err() {
+                broken.push(name.trim_end_matches(".git").to_string());
+            }
+        }
+        if s.required {
+            let gone = if missing > 0 { format!(" ({missing} missing)") } else { String::new() };
+            report(missing == 0, format!("{present} {} on disk for {} in the database{gone}", s.what, names.len()));
+        }
+        report(
+            broken.is_empty(),
+            if broken.is_empty() {
+                format!("{present} {} {}", s.what, if fsck { "pass git fsck" } else { "open cleanly" })
+            } else {
+                format!("damaged {} (ids): {broken:?}", s.what)
+            },
+        );
+        let known: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let orphans = std::fs::read_dir(&root)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".git") && !known.contains(n)))
+                    .count()
+            })
+            .unwrap_or(0);
+        report(orphans == 0, format!("{orphans} folders in {}/ with no database entry", s.dir));
+    }
     Ok(problems)
 }
 
-/// At boot: move repository folders the database doesn't know about into
-/// `orphans/` (so a new repo can never reuse stale data) and warn about missing ones.
+/// At boot: move repository, wiki and snippet folders the database doesn't
+/// know about into `orphans/` (so a new one can never reuse stale data) and
+/// warn about missing ones.
 pub fn reconcile(cfg: &Config) -> Result<()> {
     let db_path = cfg.data_dir.join("gitter.db");
     if !db_path.exists() {
         return Ok(());
     }
     let conn = Connection::open(&db_path)?;
-    let ids = repo_ids(&conn)?;
-    let known: HashSet<String> = ids.iter().map(|i| format!("{i}.git")).collect();
-    let repos = cfg.data_dir.join("repos");
-    for id in &ids {
-        if !repos.join(format!("{id}.git")).is_dir() {
-            eprintln!(
-                "warning: repository {id} is in the database but its folder is missing; run `gitter doctor`"
-            );
+    for s in STORES {
+        let names = folders(&conn, s)?;
+        let root = cfg.data_dir.join(s.dir);
+        for name in names.iter().filter(|n| s.required && !root.join(n).is_dir()) {
+            eprintln!("warning: {}/{name} is in the database but its folder is missing; run `gitter doctor`", s.dir);
         }
-    }
-    let Ok(rd) = std::fs::read_dir(&repos) else {
-        return Ok(());
-    };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".git") && !known.contains(&name) {
-            let dest = cfg.data_dir.join("orphans");
-            std::fs::create_dir_all(&dest)?;
-            let to = dest.join(format!("{name}.{}", crate::db::now()));
-            std::fs::rename(e.path(), &to)?;
-            eprintln!("moved unknown repository folder {name} to {}", to.display());
+        let Ok(rd) = std::fs::read_dir(&root) else { continue };
+        let known: HashSet<&str> = names.iter().map(String::as_str).collect();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".git") && !known.contains(name.as_str()) {
+                let dest = cfg.data_dir.join("orphans");
+                std::fs::create_dir_all(&dest)?;
+                // Repos keep their old orphan names; the others say where they came from.
+                let prefix = if s.dir == "repos" { String::new() } else { format!("{}-", s.dir) };
+                let to = dest.join(format!("{prefix}{name}.{}", crate::db::now()));
+                std::fs::rename(e.path(), &to)?;
+                eprintln!("moved unknown folder {}/{name} to {}", s.dir, to.display());
+            }
         }
     }
     Ok(())
@@ -539,6 +546,30 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn reconcile_keeps_known_wikis_and_snippets() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        crate::db::Db::open(&d.join("gitter.db")).unwrap();
+        let c = Connection::open(d.join("gitter.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO users(id, username, pass_hash, created_at) VALUES (1, 'a', 'x', 0);
+             INSERT INTO repos(id, owner_id, name, created_at, updated_at) VALUES (7, 1, 'r', 0, 0);
+             INSERT INTO snippets(id, owner_id, created_at, updated_at) VALUES ('ab', 1, 0, 0);",
+        )
+        .unwrap();
+        for p in ["repos/7.git", "wikis/7.git", "wikis/8.git", "snippets/ab.git", "snippets/cd.git"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        reconcile(&cfg_for(d)).unwrap();
+        for (p, kept) in [("repos/7.git", true), ("wikis/7.git", true), ("snippets/ab.git", true), ("wikis/8.git", false), ("snippets/cd.git", false)] {
+            assert_eq!(d.join(p).exists(), kept, "{p}");
+        }
+        let mut moved: Vec<String> = std::fs::read_dir(d.join("orphans")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        moved.sort();
+        assert!(moved[0].starts_with("snippets-cd.git.") && moved[1].starts_with("wikis-8.git."), "{moved:?}");
     }
 
     #[cfg(unix)]

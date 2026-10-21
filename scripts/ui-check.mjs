@@ -43,6 +43,7 @@ const ctx = await browser.newContext();
 const r = await ctx.request.post(BASE + '/api/auth/login', { headers: { Origin: BASE }, data: { login: 'alice', password: 'correct horse' } });
 if (!r.ok()) { console.log('✗ login failed', r.status()); process.exit(1); }
 const sha = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json()).commits.at(-1).sha;
+const snip = (await (await ctx.request.get(BASE + '/api/snippets')).json()).items[0].id;
 
 const pages = [
   ['/', ['Your repositories']],
@@ -83,6 +84,22 @@ const pages = [
   ['/admin', ['Site administration', 'Storage']],
   ['/admin/users', ['alice', 'bob']],
   ['/admin/settings', ['Instance name']],
+  ['/alice/hello/wiki', ['Hello wiki', 'Setup', 'Pages']],
+  ['/alice/hello/wiki/Setup', ['Run cargo build']],
+  ['/alice/hello/wiki/Home/edit', ['Save page', 'Editing Home']],
+  ['/alice/hello/wiki/Home/history', ['History of', 'Create Home']],
+  ['/alice/hello/wiki/_new', ['New page']],
+  ['/alice/secret/wiki', ['Welcome to the wiki', 'Create the first page']],
+  ['/alice/hello/discussions', ['How do I run it?', 'Answered', 'Q&A']],
+  ['/alice/hello/discussions?category=ideas', ['No discussions yet']],
+  ['/alice/hello/discussions/1', ['How do I run it?', 'Use cargo run', 'Answered by', 'Reply']],
+  ['/alice/hello/discussions/new', ['Start a discussion', 'Announcements']],
+  ['/snippets', ['Greeting', 'hello.py']],
+  ['/snippets/mine', ['Your snippets', 'Greeting']],
+  ['/snippets/new', ['New snippet', 'Add file']],
+  [`/snippets/${snip}`, ['Greeting', 'print', '1 revision']],
+  [`/snippets/${snip}/edit`, ['Edit snippet', 'Save changes']],
+  [`/snippets/${snip}/revisions`, ['Create snippet']],
 ];
 for (const [p, e] of pages) await visit(ctx, p, e);
 await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
@@ -216,6 +233,45 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   const other = await fetch(`${BASE}/api/repos/alice/secret`, { headers: { Authorization: 'Bearer ' + token } });
   if (errors.length || !token.startsWith('gtr_') || res.status !== 200 || other.status !== 404) { failed++; console.log('✗ deploy token', { token: !!token, clone: res.status, other: other.status, errors }); }
   else console.log('  ok deploy token from repo settings clones that repo and nothing else');
+  await page.close();
+}
+
+// Wiki, discussion and snippet forms work end to end.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const text = () => page.locator('#page').innerText();
+  const steps = [];
+  try {
+    await page.goto(BASE + '/alice/hello/wiki/_new', { waitUntil: 'networkidle' });
+    await page.fill('#wiki-name', 'From the browser');
+    await page.fill('#wiki-content', 'Written in **Chromium**, see [Setup](Setup)');
+    await page.click('#wiki-form button[type=submit]');
+    await page.waitForURL(/\/wiki\/From-the-browser$/);
+    await page.waitForSelector('.markdown-body strong');
+    if ((await page.getAttribute('.markdown-body a[href$="/wiki/Setup"]', 'href')) == null) throw new Error('wiki link not rewritten');
+    steps.push('wiki page');
+    await page.goto(BASE + '/alice/hello/discussions/1', { waitUntil: 'networkidle' });
+    const vote = page.locator('.vote-btn:not([data-vote="thread"])').first();
+    await vote.click();
+    await page.waitForFunction(() => document.querySelector('.vote-btn:not([data-vote="thread"]) span')?.textContent === '1');
+    await page.fill('#reply-body', 'Thanks from the browser');
+    await page.click('#composer button[type=submit]');
+    await page.waitForFunction(() => document.querySelector('#page').innerText.includes('Thanks from the browser'));
+    steps.push('discussion vote and reply');
+    await page.goto(BASE + '/snippets/new', { waitUntil: 'networkidle' });
+    await page.fill('[name=fname]', 'notes.txt');
+    await page.fill('.snip-file textarea', 'browser snippet');
+    await page.check('input[name=vis][value=secret]');
+    await page.click('#snip-form button[type=submit]');
+    await page.waitForURL(/\/snippets\/[0-9a-f]{32}$/);
+    await page.waitForFunction(() => document.querySelector('#page').innerText.includes('browser snippet'));
+    if (!(await text()).includes('Secret')) throw new Error('snippet not secret');
+    steps.push('secret snippet');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length) { failed++; console.log('✗ wiki/discussion/snippet forms', steps, errors); }
+  else console.log(`  ok ${steps.join(', ')} made in the browser`);
   await page.close();
 }
 

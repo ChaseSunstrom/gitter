@@ -339,6 +339,11 @@ pub async fn raw(
         None => "text/plain; charset=utf-8",
     };
     let immutable = rev.len() == 40 && validate::sha(&rev);
+    Ok(inert(data, ctype, immutable, r.private))
+}
+
+/// User file bytes served so they can never run script on this origin.
+pub fn inert(data: Vec<u8>, ctype: &'static str, immutable: bool, private: bool) -> Response {
     let mut resp = Response::new(Body::from(data));
     let h = resp.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
@@ -352,21 +357,13 @@ pub async fn raw(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(if immutable {
-            "public, max-age=31536000, immutable"
-        } else {
-            "private, max-age=60"
-        }),
-    );
-    if r.private {
-        h.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-    }
-    Ok(resp)
+    let cache = match (private, immutable) {
+        (true, _) => "private, no-store",
+        (false, true) => "public, max-age=31536000, immutable",
+        (false, false) => "private, max-age=60",
+    };
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    resp
 }
 
 /// Split "feature/x/src/main.rs" into (rev, path) using the longest matching branch or tag.
