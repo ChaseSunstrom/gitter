@@ -349,6 +349,7 @@ pub async fn remove(
     if let Err(e) = tokio::fs::remove_dir_all(&r.path).await {
         eprintln!("removing {}: {e}", r.path.display());
     }
+    let _ = tokio::fs::remove_dir_all(super::wiki::path(&st, id)).await;
     record(&st.db, Event { actor: Some(&u), subject: Some(r.owner_id), action: "repo_deleted", detail: r.full_name(), ip: &ip.0 }).await;
     ok()
 }

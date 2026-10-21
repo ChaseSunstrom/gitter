@@ -286,6 +286,7 @@ const AUDIT = {
   user_suspended: 'Suspended an account', user_unsuspended: 'Restored an account', user_deleted: 'Deleted an account',
   settings_changed: 'Changed site settings', invite_created: 'Created an invite link',
   moderation_dismiss: 'Dismissed a report', moderation_hide: 'Hid reported content', moderation_unhide: 'Unhid content', moderation_suspend: 'Suspended a reported account',
+  wiki_page_deleted: 'Deleted a wiki page', discussion_deleted: 'Deleted a discussion', snippet_deleted: 'Deleted a snippet',
 };
 export const auditLabel = (a) => AUDIT[a] || String(a).replace(/_/g, ' ');
 /** "Firefox on Linux" from a user agent string. */

@@ -20,6 +20,9 @@ c() { curl -sf -b "$TMP/jar" -c "$TMP/jar" -H "Origin: $B" -H 'Content-Type: app
 c -X POST "$B/api/auth/signup" --data "{\"username\":\"alice\",\"email\":\"a@example.com\",\"password\":\"correct horse\",\"setup\":\"$SETUP\"}" >/dev/null
 c -X POST "$B/api/repos" --data '{"name":"keep","readme":true}' >/dev/null
 c -X POST "$B/api/repos/alice/keep/issues" --data '{"title":"Remember me"}' >/dev/null
+c -X POST "$B/api/repos/alice/keep/wiki" --data '{"name":"Home","content":"Wiki survives"}' >/dev/null
+c -X POST "$B/api/repos/alice/keep/discussions" --data '{"title":"Talk survives","category":"general"}' >/dev/null
+SNIP=$(c -X POST "$B/api/snippets" --data '{"title":"Snip","secret":true,"files":[{"name":"a.txt","content":"snippet survives"}]}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 SHA=$(curl -sf "$B/api/repos/alice/keep/commits" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commits"][0]["sha"])')
 # A Git LFS file, uploaded the way git-lfs does it (batch, then PUT).
 printf 'large file %.0s' $(seq 2000) >"$TMP/asset.bin"
@@ -57,8 +60,11 @@ GITTER_DATA=$TMP/b GITTER_ADDR=127.0.0.1:$PORT2 GITTER_URL=$B2 $BIN >"$TMP/b.log
 wait_up "$B2"
 [ "$(curl -sf "$B2/api/repos/alice/keep/commits" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commits"][0]["sha"])')" = "$SHA" ] || fail "history differs after restore"
 curl -sf "$B2/api/repos/alice/keep/issues/1" | grep -q "Remember me" || fail "issue missing after restore"
+curl -sf "$B2/api/repos/alice/keep/wiki/Home" | grep -q "Wiki survives" || fail "wiki page missing after restore"
+curl -sf "$B2/api/repos/alice/keep/discussions/1" | grep -q "Talk survives" || fail "discussion missing after restore"
+curl -sf "$B2/raw/snippets/$SNIP/latest/a.txt" | grep -q "snippet survives" || fail "snippet missing after restore"
 git clone -q "$B2/alice/keep.git" "$TMP/clone" && [ -f "$TMP/clone/README.md" ] || fail "clone from restored server"
 curl -sf -H "Origin: $B2" -H 'Content-Type: application/json' -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct horse"}' >/dev/null || fail "login after restore"  # pragma: allowlist secret
 curl -sf "${AUTH[@]}" "$B2/alice/keep.git/info/lfs/objects/$OID" | cmp -s - "$TMP/asset.bin" || fail "LFS file missing or different after restore"
-echo "✓ restored server has the same history, issues, logins, clones and LFS files"
+echo "✓ restored server has the same history, issues, wiki, discussions, snippets, logins, clones and LFS files"
 echo "Backup round-trip passed."

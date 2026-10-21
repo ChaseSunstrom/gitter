@@ -8,6 +8,9 @@ const ROUTES = [
   ['/', 'home'], ['/login', 'auth', { mode: 'login' }], ['/signup', 'auth', { mode: 'signup' }], ['/new', 'newrepo'],
   ['/explore', 'explore'], ['/settings', 'settings'], ['/settings/:tab', 'settings'],
   ['/admin', 'admin'], ['/admin/:tab', 'admin'],
+  ['/snippets', 'snippets', { view: 'list' }], ['/snippets/mine', 'snippets', { view: 'mine' }], ['/snippets/new', 'snippets', { view: 'edit' }],
+  ['/snippets/:id', 'snippets', { view: 'show' }], ['/snippets/:id/edit', 'snippets', { view: 'edit' }],
+  ['/snippets/:id/revisions', 'snippets', { view: 'revisions' }],
   ['/:user', 'profile'],
   ['/:owner/:repo', 'repo', { view: 'tree' }],
   ['/:owner/:repo/tree/*', 'repo', { view: 'tree' }],
@@ -26,6 +29,11 @@ const ROUTES = [
   ['/:owner/:repo/pull/:n/:tab', 'issue', { kind: 'pr' }],
   ['/:owner/:repo/labels', 'labels'], ['/:owner/:repo/settings', 'reposettings'],
   ['/:owner/:repo/insights', 'insights'], ['/:owner/:repo/search', 'search'],
+  ['/:owner/:repo/wiki', 'wiki', { view: 'page' }], ['/:owner/:repo/wiki/_new', 'wiki', { view: 'edit', create: true }],
+  ['/:owner/:repo/wiki/:page', 'wiki', { view: 'page' }], ['/:owner/:repo/wiki/:page/edit', 'wiki', { view: 'edit' }],
+  ['/:owner/:repo/wiki/:page/history', 'wiki', { view: 'history' }],
+  ['/:owner/:repo/discussions', 'discussions', { view: 'list' }], ['/:owner/:repo/discussions/new', 'discussions', { view: 'new' }],
+  ['/:owner/:repo/discussions/:n', 'discussions', { view: 'show' }],
 ];
 
 function compile([pattern, page, extra = {}]) {
@@ -241,6 +249,7 @@ function topbar() {
     <button class="jump" id="jump" aria-label="Search or jump to">${icon('search', 'sm')}<span>Search or jump to…</span><kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'} K</kbd></button>
     <nav class="topnav">
       <a class="nav hide-sm" href="/explore" data-nav="explore">Explore</a>
+      <a class="nav hide-sm" href="/snippets" data-nav="snippets">Snippets</a>
       ${me ? html`
         <button class="btn ghost icon" id="new-menu" aria-label="Create new">${icon('plus')}</button>
         <button class="btn ghost" id="user-menu" aria-label="Account menu" style="padding:0 4px">${avatar(me.username, 26)}${icon('chev-down', 'sm')}</button>`
@@ -269,8 +278,10 @@ export function renderTopbar() {
     const r = state.repo;
     popover(e.currentTarget, html`
       <a class="menu-item" href="/new">${icon('repo')} New repository</a>
+      <a class="menu-item" href="/snippets/new">${icon('file-code')} New snippet</a>
       ${r ? html`<div class="menu-sep"></div><div class="menu-head">${r.owner}/${r.name}</div>
         <a class="menu-item" href="/${r.owner}/${r.name}/issues/new">${icon('issue')} New issue</a>
+        <a class="menu-item" href="/${r.owner}/${r.name}/discussions/new">${icon('comment')} New discussion</a>
         <a class="menu-item" href="/${r.owner}/${r.name}/compare">${icon('pr')} New pull request</a>
         ${r.can_write ? html`<a class="menu-item" href="/${r.owner}/${r.name}/new/${r.default_branch}">${icon('file')} New file</a>` : ''}` : ''}`,
     { align: 'right', onMount: (p) => p.addEventListener('click', (ev) => ev.target.closest('a') && closePop()) });
@@ -283,6 +294,7 @@ export function renderTopbar() {
       <a class="menu-item" href="/${me.username}">${icon('user')} Your profile</a>
       <a class="menu-item" href="/${me.username}?tab=repos">${icon('repo')} Your repositories</a>
       <a class="menu-item" href="/${me.username}?tab=stars">${icon('star')} Your stars</a>
+      <a class="menu-item" href="/snippets/mine">${icon('file-code')} Your snippets</a>
       <div class="menu-sep"></div>
       <button class="menu-item" data-theme-toggle>${icon('moon')} Toggle theme <span class="grow"></span><kbd>⇧T</kbd></button>
       <a class="menu-item" href="/settings">${icon('settings')} Settings</a>

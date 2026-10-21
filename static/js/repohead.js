@@ -27,6 +27,8 @@ const TABS = [
   ['code', 'code', 'Code', ''],
   ['issues', 'issue', 'Issues', '/issues'],
   ['pulls', 'pr', 'Pull requests', '/pulls'],
+  ['discussions', 'comment', 'Discussions', '/discussions'],
+  ['wiki', 'book', 'Wiki', '/wiki'],
   ['commits', 'history', 'Commits', '/commits'],
   ['branches', 'branch', 'Branches', '/branches'],
   ['insights', 'chart', 'Insights', '/insights'],

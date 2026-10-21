@@ -112,6 +112,15 @@ a.branch-name:hover { text-decoration: underline; }
 .compare-bar .box-body { padding: 10px 14px; gap: 8px; }
 .pr-form .row > .input { flex: 1; }
 
+/* ---------- discussions, wiki, snippets ---------- */
+.vote-btn.on { color: var(--accent); border-color: var(--accent-line); }
+.vote-count { display: grid; justify-items: center; min-width: 36px; color: var(--muted); font-size: 12px; }
+.vote-count b { color: var(--ink); font-size: 13px; }
+.answer-tag { color: var(--green); border-color: var(--green); background: var(--green-soft); }
+.comment-card.answer, .comment-card.answer::before { border-color: var(--green); }
+.list-row.on { background: var(--hover); font-weight: 600; }
+.snip-file .textarea { border: 0; border-radius: 0 0 var(--r) var(--r); min-height: 160px; font-size: 13px; }
+
 @media (max-width: 720px) {
   .issue-title-row { flex-direction: column; }
   .issue-title-row h1 { font-size: 21px; }

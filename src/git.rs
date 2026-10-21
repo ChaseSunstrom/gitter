@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 use crate::error::{AppError, R};
 
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const EMPTY_OID: &str = "0000000000000000000000000000000000000000";
 pub const DIFF_CAP: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -569,10 +570,12 @@ impl Git {
             for ch in c.changes {
                 match ch {
                     Change::Delete(path) => {
+                        // Mode 0 removes the entry; unlike --force-remove it needs no work tree (repos are bare).
+                        let rec = format!("0 {EMPTY_OID}\t{path}\0");
                         self.ok_env(
                             repo,
-                            &["update-index", "--force-remove", "--", path],
-                            None,
+                            &["update-index", "-z", "--index-info"],
+                            Some(rec.as_bytes()),
                             &env_idx,
                         )
                         .await?;

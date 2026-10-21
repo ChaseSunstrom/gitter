@@ -368,6 +368,12 @@ pub async fn raw(
         Some((len, body)) => (body, is_image(&path).unwrap_or("application/octet-stream"), Some(len)),
         None => (Body::from(data), ctype, None),
     };
+    Ok(inert(body, ctype, len, immutable, r.private || r.hidden || pending))
+}
+
+/// User file bytes served so they can never run script on this origin. `no_store`
+/// for what not everyone may see, or what will change at the same address.
+pub fn inert(body: Body, ctype: &'static str, len: Option<u64>, immutable: bool, no_store: bool) -> Response {
     let mut resp = Response::new(body);
     let h = resp.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
@@ -384,21 +390,13 @@ pub async fn raw(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(if immutable {
-            "public, max-age=31536000, immutable"
-        } else {
-            "private, max-age=60"
-        }),
-    );
-    if r.private || r.hidden || pending {
-        h.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-    }
-    Ok(resp)
+    let cache = match (no_store, immutable) {
+        (true, _) => "private, no-store",
+        (false, true) => "public, max-age=31536000, immutable",
+        (false, false) => "private, max-age=60",
+    };
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    resp
 }
 
 /// Split "feature/x/src/main.rs" into (rev, path) using the longest matching branch or tag.

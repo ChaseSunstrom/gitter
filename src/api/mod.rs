@@ -1,10 +1,13 @@
 pub mod account;
 pub mod admin;
 pub mod code;
+pub mod discussions;
 pub mod issues;
 pub mod moderation;
 pub mod repos;
 pub mod security;
+pub mod snippets;
+pub mod wiki;
 
 use std::net::SocketAddr;
 
@@ -132,6 +135,33 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/pulls/{{n}}/merge"),
             post(issues::merge_pull),
         )
+        .route(&format!("{repo}/wiki"), get(wiki::pages).post(wiki::create))
+        .route(
+            &format!("{repo}/wiki/{{page}}"),
+            get(wiki::show).put(wiki::update).delete(wiki::delete),
+        )
+        .route(&format!("{repo}/wiki/{{page}}/history"), get(wiki::history))
+        .route(
+            &format!("{repo}/discussions"),
+            get(discussions::list).post(discussions::create),
+        )
+        .route(
+            &format!("{repo}/discussions/{{n}}"),
+            get(discussions::show).patch(discussions::update).delete(discussions::delete),
+        )
+        .route(&format!("{repo}/discussions/{{n}}/comments"), post(discussions::comment))
+        .route(
+            &format!("{repo}/discussions/{{n}}/comments/{{id}}"),
+            patch(discussions::edit_comment).delete(discussions::delete_comment),
+        )
+        .route(&format!("{repo}/discussions/{{n}}/answer"), post(discussions::answer))
+        .route(&format!("{repo}/discussions/{{n}}/vote"), post(discussions::vote))
+        .route("/snippets", get(snippets::list).post(snippets::create))
+        .route(
+            "/snippets/{id}",
+            get(snippets::show).put(snippets::update).delete(snippets::delete),
+        )
+        .route("/snippets/{id}/revisions", get(snippets::revisions))
         .fallback(|| async { AppError::not_found() })
 }
 

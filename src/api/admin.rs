@@ -284,7 +284,7 @@ pub async fn delete_user(
     if !d.confirm.eq_ignore_ascii_case(&name) {
         return Err(AppError::bad(format!("Type {name} to confirm")));
     }
-    let (repo_ids, lfs): (Vec<i64>, Vec<String>) = st
+    let (repo_ids, snippet_ids, lfs): (Vec<i64>, Vec<String>, Vec<String>) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -297,18 +297,23 @@ pub async fn delete_user(
                 let mut s = tx.prepare("SELECT id FROM repos WHERE owner_id = ?1")?;
                 s.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?
             };
+            let snippets = super::snippets::ids_of(&tx, id)?;
             let lfs = crate::lfs::held_by(&tx, true, id)?;
             tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
             crate::security::forget_user(&tx, id)?;
             let e = Event { actor: Some(&me), subject: None, action: "user_deleted", detail: format!("{name} and {} repositories", ids.len()), ip: &ip.0 };
             crate::security::append(&tx, &e)?;
             tx.commit()?;
-            Ok((ids, lfs))
+            Ok((ids, snippets, lfs))
         })
         .await?;
     crate::lfs::collect(&st, lfs).await;
     for id in repo_ids {
         let _ = tokio::fs::remove_dir_all(st.git.repo_path(id)).await;
+        let _ = tokio::fs::remove_dir_all(super::wiki::path(&st, id)).await;
+    }
+    for id in snippet_ids {
+        let _ = tokio::fs::remove_dir_all(super::snippets::path(&st, &id)).await;
     }
     ok()
 }

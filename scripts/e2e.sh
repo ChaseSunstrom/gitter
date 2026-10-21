@@ -143,6 +143,27 @@ api GET /repos/alice/hello/issues/2
 api GET "/repos/alice/hello/blob?rev=main&path=src/lib.rs"
 ok "issues, comments, PR create/diff/merge"
 
+# --- wiki, discussions, snippets
+api POST /repos/alice/hello/wiki '{"name":"Home","content":"# Hello wiki\n\nSee [Setup](Setup)."}'
+api POST /repos/alice/hello/wiki '{"name":"Setup","content":"Run cargo build"}'
+api GET /repos/alice/hello/wiki/Home
+OID=$(jq_ 'd["page"]["oid"]')
+api PUT /repos/alice/hello/wiki/Home "{\"name\":\"Home\",\"content\":\"# Hello wiki\\n\\nSee [Setup](Setup) to start.\",\"expected_oid\":\"$OID\"}"
+EXPECT=409 api PUT /repos/alice/hello/wiki/Home "{\"name\":\"Home\",\"content\":\"stale\",\"expected_oid\":\"$OID\"}"
+api GET /repos/alice/hello/wiki/Home/history
+[ "$(jq_ 'len(d["commits"])')" = 2 ] || fail "wiki history"
+api POST /repos/alice/hello/discussions '{"title":"How do I run it?","body":"Any tips?","category":"qa"}'
+api POST /repos/alice/hello/discussions/1/comments '{"body":"Use cargo run"}'
+CID=$(jq_ 'd["id"]')
+api POST /repos/alice/hello/discussions/1/answer "{\"comment_id\":$CID}"
+api POST /repos/alice/hello/discussions/1/vote '{"up":true}'
+api GET /repos/alice/hello/discussions/1
+[ "$(jq_ 'd["discussion"]["answer_id"]')" = "$CID" ] || fail "discussion answer"
+api POST /snippets '{"title":"Greeting","files":[{"name":"hello.py","content":"print(\"hi\")\n"}]}'
+SNIP=$(jq_ 'd["id"]')
+curl -sf "$BASE/raw/snippets/$SNIP/latest/hello.py" | grep -q 'print' || fail "snippet raw"
+ok "wiki pages with history and conflict check, discussion answer and vote, snippet raw file"
+
 # --- second user, privacy, stars, forks
 JAR_A="$JAR"; JAR="$TMP/jar2"
 api POST /auth/signup '{"username":"bob","email":"bob@example.com","password":"another horse"}'

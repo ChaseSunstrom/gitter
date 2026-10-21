@@ -214,6 +214,52 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX lfs_objects_oid ON lfs_objects(oid);
     "#,
+    // v7: discussions (wikis live in GITTER_DATA/wikis/<repo id>.git), snippets
+    r#"
+    CREATE TABLE discussions (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        number INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        answer_id INTEGER REFERENCES discussion_comments(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(repo_id, number)
+    );
+    CREATE INDEX discussions_repo ON discussions(repo_id, category, updated_at);
+    CREATE TABLE discussion_comments (
+        id INTEGER PRIMARY KEY,
+        discussion_id INTEGER NOT NULL REFERENCES discussions(id) ON DELETE CASCADE,
+        author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX discussion_comments_d ON discussion_comments(discussion_id);
+    -- comment_id NULL is a vote for the thread itself.
+    CREATE TABLE discussion_votes (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        discussion_id INTEGER NOT NULL REFERENCES discussions(id) ON DELETE CASCADE,
+        comment_id INTEGER REFERENCES discussion_comments(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX discussion_votes_once ON discussion_votes(user_id, discussion_id, ifnull(comment_id, 0));
+    CREATE INDEX discussion_votes_d ON discussion_votes(discussion_id, comment_id);
+    -- id is random hex (secret links must be unguessable) and names the folder snippets/<id>.git.
+    CREATE TABLE snippets (
+        id TEXT PRIMARY KEY,
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL DEFAULT '',
+        is_secret INTEGER NOT NULL DEFAULT 0,
+        files TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX snippets_owner ON snippets(owner_id, updated_at);
+    CREATE INDEX snippets_listed ON snippets(is_secret, updated_at);
+    "#,
 ];
 
 impl Db {

@@ -448,6 +448,15 @@ async fn web_commits_keep_exec_bits_and_hide_account_email() {
         .await;
     assert_eq!(blob["editable"], true);
     assert_eq!(blob["mode"], "100755");
+
+    // Deleting a file works in a bare repository (no work tree).
+    let (s, e) = app
+        .req(&alice, "POST", "/api/repos/alice/tools/contents", Some(json!({
+            "branch": "main", "message": "Drop script", "changes": [{ "path": "run.sh", "delete": true }]
+        })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(git(&["ls-tree", "--name-only", "main"], None), "README.md");
 }
 
 #[tokio::test]
@@ -1454,4 +1463,275 @@ async fn lfs_limits_storage_slots_and_caching() {
     let (s, _) = app.req(&bob, "DELETE", "/api/repos/bob/r", Some(json!({ "confirm": "bob/r" }))).await;
     assert_eq!(s, StatusCode::OK);
     assert!(!kept.exists(), "no repository holds it any more");
+}
+
+fn names(v: &Value, key: &str) -> Vec<String> {
+    v.as_array().unwrap().iter().map(|x| x[key].as_str().unwrap().to_string()).collect()
+}
+
+async fn audit_count(app: &App, action: &'static str) -> i64 {
+    app.state.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM audit WHERE action = ?1", [action], |r| r.get(0))?)).await.unwrap()
+}
+
+#[tokio::test]
+async fn wiki_pages_have_history_conflicts_and_follow_repo_privacy() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "pub", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "priv", "private": true }))).await;
+    let w = "/api/repos/alice/pub/wiki";
+
+    let (s, v) = app.req(&anon, "GET", w, None).await;
+    assert_eq!((s, v["pages"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)), "no wiki yet: no pages");
+    let (s, v) = app.req(&anon, "GET", &format!("{w}/Home"), None).await;
+    assert_eq!((s, v["page"].is_null()), (StatusCode::OK, true), "a missing page is null, not an error");
+
+    let (s, _) = app.req(&bob, "POST", w, Some(json!({ "name": "Home", "content": "hi" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "only people who can write the repo edit its wiki");
+    let (s, v) = app.req(&alice, "POST", w, Some(json!({ "name": "Home", "content": "# Welcome" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = app.req(&alice, "POST", w, Some(json!({ "name": "Home", "content": "again" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a page name is taken once");
+    for bad in ["../evil", "a/b", ".hidden", ""] {
+        let (s, _) = app.req(&alice, "POST", w, Some(json!({ "name": bad, "content": "x" }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    app.req(&alice, "POST", w, Some(json!({ "name": "Getting started", "content": "Step 1" }))).await;
+
+    let (_, v) = app.req(&anon, "GET", &format!("{w}/Home"), None).await;
+    assert_eq!(v["page"]["content"], "# Welcome");
+    assert_eq!(names(&v["pages"], "name"), ["Getting-started", "Home"]);
+    let home_oid = v["page"]["oid"].as_str().unwrap().to_string();
+    let (_, v) = app.req(&anon, "GET", &format!("{w}/Getting-started"), None).await;
+    let gs_oid = v["page"]["oid"].as_str().unwrap().to_string();
+    assert_eq!(v["page"]["title"], "Getting started");
+
+    // Edits are checked against the page the editor started from.
+    let edit = |content: &str, oid: &str| json!({ "name": "Home", "content": content, "expected_oid": oid });
+    let (s, v) = app.req(&alice, "PUT", &format!("{w}/Home"), Some(edit("# Welcome!", &home_oid))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = app.req(&alice, "PUT", &format!("{w}/Home"), Some(edit("stale", &home_oid))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a stale edit is refused");
+    // Another page changed meanwhile, but this one didn't: a rename goes through.
+    let (s, v) = app.req(&alice, "PUT", &format!("{w}/Getting-started"), Some(json!({ "name": "Setup", "content": "Step 1", "expected_oid": gs_oid }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = app.req(&anon, "GET", w, None).await;
+    assert_eq!(names(&v["pages"], "name"), ["Home", "Setup"]);
+    let (s, _) = app.req(&bob, "PUT", &format!("{w}/Home"), Some(edit("x", ""))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // History, and old revisions stay readable.
+    let (s, h) = app.req(&anon, "GET", &format!("{w}/Home/history"), None).await;
+    assert_eq!(s, StatusCode::OK, "{h}");
+    let commits = h["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{h}");
+    let first = commits[1]["sha"].as_str().unwrap();
+    let (_, v) = app.req(&anon, "GET", &format!("{w}/Home?rev={first}"), None).await;
+    assert_eq!((v["page"]["content"].as_str(), v["page"]["latest"].as_bool()), (Some("# Welcome"), Some(false)));
+
+    let (s, _) = app.req(&bob, "DELETE", &format!("{w}/Setup"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = app.req(&alice, "DELETE", &format!("{w}/Setup"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, v) = app.req(&anon, "GET", w, None).await;
+    assert_eq!(names(&v["pages"], "name"), ["Home"]);
+    assert_eq!(audit_count(&app, "wiki_page_deleted").await, 1);
+
+    // A private repo's wiki is as private as the repo.
+    let (s, _) = app.req(&alice, "POST", "/api/repos/alice/priv/wiki", Some(json!({ "name": "Home", "content": "plans" }))).await;
+    assert_eq!(s, StatusCode::OK);
+    for c in [&bob, &anon] {
+        assert_eq!(app.req(c, "GET", "/api/repos/alice/priv/wiki", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(app.req(c, "GET", "/api/repos/alice/priv/wiki/Home", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(app.req(c, "GET", "/api/repos/alice/priv/wiki/Home/history", None).await.0, StatusCode::NOT_FOUND);
+    }
+
+    // Deleting the repository deletes its wiki.
+    let id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM repos WHERE name = 'pub'", [], |r| r.get(0))?)).await.unwrap();
+    let dir = app.state.cfg.data_dir.join(format!("wikis/{id}.git"));
+    assert!(dir.is_dir());
+    let (s, _) = app.req(&alice, "DELETE", "/api/repos/alice/pub", Some(json!({ "confirm": "alice/pub" }))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn discussion_categories_threads_answers_and_votes() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    let anon = Client::default();
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "pub", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "priv", "private": true }))).await;
+    let d = "/api/repos/alice/pub/discussions";
+    let start = |cat: &str| json!({ "title": "How do I build it", "body": "Which command?", "category": cat });
+
+    let (s, v) = app.req(&bob, "POST", d, Some(start("qa"))).await;
+    assert_eq!((s, v["number"].as_i64()), (StatusCode::OK, Some(1)), "{v}");
+    assert_eq!(app.req(&bob, "POST", d, Some(start("announcements"))).await.0, StatusCode::FORBIDDEN, "only maintainers announce");
+    assert_eq!(app.req(&bob, "POST", d, Some(start("nope"))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&anon, "POST", d, Some(start("qa"))).await.0, StatusCode::UNAUTHORIZED);
+    let (s, v) = app.req(&alice, "POST", d, Some(start("announcements"))).await;
+    assert_eq!((s, v["number"].as_i64()), (StatusCode::OK, Some(2)));
+
+    let (s, c1) = app.req(&alice, "POST", &format!("{d}/1/comments"), Some(json!({ "body": "Run `cargo build`" }))).await;
+    assert_eq!(s, StatusCode::OK, "{c1}");
+    let c1 = c1["id"].as_i64().unwrap();
+    let (_, c2) = app.req(&bob, "POST", &format!("{d}/1/comments"), Some(json!({ "body": "Thanks!" }))).await;
+    let c2 = c2["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("{d}/1/comments"), Some(json!({ "body": "  " }))).await.0, StatusCode::BAD_REQUEST);
+
+    // The asker (or a maintainer) marks the answer, in Q&A only.
+    assert_eq!(app.req(&carol, "POST", &format!("{d}/1/answer"), Some(json!({ "comment_id": c1 }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "POST", &format!("{d}/1/answer"), Some(json!({ "comment_id": c1 }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", &format!("{d}/2/answer"), Some(json!({ "comment_id": c1 }))).await.0, StatusCode::BAD_REQUEST);
+
+    // One vote per person, on the thread or a reply.
+    for (c, up) in [(&bob, true), (&bob, true), (&carol, true), (&carol, false), (&carol, true)] {
+        assert_eq!(app.req(c, "POST", &format!("{d}/1/vote"), Some(json!({ "up": up }))).await.0, StatusCode::OK);
+    }
+    app.req(&carol, "POST", &format!("{d}/1/vote"), Some(json!({ "up": true, "comment_id": c1 }))).await;
+    assert_eq!(app.req(&anon, "POST", &format!("{d}/1/vote"), Some(json!({ "up": true }))).await.0, StatusCode::UNAUTHORIZED);
+    let (s, t) = app.req(&carol, "GET", &format!("{d}/1"), None).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    assert_eq!((t["discussion"]["votes"].as_i64(), t["discussion"]["voted"].as_bool()), (Some(2), Some(true)), "{t}");
+    assert_eq!(t["discussion"]["answer_id"].as_i64(), Some(c1));
+    let first = &t["comments"][0];
+    assert_eq!((first["is_answer"].as_bool(), first["votes"].as_i64(), first["voted"].as_bool()), (Some(true), Some(1), Some(true)));
+    assert_eq!(t["comments"][1]["can_edit"], false, "carol can't edit bob's reply");
+
+    // Lists filter by category and sort by votes.
+    let (_, l) = app.req(&anon, "GET", &format!("{d}?category=qa"), None).await;
+    assert_eq!(l["items"].as_array().unwrap().len(), 1, "{l}");
+    assert_eq!(l["items"][0]["answered"], true);
+    let (_, l) = app.req(&anon, "GET", &format!("{d}?sort=top"), None).await;
+    assert_eq!(l["items"][0]["number"], 1);
+    assert!(l["categories"].as_array().unwrap().iter().any(|c| c["id"] == "announcements" && c["count"] == 1), "{l}");
+
+    // Authors and maintainers edit; nobody else.
+    assert_eq!(app.req(&carol, "PATCH", &format!("{d}/1"), Some(json!({ "title": "pwned" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", &format!("{d}/1"), Some(json!({ "title": "How do I build?" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&carol, "PATCH", &format!("{d}/1/comments/{c2}"), Some(json!({ "body": "pwned" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", &format!("{d}/1/comments/{c2}"), Some(json!({ "body": "Thanks, that worked" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "PATCH", &format!("{d}/2/comments/{c2}"), Some(json!({ "body": "x" }))).await.0, StatusCode::NOT_FOUND, "a reply belongs to its own thread");
+
+    // Deleting the answer unmarks it; deleting a thread is for maintainers and is logged.
+    assert_eq!(app.req(&alice, "DELETE", &format!("{d}/1/comments/{c1}"), None).await.0, StatusCode::OK);
+    let (_, t) = app.req(&anon, "GET", &format!("{d}/1"), None).await;
+    assert!(t["discussion"]["answer_id"].is_null(), "{t}");
+    assert_eq!(app.req(&bob, "DELETE", &format!("{d}/1"), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "DELETE", &format!("{d}/1"), None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&anon, "GET", &format!("{d}/1"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(audit_count(&app, "discussion_deleted").await, 1);
+
+    // A private repo's discussions follow its access rules.
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/priv/discussions", Some(start("general"))).await.0, StatusCode::OK);
+    for c in [&bob, &anon] {
+        assert_eq!(app.req(c, "GET", "/api/repos/alice/priv/discussions", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(app.req(c, "GET", "/api/repos/alice/priv/discussions/1", None).await.0, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(app.req(&bob, "POST", "/api/repos/alice/priv/discussions/1/comments", Some(json!({ "body": "hi" }))).await.0, StatusCode::NOT_FOUND);
+}
+
+async fn raw_get(app: &App, path: &str) -> (StatusCode, String, String) {
+    let resp = app.router.clone().oneshot(Request::get(path).header("host", "test.local").body(Body::empty()).unwrap()).await.unwrap();
+    let csp = resp.headers().get("content-security-policy").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let s = resp.status();
+    let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned();
+    (s, body, csp)
+}
+
+#[tokio::test]
+async fn snippets_public_secret_revisions_and_raw() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    let files = json!([{ "name": "hello.rs", "content": "fn main() {}\n" }, { "name": "notes.md", "content": "# hi" }]);
+    let (s, v) = app.req(&alice, "POST", "/api/snippets", Some(json!({ "title": "Hello", "files": files }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let public = v["id"].as_str().unwrap().to_string();
+    let (_, v) = app.req(&alice, "POST", "/api/snippets", Some(json!({ "title": "Keys", "secret": true, "files": [{ "name": "", "content": "shh" }] }))).await;
+    let secret = v["id"].as_str().unwrap().to_string();
+    assert_eq!(secret.len(), 32, "secret links are unguessable");
+    assert_eq!(app.req(&anon, "POST", "/api/snippets", Some(json!({ "files": files }))).await.0, StatusCode::UNAUTHORIZED);
+    for bad in [json!([]), json!([{ "name": "../x", "content": "x" }]), json!([{ "name": "a", "content": "x" }, { "name": "a", "content": "y" }]), json!([{ "name": "a", "content": "" }])] {
+        assert_eq!(app.req(&alice, "POST", "/api/snippets", Some(json!({ "files": bad }))).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    // Secret snippets are unlisted: only their owner sees them in a list.
+    let ids = |v: &Value| names(&v["items"], "id");
+    let (_, l) = app.req(&anon, "GET", "/api/snippets", None).await;
+    assert_eq!(ids(&l), [public.as_str()]);
+    assert_eq!(l["items"][0]["files"], json!(["hello.rs", "notes.md"]));
+    let (_, l) = app.req(&bob, "GET", "/api/snippets?user=alice", None).await;
+    assert_eq!(ids(&l), [public.as_str()]);
+    let (_, l) = app.req(&alice, "GET", "/api/snippets?user=alice", None).await;
+    assert_eq!(ids(&l).len(), 2);
+    // ...but open for anyone with the link.
+    let (s, v) = app.req(&anon, "GET", &format!("/api/snippets/{secret}"), None).await;
+    assert_eq!((s, v["files"][0]["name"].as_str()), (StatusCode::OK, Some("snippetfile1.txt")), "{v}");
+    assert_eq!(v["can_edit"], false);
+    assert_eq!(app.req(&anon, "GET", "/api/snippets/0123", None).await.0, StatusCode::NOT_FOUND);
+
+    // Edits make revisions; stale edits are refused; only the owner edits.
+    let (_, v) = app.req(&alice, "GET", &format!("/api/snippets/{public}"), None).await;
+    let sha = v["sha"].as_str().unwrap().to_string();
+    let one = json!({ "title": "Hello", "files": [{ "name": "hello.rs", "content": "fn main() { println!(\"hi\"); }\n" }], "expected_sha": sha });
+    assert_eq!(app.req(&bob, "PUT", &format!("/api/snippets/{public}"), Some(one.clone())).await.0, StatusCode::FORBIDDEN);
+    let (s, v) = app.req(&alice, "PUT", &format!("/api/snippets/{public}"), Some(one.clone())).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(app.req(&alice, "PUT", &format!("/api/snippets/{public}"), Some(one)).await.0, StatusCode::CONFLICT);
+    let (_, v) = app.req(&anon, "GET", &format!("/api/snippets/{public}"), None).await;
+    assert_eq!((v["files"].as_array().unwrap().len(), v["revisions"].as_i64()), (1, Some(2)), "{v}");
+    let head = v["sha"].as_str().unwrap().to_string();
+    // Changing only the title adds no revision.
+    let retitle = json!({ "title": "Hello world", "files": [{ "name": "hello.rs", "content": "fn main() { println!(\"hi\"); }\n" }] });
+    assert_eq!(app.req(&alice, "PUT", &format!("/api/snippets/{public}"), Some(retitle)).await.0, StatusCode::OK);
+    let (_, r) = app.req(&anon, "GET", &format!("/api/snippets/{public}/revisions"), None).await;
+    assert_eq!(names(&r["commits"], "sha"), [head.clone(), sha.clone()], "{r}");
+    let (_, v) = app.req(&anon, "GET", &format!("/api/snippets/{public}?rev={sha}"), None).await;
+    assert_eq!((v["files"].as_array().unwrap().len(), v["title"].as_str()), (2, Some("Hello world")));
+
+    // Raw files are served as inert text.
+    let (s, body, csp) = raw_get(&app, &format!("/raw/snippets/{public}/{sha}/notes.md")).await;
+    assert_eq!((s, body.as_str()), (StatusCode::OK, "# hi"));
+    assert!(csp.contains("sandbox"), "{csp}");
+    let (_, body, _) = raw_get(&app, &format!("/raw/snippets/{public}/latest/hello.rs")).await;
+    assert!(body.contains("println"), "{body}");
+    assert_eq!(raw_get(&app, &format!("/raw/snippets/{public}/latest/notes.md")).await.0, StatusCode::NOT_FOUND);
+
+    // Only the owner deletes; the folder goes and the deletion is logged.
+    let dir = app.state.cfg.data_dir.join(format!("snippets/{public}.git"));
+    assert!(dir.is_dir());
+    assert_eq!(app.req(&bob, "DELETE", &format!("/api/snippets/{public}"), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "DELETE", &format!("/api/snippets/{public}"), None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&anon, "GET", &format!("/api/snippets/{public}"), None).await.0, StatusCode::NOT_FOUND);
+    assert!(!dir.exists());
+    assert_eq!(audit_count(&app, "snippet_deleted").await, 1);
+}
+
+#[tokio::test]
+async fn repo_limited_tokens_cannot_make_snippets_or_touch_hidden_wikis() {
+    let app = App::new();
+    let _admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "a", "readme": true }))).await;
+    let (_, t) = app.req(&alice, "POST", "/api/repos/alice/a/deploy-tokens", Some(json!({ "name": "box", "write": true }))).await;
+    let deploy = t["token"].as_str().unwrap().to_string();
+    let (_, t) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "one", "repo": "alice/a" }))).await;
+    let one_repo = t["token"].as_str().unwrap().to_string();
+    let snippet = json!({ "title": "x", "files": [{ "name": "a.txt", "content": "hi" }] });
+    for tok in [&deploy, &one_repo] {
+        assert_eq!(bearer(&app, "POST", "/api/snippets", tok, Some(snippet.clone())).await, StatusCode::FORBIDDEN);
+    }
+    // A moderator-hidden repository's wiki and discussions are hidden with it.
+    app.req(&alice, "PUT", "/api/repos/alice/a/wiki/Home", Some(json!({ "content": "secret plans", "message": "m" }))).await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET hidden = 1", [])?)).await.unwrap();
+    let anon = Client::default();
+    assert_eq!(app.req(&anon, "GET", "/api/repos/alice/a/wiki", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&anon, "GET", "/api/repos/alice/a/discussions", None).await.0, StatusCode::NOT_FOUND);
 }

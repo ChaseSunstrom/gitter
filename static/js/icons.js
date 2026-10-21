@@ -33,6 +33,7 @@ const P = {
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
   x: '<path d="M6 6l12 12M18 6 6 18"/>',
   'chev-down': '<path d="m6 9 6 6 6-6"/>',
+  'chev-up': '<path d="m6 15 6-6 6 6"/>',
   'chev-right': '<path d="m9 6 6 6-6 6"/>',
   'chev-left': '<path d="m15 6-6 6 6 6"/>',
   download: '<path d="M12 4v11m-5-5 5 5 5-5M4 20h16"/>',

@@ -182,7 +182,7 @@ pub struct CreateReq {
     labels: Vec<i64>,
 }
 
-fn check_text(title: &str, body: &str) -> R<()> {
+pub(super) fn check_text(title: &str, body: &str) -> R<()> {
     if title.trim().is_empty() {
         return Err(AppError::bad("Add a title"));
     }

@@ -63,10 +63,11 @@ function slug(s) {
   return s.toLowerCase().trim().replace(/[^\p{L}\p{N}\s-]/gu, '').replace(/\s+/g, '-');
 }
 
-function resolveRel(href) {
-  if (!ctx?.owner || !href || /^([a-z][a-z0-9+.-]*:|\/\/|#|\/)/i.test(href)) return null;
+// Takes the context as an argument: the module-level `ctx` is only set while marked parses.
+function resolveRel(href, c) {
+  if (!c?.owner || !href || /^([a-z][a-z0-9+.-]*:|\/\/|#|\/)/i.test(href)) return null;
   const [pathPart, hash = ''] = href.split('#');
-  const parts = (ctx.dir ? ctx.dir.split('/') : []);
+  const parts = (c.dir ? c.dir.split('/') : []);
   for (const seg of pathPart.split('/')) {
     if (seg === '..') parts.pop();
     else if (seg && seg !== '.') parts.push(seg);
@@ -99,12 +100,14 @@ export function renderMarkdown(src, c = null) {
     h.prepend(a);
   });
   if (c?.owner) {
+    // In a wiki, relative links name other pages ("Setup" or "Setup.md").
+    const target = (p) => c.wiki ? `/${c.owner}/${c.repo}/wiki/${encPath(p.replace(/\.md$/i, ''))}` : `/${c.owner}/${c.repo}/blob/${encPath(c.rev)}/${encPath(p)}`;
     root.querySelectorAll('a[href]').forEach((a) => {
-      const r = resolveRel(a.getAttribute('href'));
-      if (r) a.setAttribute('href', `/${c.owner}/${c.repo}/blob/${encPath(c.rev)}/${encPath(r.path)}${r.hash ? '#' + r.hash : ''}`);
+      const r = resolveRel(a.getAttribute('href'), c);
+      if (r) a.setAttribute('href', `${target(r.path)}${r.hash ? '#' + r.hash : ''}`);
     });
     root.querySelectorAll('img[src]').forEach((img) => {
-      const r = resolveRel(img.getAttribute('src'));
+      const r = c.wiki ? null : resolveRel(img.getAttribute('src'), c);
       if (r) img.setAttribute('src', `/raw/${c.owner}/${c.repo}/${encPath(c.rev)}/${encPath(r.path)}`);
       img.setAttribute('loading', 'lazy');
     });
