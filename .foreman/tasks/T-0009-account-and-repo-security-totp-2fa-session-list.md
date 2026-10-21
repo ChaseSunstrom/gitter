@@ -9,8 +9,6 @@ depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
 updated: 2026-10-21T17:01:42Z
-inferred_deps: [T-0001]
-inferred_why: T-0001: named in its request
 ---
 # Account and repo security: TOTP 2FA, session list + revoke, audit log, step-up auth for da
 ## Raw request

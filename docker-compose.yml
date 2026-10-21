@@ -1,7 +1,8 @@
 # Gitter: one service, one volume.
 #   Start:   docker compose up -d
 #   Then:    docker compose logs gitter   (open the one-time setup link to create the admin)
-#   Backup:  docker compose exec gitter gitter backup /data/backup.tar.gz
+#   Backup:  docker compose exec -T gitter gitter backup - > gitter-$(date +%F).tar.gz
+#   Settings go in a .env file next to this one (GITTER_URL=https://git.example.com).
 services:
   gitter:
     build: .
@@ -12,6 +13,8 @@ services:
     environment:
       # The address people use to reach this server (https://... behind a proxy).
       GITTER_URL: ${GITTER_URL:-http://localhost:3000}
+      # true when a reverse proxy (Caddy, nginx) sits in front, so rate limits see real client IPs.
+      GITTER_TRUST_PROXY: ${GITTER_TRUST_PROXY:-false}
     volumes:
       - gitter-data:/data
     healthcheck:

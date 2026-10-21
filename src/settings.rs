@@ -123,3 +123,35 @@ impl Live {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saved_settings_win_over_the_environment_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.db");
+        let env = Settings { signup: "open".into(), max_push_mb: 500, ..Settings::from_config(&test_cfg()) };
+        let live = Live::new(env.clone());
+        let saved = Settings { signup: "closed".into(), announcement: "Hi".into(), ..env.clone() };
+        live.save(&Db::open(&path).unwrap(), saved.clone()).await.unwrap();
+        // A fresh process: defaults from the environment, then what was saved.
+        let after = Live::new(env);
+        after.load(&Db::open(&path).unwrap()).await.unwrap();
+        assert_eq!(after.get(), saved);
+    }
+
+    fn test_cfg() -> Config {
+        Config {
+            data_dir: std::env::temp_dir(),
+            addr: String::new(),
+            url: String::new(),
+            secure_cookies: false,
+            trust_proxy: false,
+            signup: SignupMode::Open,
+            max_push_bytes: 1 << 20,
+            max_repos_per_user: 10,
+        }
+    }
+}

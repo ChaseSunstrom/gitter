@@ -40,8 +40,8 @@ fn repo_ids(db: &Connection) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-/// Write `<out>`: a .tar.gz holding a consistent copy of the database, every
-/// repository and a manifest. Safe to run while the server is up.
+/// Write `<out>` (`-` for stdout): a .tar.gz holding a consistent copy of the
+/// database, every repository it lists and a manifest. Safe to run while the server is up.
 pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
     let db_path = cfg.data_dir.join("gitter.db");
     if !db_path.exists() {
@@ -50,57 +50,105 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
             db_path.display()
         );
     }
+    let to_stdout = out == Path::new("-");
+    let out = if to_stdout { out.to_path_buf() } else { absolute(out)? };
+    // Created before the work starts, so a refusal to overwrite never deletes an older backup.
+    let file: Box<dyn std::io::Write> = if to_stdout {
+        Box::new(std::io::stdout().lock())
+    } else {
+        Box::new(owner_only_file(&out)?)
+    };
     // The snapshot holds password and session hashes: keep it next to the data, owner-only.
     let tmp = tempdir_in(&cfg.data_dir)?;
-    let snap = tmp.join("gitter.db");
-    let conn = Connection::open(&db_path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
-    // VACUUM INTO writes a transactionally consistent snapshot without stopping writers.
-    conn.execute("VACUUM INTO ?1", [snap.to_string_lossy()])?;
-    let ids = repo_ids(&conn)?;
-    let users: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
-    drop(conn);
-    let manifest = serde_json::json!({
-        "format": FORMAT, "gitter": env!("CARGO_PKG_VERSION"), "created_at": crate::db::now(),
-        "repos": ids.len(), "users": users,
-    });
-    std::fs::write(
-        tmp.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
-    let out = absolute(out)?;
-    // Created before the work starts, so a refusal to overwrite never deletes an older backup.
-    let file = match owner_only_file(&out) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e);
-        }
-    };
-    let res = (|| -> Result<()> {
-        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
-            file,
-            flate2::Compression::default(),
-        ));
+    let res = (|| -> Result<(usize, i64)> {
+        let snap = tmp.join("gitter.db");
+        let conn = Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        // VACUUM INTO writes a transactionally consistent snapshot without stopping writers.
+        conn.execute("VACUUM INTO ?1", [snap.to_string_lossy()])?;
+        let ids = repo_ids(&Connection::open(&snap)?)?;
+        let users: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
+        drop(conn);
+        let manifest = serde_json::json!({
+            "format": FORMAT, "gitter": env!("CARGO_PKG_VERSION"), "created_at": crate::db::now(),
+            "repos": ids.len(), "users": users,
+        });
+        std::fs::write(tmp.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
         tar.follow_symlinks(false);
         tar.append_path_with_name(tmp.join("manifest.json"), "manifest.json")?;
         tar.append_path_with_name(&snap, "gitter.db")?;
-        tar.append_dir_all("repos", cfg.data_dir.join("repos"))?;
-        tar.into_inner()?.finish()?;
-        Ok(())
+        tar.append_dir("repos", &cfg.data_dir)?;
+        // Only the repositories in the snapshot, so a repo created meanwhile can't show up as an orphan.
+        for id in &ids {
+            let src = cfg.data_dir.join("repos").join(format!("{id}.git"));
+            if !src.is_dir() {
+                eprintln!("warning: repository {id} has no folder (deleted during the backup?)");
+                continue;
+            }
+            append_repo(&mut tar, &src, &format!("repos/{id}.git"))?;
+        }
+        tar.into_inner()?.finish()?.flush()?;
+        Ok((ids.len(), users))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
-    if res.is_err() {
+    if res.is_err() && !to_stdout {
         let _ = std::fs::remove_file(&out);
     }
-    res?;
-    let size = std::fs::metadata(&out)?.len();
-    println!(
-        "Backed up {users} accounts and {} repositories to {} ({:.1} MB).",
-        ids.len(),
-        out.display(),
-        size as f64 / 1e6
+    let (repos, users) = res?;
+    let size = if to_stdout { String::new() } else {
+        format!(" ({:.1} MB)", std::fs::metadata(&out)?.len() as f64 / 1e6)
+    };
+    eprintln!(
+        "Backed up {users} accounts and {repos} repositories to {}{size}.",
+        if to_stdout { "stdout".into() } else { out.display().to_string() },
     );
+    Ok(())
+}
+
+/// Add one bare repository. Refs go first: objects copied after them are a
+/// superset of what those refs need, even while a push is landing.
+// ponytail: a `git gc` racing the backup can still delete a pack mid-copy; restore's fsck catches it.
+fn append_repo<W: std::io::Write>(tar: &mut tar::Builder<W>, src: &Path, name: &str) -> Result<()> {
+    tar.append_dir(name, src)?;
+    let first = ["HEAD", "packed-refs", "config", "refs"];
+    for f in first {
+        append_tree(tar, &src.join(f), &format!("{name}/{f}"))?;
+    }
+    for e in std::fs::read_dir(src)?.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if !first.contains(&n.as_str()) && !n.starts_with("gitter-index-") {
+            append_tree(tar, &e.path(), &format!("{name}/{n}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Add a file or directory tree, skipping files that vanish while we walk (temp files, repacks).
+fn append_tree<W: std::io::Write>(tar: &mut tar::Builder<W>, path: &Path, name: &str) -> Result<()> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if gone(&e) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.is_dir() {
+        tar.append_dir(name, path)?;
+        let rd = match std::fs::read_dir(path) {
+            Ok(rd) => rd,
+            Err(e) if gone(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for e in rd.flatten() {
+            append_tree(tar, &e.path(), &format!("{name}/{}", e.file_name().to_string_lossy()))?;
+        }
+    } else if meta.is_file() {
+        match std::fs::File::open(path) {
+            Ok(mut f) => tar.append_file(name, &mut f)?,
+            Err(e) if gone(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok(())
 }
 
@@ -150,50 +198,97 @@ fn inspect_archive(archive: &Path) -> Result<serde_json::Value> {
     Ok(manifest)
 }
 
-/// Restore a backup into GITTER_DATA. Nothing existing is touched until the
-/// archive has been fully checked and unpacked into a staging folder.
+/// Unpack a checked archive into `stage` and make sure its database opens cleanly.
+fn unpack(archive: &Path, stage: &Path) -> Result<serde_json::Value> {
+    let manifest = inspect_archive(archive)?;
+    let f = std::fs::File::open(archive)?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    ar.set_preserve_permissions(true);
+    for e in ar.entries()? {
+        e?.unpack_in(stage)?;
+    }
+    std::fs::create_dir_all(stage.join("repos"))?;
+    let conn = Connection::open(stage.join("gitter.db"))?;
+    let ok: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if ok != "ok" {
+        bail!("the database in the backup is damaged: {ok}");
+    }
+    Ok(manifest)
+}
+
+/// `-` means stdin: spool it to an owner-only file under `dir` (the archive is read twice).
+fn archive_path(archive: &Path, dir: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
+    if archive != Path::new("-") {
+        let p = absolute(archive)?
+            .canonicalize()
+            .with_context(|| format!("can't find {}", archive.display()))?;
+        return Ok((p, None));
+    }
+    let tmp = tempdir_in(dir)?;
+    let p = tmp.join("stdin.tar.gz");
+    let mut f = owner_only_file(&p)?;
+    std::io::copy(&mut std::io::stdin().lock(), &mut f).context("couldn't read the backup from stdin")?;
+    Ok((p, Some(tmp)))
+}
+
+/// Check a backup end to end (archive, database, every repository's objects) without restoring it.
+pub fn verify(cfg: &Config, archive: &Path) -> Result<()> {
+    let scratch = std::env::temp_dir();
+    let (archive, spool) = archive_path(archive, &scratch)?;
+    let stage = tempdir_in(&scratch)?;
+    let res = (|| -> Result<()> {
+        let manifest = unpack(&archive, &stage)?;
+        let problems = check(&Config { data_dir: stage.clone(), ..cfg.clone() }, true)?;
+        if problems > 0 {
+            bail!("the backup has {problems} problem(s) (see above)");
+        }
+        println!("The backup is good: {} accounts and {} repositories, made by gitter {}.",
+            manifest["users"], manifest["repos"], manifest["gitter"].as_str().unwrap_or("?"));
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    if let Some(t) = spool {
+        let _ = std::fs::remove_dir_all(t);
+    }
+    res
+}
+
+/// Restore a backup (`-` for stdin) into GITTER_DATA. Nothing existing is
+/// touched until the archive has been fully checked and unpacked into a staging folder.
 pub fn restore(cfg: &Config, archive: &Path, force: bool) -> Result<()> {
-    let archive = absolute(archive)?
-        .canonicalize()
-        .with_context(|| format!("can't find {}", archive.display()))?;
     std::fs::create_dir_all(&cfg.data_dir)?;
     let data = cfg.data_dir.canonicalize()?;
-    let occupied = data.join("gitter.db").exists();
+    let has_repos = std::fs::read_dir(data.join("repos")).is_ok_and(|mut rd| rd.next().is_some());
+    let occupied = data.join("gitter.db").exists() || has_repos;
     if occupied && !force {
         bail!(
             "{} already has data. Restore into an empty directory, or pass --force to move the current data aside first.",
             data.display()
         );
     }
-    let manifest = inspect_archive(&archive)?;
-
-    let stage = tempdir_in(&data)?;
-    let staged = (|| -> Result<()> {
-        let f = std::fs::File::open(&archive)?;
-        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
-        ar.set_preserve_permissions(true);
-        for e in ar.entries()? {
-            e?.unpack_in(&stage)?;
-        }
-        std::fs::create_dir_all(stage.join("repos"))?;
-        let conn = Connection::open(stage.join("gitter.db"))?;
-        let ok: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-        if ok != "ok" {
-            bail!("the database in the backup is damaged: {ok}");
-        }
-        Ok(())
-    })();
-    if let Err(e) = staged {
-        let _ = std::fs::remove_dir_all(&stage);
-        return Err(e);
+    let (archive, spool) = archive_path(archive, &data)?;
+    let res = restore_from(cfg, &data, &archive, occupied);
+    if let Some(t) = spool {
+        let _ = std::fs::remove_dir_all(t);
     }
+    res
+}
 
+fn restore_from(cfg: &Config, data: &Path, archive: &Path, occupied: bool) -> Result<()> {
+    let stage = tempdir_in(data)?;
+    let manifest = match unpack(archive, &stage) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(e);
+        }
+    };
     if occupied {
         // Move the current contents into a subfolder (the data dir itself may be a
         // mount point, e.g. a Docker volume, so it can't be renamed).
         let aside = data.join(format!("before-restore-{}", crate::db::now()));
         std::fs::create_dir_all(&aside)?;
-        for e in std::fs::read_dir(&data)?.flatten() {
+        for e in std::fs::read_dir(data)?.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
             let keep = p == archive
@@ -206,7 +301,7 @@ pub fn restore(cfg: &Config, archive: &Path, force: bool) -> Result<()> {
                     .with_context(|| format!("couldn't move {} aside", p.display()))?;
             }
         }
-        println!("Moved the existing data to {}.", aside.display());
+        eprintln!("Moved the existing data to {}.", aside.display());
     }
     for name in ["gitter.db", "repos"] {
         std::fs::rename(stage.join(name), data.join(name))
@@ -422,16 +517,7 @@ mod tests {
     #[test]
     fn reconcile_moves_unknown_repo_folders_aside() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config {
-            data_dir: dir.path().to_path_buf(),
-            addr: String::new(),
-            url: String::new(),
-            secure_cookies: false,
-            trust_proxy: false,
-            signup: crate::SignupMode::Open,
-            max_push_bytes: 1,
-            max_repos_per_user: 1,
-        };
+        let cfg = cfg_for(dir.path());
         crate::db::Db::open(&dir.path().join("gitter.db")).unwrap();
         std::fs::create_dir_all(dir.path().join("repos/99.git")).unwrap();
         reconcile(&cfg).unwrap();

@@ -36,11 +36,11 @@ fm ideas --rounds 4 with default lenses + performance + security and safety; gro
 ## Docs impact
 none: research only
 ## Verification evidence
-- (step 1) `fm research list` → exit 0 · mission-20261021-115538  2026-10-21  2643B  Mission — gitter / mission-20261021-115538.pack  2026-10-21  978B  Context pack — gitter [ran] [tree 5fdd2b888c79] (2026-10-21T17:02:52Z)
-- (audit self) `script mapped every ideas.md bullet to a cluster; reported 0 unmapped of 543` → pass: all ideas clustered, every cluster marked with reason [tree 5fdd2b888c79] (2026-10-21T17:02:56Z)
-- (ac 1) `fm research list` → exit 0 · mission-20261021-115538  2026-10-21  2643B  Mission — gitter / mission-20261021-115538.pack  2026-10-21  978B  Context pack — gitter [ran] [tree 5fdd2b888c79] (2026-10-21T17:03:01Z)
-- (audit intent) `catalogue covers 543/543 ideas; briefs T-0004..T-0012, later T-0013..T-0023` → user asked for recursive brainstorm incl. compose + CI/runners; both are rounds B and C with briefs [tree 5fdd2b888c79] (2026-10-21T17:03:01Z)
-- (audit edge) `catalogue covers 543/543 ideas; briefs T-0004..T-0012, later T-0013..T-0023` → duplicate CI capture T-0002 dropped into T-0006; nothing silently dropped (later items captured) [tree 5fdd2b888c79] (2026-10-21T17:03:01Z)
+- (step 1) `fm research list` → exit 0 · mission-20261021-115538  2026-10-21  2643B  Mission — gitter / mission-20261021-115538.pack  2026-10-21  978B  Context pack — gitter (ran] (tree 5fdd2b888c79] (2026-10-21T17:02:52Z)
+- (audit self, imported) `script mapped every ideas.md bullet to a cluster; reported 0 unmapped of 543` → pass: all ideas clustered, every cluster marked with reason (tree 5fdd2b888c79] (2026-10-21T17:02:56Z)
+- (ac 1) `fm research list` → exit 0 · mission-20261021-115538  2026-10-21  2643B  Mission — gitter / mission-20261021-115538.pack  2026-10-21  978B  Context pack — gitter (ran] (tree 5fdd2b888c79] (2026-10-21T17:03:01Z)
+- (audit intent, imported) `catalogue covers 543/543 ideas; briefs T-0004..T-0012, later T-0013..T-0023` → user asked for recursive brainstorm incl. compose + CI/runners; both are rounds B and C with briefs (tree 5fdd2b888c79] (2026-10-21T17:03:01Z)
+- (audit edge, imported) `catalogue covers 543/543 ideas; briefs T-0004..T-0012, later T-0013..T-0023` → duplicate CI capture T-0002 dropped into T-0006; nothing silently dropped (later items captured) (tree 5fdd2b888c79] (2026-10-21T17:03:01Z)
 ## Log
 - 2026-10-21T16:55:47Z created
 - 2026-10-21T16:56:12Z focused

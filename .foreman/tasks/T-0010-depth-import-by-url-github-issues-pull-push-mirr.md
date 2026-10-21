@@ -9,8 +9,6 @@ depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
 updated: 2026-10-21T17:01:42Z
-inferred_deps: [T-0001, T-0011]
-inferred_why: T-0001: named in its request; T-0011: commit graph should use maintained commit-graph data.
 ---
 # Depth: import by URL + GitHub issues, pull/push mirrors, releases with assets, commit grap
 ## Raw request

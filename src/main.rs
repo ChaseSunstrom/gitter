@@ -44,9 +44,10 @@ const HELP: &str = "gitter — fast, simple git hosting
 
 usage:
   gitter                       start the server (same as `gitter serve`)
-  gitter backup <file.tar.gz>  back up accounts, issues and repositories (safe while running)
+  gitter backup <file.tar.gz>  back up accounts, issues and repositories (safe while running; - for stdout)
+  gitter verify <file>         check a backup end to end without restoring it (- for stdin)
   gitter restore <file> [--force]
-                               restore a backup into GITTER_DATA (--force moves existing data aside)
+                               restore a backup into GITTER_DATA (- for stdin; --force moves existing data aside)
   gitter doctor [--fsck]       check git, storage, database and repositories
   gitter --version
 
@@ -73,6 +74,12 @@ fn main() -> anyhow::Result<()> {
                 std::path::Path::new(file),
                 args.iter().any(|a| a == "--force"),
             )
+        }
+        "verify" => {
+            let file = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: gitter verify <file.tar.gz>"))?;
+            gitter::ops::verify(&cfg, std::path::Path::new(file))
         }
         "doctor" => {
             let problems = gitter::ops::check(&cfg, args.iter().any(|a| a == "--fsck"))?;

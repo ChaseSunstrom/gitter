@@ -8,7 +8,8 @@ scope: []
 depends_on: []
 source: discovered
 created: 2026-10-21T18:07:06Z
-updated: 2026-10-21T18:07:06Z
+updated: 2026-10-21T20:43:11Z
+batched_in: T-0029
 ---
 # - `refs()` (git.rs:198) and `langs::stats` (langs.rs:83) read unbounded git output on near
 ## Raw request
@@ -27,4 +28,5 @@ updated: 2026-10-21T18:07:06Z
 ## Verification evidence
 ## Log
 - 2026-10-21T18:07:06Z created
+- 2026-10-21T20:43:11Z batched into T-0029
 ## Follow-ups captured

@@ -9,9 +9,8 @@ depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
 updated: 2026-10-21T17:01:42Z
-inferred_deps: [T-0001, T-0006, T-0009]
-inferred_why: T-0001: named in its request; T-0006: CI extras extend the core pipeline and runner.; T-0009: SSH auth needs scoped tokens and deploy keys.
-group: CI pipelines, runners, and gating
+inferred_deps: [T-0006]
+inferred_why: T-0006: CI extras extend the core pipeline runner
 ---
 # CI extras and SSH: CI cache, JUnit/coverage annotations, flaky-test detection, pipeline te
 ## Raw request

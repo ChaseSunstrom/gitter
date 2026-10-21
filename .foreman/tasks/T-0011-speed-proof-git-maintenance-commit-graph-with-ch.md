@@ -9,8 +9,6 @@ depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
 updated: 2026-10-21T17:01:42Z
-inferred_deps: [T-0001]
-inferred_why: T-0001: named in its request
 ---
 # Speed proof: git maintenance (commit-graph with changed-path bloom), cached last-commit-pe
 ## Raw request

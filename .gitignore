@@ -4,3 +4,4 @@
 /scripts/node_modules
 *.log
 .claude/scheduled_tasks.lock
+.env

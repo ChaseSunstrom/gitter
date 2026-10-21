@@ -9,6 +9,9 @@ depends_on: []
 source: discovered
 created: 2026-10-21T18:07:05Z
 updated: 2026-10-21T18:07:05Z
+inferred_deps: [T-0005]
+inferred_why: T-0005: fork quotas and rate limits reuse quota framework
+group: quotas and abuse limits
 ---
 # Pre-audit "secret" hits (scripts/e2e.sh, ui-check.mjs) are test credentials, so dismiss th
 ## Raw request

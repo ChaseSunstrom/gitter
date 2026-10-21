@@ -13,21 +13,22 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 
 ```sh
 git clone <this repository> gitter && cd gitter
-GITTER_URL=https://git.example.com docker compose up -d   # builds a ~15 MB image the first time
+echo GITTER_URL=https://git.example.com > .env   # the address people will use
+docker compose up -d                             # builds a ~45 MB image the first time
 docker compose logs gitter                       # open the one-time setup link it prints
 ```
 
-That's the whole install: one service, one volume, one setting (`GITTER_PORT` changes the host port if 3000 is taken). The first link creates the admin account. After that, everything else lives in **Site administration** in the web UI: sign-up open/closed, repository and push limits, an announcement banner, and account management.
+That's the whole install: one service, one volume, one setting. Settings live in `.env` so every later `docker compose` command keeps them (`GITTER_PORT` changes the host port if 3000 is taken). The first link creates the admin account. After that, everything else lives in **Site administration** in the web UI: sign-up open/closed, repository and push limits, an announcement banner, and account management.
 
 | Task | Command |
 |---|---|
-| Back up (safe while running) | `docker compose exec gitter gitter backup /data/backup-$(date +%F).tar.gz` |
-| Copy the backup out | `docker compose cp gitter:/data/backup-2026-10-21.tar.gz .` |
-| Restore | `docker compose cp backup.tar.gz gitter:/data/restore.tar.gz`, then `docker compose stop gitter && docker compose run --rm gitter restore /data/restore.tar.gz --force && docker compose start gitter` (the old data is kept in `/data/before-restore-…`) |
+| Back up (safe while running) | `docker compose exec -T gitter gitter backup - > gitter-$(date +%F).tar.gz` |
+| Check a backup | `docker compose exec -T gitter gitter verify - < gitter-2026-10-21.tar.gz` |
+| Restore | `docker compose stop gitter && docker compose run --rm -T gitter restore - --force < gitter-2026-10-21.tar.gz && docker compose start gitter` (the old data is kept in `/data/before-restore-…`) |
 | Health check | `docker compose exec gitter gitter doctor` (add `--fsck` to verify every repository) |
-| Upgrade | `docker compose pull && docker compose up -d` (data migrates automatically) |
+| Upgrade | `git pull && docker compose up -d --build` (data migrates automatically) |
 
-Behind a reverse proxy, point it at port 3000 and set `GITTER_URL` to the public `https://` address. Caddy example:
+Behind a reverse proxy, point it at port 3000 and add `GITTER_TRUST_PROXY=true` to `.env` next to the public `https://` `GITTER_URL`, so rate limits see each visitor's address instead of the proxy's. Caddy example:
 
 ```
 git.example.com {
@@ -51,7 +52,7 @@ git clone http://localhost:3000/alice/project.git
 git push   # username + password, or username + an access token from Settings → Access tokens
 ```
 
-The same binary has the operator commands: `gitter backup <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`.
+The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]` (`-` as the file means stdout/stdin).
 
 ## Configuration
 

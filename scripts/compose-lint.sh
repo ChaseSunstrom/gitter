@@ -53,12 +53,19 @@ if [ "${1:-}" = "--smoke" ]; then
   SETUP=$(docker compose -p $P logs gitter 2>/dev/null | grep -o 'setup=[A-Za-z0-9_-]*' | head -1 | cut -d= -f2)
   W=$(mktemp -d)
   curl -sf -c "$W/jar" -H "Origin: $B" -H 'Content-Type: application/json' -X POST "$B/api/auth/signup" \
-    --data "{\"username\":\"admin\",\"email\":\"admin@example.com\",\"password\":\"correct horse\",\"setup\":\"$SETUP\"}" >/dev/null || fail "admin signup via setup link"
+    --data "{\"username\":\"boss\",\"email\":\"boss@example.com\",\"password\":\"correct horse\",\"setup\":\"$SETUP\"}" >/dev/null || fail "admin signup via setup link"
   curl -sf -b "$W/jar" -H "Origin: $B" -H 'Content-Type: application/json' -X POST "$B/api/repos" --data '{"name":"smoke","readme":true}' >/dev/null || fail "create repo"
-  git clone -q "$B/admin/smoke.git" "$W/c" || fail "clone from the container"
-  (cd "$W/c" && git -c user.name=a -c user.email=a@b.c commit -q --allow-empty -m smoke && git push -q "http://admin:correct%20horse@127.0.0.1:$PORT/admin/smoke.git" HEAD) || fail "push to the container"  # pragma: allowlist secret
+  git clone -q "$B/boss/smoke.git" "$W/c" || fail "clone from the container"
+  (cd "$W/c" && git -c user.name=a -c user.email=a@b.c commit -q --allow-empty -m smoke && git push -q "http://boss:correct%20horse@127.0.0.1:$PORT/boss/smoke.git" HEAD) || fail "push to the container"  # pragma: allowlist secret
+  # The README's backup, verify and restore commands, exactly as documented.
+  docker compose -p $P exec -T gitter gitter backup - >"$W/b.tar.gz" 2>/dev/null || fail "gitter backup - in the container"
+  docker compose -p $P exec -T gitter gitter verify - <"$W/b.tar.gz" >/dev/null || fail "gitter verify - in the container"
+  docker compose -p $P stop gitter >/dev/null 2>&1
+  docker compose -p $P run --rm -T gitter restore - --force <"$W/b.tar.gz" >/dev/null 2>&1 || fail "gitter restore - in the container"
+  docker compose -p $P start gitter >/dev/null 2>&1
+  for _ in $(seq 60); do curl -sf "$B/healthz" >/dev/null && break; sleep 0.5; done
+  git clone -q "$B/boss/smoke.git" "$W/c2" && [ "$(git -C "$W/c2" log -1 --format=%s)" = smoke ] || fail "clone after restore"
   rm -rf "$W"
-  docker compose -p $P exec -T gitter gitter backup /data/b.tar.gz >/dev/null || fail "gitter backup in the container"
   size=$(docker image inspect "$(docker compose -p $P images -q gitter | head -1)" --format '{{.Size}}')
-  echo "✓ image builds, boots healthy, serves the app; setup link, clone, push, doctor and backup work ($((size / 1024 / 1024)) MB image)"
+  echo "✓ image builds, boots healthy, serves the app; setup link, clone, push, doctor, backup, verify and restore work ($((size / 1024 / 1024)) MB image)"
 fi

@@ -9,7 +9,7 @@ depends_on: [T-0001]
 source: user
 created: 2026-10-21T17:01:42Z
 updated: 2026-10-21T18:40:56Z
-group: self-hosting and public-instance operations
+group: quotas and abuse limits
 ---
 # Abuse protection for a public instance: per-IP/user rate limits, repo/disk quotas, signup
 ## Raw request

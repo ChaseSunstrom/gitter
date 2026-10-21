@@ -33,7 +33,7 @@ async function overview() {
         <div class="disk-bar" role="img" aria-label="Disk use"><span style="width:${pct}%"></span></div>
         <div class="row wrap-ok small"><span><b>${bytes(o.repo_bytes)}</b> repositories</span><span class="muted">·</span><span><b>${bytes(o.db_bytes)}</b> database</span>
           ${o.free_bytes != null ? html`<span class="muted">·</span><span><b>${bytes(o.free_bytes)}</b> free</span>` : ''}</div>
-        <p class="muted small">Back everything up with <code>gitter backup /path/backup.tar.gz</code> (in Docker: <code>docker compose exec gitter gitter backup /data/backup.tar.gz</code>).</p>
+        <p class="muted small">Back everything up with <code>gitter backup /path/gitter-$(date +%F).tar.gz</code> (in Docker: <code>docker compose exec -T gitter gitter backup - &gt; gitter-$(date +%F).tar.gz</code>), and check one with <code>gitter verify</code>.</p>
       </div></div>
     <div class="box"><div class="box-head"><b>Newest accounts</b><span class="grow"></span><a class="btn sm" href="/admin/users">All accounts</a></div>
       <div class="list">${o.recent_users.map((u) => html`<a class="list-row" href="/${u.username}">${avatar(u.username, 22)}<b>${u.username}</b><span class="grow"></span><span class="muted small">joined ${timeEl(u.created_at)}</span></a>`)}</div></div>
@@ -111,7 +111,7 @@ export default async function (ctx) {
             if (suspend && !(await confirmDialog({ title: `Suspend ${name}?`, text: 'They are signed out everywhere and can’t sign in, push or use tokens until restored. Their repositories stay.', ok: 'Suspend', danger: true }))) return;
             await send('PATCH', url, { suspended: suspend });
           } else {
-            if (!(await confirmDialog({ title: `Delete ${name}?`, text: 'This deletes the account and every repository it owns. It can’t be undone.', ok: 'Delete account', danger: true, typed: name }))) return;
+            if (!(await confirmDialog({ title: `Delete ${name}?`, text: 'This deletes the account, every repository it owns, and every issue, pull request and comment it wrote anywhere. It can’t be undone.', ok: 'Delete account', danger: true, typed: name }))) return;
             await send('DELETE', url, { confirm: name });
           }
           toast('Saved');

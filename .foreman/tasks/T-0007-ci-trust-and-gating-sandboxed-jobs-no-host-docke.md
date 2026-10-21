@@ -9,9 +9,8 @@ depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
 updated: 2026-10-21T17:01:42Z
-inferred_deps: [T-0001, T-0006]
-inferred_why: T-0001: named in its request; T-0006: trust gating needs CI core jobs and runners first.
-group: CI pipelines, runners, and gating
+inferred_deps: [T-0006]
+inferred_why: T-0006: sandboxed gating extends the core CI runner
 ---
 # CI trust and gating: sandboxed jobs (no host docker socket, cpu/mem/time limits, network p
 ## Raw request

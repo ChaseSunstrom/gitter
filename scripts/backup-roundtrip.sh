@@ -25,6 +25,12 @@ SHA=$(curl -sf "$B/api/repos/alice/keep/commits" | python3 -c 'import json,sys; 
 GITTER_DATA=$TMP/a $BIN backup "$TMP/backup.tar.gz" || fail "backup"
 [ -s "$TMP/backup.tar.gz" ] || fail "backup file is empty"
 echo "✓ backup of a running server"
+GITTER_DATA=$TMP/a $BIN backup - >"$TMP/stream.tar.gz" 2>/dev/null || fail "backup to stdout"
+GITTER_DATA=$TMP/a $BIN verify "$TMP/backup.tar.gz" >/dev/null || fail "verify a good backup"
+GITTER_DATA=$TMP/a $BIN verify - <"$TMP/stream.tar.gz" >/dev/null || fail "verify from stdin"
+head -c 2000 "$TMP/backup.tar.gz" >"$TMP/torn.tar.gz"
+if GITTER_DATA=$TMP/a $BIN verify "$TMP/torn.tar.gz" >/dev/null 2>&1; then fail "verify must reject a truncated backup"; fi
+echo "✓ backup to stdout, verify good and truncated backups"
 
 if GITTER_DATA=$TMP/a $BIN restore "$TMP/backup.tar.gz" 2>/dev/null; then fail "restore must refuse to overwrite existing data"; fi
 echo "✓ restore refuses a non-empty data dir"
@@ -36,7 +42,7 @@ ls -d "$TMP"/a/before-restore-* >/dev/null 2>&1 || fail "--force should keep the
 GITTER_DATA=$TMP/a $BIN doctor >/dev/null || fail "doctor after in-place restore"
 echo "✓ restore --force in place keeps the old data aside"
 
-GITTER_DATA=$TMP/b $BIN restore "$TMP/backup.tar.gz" || fail "restore"
+GITTER_DATA=$TMP/b $BIN restore - <"$TMP/stream.tar.gz" || fail "restore from stdin"
 GITTER_DATA=$TMP/b $BIN doctor || fail "doctor on restored data"
 echo "✓ restore + doctor"
 

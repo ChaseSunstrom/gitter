@@ -9,6 +9,8 @@ depends_on: []
 source: followup
 created: 2026-10-21T17:01:52Z
 updated: 2026-10-21T17:01:52Z
+inferred_deps: [T-0006]
+inferred_why: T-0006: deployment jobs run as CI jobs
 ---
 # Deployments, environments, per-PR preview URLs (C28)
 ## Raw request
