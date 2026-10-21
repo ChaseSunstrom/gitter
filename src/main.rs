@@ -140,6 +140,10 @@ async fn serve(cfg: gitter::Config) -> anyhow::Result<()> {
     tokio::spawn(async move {
         st2.git.sweep().await;
         gitter::hooks::backfill_sizes(&st2).await;
+        loop {
+            gitter::lfs::sweep(&st2).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
     });
     let app = gitter::router(st);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

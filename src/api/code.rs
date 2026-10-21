@@ -330,6 +330,7 @@ pub async fn raw(
     State(st): State<AppState>,
     Viewer(v): Viewer,
     Path((o, n, rest)): Path<(String, String, String)>,
+    ip: crate::api::ClientIp,
 ) -> R<Response> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let (rev, path) = split_rev_path(&st, &r, &rest).await?;
@@ -351,12 +352,17 @@ pub async fn raw(
     };
     let immutable = rev.len() == 40 && validate::sha(&rev);
     // A Git LFS pointer serves the file it points at, when this repository holds it.
-    let lfs = match crate::lfs::parse_pointer(&data) {
+    let pointer = crate::lfs::parse_pointer(&data);
+    let lfs = match &pointer {
         Some((lfs_oid, _)) if crate::lfs::held(&st, r.id, vec![lfs_oid.clone()]).await?[0] => {
-            Some(crate::lfs::object_body(&st.cfg.data_dir, &lfs_oid).await?)
+            let slot = crate::lfs::slot(&st, &ip.0)
+                .ok_or_else(|| AppError::slow_down("Too many downloads running from your network", 5))?;
+            Some(crate::lfs::object_body(&st.cfg.data_dir, lfs_oid, slot).await?)
         }
         _ => None,
     };
+    // A pointer whose object isn't uploaded yet will serve the file once it is.
+    let pending = pointer.is_some() && lfs.is_none();
     let (body, ctype, len) = match lfs {
         // ponytail: no text sniffing for LFS files; text ones download instead of showing.
         Some((len, body)) => (body, is_image(&path).unwrap_or("application/octet-stream"), Some(len)),
@@ -386,7 +392,7 @@ pub async fn raw(
             "private, max-age=60"
         }),
     );
-    if r.private || r.hidden {
+    if r.private || r.hidden || pending {
         h.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),

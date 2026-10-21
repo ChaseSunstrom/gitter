@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T17:01:51Z
-updated: 2026-10-21T22:19:29Z
+updated: 2026-10-21T22:21:35Z
 builder: 2026-10-21T21:55:50Z
 builder_proc: archbox-hardened|pid:[4026531836]|3700487|2540304
 lane: /home/chase/projects/gitter/.claude/worktrees/agent-a0dc1e40f9e40af81
@@ -47,6 +47,9 @@ Three collaboration spaces: (1) a wiki per repository: markdown pages with histo
 - (step 1) `cargo test -q --test api -- wiki discussion snippet 2>&1 | grep -E "panicked|left:|right:|test result|assertion|internal error" -A3 | head -40` → exit 0 · test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.53s [ran] [tree 9b7f9441b7af] (2026-10-21T22:08:24Z)
 - (step 2) `cargo test -q --lib 2>&1 | grep -E "^error|^warning|panicked|test result|FAILED" -A5 | head -30` → exit 0 · test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.21s [ran] [tree 3784721e297f] (2026-10-21T22:10:00Z)
 - (step 3) `cargo test -q 2>&1 | grep -E "test result|FAILED|panicked|^error|^warning" | head -20` → exit 0 · test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.40s / test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s [ran] [tree bf2c39fee0c2] (2026-10-21T22:19:29Z)
+- (step 1) `cargo test -q --test api wiki` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 1.05s [ran] [tree 984ee6ee04ec] (2026-10-21T22:21:29Z)
+- (step 2) `cargo test -q --test api discussion` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 1.29s [ran] [tree 984ee6ee04ec] (2026-10-21T22:21:34Z)
+- (step 3) `cargo test -q --test api snippet` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 1.00s [ran] [tree 984ee6ee04ec] (2026-10-21T22:21:35Z)
 ## Log
 - 2026-10-21T17:01:51Z created
 - 2026-10-21T21:55:50Z builder brief: /home/chase/.claude/foreman/state/projects/gitter-588bc6/audits/T-0016.builder.md

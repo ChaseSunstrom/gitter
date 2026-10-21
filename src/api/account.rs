@@ -286,7 +286,7 @@ pub async fn me(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json::
     let uid = u.id;
     let used: i64 = st
         .db
-        .call(move |c| Ok(c.query_row("SELECT COALESCE(sum(size_bytes), 0) FROM repos WHERE owner_id = ?1", [uid], |r| r.get(0))?))
+        .call(move |c| Ok(c.query_row(&format!("SELECT {}", crate::repo::STORAGE_USED), [uid], |r| r.get(0))?))
         .await?;
     let storage = json!({ "used": used, "quota": if quota == 0 || u.is_admin { None } else { Some(quota * 1024 * 1024) } });
     let (mut p, mut u) = (serde_json::to_value(p).map_err(AppError::internal)?, u);

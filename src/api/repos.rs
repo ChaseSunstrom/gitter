@@ -337,9 +337,15 @@ pub async fn remove(
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
     let id = r.id;
-    st.db
-        .call(move |c| Ok(c.execute("DELETE FROM repos WHERE id = ?1", [id])?))
+    let lfs = st
+        .db
+        .call(move |c| {
+            let oids = crate::lfs::held_by(c, false, id)?;
+            c.execute("DELETE FROM repos WHERE id = ?1", [id])?;
+            Ok(oids)
+        })
         .await?;
+    crate::lfs::collect(&st, lfs).await;
     if let Err(e) = tokio::fs::remove_dir_all(&r.path).await {
         eprintln!("removing {}: {e}", r.path.display());
     }
@@ -406,10 +412,19 @@ pub async fn fork(
     if !validate::repo_name(&new_name) {
         return Err(AppError::bad("That isn't a valid repository name"));
     }
-    let sid = src.id;
+    let (sid, me) = (src.id, u.id);
+    // The fork shares the parent's LFS files, so the ones this account doesn't hold yet count too.
     let size: i64 = st
         .db
-        .call(move |c| Ok(c.query_row("SELECT size_bytes FROM repos WHERE id = ?1", [sid], |r| r.get(0))?))
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT size_bytes + COALESCE((SELECT sum(size) FROM lfs_objects WHERE repo_id = ?1 AND oid NOT IN
+                    (SELECT l.oid FROM lfs_objects l JOIN repos r ON r.id = l.repo_id WHERE r.owner_id = ?2)), 0)
+                 FROM repos WHERE id = ?1",
+                [sid, me],
+                |r| r.get(0),
+            )?)
+        })
         .await?;
     if let Some(left) = crate::repo::storage_left(&st, u.id).await?
         && size.max(0) as u64 > left

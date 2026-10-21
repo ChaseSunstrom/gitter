@@ -144,6 +144,10 @@ pub fn access(repo: &Repo, viewer: Option<&User>) -> (bool, bool) {
     (read, write)
 }
 
+/// Bytes account ?1 stores: its repositories plus the LFS objects they hold (each once).
+pub const STORAGE_USED: &str = "COALESCE((SELECT sum(size_bytes) FROM repos WHERE owner_id = ?1), 0)
+    + COALESCE((SELECT sum(size) FROM (SELECT DISTINCT l.oid, l.size FROM lfs_objects l JOIN repos r ON r.id = l.repo_id WHERE r.owner_id = ?1)), 0)";
+
 /// Bytes an account may still store across its repositories (None = no limit).
 pub async fn storage_left(st: &AppState, owner_id: i64) -> R<Option<u64>> {
     let quota = st.settings.get().max_storage_mb * 1024 * 1024;
@@ -151,7 +155,7 @@ pub async fn storage_left(st: &AppState, owner_id: i64) -> R<Option<u64>> {
         .db
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT COALESCE((SELECT sum(size_bytes) FROM repos WHERE owner_id = ?1), 0), is_admin FROM users WHERE id = ?1",
+                &format!("SELECT {STORAGE_USED}, is_admin FROM users WHERE id = ?1"),
                 [owner_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?)

@@ -8,12 +8,12 @@ scope: []
 depends_on: [T-0002]
 source: user
 created: 2026-10-21T17:01:42Z
-updated: 2026-10-21T22:13:52Z
+updated: 2026-10-21T22:30:09Z
 base: 5a67c7a92b9dc2febd3e66c65f34268bc55f2caa
-base_tree: dfbb7b0a4abe662a620a636947f3ac8a0a60a96b
+base_tree: 7da4362137363dceec0d0331e52c4a205824eb45
 plan0_at: 2026-10-21T22:09:16Z
 plan0_scope: []
-paused_tree: 50224755b67a96f0fb72aad85d345a21b5f62f73
+paused_tree: 5efaabf356c276a5b05fb98ebcfa26bfd76767b3
 ---
 # CI core: .gitter/ci.yml (small YAML subset: jobs, steps, needs, image, env, matrix, path f
 ## Raw request
@@ -42,9 +42,9 @@ Config: (a) own YAML-subset parser into serde_json::Value then serde structs [ch
 6. [ ] tests + external runner e2e + browser checks
 ## Resume here
 <!-- auto -->
-- 2026-10-21T22:13:51Z step 2/6: schema + queue: runs/jobs/runners, triggers (push, PR, manual, schedule), lease/heartbeat/requeue/fence
-- git: main; 32 uncommitted: Cargo.lock, Cargo.toml, README.md, scripts/ui-check.mjs, src/api/account.rs, src/api/admin.rs, src/api/issues.rs, src/api/mod.rs, src/api/repos.rs, src/auth.rs
-- touched since last checkpoint: Cargo.lock, Cargo.toml, src/lib.rs, src/ci/mod.rs, src/ci/config.rs
+- 2026-10-21T22:25:25Z step 2/6: schema + queue: runs/jobs/runners, triggers (push, PR, manual, schedule), lease/heartbeat/requeue/fence
+- git: main; 16 uncommitted: README.md, scripts/backup-roundtrip.sh, scripts/e2e.sh, scripts/ui-check.mjs, src/api/code.rs, src/api/repos.rs, src/db.rs, src/lfs.rs, src/lib.rs, src/ops.rs
+- touched since last checkpoint: README.md, scripts/backup-roundtrip.sh, scripts/e2e.sh, scripts/ui-check.mjs, src/api/code.rs, src/api/repos.rs, src/lfs.rs, src/lib.rs, src/ops.rs, src/settings.rs, static/js/pages/repo.js, src/db.rs, static/js/pages/admin.js, tests/api.rs
 ## Docs impact
 ## Verification evidence
 - (step 1) `cargo test -q --lib ci::` → exit 0 · .... / test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s [ran] [tree 50224755b67a] (2026-10-21T22:13:51Z)
@@ -56,6 +56,9 @@ Config: (a) own YAML-subset parser into serde_json::Value then serde structs [ch
 - 2026-10-21T22:09:16Z set approved=True
 - 2026-10-21T22:09:16Z focused
 - 2026-10-21T22:13:52Z paused: focus moved to T-0005
+- 2026-10-21T22:22:02Z re-based: what other work changed while it was paused isn't its own change
+- 2026-10-21T22:22:02Z focused
+- 2026-10-21T22:30:09Z paused: focus moved to T-0015
 ## Follow-ups captured
 ## Build vs reuse
 Reuses: git::Git (clone/checkout via the scrubbed git command, run_timeout), auth::Limiter + new_secret/sha256 (runner and job tokens), hooks::on_push (trigger point), security::record (secret changes), smart_http access rules (job clones over HTTP with a job token), axum SSE (logs), tower-free in-process queue for the embedded runner. New crates only where nothing fits: chacha20poly1305 (secret encryption; no AEAD in the tree) and ureq (blocking HTTP client for the remote runner, later webhooks/imports; no client in the tree). No YAML or cron crate: both subsets are small and parsed in src/ci/.

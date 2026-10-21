@@ -1358,3 +1358,100 @@ async fn lfs_batch_upload_and_download_check_access_and_hashes() {
     let got = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
     assert!(got == data, "raw serves the stored object, not the pointer");
 }
+
+#[tokio::test]
+async fn lfs_limits_storage_slots_and_caching() {
+    use sha2::{Digest, Sha256};
+    let app = App::new();
+    let _admin = app.signup("root1").await;
+    let bob = app.signup("bob").await;
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let pw = basic("bob", "correct horse");
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 0", [])?)).await.unwrap();
+
+    // LFS objects count toward the account's storage quota.
+    let a = vec![1u8; 600 * 1024];
+    let a_oid = hex::encode(Sha256::digest(&a));
+    let a_href = format!("/bob/r.git/info/lfs/objects/{a_oid}");
+    assert_eq!(send_raw(&app, "PUT", &a_href, Some(&pw), a.clone()).await.0, StatusCode::OK);
+    let (_, me) = app.req(&bob, "GET", "/api/me", None).await;
+    assert_eq!(me["storage"]["used"], a.len(), "{me}");
+    let b = vec![2u8; 600 * 1024];
+    let b_oid = hex::encode(Sha256::digest(&b));
+    let (_, up) = lfs_batch(&app, "bob/r", Some(&pw), "upload", &b_oid, b.len()).await;
+    assert_eq!(up["objects"][0]["error"]["code"], 422, "out of storage: {up}");
+    let b_href = format!("/bob/r.git/info/lfs/objects/{b_oid}");
+    assert_eq!(send_raw(&app, "PUT", &b_href, Some(&pw), b).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    // Announcing an object the repo already holds needs no room (a new branch, `git lfs push --all`).
+    let (_, again) = lfs_batch(&app, "bob/r", Some(&pw), "upload", &a_oid, a.len()).await;
+    assert!(again["objects"][0]["error"].is_null(), "{again}");
+    // Forking charges the LFS files the fork shares.
+    let carol = app.signup("carol").await;
+    app.req(&carol, "POST", "/api/repos", Some(json!({ "name": "mine" }))).await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 500000 WHERE name = 'mine'", [])?)).await.unwrap();
+    let (s, f) = app.req(&carol, "POST", "/api/repos/bob/r/fork", Some(json!({}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{f}");
+
+    // Batch answers carry credentials, so nothing may cache them.
+    let (_, h, _) = send_raw(&app, "POST", "/bob/r.git/info/lfs/objects/batch", Some(&pw), br#"{"operation":"download","objects":[]}"#.to_vec()).await;
+    assert_eq!(h["cache-control"], "no-store");
+
+    // Transfers from one address are capped (separately from clones, so git-lfs's 8 parallel transfers fit).
+    let held: Vec<_> = (0..8).map(|_| gitter::lfs::slot(&app.state, "unknown").unwrap()).collect();
+    assert_eq!(send_raw(&app, "GET", &a_href, Some(&pw), vec![]).await.0, StatusCode::TOO_MANY_REQUESTS);
+    drop(held);
+    assert_eq!(send_raw(&app, "GET", &a_href, Some(&pw), vec![]).await.0, StatusCode::OK);
+
+    // A pointer whose object isn't uploaded yet isn't cached forever at its commit.
+    let pointer = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{b_oid}\nsize 614400\n");
+    let (_, br) = app.req(&bob, "GET", "/api/repos/bob/r/branches", None).await;
+    let head = br["branches"][0]["sha"].as_str().unwrap().to_string();
+    let change = json!({ "branch": "main", "expected_sha": head, "message": "m", "changes": [{ "path": "x.bin", "content": pointer }] });
+    let (s, c) = app.req(&bob, "POST", "/api/repos/bob/r/contents", Some(change)).await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+    let (_, br) = app.req(&bob, "GET", "/api/repos/bob/r/branches", None).await;
+    let sha = br["branches"][0]["sha"].as_str().unwrap().to_string();
+    let (s, h, _) = send_raw(&app, "GET", &format!("/raw/bob/r/{sha}/x.bin"), None, vec![]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h["cache-control"].to_str().unwrap().contains("no-store"), "{:?}", h["cache-control"]);
+
+    // The boot sweep removes stale temp files and objects no repository holds, and keeps the rest.
+    let data = &app.state.cfg.data_dir;
+    let orphan = "0".repeat(64);
+    let stale = |p: &std::path::Path| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        if !p.exists() {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)).unwrap();
+    };
+    let (kept, gone, tmp) = (gitter::lfs::object_path(data, &a_oid), gitter::lfs::object_path(data, &orphan), data.join("lfs/tmp/cut-off"));
+    for p in [&kept, &gone, &tmp] {
+        stale(p);
+    }
+    gitter::lfs::sweep(&app.state).await;
+    assert_eq!((kept.exists(), gone.exists(), tmp.exists()), (true, false, false));
+
+    // Parallel uploads can't overshoot the quota together.
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 2;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    let (c, d) = (vec![3u8; 1 << 20], vec![4u8; 1 << 20]);
+    let href = |x: &[u8]| format!("/bob/r.git/info/lfs/objects/{}", hex::encode(Sha256::digest(x)));
+    let (hc, hd) = (href(&c), href(&d));
+    let (rc, rd) = tokio::join!(send_raw(&app, "PUT", &hc, Some(&pw), c.clone()), send_raw(&app, "PUT", &hd, Some(&pw), d.clone()));
+    let mut got = [rc.0, rd.0];
+    got.sort();
+    assert_eq!(got, [StatusCode::OK, StatusCode::PAYLOAD_TOO_LARGE]);
+    let (_, me) = app.req(&bob, "GET", "/api/me", None).await;
+    assert!(me["storage"]["used"].as_u64().unwrap() <= 2 << 20, "{me}");
+
+    // Deleting the repository frees its LFS files right away.
+    let (s, _) = app.req(&bob, "DELETE", "/api/repos/bob/r", Some(json!({ "confirm": "bob/r" }))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!kept.exists(), "no repository holds it any more");
+}
