@@ -88,6 +88,7 @@ async function settings() {
     <div class="row wrap-ok" style="align-items:flex-start;gap:16px">
       <div class="field" style="width:220px"><label for="s-repos">Repositories per person</label><input id="s-repos" class="input" type="number" min="1" value="${s.max_repos_per_user}"><span class="hint">Admins have no limit.</span></div>
       <div class="field" style="width:220px"><label for="s-push">Largest push (MB)</label><input id="s-push" class="input" type="number" min="1" value="${s.max_push_mb}"><span class="hint">Applies to every repository right away.</span></div>
+      <div class="field" style="width:220px"><label for="s-lfs">Largest Git LFS file (MB)</label><input id="s-lfs" class="input" type="number" min="1" value="${s.max_lfs_mb}"><span class="hint">Per file, checked while uploading.</span></div>
     </div>
     <div class="field"><label for="s-ann">Announcement</label><input id="s-ann" class="input" value="${s.announcement}" maxlength="280" placeholder="e.g. Maintenance on Sunday 10:00 UTC">
       <span class="hint">Shown at the top of every page. Leave empty to hide it.</span></div>
@@ -147,6 +148,7 @@ export default async function (ctx) {
           signup: $$('input[name=signup]', el).find((r) => r.checked).value,
           max_repos_per_user: +$('#s-repos', el).value,
           max_push_mb: +$('#s-push', el).value,
+          max_lfs_mb: +$('#s-lfs', el).value,
           announcement: $('#s-ann', el).value.trim(),
         };
         const saved = await send('PUT', '/admin/settings', body);

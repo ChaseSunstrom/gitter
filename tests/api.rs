@@ -1050,3 +1050,131 @@ async fn deploy_tokens_cannot_act_or_peek_outside_their_repo() {
     let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
     assert!(!body.contains("alice@example.com"), "{body}");
 }
+
+fn basic(user: &str, secret: &str) -> String {
+    use base64::Engine;
+    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}")))
+}
+
+async fn send_raw(app: &App, method: &str, path: &str, auth: Option<&str>, body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(path.strip_prefix(ORIGIN).unwrap_or(path))
+        .header("host", "test.local")
+        .header("content-type", "application/vnd.git-lfs+json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    let resp = app.router.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+    let (s, h) = (resp.status(), resp.headers().clone());
+    (s, h, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+}
+
+async fn lfs_batch(app: &App, repo: &str, auth: Option<&str>, op: &str, oid: &str, size: usize) -> (StatusCode, Value) {
+    let body = json!({ "operation": op, "transfers": ["basic"], "objects": [{ "oid": oid, "size": size }], "hash_algo": "sha256" });
+    let (s, _, b) = send_raw(app, "POST", &format!("/{repo}.git/info/lfs/objects/batch"), auth, body.to_string().into_bytes()).await;
+    (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn lfs_batch_upload_and_download_check_access_and_hashes() {
+    use sha2::{Digest, Sha256};
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    for (n, private) in [("p", true), ("q", true), ("pub", false)] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n, "private": private, "readme": true }))).await;
+    }
+    let mk = |body: Value| {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", "/api/me/tokens", Some(body)).await.1["token"].as_str().unwrap().to_string() }
+    };
+    let full = basic("alice", &mk(json!({ "name": "ci" })).await);
+    let read = basic("alice", &mk(json!({ "name": "ro", "scope": "read" })).await);
+    let bob_pw = basic("bob", "correct horse");
+    let data = b"big binary asset\n".repeat(1000);
+    let oid = hex::encode(Sha256::digest(&data));
+
+    // Who may ask: anonymous gets a challenge, others' private repos don't exist, read tokens can't upload.
+    let (s, _) = lfs_batch(&app, "alice/p", None, "download", &oid, data.len()).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (_, h, _) = send_raw(&app, "POST", "/alice/p.git/info/lfs/objects/batch", None, b"{}".to_vec()).await;
+    assert!(h.get("www-authenticate").is_some(), "git-lfs needs the challenge to send credentials");
+    assert_eq!(lfs_batch(&app, "alice/p", Some(&bob_pw), "download", &oid, data.len()).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(lfs_batch(&app, "alice/p", Some(&read), "upload", &oid, data.len()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(lfs_batch(&app, "alice/p", Some(&full), "upload", "../../etc", 1).await.1["objects"][0]["error"]["code"], 422);
+
+    // Upload: a wrong hash is refused and leaves nothing behind; the right bytes are kept.
+    let (s, up) = lfs_batch(&app, "alice/p", Some(&full), "upload", &oid, data.len()).await;
+    assert_eq!(s, StatusCode::OK, "{up}");
+    assert_eq!(up["transfer"], "basic");
+    let action = &up["objects"][0]["actions"]["upload"];
+    let href = action["href"].as_str().unwrap().to_string();
+    assert_eq!(href, format!("{ORIGIN}/alice/p.git/info/lfs/objects/{oid}"));
+    assert_eq!(action["header"]["Authorization"], full.as_str());
+    let mut wrong = data.clone();
+    wrong[0] ^= 1;
+    assert_eq!(send_raw(&app, "PUT", &href, Some(&full), wrong).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(send_raw(&app, "PUT", &href, Some(&read), data.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(send_raw(&app, "PUT", &href, None, data.clone()).await.0, StatusCode::UNAUTHORIZED);
+    let (_, down) = lfs_batch(&app, "alice/p", Some(&full), "download", &oid, data.len()).await;
+    assert_eq!(down["objects"][0]["error"]["code"], 404, "a refused upload stores nothing: {down}");
+    assert_eq!(send_raw(&app, "PUT", &href, Some(&full), data.clone()).await.0, StatusCode::OK);
+    let (_, again) = lfs_batch(&app, "alice/p", Some(&full), "upload", &oid, data.len()).await;
+    assert!(again["objects"][0]["actions"].is_null(), "already uploaded: {again}");
+
+    // Download with any read access; the object belongs to this repo only.
+    let (s, down) = lfs_batch(&app, "alice/p", Some(&read), "download", &oid, data.len()).await;
+    assert_eq!(s, StatusCode::OK);
+    let href = down["objects"][0]["actions"]["download"]["href"].as_str().unwrap().to_string();
+    let (s, _, got) = send_raw(&app, "GET", &href, Some(&read), vec![]).await;
+    assert_eq!((s, got == data), (StatusCode::OK, true));
+    assert_eq!(send_raw(&app, "GET", &href, None, vec![]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(send_raw(&app, "GET", &href, Some(&bob_pw), vec![]).await.0, StatusCode::NOT_FOUND);
+    let (_, other) = lfs_batch(&app, "alice/q", Some(&full), "download", &oid, data.len()).await;
+    assert_eq!(other["objects"][0]["error"]["code"], 404, "knowing an oid doesn't open another repo's object");
+    let q_href = format!("/alice/q.git/info/lfs/objects/{oid}");
+    assert_eq!(send_raw(&app, "GET", &q_href, Some(&full), vec![]).await.0, StatusCode::NOT_FOUND);
+
+    // A fork can fetch its parent's objects.
+    let pub_href = format!("/alice/pub.git/info/lfs/objects/{oid}");
+    assert_eq!(send_raw(&app, "PUT", &pub_href, Some(&full), data.clone()).await.0, StatusCode::OK);
+    app.req(&bob, "POST", "/api/repos/alice/pub/fork", Some(json!({}))).await;
+    let (_, fork) = lfs_batch(&app, "bob/pub", None, "download", &oid, data.len()).await;
+    assert!(fork["objects"][0]["actions"]["download"]["href"].is_string(), "{fork}");
+
+    // Per-object size limit, in the batch answer and while streaming.
+    let mut s = app.state.settings.get();
+    s.max_lfs_mb = 1;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    let big = vec![7u8; 1024 * 1024 + 1];
+    let big_oid = hex::encode(Sha256::digest(&big));
+    let (_, b) = lfs_batch(&app, "alice/p", Some(&full), "upload", &big_oid, big.len()).await;
+    assert_eq!(b["objects"][0]["error"]["code"], 422, "{b}");
+    let big_href = format!("/alice/p.git/info/lfs/objects/{big_oid}");
+    assert_eq!(send_raw(&app, "PUT", &big_href, Some(&full), big).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // No locking API: git-lfs skips lock checks on a 404.
+    assert_eq!(send_raw(&app, "POST", "/alice/p.git/info/lfs/locks/verify", Some(&full), b"{}".to_vec()).await.0, StatusCode::NOT_FOUND);
+
+    // The web view shows the pointer as an LFS file, and /raw serves the real bytes.
+    let pointer = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n", data.len());
+    let (_, br) = app.req(&alice, "GET", "/api/repos/alice/p/branches", None).await;
+    let head = br["branches"][0]["sha"].as_str().unwrap().to_string();
+    let change = json!({ "branch": "main", "expected_sha": head, "message": "Add asset", "changes": [{ "path": "asset.bin", "content": pointer }] });
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/p/contents", Some(change)).await.0, StatusCode::OK);
+    let (_, blob) = app.req(&alice, "GET", "/api/repos/alice/p/blob?path=asset.bin", None).await;
+    assert_eq!((blob["lfs"]["oid"].as_str(), blob["lfs"]["size"].as_u64(), blob["lfs"]["stored"].as_bool()), (Some(oid.as_str()), Some(data.len() as u64), Some(true)), "{blob}");
+    assert_eq!(blob["editable"], false);
+    assert_eq!(send_raw(&app, "GET", "/raw/alice/p/main/asset.bin", None, vec![]).await.0, StatusCode::NOT_FOUND);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(Request::get("/raw/alice/p/main/asset.bin").header("host", "test.local").header("cookie", format!("gitter_session={}", alice.0.clone().unwrap())).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-security-policy"].to_str().unwrap().contains("sandbox"));
+    let got = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    assert!(got == data, "raw serves the stored object, not the pointer");
+}

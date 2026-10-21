@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use sha2::Digest;
 
 use crate::Config;
 
@@ -40,8 +41,29 @@ fn repo_ids(db: &Connection) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
+/// Git LFS object ids the database refers to (none before the table exists).
+fn lfs_oids(db: &Connection) -> Result<Vec<String>> {
+    let table = db
+        .query_row("SELECT 1 FROM sqlite_master WHERE name = 'lfs_objects'", [], |_| Ok(()))
+        .optional()?;
+    if table.is_none() {
+        return Ok(vec![]);
+    }
+    let mut s = db.prepare("SELECT DISTINCT oid FROM lfs_objects ORDER BY oid")?;
+    let oids = s
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(oids.into_iter().filter(|o| crate::lfs::valid_oid(o)).collect())
+}
+
+fn sha256_file(p: &Path) -> Result<String> {
+    let mut h = sha2::Sha256::new();
+    std::io::copy(&mut std::fs::File::open(p)?, &mut h)?;
+    Ok(hex::encode(h.finalize()))
+}
+
 /// Write `<out>` (`-` for stdout): a .tar.gz holding a consistent copy of the
-/// database, every repository it lists and a manifest. Safe to run while the server is up.
+/// database, every repository and Git LFS file it lists and a manifest. Safe to run while the server is up.
 pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
     let db_path = cfg.data_dir.join("gitter.db");
     if !db_path.exists() {
@@ -60,18 +82,21 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
     };
     // The snapshot holds password and session hashes: keep it next to the data, owner-only.
     let tmp = tempdir_in(&cfg.data_dir)?;
-    let res = (|| -> Result<(usize, i64)> {
+    let res = (|| -> Result<(usize, i64, usize)> {
         let snap = tmp.join("gitter.db");
         let conn = Connection::open(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         // VACUUM INTO writes a transactionally consistent snapshot without stopping writers.
         conn.execute("VACUUM INTO ?1", [snap.to_string_lossy()])?;
-        let ids = repo_ids(&Connection::open(&snap)?)?;
+        let (ids, oids) = {
+            let s = Connection::open(&snap)?;
+            (repo_ids(&s)?, lfs_oids(&s)?)
+        };
         let users: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
         drop(conn);
         let manifest = serde_json::json!({
             "format": FORMAT, "gitter": env!("CARGO_PKG_VERSION"), "created_at": crate::db::now(),
-            "repos": ids.len(), "users": users,
+            "repos": ids.len(), "users": users, "lfs_objects": oids.len(),
         });
         std::fs::write(tmp.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
@@ -88,19 +113,31 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
             }
             append_repo(&mut tar, &src, &format!("repos/{id}.git"))?;
         }
+        // A row is written only once its file is in place, and files are never rewritten
+        // with other content, so every object the snapshot lists is on disk.
+        tar.append_dir("lfs", &cfg.data_dir)?;
+        for oid in &oids {
+            let src = crate::lfs::object_path(&cfg.data_dir, oid);
+            if !src.is_file() {
+                eprintln!("warning: Git LFS object {oid} is missing");
+                continue;
+            }
+            let name = crate::lfs::object_path(Path::new(""), oid);
+            tar.append_path_with_name(&src, name)?;
+        }
         tar.into_inner()?.finish()?.flush()?;
-        Ok((ids.len(), users))
+        Ok((ids.len(), users, oids.len()))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     if res.is_err() && !to_stdout {
         let _ = std::fs::remove_file(&out);
     }
-    let (repos, users) = res?;
+    let (repos, users, lfs) = res?;
     let size = if to_stdout { String::new() } else {
         format!(" ({:.1} MB)", std::fs::metadata(&out)?.len() as f64 / 1e6)
     };
     eprintln!(
-        "Backed up {users} accounts and {repos} repositories to {}{size}.",
+        "Backed up {users} accounts, {repos} repositories and {lfs} Git LFS files to {}{size}.",
         if to_stdout { "stdout".into() } else { out.display().to_string() },
     );
     Ok(())
@@ -166,7 +203,9 @@ fn inspect_archive(archive: &Path) -> Result<serde_json::Value> {
         let known = name == "manifest.json"
             || name == "gitter.db"
             || name == "repos"
-            || name.starts_with("repos/");
+            || name.starts_with("repos/")
+            || name == "lfs"
+            || name.starts_with("lfs/");
         // Only plain relative paths, no `..`, no absolute paths, no links that could point outside.
         let safe = path
             .components()
@@ -208,6 +247,7 @@ fn unpack(archive: &Path, stage: &Path) -> Result<serde_json::Value> {
         e?.unpack_in(stage)?;
     }
     std::fs::create_dir_all(stage.join("repos"))?;
+    std::fs::create_dir_all(stage.join("lfs"))?;
     let conn = Connection::open(stage.join("gitter.db"))?;
     let ok: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     if ok != "ok" {
@@ -258,8 +298,8 @@ pub fn verify(cfg: &Config, archive: &Path) -> Result<()> {
 pub fn restore(cfg: &Config, archive: &Path, force: bool) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let data = cfg.data_dir.canonicalize()?;
-    let has_repos = std::fs::read_dir(data.join("repos")).is_ok_and(|mut rd| rd.next().is_some());
-    let occupied = data.join("gitter.db").exists() || has_repos;
+    let has = |d: &str| std::fs::read_dir(data.join(d)).is_ok_and(|mut rd| rd.next().is_some());
+    let occupied = data.join("gitter.db").exists() || has("repos") || has("lfs");
     if occupied && !force {
         bail!(
             "{} already has data. Restore into an empty directory, or pass --force to move the current data aside first.",
@@ -303,7 +343,7 @@ fn restore_from(cfg: &Config, data: &Path, archive: &Path, occupied: bool) -> Re
         }
         eprintln!("Moved the existing data to {}.", aside.display());
     }
-    for name in ["gitter.db", "repos"] {
+    for name in ["gitter.db", "repos", "lfs"] {
         std::fs::rename(stage.join(name), data.join(name))
             .with_context(|| format!("couldn't move the restored {name} into place"))?;
     }
@@ -450,12 +490,33 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
         orphans == 0,
         format!("{orphans} repository folders with no database entry"),
     );
+    let oids = lfs_oids(&conn)?;
+    if !oids.is_empty() {
+        let (mut missing, mut damaged) = (0, 0);
+        for oid in &oids {
+            let p = crate::lfs::object_path(data, oid);
+            if !p.is_file() {
+                missing += 1;
+            } else if fsck && sha256_file(&p).ok().as_ref() != Some(oid) {
+                damaged += 1;
+            }
+        }
+        report(
+            missing == 0,
+            format!("{} of {} Git LFS files on disk", oids.len() - missing, oids.len()),
+        );
+        if fsck {
+            report(damaged == 0, format!("{damaged} Git LFS files don't match their hash"));
+        }
+    }
     Ok(problems)
 }
 
 /// At boot: move repository folders the database doesn't know about into
 /// `orphans/` (so a new repo can never reuse stale data) and warn about missing ones.
 pub fn reconcile(cfg: &Config) -> Result<()> {
+    // Git LFS uploads cut off by the restart.
+    let _ = std::fs::remove_dir_all(cfg.data_dir.join("lfs/tmp"));
     let db_path = cfg.data_dir.join("gitter.db");
     if !db_path.exists() {
         return Ok(());
@@ -660,6 +721,47 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("before-restore-")
         }));
+    }
+
+    #[test]
+    fn backups_carry_lfs_files_and_verify_checks_their_hashes() {
+        use sha2::Digest;
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(data.join("repos")).unwrap();
+        crate::db::Db::open(&data.join("gitter.db")).unwrap();
+        run(git(&["init", "-q", "--bare", &data.join("repos/1.git").to_string_lossy()]), "git init").unwrap();
+        let body = b"pretend this is a large video".to_vec();
+        let oid = hex::encode(sha2::Sha256::digest(&body));
+        Connection::open(data.join("gitter.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO users(id, username, pass_hash, created_at) VALUES (1, 'a', 'x', 0);
+                 INSERT INTO repos(id, owner_id, name, created_at, updated_at) VALUES (1, 1, 'r', 0, 0);
+                 INSERT INTO lfs_objects(repo_id, oid, size, created_at) VALUES (1, '{oid}', {}, 0);",
+                body.len()
+            ))
+            .unwrap();
+        let obj = crate::lfs::object_path(&data, &oid);
+        std::fs::create_dir_all(obj.parent().unwrap()).unwrap();
+        std::fs::write(&obj, &body).unwrap();
+        std::fs::create_dir_all(data.join("lfs/tmp")).unwrap();
+        std::fs::write(data.join("lfs/tmp/half-upload"), b"x").unwrap();
+
+        let good = root.path().join("good.tar.gz");
+        backup(&cfg_for(&data), &good).unwrap();
+        verify(&cfg_for(&data), &good).unwrap();
+        let fresh = root.path().join("fresh");
+        restore(&cfg_for(&fresh), &good, false).unwrap();
+        assert_eq!(std::fs::read(crate::lfs::object_path(&fresh, &oid)).unwrap(), body);
+        assert!(!fresh.join("lfs/tmp").exists(), "unfinished uploads aren't backed up");
+
+        std::fs::write(&obj, b"bit rot").unwrap();
+        let bad = root.path().join("bad.tar.gz");
+        backup(&cfg_for(&data), &bad).unwrap();
+        assert!(verify(&cfg_for(&data), &bad).is_err(), "a damaged LFS file fails verify");
+        std::fs::remove_file(&obj).unwrap();
+        assert_eq!(check(&cfg_for(&data), false).unwrap(), 1, "a missing LFS file is a problem");
     }
 
     #[test]

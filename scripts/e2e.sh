@@ -180,6 +180,40 @@ api GET "/search?q=hel"
 [ "$(jq_ 'd["repos"][0]["name"]')" = hello ] || fail "search"
 ok "profile, feed, search"
 
+# --- Git LFS with the real client (the official static build, cached outside the repo)
+LFS_VER=v3.8.0
+LFS_SUM=e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d
+LFS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gitter-test/git-lfs-$LFS_VER"
+if ! command -v git-lfs >/dev/null && [ ! -x "$LFS_DIR/git-lfs" ] && [ "$(uname -sm)" = "Linux x86_64" ]; then
+  mkdir -p "$LFS_DIR"
+  if curl -sfL -m 120 -o "$LFS_DIR/dl.tar.gz" "https://github.com/git-lfs/git-lfs/releases/download/$LFS_VER/git-lfs-linux-amd64-$LFS_VER.tar.gz" \
+    && echo "$LFS_SUM  $LFS_DIR/dl.tar.gz" | sha256sum -c --quiet; then
+    tar -xzf "$LFS_DIR/dl.tar.gz" -C "$LFS_DIR" --strip-components=1 --wildcards '*/git-lfs' || rm -f "$LFS_DIR/git-lfs"
+  fi
+  rm -f "$LFS_DIR/dl.tar.gz"
+fi
+PATH="$LFS_DIR:$PATH"
+if command -v git-lfs >/dev/null; then
+  # A throwaway global config, so `git lfs install` never touches ~/.gitconfig; never prompt.
+  export GIT_CONFIG_GLOBAL="$TMP/lfs.gitconfig" GIT_TERMINAL_PROMPT=0
+  api POST /repos '{"name":"media"}'
+  L="$TMP/lfs-work"
+  git init -q -b main "$L"
+  (cd "$L" && git config user.name Alice && git config user.email alice@example.com && git lfs install >/dev/null \
+    && git lfs track '*.bin' >/dev/null && head -c 300000 /dev/urandom >big.bin && git add .gitattributes big.bin \
+    && git commit -qm "Add a big file" && git push -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/media.git" main 2>"$TMP/lfs-push.log") \
+    || { cat "$TMP/lfs-push.log"; fail "push with git-lfs"; }  # pragma: allowlist secret
+  api GET "/repos/alice/media/blob?rev=main&path=big.bin"
+  [ "$(jq_ 'd["lfs"]["stored"]')" = True ] || fail "pushed LFS object not stored: $BODY"
+  git clone -q "$BASE/alice/media.git" "$TMP/lfs-clone" 2>"$TMP/lfs-clone.log" || { cat "$TMP/lfs-clone.log"; fail "clone with git-lfs"; }
+  cmp -s "$L/big.bin" "$TMP/lfs-clone/big.bin" || fail "cloned LFS file differs from the pushed one"
+  curl -sf "$BASE/raw/alice/media/main/big.bin" | cmp -s - "$L/big.bin" || fail "raw should serve the LFS file"
+  unset GIT_CONFIG_GLOBAL GIT_TERMINAL_PROMPT
+  ok "git-lfs $(git-lfs version | cut -d' ' -f1 | cut -d/ -f2) pushes and clones LFS files; raw serves them"
+else
+  echo "· git-lfs not installed and the download failed: LFS client check skipped"
+fi
+
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")
 [ "$code" = 200 ] && grep -q '<html' "$TMP/index.html" || fail "SPA route"

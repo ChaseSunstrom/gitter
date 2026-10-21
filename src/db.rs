@@ -166,6 +166,18 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tokens ADD COLUMN expires_at INTEGER;
     CREATE INDEX tokens_repo ON tokens(repo_id);
     "#,
+    // v5: Git LFS objects. The files are shared by content (GITTER_DATA/lfs); a row
+    // says a repository holds one, which is what lets it be downloaded from there.
+    r#"
+    CREATE TABLE lfs_objects (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        oid TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(repo_id, oid)
+    );
+    CREATE INDEX lfs_objects_oid ON lfs_objects(oid);
+    "#,
 ];
 
 impl Db {

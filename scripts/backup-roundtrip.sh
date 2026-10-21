@@ -21,6 +21,13 @@ c -X POST "$B/api/auth/signup" --data "{\"username\":\"alice\",\"email\":\"a@exa
 c -X POST "$B/api/repos" --data '{"name":"keep","readme":true}' >/dev/null
 c -X POST "$B/api/repos/alice/keep/issues" --data '{"title":"Remember me"}' >/dev/null
 SHA=$(curl -sf "$B/api/repos/alice/keep/commits" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commits"][0]["sha"])')
+# A Git LFS file, uploaded the way git-lfs does it (batch, then PUT).
+printf 'large file %.0s' $(seq 2000) >"$TMP/asset.bin"
+OID=$(sha256sum "$TMP/asset.bin" | cut -d' ' -f1); SIZE=$(wc -c <"$TMP/asset.bin")
+AUTH=(-u 'alice:correct horse')  # pragma: allowlist secret
+curl -sf "${AUTH[@]}" -H 'Content-Type: application/vnd.git-lfs+json' -X POST "$B/alice/keep.git/info/lfs/objects/batch" \
+  --data "{\"operation\":\"upload\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}" | grep -q '"upload"' || fail "LFS batch upload"
+curl -sf "${AUTH[@]}" -X PUT --data-binary @"$TMP/asset.bin" "$B/alice/keep.git/info/lfs/objects/$OID" >/dev/null || fail "LFS upload"
 
 GITTER_DATA=$TMP/a $BIN backup "$TMP/backup.tar.gz" || fail "backup"
 [ -s "$TMP/backup.tar.gz" ] || fail "backup file is empty"
@@ -52,5 +59,6 @@ wait_up "$B2"
 curl -sf "$B2/api/repos/alice/keep/issues/1" | grep -q "Remember me" || fail "issue missing after restore"
 git clone -q "$B2/alice/keep.git" "$TMP/clone" && [ -f "$TMP/clone/README.md" ] || fail "clone from restored server"
 curl -sf -H "Origin: $B2" -H 'Content-Type: application/json' -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct horse"}' >/dev/null || fail "login after restore"  # pragma: allowlist secret
-echo "✓ restored server has the same history, issues, logins and clones"
+curl -sf "${AUTH[@]}" "$B2/alice/keep.git/info/lfs/objects/$OID" | cmp -s - "$TMP/asset.bin" || fail "LFS file missing or different after restore"
+echo "✓ restored server has the same history, issues, logins, clones and LFS files"
 echo "Backup round-trip passed."

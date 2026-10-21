@@ -17,6 +17,9 @@ pub struct Settings {
     pub signup: String,
     pub max_repos_per_user: i64,
     pub max_push_mb: u64,
+    /// The largest single Git LFS file accepted.
+    #[serde(default = "default_lfs_mb")]
+    pub max_lfs_mb: u64,
     /// A short notice shown to every visitor (maintenance, rules). Empty hides it.
     pub announcement: String,
 }
@@ -32,6 +35,7 @@ impl Settings {
             },
             max_repos_per_user: cfg.max_repos_per_user,
             max_push_mb: cfg.max_push_bytes / (1024 * 1024),
+            max_lfs_mb: default_lfs_mb(),
             announcement: String::new(),
         }
     }
@@ -42,6 +46,10 @@ impl Settings {
 
     pub fn max_push_bytes(&self) -> u64 {
         self.max_push_mb * 1024 * 1024
+    }
+
+    pub fn max_lfs_bytes(&self) -> u64 {
+        self.max_lfs_mb * 1024 * 1024
     }
 
     pub fn validate(&self) -> R<()> {
@@ -61,11 +69,20 @@ impl Settings {
                 "The push limit must be between 1 MB and 100 GB",
             ));
         }
+        if !(1..=100_000).contains(&self.max_lfs_mb) {
+            return Err(AppError::bad(
+                "The LFS file limit must be between 1 MB and 100 GB",
+            ));
+        }
         if self.announcement.chars().count() > 280 {
             return Err(AppError::bad("Keep the announcement under 280 characters"));
         }
         Ok(())
     }
+}
+
+fn default_lfs_mb() -> u64 {
+    2048
 }
 
 /// The current settings, shared by every request.

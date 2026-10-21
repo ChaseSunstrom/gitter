@@ -82,8 +82,10 @@ const pages = [
   ['/settings/appearance', []],
   ['/admin', ['Site administration', 'Storage']],
   ['/admin/users', ['alice', 'bob']],
-  ['/admin/settings', ['Instance name']],
+  ['/admin/settings', ['Instance name', 'Largest Git LFS file']],
 ];
+// Pushed by e2e.sh when the git-lfs client is available.
+if ((await ctx.request.get(BASE + '/api/repos/alice/media')).ok()) pages.push(['/alice/media/blob/main/big.bin', ['Stored with Git LFS', 'Download', 'Git LFS']]);
 for (const [p, e] of pages) await visit(ctx, p, e);
 await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
 

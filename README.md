@@ -79,6 +79,8 @@ git clone https://git.example.com/alice/project.git   # username: anything, pass
 
 Accounts with two-factor authentication need a token for git over HTTPS; the password alone is refused.
 
+Git LFS works with no setup: `git lfs track '*.psd'`, commit and push as usual. Files are stored once by content under `GITTER_DATA/lfs` (forks share them), each repository can only download the files pushed to it, the largest file is set in Site administration (2 GB by default), and backups include them. The web view shows LFS files as "Stored with Git LFS" with a download link, and raw links serve the real file. File locking isn't supported (git-lfs skips it).
+
 The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`, `gitter bench [--check]` (`-` as the file means stdout/stdin).
 
 ## Configuration

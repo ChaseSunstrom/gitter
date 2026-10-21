@@ -288,10 +288,20 @@ pub async fn blob(
     let (mode, last) = (mode?.unwrap_or_default(), last?);
     // The browser editor only round-trips plain UTF-8 text with consistent line endings.
     let (mut content, mut binary, mut editable, mut eol) = (None, false, false, "lf");
-    if too_large || (image && !path.ends_with(".svg")) {
+    // Small files are read up front: one may be a Git LFS pointer (images too).
+    let small = if size <= 1024 { Some(st.git.blob(&r.path, &oid).await?) } else { None };
+    let mut lfs = None;
+    if let Some((lfs_oid, lfs_size)) = small.as_deref().and_then(crate::lfs::parse_pointer) {
+        let stored = crate::lfs::held(&st, r.id, vec![lfs_oid.clone()]).await?[0];
+        lfs = Some(json!({ "oid": lfs_oid, "size": lfs_size, "stored": stored }));
+        binary = true;
+    } else if too_large || (image && !path.ends_with(".svg")) {
         binary = !path.ends_with(".svg");
     } else {
-        let data = st.git.blob(&r.path, &oid).await?;
+        let data = match small {
+            Some(d) => d,
+            None => st.git.blob(&r.path, &oid).await?,
+        };
         if data.iter().take(8000).any(|b| *b == 0) {
             binary = true;
         } else {
@@ -310,6 +320,7 @@ pub async fn blob(
     Ok(Json(json!({
         "sha": sha, "path": path, "oid": oid, "size": size, "binary": binary, "image": image, "mode": mode,
         "too_large": too_large, "content": content, "editable": editable, "eol": eol, "last_commit": last, "language": lang,
+        "lfs": lfs,
     })))
 }
 
@@ -339,9 +350,24 @@ pub async fn raw(
         None => "text/plain; charset=utf-8",
     };
     let immutable = rev.len() == 40 && validate::sha(&rev);
-    let mut resp = Response::new(Body::from(data));
+    // A Git LFS pointer serves the file it points at, when this repository holds it.
+    let lfs = match crate::lfs::parse_pointer(&data) {
+        Some((lfs_oid, _)) if crate::lfs::held(&st, r.id, vec![lfs_oid.clone()]).await?[0] => {
+            Some(crate::lfs::object_body(&st.cfg.data_dir, &lfs_oid).await?)
+        }
+        _ => None,
+    };
+    let (body, ctype, len) = match lfs {
+        // ponytail: no text sniffing for LFS files; text ones download instead of showing.
+        Some((len, body)) => (body, is_image(&path).unwrap_or("application/octet-stream"), Some(len)),
+        None => (Body::from(data), ctype, None),
+    };
+    let mut resp = Response::new(body);
     let h = resp.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
+    if let Some(len) = len {
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(

@@ -429,7 +429,12 @@ pub async fn fork(
     let lang_src = src.id;
     st.db
         .call(move |c| {
-            Ok(c.execute("UPDATE repos SET language = (SELECT language FROM repos WHERE id = ?1) WHERE id = ?2", [lang_src, id])?)
+            c.execute("UPDATE repos SET language = (SELECT language FROM repos WHERE id = ?1) WHERE id = ?2", [lang_src, id])?;
+            // The fork shares the parent's Git LFS files (stored once by content).
+            Ok(c.execute(
+                "INSERT OR IGNORE INTO lfs_objects(repo_id, oid, size, created_at) SELECT ?2, oid, size, created_at FROM lfs_objects WHERE repo_id = ?1",
+                [lang_src, id],
+            )?)
         })
         .await?;
     record_event(&st.db, u.id, Some(id), "fork", &src.full_name(), "", 1).await?;
