@@ -63,7 +63,7 @@ export default async function (ctx) {
       mountRepoHeader(el, meta);
       placeTabBar(el.querySelector('.issue-page'));
       mountHeader(el, api, issue);
-      if (tab === 'files') mountDiff(el, pd.diff, { key: `${owner}/${repo}#${n}:${pd.head_sha}` });
+      if (tab === 'files') mountDiff(el, pd.diff, { key: `${owner}/${repo}#${n}:${pd.head_sha}`, load: (q) => get(`/repos/${owner}/${repo}/pulls/${n}/diff?${q}`).then((x) => x.diff.files[0]) });
       if (tab === 'conversation') mountConversation(el, meta, api, data, mdCtx);
     },
   };

@@ -12,4 +12,13 @@ pub async fn on_push(st: &AppState, repo: &Repo, _user: &User, updates: &[RefUpd
     if empty_before || updates.iter().any(|u| u.refname == default_ref) {
         crate::langs::refresh(st, repo.id, &repo.path).await;
     }
+    st.git.maintain_soon(repo.path.clone());
+}
+
+/// After history arrived outside a push (an import, the bench seed): refresh what pushes refresh.
+pub async fn after_import(st: &AppState, repo_id: i64) {
+    let path = st.git.repo_path(repo_id);
+    let _ = st.git.maintain(&path).await;
+    crate::langs::refresh(st, repo_id, &path).await;
+    let _ = crate::repo::touch(&st.db, repo_id, true).await;
 }

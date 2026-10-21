@@ -36,6 +36,24 @@ git.example.com {
 }
 ```
 
+## How fast is it?
+
+`gitter bench` boots a throwaway instance, seeds a repository with 5,000 commits and 1,000 files, and times the pages people open most (release build, warm cache, through the full HTTP stack; measured on an 8-core Ryzen desktop, so expect a small VPS to be a few times slower):
+
+| Page | p50 | p95 |
+|---|---|---|
+| Repository home (file list, README, last commit) | 9 ms | 12 ms |
+| Last commit for every entry in a folder | 3 ms | 6 ms |
+| A file | 11 ms | 15 ms |
+| History of one file | 8 ms | 12 ms |
+| A commit's diff | 9 ms | 16 ms |
+| Blame | 5 ms | 7 ms |
+| `git clone` of the whole history over HTTP | 330 ms | |
+
+Memory: **8 MB** after boot and about **32 MB** after the run. For comparison, GitLab's documented baseline for a single node is 16 GB of RAM and 8 vCPU (8 GB at the very least).
+
+What keeps it there: commit-graphs with changed-path Bloom filters refreshed after every push, a cache for answers that can't change for a given commit (last commits, blame, language stats), and a diff view that renders huge files a chunk at a time. Run `gitter bench` on your own box; `scripts/perf-budget.sh` (`gitter bench --check`) fails if any page goes over its budget.
+
 ## Run it without Docker
 
 Needs `git` 2.38 or newer (for server-side merges).
@@ -52,7 +70,7 @@ git clone http://localhost:3000/alice/project.git
 git push   # username + password, or username + an access token from Settings → Access tokens
 ```
 
-The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]` (`-` as the file means stdout/stdin).
+The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`, `gitter bench [--check]` (`-` as the file means stdout/stdin).
 
 ## Configuration
 

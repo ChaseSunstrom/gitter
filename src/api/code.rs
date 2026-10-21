@@ -56,6 +56,10 @@ async fn last_commit(
     sha: &str,
     path: &str,
 ) -> R<Option<crate::git::Commit>> {
+    let key = format!("lc:{}:{sha}:{path}", r.id);
+    if let Some(hit) = st.git.memo.get(&key) {
+        return Ok(hit);
+    }
     let q = LogQuery {
         range: sha,
         path: Some(path),
@@ -65,7 +69,20 @@ async fn last_commit(
         author: None,
         first_parent: false,
     };
-    Ok(st.git.log(&r.path, &q).await?.into_iter().next())
+    let c = st.git.log(&r.path, &q).await?.into_iter().next();
+    st.git.memo.put(key, &c);
+    Ok(c)
+}
+
+/// Commits reachable from `sha` (immutable, so cached).
+async fn commit_count(st: &AppState, r: &Repo, sha: &str) -> R<u64> {
+    let key = format!("cnt:{}:{sha}", r.id);
+    if let Some(n) = st.git.memo.get(&key) {
+        return Ok(n);
+    }
+    let n = st.git.count(&r.path, sha).await?;
+    st.git.memo.put(key, &n);
+    Ok(n)
 }
 
 fn is_readme(name: &str) -> Option<u8> {
@@ -126,7 +143,7 @@ pub async fn tree(
     };
     let (last, count) = tokio::join!(
         last_commit(&st, &r, &sha, &path),
-        st.git.count(&r.path, &sha)
+        commit_count(&st, &r, &sha)
     );
     Ok(Json(
         json!({ "sha": sha, "path": path, "entries": entries, "readme": readme, "last_commit": last?, "commit_count": count? }),
@@ -144,6 +161,10 @@ pub async fn tree_commits(
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let sha = resolve_rev(&st, &r, q.rev.as_deref()).await?;
     let path = clean_path(q.path.as_deref())?;
+    let key = format!("tc:{}:{sha}:{path}", r.id);
+    if let Some(found) = st.git.memo.get::<HashMap<String, serde_json::Value>>(&key) {
+        return Ok(Json(json!({ "sha": sha, "commits": found })));
+    }
     let names: HashSet<String> = st
         .git
         .ls_tree(&r.path, &sha, &path)
@@ -151,7 +172,10 @@ pub async fn tree_commits(
         .into_iter()
         .map(|e| e.name)
         .collect();
-    let found = last_commits(&st, &r.path, &sha, &path, names).await?;
+    let (found, complete) = last_commits(&st, &r.path, &sha, &path, names).await?;
+    if complete {
+        st.git.memo.put(key, &found);
+    }
     Ok(Json(json!({ "sha": sha, "commits": found })))
 }
 
@@ -161,7 +185,7 @@ async fn last_commits(
     sha: &str,
     dir: &str,
     mut want: HashSet<String>,
-) -> R<HashMap<String, serde_json::Value>> {
+) -> R<(HashMap<String, serde_json::Value>, bool)> {
     let _permit = st.git.permit().await?;
     let mut cmd = st.git.command(Some(repo));
     cmd.args([
@@ -212,9 +236,14 @@ async fn last_commits(
             }
         }
     };
-    let _ = tokio::time::timeout(Duration::from_secs(10), work).await;
+    // Only a walk that finished cleanly (or found everything) is repeatable, so only that is cached.
+    let finished = tokio::time::timeout(Duration::from_secs(10), work).await.is_ok();
+    let found_all = want.is_empty();
+    let exited_ok = finished
+        && !found_all
+        && matches!(tokio::time::timeout(Duration::from_secs(2), child.wait()).await, Ok(Ok(s)) if s.success());
     let _ = child.kill().await;
-    Ok(out)
+    Ok((out, found_all || exited_ok))
 }
 
 fn is_image(path: &str) -> Option<&'static str> {
@@ -557,10 +586,33 @@ pub async fn commits(
     ))
 }
 
+#[derive(Deserialize, Default)]
+pub struct FileQ {
+    /// Diff only this file, with a larger size limit (for "Load diff").
+    pub path: Option<String>,
+    /// The file's old path when it was renamed, so the rename still pairs up.
+    pub old: Option<String>,
+}
+
+/// Diff `from..to`, optionally just one file (plus its old name).
+pub async fn diff_of(st: &AppState, repo: &FsPath, from: Option<&str>, to: &str, f: &FileQ) -> R<diff::DiffSummary> {
+    let mut paths = Vec::new();
+    for p in [&f.path, &f.old].into_iter().flatten() {
+        let p = clean_path(Some(p))?;
+        if !p.is_empty() && !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let (text, cut) = st.git.diff(repo, from, to, &refs).await?;
+    Ok(if refs.is_empty() { diff::parse(&text, cut) } else { diff::parse_one(&text, cut) })
+}
+
 pub async fn commit(
     State(st): State<AppState>,
     Viewer(v): Viewer,
     Path((o, n, sha)): Path<(String, String, String)>,
+    Query(fq): Query<FileQ>,
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let sha = resolve_rev(&st, &r, Some(&sha)).await?;
@@ -570,8 +622,7 @@ pub async fn commit(
         .await?
         .ok_or_else(AppError::not_found)?;
     let parent = info.parents.first().cloned();
-    let (text, cut) = st.git.diff(&r.path, parent.as_deref(), &sha, None).await?;
-    let d = diff::parse(&text, cut);
+    let d = diff_of(&st, &r.path, parent.as_deref(), &sha, &fq).await?;
     Ok(Json(json!({ "commit": info, "diff": d })))
 }
 
@@ -579,6 +630,8 @@ pub async fn commit(
 pub struct CompareQ {
     base: String,
     head: String,
+    #[serde(flatten)]
+    file: FileQ,
 }
 
 pub struct Comparison {
@@ -599,7 +652,7 @@ impl Comparison {
 }
 
 /// What `head` adds on top of `base` (three-dot semantics, like a pull request).
-pub async fn compare_shas(st: &AppState, path: &FsPath, base: &str, head: &str) -> R<Comparison> {
+pub async fn compare_shas(st: &AppState, path: &FsPath, base: &str, head: &str, file: &FileQ) -> R<Comparison> {
     let mb = st.git.merge_base(path, base, head).await?;
     let from = mb.clone().unwrap_or_else(|| base.to_string());
     let range = format!("{from}..{head}");
@@ -617,9 +670,8 @@ pub async fn compare_shas(st: &AppState, path: &FsPath, base: &str, head: &str) 
         st.git.log(path, &lq),
         st.git.count(path, &fwd),
         st.git.count(path, &back),
-        st.git.diff(path, Some(&from), head, None),
+        diff_of(st, path, Some(&from), head, file),
     );
-    let (text, cut) = d?;
     let mut commits = commits?;
     commits.reverse();
     Ok(Comparison {
@@ -629,7 +681,7 @@ pub async fn compare_shas(st: &AppState, path: &FsPath, base: &str, head: &str) 
         ahead: ahead?,
         behind: behind?,
         commits,
-        diff: diff::parse(&text, cut),
+        diff: d?,
     })
 }
 
@@ -642,7 +694,7 @@ pub async fn compare(
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let base = resolve_rev(&st, &r, Some(&q.base)).await?;
     let head = resolve_rev(&st, &r, Some(&q.head)).await?;
-    let c = compare_shas(&st, &r.path, &base, &head).await?;
+    let c = compare_shas(&st, &r.path, &base, &head, &q.file).await?;
     Ok(Json(c.to_json()))
 }
 
@@ -666,8 +718,16 @@ pub async fn blame(
     if size > BLOB_DISPLAY_CAP {
         return Err(AppError::bad("This file is too large to blame"));
     }
-    let out = st.git.blame(&r.path, &sha, &path).await?;
-    let chunks = parse_blame(&String::from_utf8_lossy(&out));
+    let key = format!("bl:{}:{sha}:{path}", r.id);
+    let chunks = match st.git.memo.get::<serde_json::Value>(&key) {
+        Some(c) => c,
+        None => {
+            let out = st.git.blame(&r.path, &sha, &path).await?;
+            let c = serde_json::to_value(parse_blame(&String::from_utf8_lossy(&out))).map_err(AppError::internal)?;
+            st.git.memo.put(key, &c);
+            c
+        }
+    };
     Ok(Json(
         json!({ "sha": sha, "path": path, "chunks": chunks, "language": crate::langs::detect(&path).map(|l| l.0) }),
     ))
@@ -679,7 +739,20 @@ pub async fn languages(
     Path((o, n)): Path<(String, String)>,
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
-    let s = crate::langs::stats(&st, &r.path, "HEAD").await;
+    let Some(head) = st.git.resolve(&r.path, "HEAD").await? else {
+        return Ok(Json(json!({ "languages": [] })));
+    };
+    let key = format!("lang:{}:{head}", r.id);
+    let s = match st.git.memo.get(&key) {
+        Some(s) => s,
+        None => {
+            let s = crate::langs::stats(&st, &r.path, &head).await;
+            if let Some(s) = &s {
+                st.git.memo.put(key, s);
+            }
+            s.unwrap_or_default()
+        }
+    };
     let total: u64 = s.iter().map(|x| x.2).sum::<u64>().max(1);
     let out: Vec<_> = s
         .iter()

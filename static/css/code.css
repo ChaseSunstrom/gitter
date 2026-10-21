@@ -68,6 +68,8 @@
 .statbar i.r { background: var(--red); }
 .dbody { overflow-x: auto; border-radius: 0 0 var(--r) var(--r); }
 .dplaceholder { padding: 24px; display: grid; place-items: center; color: var(--faint); }
+.dmore { padding: 16px; display: grid; place-items: center; }
+.dnote .btn { margin-left: 8px; }
 .dnote { padding: 18px 16px; color: var(--muted); font-size: 13px; text-align: center; }
 .dtable { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; line-height: 20px; table-layout: fixed; }
 .dtable col.cn { width: calc(5ch + 20px); }

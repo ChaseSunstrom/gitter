@@ -759,6 +759,7 @@ pub async fn pull_diff(
     State(st): State<AppState>,
     Viewer(v): Viewer,
     Path((o, n, num)): Path<(String, String, i64)>,
+    Query(fq): Query<super::code::FileQ>,
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let mut issue = load_issue(&st, &r, num).await?;
@@ -774,7 +775,7 @@ pub async fn pull_diff(
             json!({ "commits": [], "diff": { "files": [], "additions": 0, "deletions": 0, "truncated": false } }),
         ));
     };
-    let c = super::code::compare_shas(&st, &r.path, &base, &head).await?;
+    let c = super::code::compare_shas(&st, &r.path, &base, &head, &fq).await?;
     Ok(Json(c.to_json()))
 }
 

@@ -44,7 +44,7 @@ export default async function (ctx) {
     html: repoPage(meta, 'commits', body),
     mount(el) {
       mountRepoHeader(el, meta);
-      mountDiff(el, d.diff, { key: `${owner}/${repo}@${c.sha}` });
+      mountDiff(el, d.diff, { key: `${owner}/${repo}@${c.sha}`, load: (q) => get(`/repos/${owner}/${repo}/commit/${c.sha}?${q}`).then((x) => x.diff.files[0]) });
     },
   };
 }

@@ -132,6 +132,15 @@ fn parse_range(s: &str) -> (u32, u32) {
 }
 
 pub fn parse(text: &str, input_truncated: bool) -> DiffSummary {
+    parse_with(text, input_truncated, FILE_LINE_CAP)
+}
+
+/// A diff of one file asked for on its own gets the whole budget.
+pub fn parse_one(text: &str, input_truncated: bool) -> DiffSummary {
+    parse_with(text, input_truncated, TOTAL_LINE_CAP)
+}
+
+fn parse_with(text: &str, input_truncated: bool, file_cap: usize) -> DiffSummary {
     let mut sum = DiffSummary {
         truncated: input_truncated,
         ..Default::default()
@@ -198,7 +207,7 @@ pub fn parse(text: &str, input_truncated: bool) -> DiffSummary {
                 };
                 file_lines += 1;
                 total_lines += 1;
-                if file_lines > FILE_LINE_CAP || total_lines > TOTAL_LINE_CAP {
+                if file_lines > file_cap || total_lines > TOTAL_LINE_CAP {
                     f.too_large = true;
                     f.hunks.clear();
                     if total_lines > TOTAL_LINE_CAP {

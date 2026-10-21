@@ -100,5 +100,28 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   await page.close();
 }
 
+// A file too big for the full diff loads on demand and renders as you scroll.
+{
+  const content = Array.from({ length: 5000 }, (_, i) => `row ${i}`).join('\n') + '\n';
+  const w = await ctx.request.post(BASE + '/api/repos/alice/hello/contents', { headers: { Origin: BASE },
+    data: { branch: 'main', new_branch: 'bigdiff', message: 'Big table', changes: [{ path: 'big.csv', content }] } });
+  const { sha: big } = await w.json();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(`${BASE}/alice/hello/commit/${big}`, { waitUntil: 'networkidle' });
+  await page.click('[data-load]');
+  await page.waitForSelector('.dfile .dtable tr.add');
+  const first = await page.locator('.dfile .dtable tr').count();
+  for (let k = 0; k < 20 && (await page.locator('.dmore').count()); k++) {
+    await page.locator('.dmore').scrollIntoViewIfNeeded();
+    await page.waitForTimeout(100);
+  }
+  const all = await page.locator('.dfile .dtable tr.add').count();
+  if (errors.length || first > 1100 || all !== 5000) { failed++; console.log(`✗ big diff: first chunk ${first} rows, ${all} added rows after scrolling`, errors); }
+  else console.log(`  ok big diff loads on demand (${first} rows first, ${all} after scrolling)`);
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

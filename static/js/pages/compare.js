@@ -82,7 +82,7 @@ export default async function (ctx) {
       mountRepoHeader(el, meta);
       mountRefPicker(el, meta, base, (r) => url(r, head || r), 'base-picker');
       mountRefPicker(el, meta, head || base, (r) => url(base, r), 'head-picker');
-      if (d && d.ahead > 0) mountDiff(el, d.diff);
+      if (d && d.ahead > 0) mountDiff(el, d.diff, { load: (q) => get(`${repoUrl(owner, repo)}/compare?base=${enc(base)}&head=${enc(head)}&${q}`).then((x) => x.diff.files[0]) });
       mountMdEditor(el, { owner, repo, rev: meta.default_branch, dir: '' });
       const f = $('#pr-form', el);
       if (f) {

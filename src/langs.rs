@@ -84,13 +84,11 @@ fn vendored(path: &str) -> bool {
         || path.ends_with(".min.css")
 }
 
-/// Bytes per language at `rev`, largest first.
-pub async fn stats(st: &AppState, path: &Path, rev: &str) -> Vec<(String, String, u64)> {
+/// Bytes per language at `rev`, largest first; None when git failed.
+pub async fn stats(st: &AppState, path: &Path, rev: &str) -> Option<Vec<(String, String, u64)>> {
     // ponytail: past 32 MB of listing (~300k files) the stats cover only the first files; fine for a bar.
     let args = ["ls-tree", "-r", "-l", "-z", rev];
-    let Ok(out) = st.git.run_records(path, &args, 32 << 20, 0).await else {
-        return vec![];
-    };
+    let out = st.git.run_records(path, &args, 32 << 20, 0).await.ok()?;
     let mut m: HashMap<&'static str, (&'static str, u64)> = HashMap::new();
     for rec in out.split(|b| *b == 0) {
         let rec = String::from_utf8_lossy(rec);
@@ -113,12 +111,12 @@ pub async fn stats(st: &AppState, path: &Path, rev: &str) -> Vec<(String, String
         .map(|(n, (c, s))| (n.to_string(), c.to_string(), s))
         .collect();
     v.sort_by_key(|x| std::cmp::Reverse(x.2));
-    v
+    Some(v)
 }
 
 /// Recompute and store a repo's primary language (default branch).
 pub async fn refresh(st: &AppState, id: i64, path: &Path) {
-    let v = stats(st, path, "HEAD").await;
+    let Some(v) = stats(st, path, "HEAD").await else { return };
     let lang = v.first().map(|x| x.0.clone()).unwrap_or_default();
     let _ = st
         .db

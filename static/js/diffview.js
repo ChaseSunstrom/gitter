@@ -71,20 +71,20 @@ function lineHtml(text, lang, range) {
   return h || ' ';
 }
 
-function renderHunks(f, mode) {
+/** Table rows for a file's hunks, produced lazily so huge files render a chunk at a time. */
+function* rowsOf(f, mode) {
   const lang = langOf(f.new_path || f.old_path);
-  let out = '';
   for (const h of f.hunks) {
     const head = `@@ -${h.old_start} +${h.new_start} @@ ${esc(h.header)}`;
-    out += mode === 'split'
+    yield mode === 'split'
       ? `<tr class="hunk"><td class="dn"></td><td class="dc" colspan="3">${head}</td></tr>`
       : `<tr class="hunk"><td class="dn" colspan="2"></td><td class="dc">${head}</td></tr>`;
     for (const r of pairRows(h.lines)) {
-      if (r.note) { out += `<tr class="note"><td class="dn" colspan="2"></td><td class="dc" colspan="${mode === 'split' ? 2 : 1}">${esc(r.note)}</td></tr>`; continue; }
+      if (r.note) { yield `<tr class="note"><td class="dn" colspan="2"></td><td class="dc" colspan="${mode === 'split' ? 2 : 1}">${esc(r.note)}</td></tr>`; continue; }
       if (r.ctx) {
         const [, o, n, t] = r.ctx;
         const c = lineHtml(t, lang);
-        out += mode === 'split'
+        yield mode === 'split'
           ? `<tr class="ctx"><td class="dn" data-n="${o}"></td><td class="dc">${c}</td><td class="dn" data-n="${n}"></td><td class="dc">${c}</td></tr>`
           : `<tr class="ctx"><td class="dn" data-n="${o}"></td><td class="dn" data-n="${n}"></td><td class="dc">${c}</td></tr>`;
         continue;
@@ -94,18 +94,30 @@ function renderHunks(f, mode) {
       const dh = r.del ? lineHtml(r.del[3], lang, dr) : '';
       const ah = r.add ? lineHtml(r.add[3], lang, ar) : '';
       if (mode === 'split') {
-        out += '<tr>'
+        yield '<tr>'
           + (r.del ? `<td class="dn del" data-n="${r.del[1]}"></td><td class="dc del">${dh}</td>` : '<td class="dn empty"></td><td class="dc empty"></td>')
           + (r.add ? `<td class="dn add" data-n="${r.add[2]}"></td><td class="dc add">${ah}</td>` : '<td class="dn empty"></td><td class="dc empty"></td>')
           + '</tr>';
       } else {
-        if (r.del) out += `<tr class="del"><td class="dn" data-n="${r.del[1]}"></td><td class="dn"></td><td class="dc">${dh}</td></tr>`;
-        if (r.add) out += `<tr class="add"><td class="dn"></td><td class="dn" data-n="${r.add[2]}"></td><td class="dc">${ah}</td></tr>`;
+        if (r.del) yield `<tr class="del"><td class="dn" data-n="${r.del[1]}"></td><td class="dn"></td><td class="dc">${dh}</td></tr>`;
+        if (r.add) yield `<tr class="add"><td class="dn"></td><td class="dn" data-n="${r.add[2]}"></td><td class="dc">${ah}</td></tr>`;
       }
     }
   }
-  return `<table class="dtable ${mode}"><colgroup>${mode === 'split' ? '<col class="cn"><col><col class="cn"><col>' : '<col class="cn"><col class="cn"><col>'}</colgroup><tbody>${out}</tbody></table>`;
 }
+
+const CHUNK = 1000;
+/** Up to `n` more rows from a row generator, and whether it's finished. */
+function take(gen, n) {
+  let out = '';
+  for (let k = 0; k < n; k++) {
+    const r = gen.next();
+    if (r.done) return [out, true];
+    out += r.value;
+  }
+  return [out, false];
+}
+const tableOpen = (mode) => `<table class="dtable ${mode}"><colgroup>${mode === 'split' ? '<col class="cn"><col><col class="cn"><col>' : '<col class="cn"><col class="cn"><col>'}</colgroup><tbody>`;
 
 function statBar(a, d) {
   const total = a + d;
@@ -115,15 +127,19 @@ function statBar(a, d) {
   return `<span class="statbar">${'<i class="g"></i>'.repeat(g)}${'<i class="r"></i>'.repeat(r)}${'<i></i>'.repeat(blocks - g - r)}</span>`;
 }
 
-function fileBody(f, mode) {
+/** A note instead of rows (binary, too large, empty), or null when there are rows to show. */
+function fileNote(f, i, canLoad) {
   if (f.binary) return '<div class="dnote">Binary file not shown.</div>';
-  if (f.too_large) return `<div class="dnote">This diff is too large to show here (${num(f.additions)} additions, ${num(f.deletions)} deletions).</div>`;
+  if (f.too_large) {
+    const load = canLoad && !f.load_failed ? ` <button class="btn sm" data-load="${i}">Load diff</button>` : '';
+    return `<div class="dnote">This diff is large (${num(f.additions)} additions, ${num(f.deletions)} deletions).${load}</div>`;
+  }
   if (!f.hunks.length) {
     if (f.status === 'renamed') return '<div class="dnote">File renamed without changes.</div>';
     if (f.old_mode && f.new_mode) return `<div class="dnote">Mode changed from ${esc(f.old_mode)} to ${esc(f.new_mode)}.</div>`;
     return '<div class="dnote">Empty file.</div>';
   }
-  return renderHunks(f, mode);
+  return null;
 }
 
 /**
@@ -175,6 +191,9 @@ export function diffView(diff, opts = {}) {
   </div>`;
 }
 
+/**
+ * Wire up a rendered diff. opts: { key (viewed state), load(query) -> one file's diff for `path=…&old=…` (enables "Load diff") }
+ */
 export async function mountDiff(root, diff, opts = {}) {
   const el = root.querySelector('.diff');
   if (!el) return;
@@ -185,8 +204,28 @@ export async function mountDiff(root, diff, opts = {}) {
   const renderBody = (i) => {
     const body = el.querySelector(`[data-body="${i}"]`);
     if (!body) return;
-    body.innerHTML = fileBody(files[i], mode);
     rendered.add(i);
+    body._more?.disconnect();
+    const note = fileNote(files[i], i, !!opts.load);
+    if (note) { body.innerHTML = note; return; }
+    // Rows go in a chunk at a time as the reader scrolls, so a 40,000-line file stays smooth.
+    const gen = rowsOf(files[i], mode);
+    // Re-rendering (e.g. switching split/unified) keeps as many rows as were already shown.
+    const [first, done] = take(gen, Math.max(CHUNK, body._shown || 0));
+    body._shown = Math.max(CHUNK, body._shown || 0);
+    body.innerHTML = `${tableOpen(mode)}${first}</tbody></table>${done ? '' : '<div class="dmore"><span class="spin"></span></div>'}`;
+    if (done) return;
+    const tbody = body.querySelector('tbody'), more = body.querySelector('.dmore');
+    const ob = new IntersectionObserver((es) => {
+      if (!es.some((e) => e.isIntersecting)) return;
+      const [rows, fin] = take(gen, CHUNK);
+      tbody.insertAdjacentHTML('beforeend', rows);
+      body._shown += CHUNK;
+      if (fin) { ob.disconnect(); more.remove(); return; }
+      ob.unobserve(more); ob.observe(more); // fire again if it's still on screen
+    }, { rootMargin: '1500px 0px' });
+    ob.observe(more);
+    body._more = ob;
   };
   // Render the first screenful now, the rest as they approach the viewport.
   let budget = 1500;
@@ -199,8 +238,21 @@ export async function mountDiff(root, diff, opts = {}) {
   }, { rootMargin: '1200px 0px' });
   el.querySelectorAll('[data-body]').forEach((b) => { if (!rendered.has(+b.dataset.body)) io.observe(b); });
 
-  el.addEventListener('click', (e) => {
+  el.addEventListener('click', async (e) => {
     const t = e.target;
+    const lb = t.closest('[data-load]');
+    if (lb && opts.load) {
+      const i = +lb.dataset.load, f = files[i];
+      lb.disabled = true; lb.textContent = 'Loading…';
+      try {
+        const path = f.status === 'deleted' ? f.old_path : f.new_path;
+        const old = f.old_path && f.old_path !== path ? `&old=${encodeURIComponent(f.old_path)}` : '';
+        const one = await opts.load(`path=${encodeURIComponent(path)}${old}`);
+        if (one && !one.too_large) files[i] = one; else f.load_failed = true;
+      } catch { f.load_failed = true; }
+      renderBody(i);
+      return;
+    }
     const tog = t.closest('.dtoggle');
     if (tog) {
       const sec = tog.closest('.dfile');

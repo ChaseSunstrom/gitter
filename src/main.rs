@@ -49,6 +49,7 @@ usage:
   gitter restore <file> [--force]
                                restore a backup into GITTER_DATA (- for stdin; --force moves existing data aside)
   gitter doctor [--fsck]       check git, storage, database and repositories
+  gitter bench [--check]       time the main pages on a seeded throwaway instance (--check enforces budgets)
   gitter --version
 
 Settings come from environment variables; see the README.";
@@ -89,6 +90,8 @@ fn main() -> anyhow::Result<()> {
             println!("All good.");
             Ok(())
         }
+        "bench" => tokio::runtime::Runtime::new()?
+            .block_on(gitter::bench::run(args.iter().any(|a| a == "--check"))),
         "--version" | "-V" | "version" => {
             println!("gitter {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -132,6 +135,8 @@ async fn serve(cfg: gitter::Config) -> anyhow::Result<()> {
         );
         *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
     }
+    let git = st.git.clone();
+    tokio::spawn(async move { git.sweep().await });
     let app = gitter::router(st);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(

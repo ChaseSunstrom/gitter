@@ -19,6 +19,10 @@ pub const DIFF_CAP: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Git {
     pub root: PathBuf,
+    /// Results that never change for a given commit (last commits, blame...).
+    pub memo: Arc<Memo>,
+    /// Repos with maintenance running; `true` means another push arrived meanwhile.
+    pending: Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>>,
     /// Short git calls behind API requests.
     sem: Arc<Semaphore>,
     /// Long transfers (clone, fetch, push, archives), kept apart so slow clients can't starve the UI.
@@ -45,6 +49,8 @@ impl Git {
     pub fn new(root: PathBuf, home: PathBuf, max_procs: usize) -> Git {
         Git {
             root,
+            memo: Arc::default(),
+            pending: Arc::default(),
             sem: Arc::new(Semaphore::new(max_procs)),
             stream_sem: Arc::new(Semaphore::new(max_procs / 2)),
             home,
@@ -69,6 +75,8 @@ impl Git {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_NO_REPLACE_OBJECTS", "1")
+            // User paths are paths, never globs or :(magic).
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .args([
                 "-c",
                 "core.hooksPath=/dev/null",
@@ -240,6 +248,61 @@ impl Git {
         }
         drop(_permit);
         self.configure(dst, max_push).await
+    }
+
+    // ---------- maintenance ----------
+
+    /// Refresh the commit-graph with changed-path Bloom filters, which makes
+    /// history, path-limited logs and "last commit" lookups fast on big repos.
+    /// Incremental (`--split`), so it stays cheap after each push.
+    pub async fn maintain(&self, repo: &Path) -> R<()> {
+        let args = ["commit-graph", "write", "--reachable", "--changed-paths", "--split", "--no-progress"];
+        let o = self.run_timeout(repo, &args, None, &[], Duration::from_secs(600)).await?;
+        if o.code != 0 {
+            return Err(AppError::internal(String::from_utf8_lossy(&o.stderr)));
+        }
+        Ok(())
+    }
+
+    /// `maintain` in the background, at most one run per repo at a time; pushes
+    /// that land during a run get one more run afterwards.
+    pub fn maintain_soon(&self, repo: PathBuf) {
+        {
+            let mut m = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(again) = m.get_mut(&repo) {
+                *again = true;
+                return;
+            }
+            m.insert(repo.clone(), false);
+        }
+        let g = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = g.maintain(&repo).await {
+                    eprintln!("maintenance of {}: {}", repo.display(), e.msg);
+                }
+                let mut m = g.pending.lock().unwrap_or_else(|p| p.into_inner());
+                if m.get(&repo) == Some(&true) {
+                    m.insert(repo.clone(), false);
+                } else {
+                    m.remove(&repo);
+                    break;
+                }
+            }
+        });
+    }
+
+    /// At boot: give every repository without a commit-graph one, one repo at a time.
+    pub async fn sweep(&self) {
+        let Ok(rd) = std::fs::read_dir(&self.root) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let info = p.join("objects/info");
+            let has = info.join("commit-graph").exists() || info.join("commit-graphs").exists();
+            if p.extension().is_some_and(|x| x == "git") && !has && p.join("refs").is_dir() {
+                let _ = self.maintain(&p).await;
+            }
+        }
     }
 
     // ---------- reading ----------
@@ -416,7 +479,7 @@ impl Git {
         repo: &Path,
         from: Option<&str>,
         to: &str,
-        path: Option<&str>,
+        paths: &[&str],
     ) -> R<(String, bool)> {
         let from = from.unwrap_or(EMPTY_TREE);
         let mut args = vec![
@@ -429,9 +492,7 @@ impl Git {
             to,
             "--",
         ];
-        if let Some(p) = path.filter(|p| !p.is_empty()) {
-            args.push(p);
-        }
+        args.extend(paths.iter().filter(|p| !p.is_empty()));
         let (out, cut) = self.run_capped(repo, &args, DIFF_CAP).await?;
         Ok((String::from_utf8_lossy(&out).into_owned(), cut))
     }
@@ -647,6 +708,39 @@ impl Git {
     }
 }
 
+/// A bounded cache of JSON-encoded results whose keys pin everything they depend
+/// on (repo id + commit sha + path), so entries never go stale.
+#[derive(Default)]
+pub struct Memo(std::sync::Mutex<(std::collections::HashMap<String, Arc<Vec<u8>>>, usize)>);
+
+// ponytail: drops everything when full instead of LRU; fine while hits dwarf refills.
+const MEMO_CAP: usize = 64 << 20;
+
+impl Memo {
+    pub fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let hit = self.0.lock().unwrap_or_else(|p| p.into_inner()).0.get(key).cloned()?;
+        serde_json::from_slice(&hit).ok()
+    }
+
+    pub fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+    }
+
+    pub fn put<T: Serialize>(&self, key: String, v: &T) {
+        let Ok(bytes) = serde_json::to_vec(v) else { return };
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if m.1 + bytes.len() + key.len() > MEMO_CAP {
+            m.0.clear();
+            m.1 = 0;
+        }
+        let (klen, size) = (key.len(), bytes.len() + key.len());
+        if let Some(old) = m.0.insert(key, Arc::new(bytes)) {
+            m.1 -= old.len() + klen;
+        }
+        m.1 += size;
+    }
+}
+
 fn tempfile_path(repo: &Path) -> PathBuf {
     let mut b = [0u8; 8];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
@@ -689,7 +783,7 @@ pub struct LogQuery<'a> {
 /// with NUL (`-z`), which git never allows inside a commit message.
 const COMMIT_FMT: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%B";
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Commit {
     pub sha: String,
     pub parents: Vec<String>,
@@ -888,6 +982,37 @@ pub fn parse_blame(out: &str) -> Vec<BlameChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memo_round_trips_and_stays_bounded() {
+        let m = Memo::default();
+        m.put("a".into(), &vec![1, 2, 3]);
+        assert_eq!(m.get::<Vec<i32>>("a"), Some(vec![1, 2, 3]));
+        assert_eq!(m.get::<Vec<i32>>("b"), None);
+        let big = "x".repeat(MEMO_CAP / 2);
+        m.put("b".into(), &big);
+        m.put("c".into(), &big);
+        assert!(m.0.lock().unwrap().1 <= MEMO_CAP);
+        assert_eq!(m.get::<String>("c").as_deref(), Some(big.as_str()));
+    }
+
+    #[tokio::test]
+    async fn maintenance_writes_a_commit_graph_with_bloom_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Git::new(dir.path().join("r"), dir.path().to_path_buf(), 4);
+        let repo = g.root.join("1.git");
+        std::fs::create_dir_all(&g.root).unwrap();
+        g.init_bare(&repo, "main", 1 << 20).await.unwrap();
+        let c = g.commit_tree(&repo, EMPTY_TREE, &[], "init", ("a", "a@b.c")).await.unwrap();
+        g.update_ref(&repo, "refs/heads/main", &c, None).await.unwrap();
+        g.sweep().await;
+        let chain = repo.join("objects/info/commit-graphs/commit-graph-chain");
+        let layer = std::fs::read_to_string(&chain).unwrap();
+        let file = repo.join(format!("objects/info/commit-graphs/graph-{}.graph", layer.trim()));
+        let bytes = std::fs::read(file).unwrap();
+        assert!(bytes.windows(4).any(|w| w == b"BIDX"), "changed-path Bloom filters present");
+        assert_eq!(g.ok(&repo, &["commit-graph", "verify"]).await.map(|_| ()).ok(), Some(()));
+    }
 
     #[tokio::test]
     async fn capped_reads_keep_whole_records() {

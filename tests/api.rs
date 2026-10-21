@@ -697,3 +697,32 @@ async fn merge_rolls_back_when_it_cannot_be_recorded() {
     let (_, issue) = app.req(&alice, "GET", &format!("/api/repos/alice/m/issues/{n}"), None).await;
     assert_eq!(issue["issue"]["state"], "open");
 }
+
+#[tokio::test]
+async fn single_file_diff_loads_a_file_too_big_for_the_full_view() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "big", "readme": true })))
+        .await;
+    let content: String = (0..5000).map(|i| format!("row {i}\n")).collect();
+    let (s, w) = app
+        .req(&alice, "POST", "/api/repos/alice/big/contents", Some(json!({
+            "branch": "main", "message": "Add table", "changes": [{ "path": "t.csv", "content": content }]
+        })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{w}");
+    let sha = w["sha"].as_str().expect("commit sha").to_string();
+    let (_, full) = app.req(&alice, "GET", &format!("/api/repos/alice/big/commit/{sha}"), None).await;
+    assert_eq!(full["diff"]["files"][0]["too_large"], true);
+    let (s, one) = app
+        .req(&alice, "GET", &format!("/api/repos/alice/big/commit/{sha}?path=t.csv"), None)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let f = &one["diff"]["files"][0];
+    assert_eq!(f["too_large"], false);
+    assert_eq!(f["hunks"][0]["lines"].as_array().unwrap().len(), 5000);
+    let (s, _) = app
+        .req(&alice, "GET", &format!("/api/repos/alice/big/commit/{sha}?path=../etc"), None)
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}

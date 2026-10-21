@@ -77,6 +77,7 @@ none: internal robustness, no user-visible behaviour or settings change
 - 2026-10-21T20:54:19Z re-based: what other work changed while it was paused isn't its own change
 - 2026-10-21T20:54:19Z focused
 - 2026-10-21T20:55:51Z done
+- 2026-10-21T20:55:51Z committed e8fd6f2 (10 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

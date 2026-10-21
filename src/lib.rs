@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod bench;
 pub mod db;
 pub mod diff;
 pub mod error;
