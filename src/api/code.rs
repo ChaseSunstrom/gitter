@@ -360,7 +360,7 @@ pub async fn raw(
             "private, max-age=60"
         }),
     );
-    if r.private {
+    if r.private || r.hidden {
         h.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
@@ -392,6 +392,7 @@ pub async fn split_rev_path(st: &AppState, r: &Repo, rest: &str) -> R<(String, S
 pub async fn archive(
     State(st): State<AppState>,
     Viewer(v): Viewer,
+    ip: super::ClientIp,
     Path((o, n, spec)): Path<(String, String, String)>,
 ) -> R<Response> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
@@ -404,6 +405,8 @@ pub async fn archive(
     };
     let sha = resolve_rev(&st, &r, Some(rev)).await?;
     let label = format!("{}-{}", r.name, rev.replace('/', "-"));
+    let slot = crate::smart_http::Slot::take(&st, &ip.0)
+        .ok_or_else(|| AppError::slow_down("Too many downloads running from your network. Try again when one finishes.", 10))?;
     let permit = st.git.permit_stream().await?;
     let mut cmd = st.git.command(Some(&r.path));
     cmd.args([
@@ -416,7 +419,7 @@ pub async fn archive(
     let mut child = cmd.spawn().map_err(AppError::internal)?;
     let stdout = child.stdout.take().expect("stdout");
     tokio::spawn(async move {
-        let _p = permit;
+        let (_p, _slot) = (permit, slot);
         if tokio::time::timeout(Duration::from_secs(300), child.wait())
             .await
             .is_err()
@@ -873,6 +876,11 @@ pub async fn write_contents(
             ));
         }
         decoded.push((p.to_string(), Some(bytes)));
+    }
+    if let Some(left) = crate::repo::storage_left(&st, r.owner_id).await?
+        && total as u64 > left
+    {
+        return Err(AppError::bad("This account is out of storage. Delete something, or ask the site admin for more space."));
     }
 
     let head = st

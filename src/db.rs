@@ -166,6 +166,42 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tokens ADD COLUMN expires_at INTEGER;
     CREATE INDEX tokens_repo ON tokens(repo_id);
     "#,
+    // v5: abuse protection: storage use, invite links, reports, moderator-hidden content
+    r#"
+    ALTER TABLE repos ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE repos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE issues ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE comments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE invites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code_hash TEXT NOT NULL UNIQUE,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        note TEXT NOT NULL DEFAULT '',
+        max_uses INTEGER NOT NULL DEFAULT 1,
+        uses INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER,
+        created_at INTEGER NOT NULL
+    );
+    -- One target column per kind, so a report disappears with what it reports
+    -- (and can never land on a later row that reuses the id).
+    CREATE TABLE reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reporter_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        kind TEXT NOT NULL,
+        repo_id INTEGER REFERENCES repos(id) ON DELETE CASCADE,
+        issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
+        comment_id INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        details TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'open',
+        resolution TEXT NOT NULL DEFAULT '',
+        resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        resolved_at INTEGER
+    );
+    CREATE INDEX reports_status ON reports(status, id);
+    "#,
 ];
 
 impl Db {

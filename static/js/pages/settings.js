@@ -1,5 +1,5 @@
 // Account settings: profile, password, access tokens, appearance.
-import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName } from '../lib.js';
+import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName, bytes } from '../lib.js';
 import { icon } from '../icons.js';
 import { refresh, renderTopbar, setTheme, getTheme, SKINS, getSkin, setSkin } from '../main.js';
 
@@ -10,9 +10,11 @@ function nav(tab) {
     html`<a href="/settings${k === 'profile' ? '' : '/' + k}" class="${tab === k ? 'on' : ''}">${icon(ic, 'sm')}${label}</a>`)}</nav>`;
 }
 
-function profileTab(p) {
+function profileTab(p, storage) {
+  const pct = storage?.quota ? Math.min(100, (storage.used / storage.quota) * 100) : 0;
   return html`<form id="profile-form" class="stack settings-form" novalidate>
     <h2>Public profile</h2>
+    ${storage ? html`<div class="small muted">Storage: <b>${bytes(storage.used)}</b>${storage.quota ? html` of ${bytes(storage.quota)} used <span class="disk-bar small-bar" role="img" aria-label="Storage used"><span style="width:${pct}%"></span></span>` : ' used'}</div>` : ''}
     <div class="field"><label for="display_name">Name</label><input class="input" id="display_name" name="display_name" value="${p.display_name}" maxlength="80" autocomplete="name">
       <span class="hint">Shown on your profile and on commits you make on the web.</span></div>
     <div class="field"><label for="email">Email</label><input class="input" id="email" name="email" type="email" value="${p.email}" maxlength="254" autocomplete="email">
@@ -129,7 +131,7 @@ export default async function (ctx) {
   if (!state.me) return { redirect: '/login?next=' + encodeURIComponent(ctx.path) };
   const tab = TABS.some(([k]) => k === ctx.params.tab) ? ctx.params.tab : 'profile';
   let inner;
-  if (tab === 'profile') inner = profileTab((await get('/me', { fresh: true })).profile);
+  if (tab === 'profile') { const m = await get('/me', { fresh: true }); inner = profileTab(m.profile, m.storage); }
   else if (tab === 'tokens') inner = tokensTab((await get('/me/tokens', { fresh: true })).tokens);
   else if (tab === 'account') inner = accountTab();
   else if (tab === 'security') {

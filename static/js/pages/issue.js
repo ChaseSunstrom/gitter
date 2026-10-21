@@ -1,5 +1,5 @@
 // A single issue or pull request: conversation, commits and changed files.
-import { html, raw, state, get, send, action, timeEl, avatar, short, plural, $, popover, closePop, confirmDialog, toast, toastErr, encPath } from '../lib.js';
+import { html, raw, state, get, send, action, timeEl, avatar, short, plural, $, popover, closePop, confirmDialog, toast, toastErr, encPath, reportDialog } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader, placeTabBar } from '../repohead.js';
 import { renderMarkdown, preloadLangs } from '../md.js';
@@ -215,7 +215,8 @@ function conversation(meta, data, pd, mdCtx) {
       bodyHtml: issue.body.trim() ? raw(renderMarkdown(issue.body, mdCtx)) : html`<p class="muted"><em>No description provided.</em></p>` }),
     ...data.comments.map((c) => c.kind === 'comment'
       ? card({ id: `comment-${c.id}`, author: c.author, time: c.created_at, edited: c.updated_at > c.created_at + 5, tag: c.author === issue.author ? 'Author' : '',
-        bodyHtml: raw(renderMarkdown(c.body, mdCtx)) })
+        bodyHtml: c.hidden && !c.body ? html`<p class="muted"><em>A moderator hid this comment.</em></p>`
+          : html`${c.hidden ? html`<p class="mod-note">${icon('eye', 'sm')} A moderator hid this comment; only you and admins can read it.</p>` : ''}${raw(renderMarkdown(c.body, mdCtx))}` })
       : eventRow(c, meta, base)),
   ];
   const mayToggle = data.can_edit && issue.state !== 'merged';
@@ -285,7 +286,8 @@ function mountConversation(el, meta, api, data, mdCtx) {
       <button class="menu-item" data-act="link">${icon('link', 'sm')} Copy link</button>
       ${data.signed_in ? html`<button class="menu-item" data-act="quote">${icon('comment', 'sm')} Quote reply</button>` : ''}
       ${c?.can_edit ? html`<div class="menu-sep"></div><button class="menu-item" data-act="edit">${icon('edit', 'sm')} Edit</button>` : ''}
-      ${c?.can_edit && !isBody ? html`<button class="menu-item danger-item" data-act="delete">${icon('trash', 'sm')} Delete</button>` : ''}`,
+      ${c?.can_edit && !isBody ? html`<button class="menu-item danger-item" data-act="delete">${icon('trash', 'sm')} Delete</button>` : ''}
+      ${data.signed_in && (isBody ? issue.author : c?.author) !== state.me?.username ? html`<div class="menu-sep"></div><button class="menu-item" data-act="report">${icon('flag', 'sm')} Report</button>` : ''}`,
     {
       align: 'right', width: 200,
       onMount(p) {
@@ -304,6 +306,7 @@ function mountConversation(el, meta, api, data, mdCtx) {
             ta.scrollIntoView({ block: 'center', behavior: 'smooth' });
           }
           if (act === 'edit') startEdit(el, api, issue, id, cid, c, mdCtx);
+          if (act === 'report') reportDialog(isBody ? { kind: 'issue', owner: meta.owner, repo: meta.name, number: issue.number } : { kind: 'comment', owner: meta.owner, repo: meta.name, comment: cid }, isBody ? (issue.is_pr ? 'pull request' : 'issue') : 'comment');
           if (act === 'delete') {
             const ok = await confirmDialog({ title: 'Delete this comment?', text: 'This can’t be undone.', ok: 'Delete', danger: true });
             if (!ok) return;

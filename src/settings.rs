@@ -19,20 +19,43 @@ pub struct Settings {
     pub max_push_mb: u64,
     /// A short notice shown to every visitor (maintenance, rules). Empty hides it.
     pub announcement: String,
+    /// Disk space each account's repositories may use, in MB (0 = no limit; admins have none).
+    #[serde(default = "default_storage")]
+    pub max_storage_mb: u64,
+    /// API requests per minute from one address (0 = no limit).
+    #[serde(default = "default_api_rate")]
+    pub api_rate_per_min: u32,
+    /// Changes (posts, edits, pushes) per minute from one account (0 = no limit).
+    #[serde(default = "default_write_rate")]
+    pub write_rate_per_min: u32,
+}
+
+fn default_storage() -> u64 {
+    2048
+}
+fn default_api_rate() -> u32 {
+    1200
+}
+fn default_write_rate() -> u32 {
+    120
 }
 
 impl Settings {
     pub fn from_config(cfg: &Config) -> Settings {
         Settings {
             instance_name: "Gitter".into(),
-            signup: if cfg.signup == SignupMode::Closed {
-                "closed".into()
-            } else {
-                "open".into()
-            },
+            signup: match cfg.signup {
+                SignupMode::Open => "open",
+                SignupMode::Invite => "invite",
+                SignupMode::Closed => "closed",
+            }
+            .into(),
             max_repos_per_user: cfg.max_repos_per_user,
             max_push_mb: cfg.max_push_bytes / (1024 * 1024),
             announcement: String::new(),
+            max_storage_mb: default_storage(),
+            api_rate_per_min: default_api_rate(),
+            write_rate_per_min: default_write_rate(),
         }
     }
 
@@ -48,8 +71,11 @@ impl Settings {
         if self.instance_name.trim().is_empty() || self.instance_name.chars().count() > 40 {
             return Err(AppError::bad("The instance name is 1 to 40 characters"));
         }
-        if !matches!(self.signup.as_str(), "open" | "closed") {
-            return Err(AppError::bad("Sign-up must be open or closed"));
+        if !matches!(self.signup.as_str(), "open" | "invite" | "closed") {
+            return Err(AppError::bad("Sign-up must be open, invite-only or closed"));
+        }
+        if self.max_storage_mb > 10_000_000 {
+            return Err(AppError::bad("Storage per account must be under 10 TB (0 means no limit)"));
         }
         if !(1..=100_000).contains(&self.max_repos_per_user) {
             return Err(AppError::bad(

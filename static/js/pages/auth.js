@@ -56,7 +56,12 @@ function signupView(ctx) {
     return card(html`<h1>Finish setting up Gitter</h1><p class="muted">This server has no accounts yet. To create the admin account, open the setup link printed in the server log
       (with Docker: <code>docker compose logs gitter</code>).</p>`);
   }
-  if (!state.signup && !state.instance?.needs_setup) {
+  const invite = ctx.query.get('invite') || '';
+  if (state.signupMode === 'invite' && !invite && !state.instance?.needs_setup) {
+    return card(html`<h1>Sign-up is by invitation</h1><p class="muted">Ask the person who runs this Gitter for an invite link.</p>
+      <a class="btn lg" href="/login${ctx.url.search}">Sign in instead</a>`);
+  }
+  if (!state.signup && !invite && !state.instance?.needs_setup) {
     return card(html`<h1>Sign-ups are closed</h1><p class="muted">This Gitter instance isn't accepting new accounts right now. Ask the person who runs it for an invite.</p>
       <a class="btn lg" href="/login${ctx.url.search}">Sign in instead</a>`);
   }
@@ -145,7 +150,7 @@ export default async function (ctx) {
           if (ue) { user.focus(); return showErr(ue); }
           if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(f.email.trim())) return showErr('Enter a valid email address');
           if (f.password.length < 8) { pw.focus(); return showErr('Use at least 8 characters for your password'); }
-          try { res = await send('POST', '/auth/signup', { username: f.username.trim(), email: f.email.trim(), password: f.password, setup: ctx.query.get('setup') || '' }); }
+          try { res = await send('POST', '/auth/signup', { username: f.username.trim(), email: f.email.trim(), password: f.password, setup: ctx.query.get('setup') || '', invite: ctx.query.get('invite') || '' }); }
           catch (e) { return showErr(e.message); }
         } else {
           if (!f.login.trim() || !f.password) return showErr('Enter your username and password');

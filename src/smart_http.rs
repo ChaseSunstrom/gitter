@@ -18,6 +18,47 @@ use crate::repo::{Repo, record_event, touch};
 
 const FETCH_BODY_CAP: u64 = 64 * 1024 * 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// A client that sends nothing for this long while uploading is dropped (slowloris).
+const RECV_IDLE: Duration = Duration::from_secs(60);
+/// Clones/fetches/pushes running at once from one address, and started per minute.
+const TRANSFERS_PER_IP: u32 = 8;
+const TRANSFER_STARTS_PER_MIN: u32 = 120;
+
+/// One running transfer for an address; frees its slot when dropped.
+pub struct Slot(AppState, String);
+
+impl Slot {
+    pub fn take(st: &AppState, ip: &str) -> Option<Slot> {
+        let ip = &crate::auth::ip_bucket(ip);
+        let mut m = st.transfers.lock().unwrap_or_else(|p| p.into_inner());
+        let n = m.entry(ip.to_string()).or_insert(0);
+        if *n >= TRANSFERS_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(Slot(st.clone(), ip.to_string()))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut m = self.0.transfers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = m.get_mut(&self.1) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
+}
+
+fn too_many(msg: &str, wait: i64) -> Response {
+    let mut r = plain(StatusCode::TOO_MANY_REQUESTS, msg);
+    if let Ok(v) = HeaderValue::from_str(&wait.max(1).to_string()) {
+        r.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    r
+}
 
 fn plain(status: StatusCode, msg: &str) -> Response {
     (
@@ -104,6 +145,13 @@ async fn serve_inner(
     req: Request,
 ) -> Result<Response, AppError> {
     let headers = req.headers().clone();
+    let ip = crate::api::client_ip(&st, &headers, req.extensions());
+    if let Err(wait) = st.limiter.check(&format!("git:{}", crate::auth::ip_bucket(&ip)), TRANSFER_STARTS_PER_MIN, 60) {
+        return Ok(too_many("Too many git requests from your network. Try again shortly.", wait));
+    }
+    let Some(slot) = Slot::take(&st, &ip) else {
+        return Ok(too_many("Too many git transfers running from your network. Try again when one finishes.", 10));
+    };
     let user = user_by_basic(&st, &headers).await?;
     let repo = match Repo::load(&st, user.as_ref(), &owner, &name).await {
         Ok(r) => r,
@@ -135,6 +183,16 @@ async fn serve_inner(
     }
 
     let is_post = req.method() == Method::POST;
+    // A push is a change like any other for the per-account rate limit.
+    let rate = st.settings.get().write_rate_per_min;
+    if push
+        && is_post
+        && rate > 0
+        && let Some(u) = user.as_ref().filter(|u| !u.is_admin)
+        && let Err(wait) = st.limiter.check(&format!("write:{}", u.id), rate, 60)
+    {
+        return Ok(too_many("You're pushing very often. Wait a moment and try again.", wait));
+    }
     let before = if push && is_post {
         Some(ref_map(&st, &repo).await?)
     } else {
@@ -142,7 +200,19 @@ async fn serve_inner(
     };
 
     let permit = st.git.permit_stream().await?;
-    let max_push = st.settings.get().max_push_bytes();
+    let mut max_push = st.settings.get().max_push_bytes();
+    if push {
+        // git itself refuses a pack bigger than what the owner has left, so nothing is half-written.
+        if let Some(left) = crate::repo::storage_left(&st, repo.owner_id).await? {
+            if left == 0 {
+                return Ok(plain(
+                    StatusCode::FORBIDDEN,
+                    "This account is out of storage. Delete something, or ask the site admin for more space.",
+                ));
+            }
+            max_push = max_push.min(left);
+        }
+    }
     let mut cmd = st.git.command(None);
     // The current push limit overrides whatever was stored when the repo was created.
     cmd.arg("-c")
@@ -180,7 +250,11 @@ async fn serve_inner(
     let mut body_stream = req.into_body().into_data_stream();
     let feeder = tokio::spawn(async move {
         let mut total: u64 = 0;
-        while let Some(chunk) = body_stream.next().await {
+        loop {
+            let Ok(next) = tokio::time::timeout(RECV_IDLE, body_stream.next()).await else {
+                return false;
+            };
+            let Some(chunk) = next else { break };
             let Ok(chunk) = chunk else { return false };
             total += chunk.len() as u64;
             if total > cap || stdin.write_all(&chunk).await.is_err() {
@@ -224,6 +298,7 @@ async fn serve_inner(
     let st2 = st.clone();
     tokio::spawn(async move {
         let _permit = permit;
+        let _slot = slot;
         // A client that stops reading for a minute (or disconnects) aborts the transfer.
         let send = |data: Result<Vec<u8>, std::io::Error>| {
             let tx = tx.clone();

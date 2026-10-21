@@ -11,6 +11,8 @@ pub struct AppError {
     pub msg: String,
     /// A machine-readable reason the web app acts on (e.g. "reauth").
     pub code: Option<&'static str>,
+    /// Seconds until a rate limit lifts (sent as Retry-After).
+    pub retry_after: Option<i64>,
 }
 
 pub type R<T> = Result<T, AppError>;
@@ -21,7 +23,14 @@ impl AppError {
             status,
             msg: msg.into(),
             code: None,
+            retry_after: None,
         }
+    }
+    /// 429 with a Retry-After header.
+    pub fn slow_down(msg: impl Into<String>, retry_after: i64) -> Self {
+        let mut e = Self::new(StatusCode::TOO_MANY_REQUESTS, msg).with_code("rate_limited");
+        e.retry_after = Some(retry_after.max(1));
+        e
     }
     pub fn with_code(mut self, code: &'static str) -> Self {
         self.code = Some(code);
@@ -61,7 +70,13 @@ impl IntoResponse for AppError {
             Some(c) => serde_json::json!({ "error": self.msg, "code": c }),
             None => serde_json::json!({ "error": self.msg }),
         };
-        (self.status, Json(body)).into_response()
+        let mut r = (self.status, Json(body)).into_response();
+        if let Some(s) = self.retry_after
+            && let Ok(v) = axum::http::HeaderValue::from_str(&s.to_string())
+        {
+            r.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+        r
     }
 }
 

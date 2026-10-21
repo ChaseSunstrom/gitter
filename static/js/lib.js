@@ -284,7 +284,8 @@ const AUDIT = {
   repo_deleted: 'Deleted a repository', repo_visibility: 'Changed who can see a repository',
   admin_granted: 'Made someone an admin', admin_revoked: 'Removed someone’s admin rights',
   user_suspended: 'Suspended an account', user_unsuspended: 'Restored an account', user_deleted: 'Deleted an account',
-  settings_changed: 'Changed site settings',
+  settings_changed: 'Changed site settings', invite_created: 'Created an invite link',
+  moderation_dismiss: 'Dismissed a report', moderation_hide: 'Hid reported content', moderation_unhide: 'Unhid content', moderation_suspend: 'Suspended a reported account',
 };
 export const auditLabel = (a) => AUDIT[a] || String(a).replace(/_/g, ' ');
 /** "Firefox on Linux" from a user agent string. */
@@ -292,4 +293,28 @@ export function deviceName(ua) {
   const b = [['Firefox', 'Firefox'], ['Edg', 'Edge'], ['Chrome', 'Chrome'], ['Safari', 'Safari'], ['git', 'git'], ['curl', 'curl']].find(([k]) => ua.includes(k));
   const o = [['Windows', 'Windows'], ['Mac OS', 'macOS'], ['Android', 'Android'], ['iPhone', 'iPhone'], ['Linux', 'Linux']].find(([k]) => ua.includes(k));
   return `${b ? b[1] : 'Unknown browser'}${o ? ' on ' + o[1] : ''}`;
+}
+
+// ---------- reporting ----------
+const REASONS = [['spam', 'Spam or advertising'], ['abuse', 'Harassment or abuse'], ['illegal', 'Illegal content'], ['malware', 'Malware or phishing'], ['impersonation', 'Impersonation'], ['other', 'Something else']];
+/** Ask why, then report `target` ({ kind, owner, repo, number, comment, user }) to the site's moderators. */
+export function reportDialog(target, what) {
+  return modal({
+    title: `Report ${what}`,
+    body: html`<p class="muted small">Reports go to this site's moderators. They won't see who you are unless they're admins.</p>
+      <div class="choice report-reasons">${REASONS.map(([v, label], i) => html`<label><input type="radio" name="reason" value="${v}" ${i === 0 ? 'checked' : ''}><span>${label}</span></label>`)}</div>
+      <div class="field"><label for="rp-details">Anything moderators should know? <span class="muted">(optional)</span></label><textarea class="textarea" id="rp-details" maxlength="2000" rows="3"></textarea></div>`,
+    foot: html`<button class="btn" data-close>Cancel</button><button class="btn danger" data-ok>Send report</button>`,
+    onMount(el, close) {
+      const ok = el.querySelector('[data-ok]');
+      ok.addEventListener('click', async () => {
+        busy(ok, true);
+        try {
+          await send('POST', '/reports', { ...target, reason: el.querySelector('input[name=reason]:checked').value, details: el.querySelector('#rp-details').value });
+          toast('Thanks. A moderator will take a look.');
+          close(true);
+        } catch (e) { toastErr(e); } finally { busy(ok, false); }
+      });
+    },
+  });
 }

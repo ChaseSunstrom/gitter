@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{J, like, ok};
-use crate::auth::{Authed, Viewer};
+use crate::auth::{Authed, User, Viewer};
 use crate::db::now;
 use crate::error::{AppError, R};
 use crate::repo::{Repo, record_event, touch};
@@ -37,11 +37,13 @@ pub struct IssueRow {
     labels: Vec<Label>,
     head: Option<String>,
     base: Option<String>,
+    /// Hidden by a moderator: shown only to its author and admins.
+    hidden: bool,
 }
 
 const ISSUE_SELECT: &str = "SELECT i.id, i.number, i.title, i.body, i.state, i.is_pr, u.username, i.author_id, i.created_at,
     i.updated_at, i.closed_at, (SELECT count(*) FROM comments c WHERE c.issue_id = i.id AND c.kind = 'comment'),
-    p.head_branch, p.base_branch
+    p.head_branch, p.base_branch, i.hidden
     FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id";
 
 fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
@@ -61,6 +63,7 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
         labels: vec![],
         head: r.get(12)?,
         base: r.get(13)?,
+        hidden: r.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -112,12 +115,17 @@ pub async fn list(
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let page = super::page(q.page);
     let rid = r.id;
+    let (vid, admin) = (v.as_ref().map(|u| u.id).unwrap_or(-1), v.as_ref().is_some_and(|u| u.is_admin));
     let out = st
         .db
         .call(move |c| {
             let is_pr = (q.kind.as_deref() == Some("pr")) as i64;
             let mut cond = String::from("i.repo_id = ? AND i.is_pr = ?");
             let mut params: Vec<Value> = vec![Value::Integer(rid), Value::Integer(is_pr)];
+            if !admin {
+                cond.push_str(" AND (i.hidden = 0 OR i.author_id = ?)");
+                params.push(Value::Integer(vid));
+            }
             match q.state.as_deref() {
                 Some("closed") => cond.push_str(" AND i.state != 'open'"),
                 Some("all") => {}
@@ -252,9 +260,12 @@ pub async fn create(
     Ok(Json(json!({ "number": num })))
 }
 
-async fn load_issue(st: &AppState, r: &Repo, number: i64) -> R<IssueRow> {
+/// An issue or PR by number, as `viewer` may see it (moderator-hidden ones only
+/// for their author and admins).
+async fn load_issue(st: &AppState, r: &Repo, number: i64, viewer: Option<&User>) -> R<IssueRow> {
     let rid = r.id;
-    st.db
+    let (vid, admin) = (viewer.map(|u| u.id).unwrap_or(-1), viewer.is_some_and(|u| u.is_admin));
+    let i = st.db
         .call(move |c| {
             let mut i = c.query_row(
                 &format!("{ISSUE_SELECT} WHERE i.repo_id = ?1 AND i.number = ?2"),
@@ -264,7 +275,11 @@ async fn load_issue(st: &AppState, r: &Repo, number: i64) -> R<IssueRow> {
             i.labels = labels_for(c, &[i.id])?.remove(&i.id).unwrap_or_default();
             Ok(i)
         })
-        .await
+        .await?;
+    if i.hidden && !(admin || i.author_id == vid) {
+        return Err(AppError::not_found());
+    }
+    Ok(i)
 }
 
 pub async fn show(
@@ -273,7 +288,7 @@ pub async fn show(
     Path((o, n, num)): Path<(String, String, i64)>,
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
-    let mut issue = load_issue(&st, &r, num).await?;
+    let mut issue = load_issue(&st, &r, num, v.as_ref()).await?;
     let pr = if issue.is_pr {
         Some(pull_status(&st, &r, &mut issue).await?)
     } else {
@@ -281,20 +296,24 @@ pub async fn show(
     };
     let (iid, rid) = (issue.id, r.id);
     let vid = v.as_ref().map(|u| u.id).unwrap_or(-1);
+    let viewer_admin = v.as_ref().is_some_and(|u| u.is_admin);
     let can_write = r.can_write;
     let (comments, all_labels, participants) = st
         .db
         .call(move |c| {
             let mut s = c.prepare(
-                "SELECT c.id, u.username, c.author_id, c.kind, c.body, c.created_at, c.updated_at FROM comments c
+                "SELECT c.id, u.username, c.author_id, c.kind, c.body, c.created_at, c.updated_at, c.hidden FROM comments c
                  JOIN users u ON u.id = c.author_id WHERE c.issue_id = ?1 ORDER BY c.id",
             )?;
             let comments: Vec<serde_json::Value> = s
                 .query_map([iid], |r| {
                     let author_id: i64 = r.get(2)?;
+                    let hidden = r.get::<_, i64>(7)? != 0;
+                    // A hidden comment keeps its place in the thread, but only its author and admins read it.
+                    let body: String = if hidden && !(viewer_admin || author_id == vid) { String::new() } else { r.get(4)? };
                     Ok(json!({ "id": r.get::<_, i64>(0)?, "author": r.get::<_, String>(1)?, "kind": r.get::<_, String>(3)?,
-                        "body": r.get::<_, String>(4)?, "created_at": r.get::<_, i64>(5)?, "updated_at": r.get::<_, i64>(6)?,
-                        "can_edit": author_id == vid || can_write }))
+                        "body": body, "created_at": r.get::<_, i64>(5)?, "updated_at": r.get::<_, i64>(6)?,
+                        "can_edit": author_id == vid || can_write, "hidden": hidden }))
                 })?
                 .collect::<Result<_, _>>()?;
             let mut ls = c.prepare("SELECT id, name, color FROM labels WHERE repo_id = ?1 ORDER BY name")?;
@@ -413,7 +432,7 @@ pub async fn update(
     Json(req): Json<UpdateReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, Some(&u), &o, &n).await?;
-    let issue = load_issue(&st, &r, num).await?;
+    let issue = load_issue(&st, &r, num, Some(&u)).await?;
     let is_author = issue.author_id == u.id;
     if !(is_author || r.can_write) {
         return Err(AppError::forbidden());
@@ -481,7 +500,7 @@ pub async fn comment(
     Json(req): Json<CommentReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, Some(&u), &o, &n).await?;
-    let issue = load_issue(&st, &r, num).await?;
+    let issue = load_issue(&st, &r, num, Some(&u)).await?;
     let body = req.body.trim().to_string();
     if body.len() > 65_536 {
         return Err(AppError::bad("That's too long (64 KB max)"));
@@ -762,7 +781,7 @@ pub async fn pull_diff(
     Query(fq): Query<super::code::FileQ>,
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
-    let mut issue = load_issue(&st, &r, num).await?;
+    let mut issue = load_issue(&st, &r, num, v.as_ref()).await?;
     if !issue.is_pr {
         return Err(AppError::not_found());
     }
@@ -800,7 +819,7 @@ pub async fn merge_pull(
     Json(req): Json<MergeReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
-    let issue = load_issue(&st, &r, num).await?;
+    let issue = load_issue(&st, &r, num, Some(&u)).await?;
     if !issue.is_pr {
         return Err(AppError::not_found());
     }

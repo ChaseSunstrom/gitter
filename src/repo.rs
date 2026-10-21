@@ -25,6 +25,8 @@ pub struct Repo {
     pub created_at: i64,
     pub updated_at: i64,
     pub pushed_at: Option<i64>,
+    /// Hidden by a moderator: only the owner and admins can see it.
+    pub hidden: bool,
     #[serde(skip)]
     pub path: PathBuf,
     #[serde(skip)]
@@ -34,7 +36,7 @@ pub struct Repo {
 }
 
 pub const REPO_SELECT: &str = "SELECT r.id, r.owner_id, u.username, r.name, r.description, r.website, r.is_private,
-    r.default_branch, r.forked_from, r.created_at, r.updated_at, r.pushed_at FROM repos r JOIN users u ON u.id = r.owner_id";
+    r.default_branch, r.forked_from, r.created_at, r.updated_at, r.pushed_at, r.hidden FROM repos r JOIN users u ON u.id = r.owner_id";
 
 pub fn row_to_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
     Ok(Repo {
@@ -50,6 +52,7 @@ pub fn row_to_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
         created_at: r.get(9)?,
         updated_at: r.get(10)?,
         pushed_at: r.get(11)?,
+        hidden: r.get::<_, i64>(12)? != 0,
         path: PathBuf::new(),
         can_read: false,
         can_write: false,
@@ -129,16 +132,35 @@ impl Repo {
 /// token sees other repositories as if signed out.
 pub fn access(repo: &Repo, viewer: Option<&User>) -> (bool, bool) {
     let write = viewer.is_some_and(|u| u.id == repo.owner_id || u.is_admin);
-    let (mut read, mut write) = (!repo.private || write, write);
+    let (mut read, mut write) = (!(repo.private || repo.hidden) || write, write);
     if let Some(l) = viewer.and_then(|u| u.limits.as_ref()) {
         if l.repo_id.is_some_and(|id| id != repo.id) {
-            (read, write) = (!repo.private, false);
+            (read, write) = (!(repo.private || repo.hidden), false);
         }
         if l.scope == crate::auth::Scope::Read {
             write = false;
         }
     }
     (read, write)
+}
+
+/// Bytes an account may still store across its repositories (None = no limit).
+pub async fn storage_left(st: &AppState, owner_id: i64) -> R<Option<u64>> {
+    let quota = st.settings.get().max_storage_mb * 1024 * 1024;
+    let (used, admin): (i64, bool) = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT COALESCE((SELECT sum(size_bytes) FROM repos WHERE owner_id = ?1), 0), is_admin FROM users WHERE id = ?1",
+                [owner_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await?;
+    if quota == 0 || admin {
+        return Ok(None);
+    }
+    Ok(Some(quota.saturating_sub(used.max(0) as u64)))
 }
 
 pub async fn record_event(
@@ -198,6 +220,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             pushed_at: None,
+            hidden: false,
             path: PathBuf::new(),
             can_read: false,
             can_write: false,

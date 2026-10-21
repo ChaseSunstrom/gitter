@@ -453,6 +453,20 @@ impl FromRequestParts<AppState> for Authed {
     }
 }
 
+/// The part of an address that identifies one client for rate limits: the
+/// whole IPv4 address, or the /64 of an IPv6 one (a home or VPS usually gets a
+/// whole /64, so rotating within it mustn't reset the limits).
+pub fn ip_bucket(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.to_ipv4_mapped().map(|v| v.to_string()).unwrap_or_default(),
+        _ => ip.to_string(),
+    }
+}
+
 /// Fixed-window rate limiter keyed by string (IP, username, ...). Each entry
 /// remembers its own window, and the map is bounded.
 #[derive(Default)]
@@ -485,6 +499,16 @@ impl Limiter {
         self.bump(key, window_secs);
     }
 
+    /// Count one event against `max` per `window_secs`; Err(seconds to wait) when over.
+    pub fn check(&self, key: &str, max: u32, window_secs: i64) -> Result<(), i64> {
+        if self.allow(key, max, window_secs) {
+            return Ok(());
+        }
+        let t = now();
+        let m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        Err(m.get(key).map(|w| w.start + w.len - t).unwrap_or(window_secs).max(1))
+    }
+
     /// Forget `key` (after a success, when attempts are counted up front with `allow`).
     pub fn reset(&self, key: &str) {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
@@ -496,7 +520,12 @@ impl Limiter {
         if m.len() >= LIMITER_CAP {
             m.retain(|_, w| t - w.start < w.len);
             if m.len() >= LIMITER_CAP {
-                m.clear();
+                // Still full of live windows: drop the oldest half, never everything
+                // (clearing would let a flood of new keys reset login lockouts).
+                let mut starts: Vec<i64> = m.values().map(|w| w.start).collect();
+                starts.sort_unstable();
+                let cut = starts[starts.len() / 2];
+                m.retain(|_, w| w.start > cut);
             }
         }
         let w = m.entry(key.to_string()).or_insert(Window {
@@ -539,6 +568,14 @@ mod tests {
             "a=1; gitter_session=xyz; b=2".parse().unwrap(),
         );
         assert_eq!(cookie_value(&h, SESSION_COOKIE), Some("xyz"));
+    }
+
+    #[test]
+    fn ip_buckets() {
+        assert_eq!(ip_bucket("203.0.113.9"), "203.0.113.9");
+        assert_eq!(ip_bucket("2001:db8:1:2:aaaa::1"), ip_bucket("2001:db8:1:2:ffff::9"));
+        assert_ne!(ip_bucket("2001:db8:1:2::1"), ip_bucket("2001:db8:1:3::1"));
+        assert_eq!(ip_bucket("::ffff:198.51.100.7"), "198.51.100.7");
     }
 
     #[test]

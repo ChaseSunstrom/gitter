@@ -8,6 +8,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 - **Speed:** pages prefetch on hover, the UI has no framework, and diffs render lazily, so even huge commits stay smooth.
 - **Command palette:** press `Ctrl K` or `/` to jump to any repository, file, branch or action. Press `?` for every shortcut.
 - **Account security:** optional two-factor sign-in (any authenticator app, with recovery codes), a list of where you're signed in with one-click sign-out, a password re-check before dangerous actions (deleting a repo, making a private repo public, creating tokens), and a tamper-evident security log for you and for admins (`gitter doctor` verifies it). Code views mark hidden Unicode ("Trojan Source" bidi tricks, zero-width characters) and look-alike letters from other alphabets, with a warning above the file or diff.
+- **Safe to run in public:** per-address and per-account rate limits (429 with Retry-After), limits on concurrent git transfers, per-account storage quotas enforced by git itself on push, open / invite-only / closed sign-up with invite links, and a report button on repositories, issues, comments and accounts that feeds an admin queue where moderators dismiss, hide or suspend.
 - **Themes:** Aurora (the default), Forge, Ultraviolet and Daylight, each in light and dark. Pick one in Settings → Appearance or from the palette.
 
 ## Self-host it (one file)
@@ -90,7 +91,7 @@ Everything is optional. The defaults are tuned for a single small server, and th
 | `GITTER_URL` | `http://localhost:3000` | Public address, used in clone URLs. `https://` also turns on secure cookies. |
 | `GITTER_ADDR` | `0.0.0.0:3000` | Address to listen on. |
 | `GITTER_DATA` | `./data` | Where the database and repositories live. Back this folder up. |
-| `GITTER_SIGNUP` | `open` | `closed` stops new sign-ups. The first (admin) account is always created through the setup link. |
+| `GITTER_SIGNUP` | `open` | `invite` needs an invite link from an admin; `closed` stops new sign-ups. The first (admin) account is always created through the setup link. |
 | `GITTER_MAX_PUSH_MB` | `500` | Largest single push. |
 | `GITTER_MAX_REPOS` | `200` | Repositories per user (admins are exempt). |
 | `GITTER_TRUST_PROXY` | `false` | Behind a reverse proxy, set this so rate limits use the client address from `X-Forwarded-For` (the last hop, which your proxy adds). |

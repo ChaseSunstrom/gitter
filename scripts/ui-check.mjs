@@ -219,5 +219,35 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   await page.close();
 }
 
+// Report → moderate: someone reports an issue, the admin hides it from the Reports tab; invite links work.
+{
+  const dctx = await browser.newContext();
+  const su = await dctx.request.post(BASE + '/api/auth/signup', { headers: { Origin: BASE }, data: { username: 'dave', email: 'dave@example.com', password: 'correct horse' } });
+  const errors = [];
+  const page = await dctx.newPage();
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/alice/hello/issues/1', { waitUntil: 'networkidle' });
+  await page.click('[data-menu="issue-body"]');
+  await page.click('.pop [data-act="report"]');
+  await page.click('.modal [data-ok]');
+  await page.waitForSelector('.toast', { timeout: 5000 }).catch(() => {});
+  const apage = await ctx.newPage();
+  apage.on('pageerror', (e) => errors.push(String(e)));
+  await apage.goto(BASE + '/admin/reports', { waitUntil: 'networkidle' });
+  const rows = await apage.locator('.report-row').count();
+  await apage.click('.report-row [data-resolve="hide"]');
+  await apage.click('.modal [data-ok]');
+  await apage.waitForTimeout(400);
+  const gone = (await fetch(`${BASE}/api/repos/alice/hello/issues/1`)).status;
+  await apage.goto(BASE + '/admin/settings', { waitUntil: 'networkidle' });
+  await apage.click('#inv-form button[type=submit]');
+  await apage.waitForSelector('#inv-new input', { timeout: 5000 }).catch(() => {});
+  const link = await apage.locator('#inv-new input').inputValue().catch(() => '');
+  if (!su.ok() || errors.length || rows !== 1 || gone !== 404 || !link.includes('/signup?invite=')) {
+    failed++; console.log('✗ report and moderate', { signup: su.status(), rows, gone, link, errors });
+  } else console.log('  ok report → admin hides it → it disappears; invite links are created');
+  await page.close(); await apage.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

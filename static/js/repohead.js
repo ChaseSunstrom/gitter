@@ -1,5 +1,5 @@
 // Shared repository chrome: header, tabs, branch picker, clone menu, breadcrumbs.
-import { html, state, get, send, popover, closePop, toastErr, num, encPath, esc, modal, action, $, toast } from './lib.js';
+import { html, state, get, send, popover, closePop, toastErr, num, encPath, esc, modal, action, $, toast, reportDialog } from './lib.js';
 import { icon } from './icons.js';
 import { navigate, refresh } from './main.js';
 
@@ -53,8 +53,10 @@ export function repoHeader(meta, tab) {
           <span class="btn sm" style="pointer-events:none"><span class="count">${num(meta.forks)}</span></span>
         </div>
         <button class="btn sm primary" id="clone-btn">${icon('code', 'sm')}<span>Clone</span>${icon('chev-down', 'sm')}</button>
+        ${state.me && !meta.is_owner ? html`<button class="btn sm icon ghost" id="report-btn" title="Report this repository" aria-label="Report this repository">${icon('flag', 'sm')}</button>` : ''}
       </div>
     </div>
+    ${meta.hidden ? html`<div class="mod-banner">${icon('eye', 'sm')} A moderator hid this repository. Only you and the site's admins can see it.</div>` : ''}
     ${meta.fork_of ? html`<div class="forked muted small">${icon('fork', 'sm')} forked from <a href="/${meta.fork_of.owner}/${meta.fork_of.name}">${meta.fork_of.owner}/${meta.fork_of.name}</a></div>` : ''}
     <nav class="tabs repo-tabs" aria-label="Repository">
       ${TABS.filter(([k]) => k !== 'settings' || meta.can_write).map(([k, ic, label, path]) => html`<a href="${base}${path}" class="${tab === k ? 'on' : ''}" data-tab="${k}">
@@ -86,6 +88,7 @@ export function placeTabBar(root) {
 
 export function mountRepoHeader(root, meta) {
   placeTabBar(root);
+  $('#report-btn', root)?.addEventListener('click', () => reportDialog({ kind: 'repo', owner: meta.owner, repo: meta.name }, 'repository'));
   const base = repoUrl(meta.owner, meta.name);
   const starBtn = $('#star-btn', root);
   starBtn?.addEventListener('click', async () => {

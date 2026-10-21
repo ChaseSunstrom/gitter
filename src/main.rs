@@ -24,9 +24,10 @@ fn config() -> Config {
         ),
         signup: match env("GITTER_SIGNUP", "open").to_ascii_lowercase().as_str() {
             "open" => SignupMode::Open,
+            "invite" => SignupMode::Invite,
             "closed" => SignupMode::Closed,
             other => {
-                eprintln!("GITTER_SIGNUP must be 'open' or 'closed', not '{other}'");
+                eprintln!("GITTER_SIGNUP must be 'open', 'invite' or 'closed', not '{other}'");
                 std::process::exit(2);
             }
         },
@@ -135,8 +136,11 @@ async fn serve(cfg: gitter::Config) -> anyhow::Result<()> {
         );
         *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
     }
-    let git = st.git.clone();
-    tokio::spawn(async move { git.sweep().await });
+    let st2 = st.clone();
+    tokio::spawn(async move {
+        st2.git.sweep().await;
+        gitter::hooks::backfill_sizes(&st2).await;
+    });
     let app = gitter::router(st);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(

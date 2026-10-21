@@ -318,6 +318,7 @@ async function boot() {
     const me = await get('/me', { fresh: true });
     state.me = me.user;
     state.signup = me.signup;
+    state.signupMode = me.signup_mode;
     state.instance = me.instance;
   } catch { state.me = null; }
   renderTopbar();

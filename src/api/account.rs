@@ -25,6 +25,9 @@ pub struct SignupReq {
     /// The one-time setup code, only needed for the very first account.
     #[serde(default)]
     setup: String,
+    /// An invite code, needed when sign-up is invite-only.
+    #[serde(default)]
+    invite: String,
 }
 
 fn check_password(pw: &str) -> R<()> {
@@ -52,7 +55,7 @@ pub async fn signup(
     headers: HeaderMap,
     Json(req): Json<SignupReq>,
 ) -> R<Response> {
-    if !st.limiter.allow(&format!("signup:{}", ip.0), 5, 3600) {
+    if !st.limiter.allow(&format!("signup:{}", crate::auth::ip_bucket(&ip.0)), 5, 3600) {
         return Err(AppError::new(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "Too many sign-ups from your network. Try again later.",
@@ -70,7 +73,8 @@ pub async fn signup(
     }
     check_password(&req.password)?;
     let hash = hash_password(req.password).await?;
-    let closed = !st.settings.get().signup_open();
+    let mode = st.settings.get().signup;
+    let invite_hash = (!req.invite.trim().is_empty()).then(|| sha256_hex(req.invite.trim()));
     let (setup, given) = (st.setup_code.clone(), req.setup.clone());
     let (u2, e2) = (username.clone(), email.clone());
     let user = st
@@ -91,8 +95,22 @@ pub async fn signup(
                         "To create the admin account, open the setup link printed in the server log",
                     ));
                 }
-            } else if closed {
+            } else if mode == "closed" {
                 return Err(AppError::forbidden());
+            } else if mode == "invite" {
+                let used = match &invite_hash {
+                    Some(h) => tx.execute(
+                        "UPDATE invites SET uses = uses + 1 WHERE code_hash = ?1 AND uses < max_uses AND (expires_at IS NULL OR expires_at > ?2)",
+                        rusqlite::params![h, now()],
+                    )?,
+                    None => 0,
+                };
+                if used == 0 {
+                    return Err(AppError::new(
+                        axum::http::StatusCode::FORBIDDEN,
+                        "Sign-up here is by invitation, and that invite link is missing, used up or expired",
+                    ));
+                }
             }
             let taken: bool = tx
                 .query_row("SELECT 1 FROM users WHERE username = ?1 OR (email = ?2 COLLATE NOCASE AND email != '')", [&u2, &e2], |_| Ok(true))
@@ -135,8 +153,8 @@ pub async fn login(
     let login = req.login.trim().to_string();
     // Only failures count, per account+IP and per IP, so nobody can lock someone else out.
     let (k_user, k_ip) = (
-        format!("login:{}:{}", login.to_lowercase(), ip.0),
-        format!("login-ip:{}", ip.0),
+        format!("login:{}:{}", login.to_lowercase(), crate::auth::ip_bucket(&ip.0)),
+        format!("login-ip:{}", crate::auth::ip_bucket(&ip.0)),
     );
     if st.limiter.blocked(&k_user, 10) || st.limiter.blocked(&k_ip, 40) {
         return Err(AppError::new(
@@ -250,7 +268,7 @@ const PROFILE_COLS: &str =
 pub async fn me(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json::Value> {
     let Some(u) = v else {
         return Ok(Json(
-            json!({ "user": null, "signup": st.settings.get().signup_open(), "instance": instance_info(&st) }),
+            json!({ "user": null, "signup": st.settings.get().signup_open(), "signup_mode": st.settings.get().signup, "instance": instance_info(&st) }),
         ));
     };
     let id = u.id;
@@ -264,6 +282,13 @@ pub async fn me(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json::
             )?)
         })
         .await?;
+    let quota = st.settings.get().max_storage_mb;
+    let uid = u.id;
+    let used: i64 = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT COALESCE(sum(size_bytes), 0) FROM repos WHERE owner_id = ?1", [uid], |r| r.get(0))?))
+        .await?;
+    let storage = json!({ "used": used, "quota": if quota == 0 || u.is_admin { None } else { Some(quota * 1024 * 1024) } });
     let (mut p, mut u) = (serde_json::to_value(p).map_err(AppError::internal)?, u);
     if u.limits.is_some() {
         // A limited token proves which account it is, not the account's private details.
@@ -271,7 +296,7 @@ pub async fn me(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json::
         u.email.clear();
     }
     Ok(Json(
-        json!({ "user": u, "profile": p, "signup": st.settings.get().signup_open(), "instance": instance_info(&st) }),
+        json!({ "user": u, "profile": p, "signup": st.settings.get().signup_open(), "signup_mode": st.settings.get().signup, "instance": instance_info(&st), "storage": storage }),
     ))
 }
 
@@ -562,7 +587,10 @@ fn events(
         "SELECT e.kind, u.username, ou.username || '/' || r.name, e.title, e.target, e.count, e.created_at
          FROM events e JOIN users u ON u.id = e.user_id
          LEFT JOIN repos r ON r.id = e.repo_id LEFT JOIN users ou ON ou.id = r.owner_id
-         WHERE ({cond}) AND (e.repo_id IS NULL OR {VISIBLE}) ORDER BY e.id DESC LIMIT {limit}"
+         WHERE ({cond}) AND (e.repo_id IS NULL OR {VISIBLE})
+           AND NOT (e.kind IN ('issue', 'pull', 'comment', 'merge') AND EXISTS (
+             SELECT 1 FROM issues hi WHERE hi.repo_id = e.repo_id AND hi.number = CAST(e.target AS INTEGER) AND hi.hidden = 1))
+         ORDER BY e.id DESC LIMIT {limit}"
     );
     params.extend(visible_params(viewer));
     let mut s = c.prepare(&sql)?;
@@ -654,7 +682,7 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
                 let ev = events(c, "1=1", vec![], None, 40)?;
                 let trending = repo_cards(
                     c,
-                    "WHERE r.is_private = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id AND s.created_at > strftime('%s','now') - 7*86400) DESC, r.updated_at DESC LIMIT 8",
+                    "WHERE r.is_private = 0 AND r.hidden = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id AND s.created_at > strftime('%s','now') - 7*86400) DESC, r.updated_at DESC LIMIT 8",
                     vec![],
                 )?;
                 return Ok(json!({ "events": ev, "repos": [], "trending": trending }));
@@ -673,7 +701,7 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
             let global = if ev.len() < 10 { events(c, "1=1", vec![], Some(&u), 30)? } else { vec![] };
             let trending = repo_cards(
                 c,
-                "WHERE r.is_private = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) DESC, r.updated_at DESC LIMIT 6",
+                "WHERE r.is_private = 0 AND r.hidden = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) DESC, r.updated_at DESC LIMIT 6",
                 vec![],
             )?;
             Ok(json!({ "events": ev, "global": global, "repos": mine, "trending": trending }))

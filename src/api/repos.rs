@@ -44,6 +44,11 @@ async fn insert_repo(
     forked_from: Option<i64>,
 ) -> R<i64> {
     let max = st.settings.get().max_repos_per_user;
+    if !owner.is_admin
+        && let Err(wait) = st.limiter.check(&format!("create:{}", owner.id), 30, 3600)
+    {
+        return Err(AppError::slow_down("You've created a lot of repositories in the last hour. Try again later.", wait));
+    }
     let (oid, admin, n, d) = (
         owner.id,
         owner.is_admin,
@@ -175,7 +180,7 @@ pub async fn show(
             let parent: Option<(String, String, bool)> = match fork_of {
                 Some(pid) => c
                     .query_row(
-                        "SELECT u.username, p.name, p.is_private FROM repos p JOIN users u ON u.id = p.owner_id WHERE p.id = ?1",
+                        "SELECT u.username, p.name, p.is_private OR p.hidden FROM repos p JOIN users u ON u.id = p.owner_id WHERE p.id = ?1",
                         [pid],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
                     )
@@ -195,7 +200,7 @@ pub async fn show(
         "updated_at": r.updated_at, "pushed_at": r.pushed_at, "language": language,
         "empty": branches.is_empty(), "branches": branches, "tags": tags,
         "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
-        "fork_of": parent, "can_write": r.can_write, "is_owner": r.is_owner,
+        "fork_of": parent, "can_write": r.can_write, "is_owner": r.is_owner, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
     })))
 }
@@ -394,9 +399,22 @@ pub async fn fork(
     Json(req): Json<ForkReq>,
 ) -> J<serde_json::Value> {
     let src = Repo::readable(&st, Some(&u), &owner, &name).await?;
+    if src.hidden {
+        return Err(AppError::bad("A moderator hid this repository, so it can't be forked"));
+    }
     let new_name = req.name.unwrap_or_else(|| src.name.clone());
     if !validate::repo_name(&new_name) {
         return Err(AppError::bad("That isn't a valid repository name"));
+    }
+    let sid = src.id;
+    let size: i64 = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT size_bytes FROM repos WHERE id = ?1", [sid], |r| r.get(0))?))
+        .await?;
+    if let Some(left) = crate::repo::storage_left(&st, u.id).await?
+        && size.max(0) as u64 > left
+    {
+        return Err(AppError::bad("You don't have enough storage left to fork this repository"));
     }
     let id = insert_repo(
         &st,
@@ -432,6 +450,7 @@ pub async fn fork(
             Ok(c.execute("UPDATE repos SET language = (SELECT language FROM repos WHERE id = ?1) WHERE id = ?2", [lang_src, id])?)
         })
         .await?;
+    crate::hooks::refresh_size(&st, id).await;
     record_event(&st.db, u.id, Some(id), "fork", &src.full_name(), "", 1).await?;
     Ok(Json(json!({ "owner": u.username, "name": new_name })))
 }

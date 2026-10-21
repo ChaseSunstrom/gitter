@@ -2,6 +2,7 @@ pub mod account;
 pub mod admin;
 pub mod code;
 pub mod issues;
+pub mod moderation;
 pub mod repos;
 pub mod security;
 
@@ -54,6 +55,11 @@ pub fn router() -> Router<AppState> {
         .route("/admin/overview", get(admin::overview))
         .route("/admin/users", get(admin::users))
         .route("/admin/audit", get(security::admin_log))
+        .route("/admin/invites", get(admin::invites).post(admin::create_invite))
+        .route("/admin/invites/{id}", delete(admin::delete_invite))
+        .route("/admin/reports", get(moderation::queue))
+        .route("/admin/reports/{id}/resolve", post(moderation::resolve))
+        .route("/reports", post(moderation::report))
         .route(
             "/admin/users/{user}",
             patch(admin::update_user).delete(admin::delete_user),
@@ -200,6 +206,55 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
         && !matches!(segs[3], "fork" | "deploy-tokens")
 }
 
+/// Per-address limits on all API requests, and per-account limits on changes
+/// (admins exempt), so one client can't flood a public instance.
+pub async fn rate_limit(
+    axum::extract::State(st): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let s = st.settings.get();
+    let (mut parts, body) = req.into_parts();
+    let ip = crate::auth::ip_bucket(&client_ip(&st, &parts.headers, &parts.extensions));
+    if s.api_rate_per_min > 0
+        && let Err(wait) = st.limiter.check(&format!("api:{ip}"), s.api_rate_per_min, 60)
+    {
+        return AppError::slow_down("Too many requests from your network. Slow down a little.", wait).into_response();
+    }
+    let mutating = !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+    if mutating && s.write_rate_per_min > 0 {
+        let v = crate::auth::Viewer::from_request_parts(&mut parts, &st).await.ok().and_then(|v| v.0);
+        let key = match &v {
+            Some(u) if u.is_admin => None,
+            Some(u) => Some(format!("write:{}", u.id)),
+            None => Some(format!("write-ip:{ip}")),
+        };
+        if let Some(k) = key
+            && let Err(wait) = st.limiter.check(&k, s.write_rate_per_min, 60)
+        {
+            return AppError::slow_down("You're making changes very quickly. Wait a moment and try again.", wait).into_response();
+        }
+    }
+    next.run(axum::extract::Request::from_parts(parts, body)).await
+}
+
+/// The client's address: the socket's, or behind a trusted proxy the last
+/// X-Forwarded-For hop (added by our own proxy; earlier hops are client-controlled).
+pub fn client_ip(st: &AppState, headers: &axum::http::HeaderMap, ext: &axum::http::Extensions) -> String {
+    if st.cfg.trust_proxy
+        && let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+    {
+        return ip.trim().to_string();
+    }
+    ext.get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// The client's IP: the socket address, or the last X-Forwarded-For hop (added by
 /// our own proxy; earlier hops are client-controlled) when behind a trusted proxy.
 pub struct ClientIp(pub String);
@@ -207,21 +262,7 @@ pub struct ClientIp(pub String);
 impl FromRequestParts<AppState> for ClientIp {
     type Rejection = AppError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> R<Self> {
-        if st.cfg.trust_proxy
-            && let Some(ip) = parts
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit(',').next())
-        {
-            return Ok(ClientIp(ip.trim().to_string()));
-        }
-        let ip = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip().to_string())
-            .unwrap_or_else(|| "unknown".into());
-        Ok(ClientIp(ip))
+        Ok(ClientIp(client_ip(st, &parts.headers, &parts.extensions)))
     }
 }
 
@@ -243,11 +284,11 @@ pub const CARD_SELECT: &str = "SELECT u.username, r.name, r.description, r.is_pr
     (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) AS stars,
     (SELECT count(*) FROM repos f WHERE f.forked_from = r.id) AS forks,
     r.updated_at,
-    (SELECT pu.username || '/' || p.name FROM repos p JOIN users pu ON pu.id = p.owner_id WHERE p.id = r.forked_from AND p.is_private = 0)
+    (SELECT pu.username || '/' || p.name FROM repos p JOIN users pu ON pu.id = p.owner_id WHERE p.id = r.forked_from AND p.is_private = 0 AND p.hidden = 0)
     FROM repos r JOIN users u ON u.id = r.owner_id";
 
 /// SQL condition: repo `r` is visible to the viewer. Binds one parameter (viewer id, or -1).
-pub const VISIBLE: &str = "(r.is_private = 0 OR r.owner_id = ? OR EXISTS (SELECT 1 FROM users a WHERE a.id = ? AND a.is_admin = 1))";
+pub const VISIBLE: &str = "((r.is_private = 0 AND r.hidden = 0) OR r.owner_id = ? OR EXISTS (SELECT 1 FROM users a WHERE a.id = ? AND a.is_admin = 1))";
 
 pub fn visible_params(viewer: Option<&crate::auth::User>) -> [Value; 2] {
     // A deploy token lists repositories as if signed out (it's for one repo only).

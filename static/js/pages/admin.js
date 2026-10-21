@@ -3,7 +3,7 @@ import { html, state, get, send, bytes, num, timeEl, avatar, toast, action, conf
 import { icon } from '../icons.js';
 import { navigate, refresh, renderTopbar } from '../main.js';
 
-const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['audit', 'shield', 'Security log'], ['settings', 'settings', 'Settings']];
+const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['reports', 'flag', 'Reports'], ['audit', 'shield', 'Security log'], ['settings', 'settings', 'Settings']];
 
 function uptime(s) {
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
@@ -77,6 +77,49 @@ async function audit(q, page) {
   </div>`;
 }
 
+const REASON = { spam: 'Spam', abuse: 'Abuse', illegal: 'Illegal', malware: 'Malware', impersonation: 'Impersonation', other: 'Other' };
+
+async function reports(status) {
+  const d = await get(`/admin/reports?status=${status}`, { fresh: true });
+  const open = status !== 'resolved';
+  return html`<div class="stack">
+    <div class="row"><div class="seg" role="group" aria-label="Which reports">
+      <a class="btn sm ${open ? 'on' : ''}" href="/admin/reports">Open <span class="counter">${d.open}</span></a>
+      <a class="btn sm ${open ? '' : 'on'}" href="/admin/reports?status=resolved">Resolved</a></div></div>
+    <div class="box list">${d.reports.length ? d.reports.map((r) => html`<div class="list-row report-row" data-report="${r.id}" data-kind="${r.kind}">
+      <div class="grow" style="display:grid;gap:4px">
+        <div class="row wrap-ok"><span class="pill">${r.kind}</span><span class="pill closed">${REASON[r.reason] || r.reason}</span>
+          ${r.target.url ? html`<a href="${r.target.url}"><b>${r.target.label}</b></a>` : html`<b>${r.target.label}</b>`}
+          ${r.target.hidden ? html`<span class="pill">${r.kind === 'user' ? 'Suspended' : 'Hidden'}</span>` : ''}</div>
+        ${r.target.excerpt ? html`<div class="small muted ellipsis">“${r.target.excerpt}”</div>` : ''}
+        ${r.details ? html`<div class="small">${r.details}</div>` : ''}
+        <div class="tiny muted">Reported by ${r.reporter || 'a deleted account'} ${timeEl(r.created_at)}${r.target.author ? html` · by ${r.target.author}` : ''}${r.resolution ? html` · ${r.resolution} by ${r.resolved_by || '?'} ${timeEl(r.resolved_at)}` : ''}</div>
+      </div>
+      <div class="row">${open ? html`
+        <button class="btn sm" data-resolve="dismiss">Dismiss</button>
+        ${r.kind !== 'user' ? html`<button class="btn sm danger" data-resolve="hide">Hide</button>` : ''}
+        <button class="btn sm danger" data-resolve="suspend">Suspend ${r.target.author || 'account'}</button>`
+        : r.target.hidden && r.kind !== 'user' ? html`<button class="btn sm" data-resolve="unhide">Unhide</button>` : ''}</div>
+    </div>`) : html`<div class="empty">${icon('flag', 'big')}<h3>${open ? 'No open reports' : 'Nothing resolved yet'}</h3><p>When people report repositories, issues, comments or accounts, they show up here.</p></div>`}</div>
+  </div>`;
+}
+
+async function invitesBox() {
+  const d = await get('/admin/invites', { fresh: true });
+  return html`<div class="box" id="invites"><div class="box-head"><b>Invite links</b><span class="grow"></span><span class="muted small">For invite-only sign-up</span></div>
+    <div class="box-body stack">
+      <form class="row wrap-ok" id="inv-form">
+        <input class="input" name="note" placeholder="Who it's for (only you see this)" maxlength="120" style="max-width:260px" aria-label="Note">
+        <select class="select" name="max_uses" style="max-width:140px" aria-label="Uses"><option value="1">1 person</option><option value="10">10 people</option><option value="100">100 people</option></select>
+        <select class="select" name="expires_days" style="max-width:160px" aria-label="Expires"><option value="7">Expires in 7 days</option><option value="30">30 days</option><option value="">Never expires</option></select>
+        <button class="btn primary" type="submit">Create link</button>
+      </form>
+      <div id="inv-new"></div>
+      ${d.invites.length ? html`<div class="list">${d.invites.map((i) => html`<div class="list-row small"><span class="grow"><b>${i.note || 'Invite'}</b> · ${i.uses} of ${i.max_uses} used${i.expires_at ? html` · expires ${timeEl(i.expires_at)}` : ''}${i.live ? '' : html` <span class="pill closed">Done</span>`}</span>
+        <button class="btn sm" data-inv-del="${i.id}">Delete</button></div>`)}</div>` : ''}
+    </div></div>`;
+}
+
 async function settings() {
   const s = await get('/admin/settings', { fresh: true });
   return html`<form class="box" id="site-settings"><div class="box-body settings-sec" style="max-width:640px">
@@ -84,15 +127,22 @@ async function settings() {
       <span class="hint">Shown in the browser tab and the top bar.</span></div>
     <div class="field"><label>Sign-up</label><div class="choice">
       <label><input type="radio" name="signup" value="open" ${s.signup === 'open' ? 'checked' : ''}><span><b>Open</b><br><span class="muted small">Anyone can create an account.</span></span></label>
+      <label><input type="radio" name="signup" value="invite" ${s.signup === 'invite' ? 'checked' : ''}><span><b>Invite only</b><br><span class="muted small">People need an invite link from you (make them below).</span></span></label>
       <label><input type="radio" name="signup" value="closed" ${s.signup === 'closed' ? 'checked' : ''}><span><b>Closed</b><br><span class="muted small">Only existing accounts can sign in. Good for a private team server.</span></span></label></div></div>
     <div class="row wrap-ok" style="align-items:flex-start;gap:16px">
       <div class="field" style="width:220px"><label for="s-repos">Repositories per person</label><input id="s-repos" class="input" type="number" min="1" value="${s.max_repos_per_user}"><span class="hint">Admins have no limit.</span></div>
       <div class="field" style="width:220px"><label for="s-push">Largest push (MB)</label><input id="s-push" class="input" type="number" min="1" value="${s.max_push_mb}"><span class="hint">Applies to every repository right away.</span></div>
+      <div class="field" style="width:220px"><label for="s-storage">Storage per person (MB)</label><input id="s-storage" class="input" type="number" min="0" value="${s.max_storage_mb}"><span class="hint">0 means no limit. Admins have none.</span></div>
+    </div>
+    <div class="row wrap-ok" style="align-items:flex-start;gap:16px">
+      <div class="field" style="width:220px"><label for="s-api">Requests per minute per address</label><input id="s-api" class="input" type="number" min="0" value="${s.api_rate_per_min}"><span class="hint">Slows down scrapers. 0 means no limit.</span></div>
+      <div class="field" style="width:220px"><label for="s-write">Changes per minute per person</label><input id="s-write" class="input" type="number" min="0" value="${s.write_rate_per_min}"><span class="hint">Posts, edits and pushes. Admins have no limit.</span></div>
     </div>
     <div class="field"><label for="s-ann">Announcement</label><input id="s-ann" class="input" value="${s.announcement}" maxlength="280" placeholder="e.g. Maintenance on Sunday 10:00 UTC">
       <span class="hint">Shown at the top of every page. Leave empty to hide it.</span></div>
     <div><button class="btn primary" id="s-save">Save settings</button></div>
-  </div></form>`;
+  </div></form>
+  ${await invitesBox()}`;
 }
 
 export default async function (ctx) {
@@ -101,7 +151,7 @@ export default async function (ctx) {
   const tab = ctx.params.tab || '';
   const q = ctx.query.get('q') || '';
   const page = +(ctx.query.get('page') || 1);
-  const inner = tab === 'users' ? await users(q, page) : tab === 'audit' ? await audit(q, page) : tab === 'settings' ? await settings() : await overview();
+  const inner = tab === 'users' ? await users(q, page) : tab === 'reports' ? await reports(ctx.query.get('status') || 'open') : tab === 'audit' ? await audit(q, page) : tab === 'settings' ? await settings() : await overview();
   return {
     title: 'Site administration',
     html: html`<div class="wrap">
@@ -116,6 +166,20 @@ export default async function (ctx) {
       $('#aq', el)?.addEventListener('input', debounce((e) => navigate(`/admin/audit?q=${encodeURIComponent(e.target.value.trim())}`, { replace: true, scroll: false }), 300));
       if ($('#aq', el) && q) { const i = $('#aq', el); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
       el.addEventListener('click', async (e) => {
+        const rb = e.target.closest('[data-resolve]');
+        if (rb) {
+          const act = rb.dataset.resolve, row = rb.closest('[data-report]');
+          const words = { dismiss: ['Dismiss this report?', 'Nothing changes; the report is closed.', 'Dismiss'], hide: ['Hide this?', 'Only its owner and admins will see it. Other reports about it are closed too.', 'Hide'],
+            suspend: ['Suspend this account?', 'They are signed out everywhere and can’t sign in, push or use tokens until restored.', 'Suspend'], unhide: ['Show this again?', 'Everyone who could see it before can see it again.', 'Unhide'] }[act];
+          if (!(await confirmDialog({ title: words[0], text: words[1], ok: words[2], danger: act === 'hide' || act === 'suspend' }))) return;
+          await action(rb, async () => { await send('POST', `/admin/reports/${row.dataset.report}/resolve`, { action: act }); toast('Done'); refresh(); })();
+          return;
+        }
+        const del = e.target.closest('[data-inv-del]');
+        if (del) {
+          await action(del, async () => { await send('DELETE', `/admin/invites/${del.dataset.invDel}`); refresh(); })();
+          return;
+        }
         const b = e.target.closest('[data-act]');
         if (!b) return;
         const name = b.closest('[data-user]').dataset.user;
@@ -140,6 +204,14 @@ export default async function (ctx) {
           refresh();
         })();
       });
+      const inv = $('#inv-form', el);
+      inv?.addEventListener('submit', action(inv.querySelector('button'), async () => {
+        const f = Object.fromEntries(new FormData(inv));
+        const r = await send('POST', '/admin/invites', { note: f.note, max_uses: +f.max_uses, expires_days: f.expires_days ? +f.expires_days : null });
+        $('#inv-new', el).innerHTML = html`<div class="token-reveal fade"><b>Invite link created</b><p class="small">Send this to the people you're inviting. It won't be shown again.</p>
+          <div class="row"><input class="input mono" readonly value="${r.url}" aria-label="Invite link"><button class="btn primary" type="button" data-copy="${r.url}" data-copy-label="Link copied">Copy</button></div></div>`.s;
+        inv.reset();
+      }));
       const form = $('#site-settings', el);
       form?.addEventListener('submit', action($('#s-save', el), async () => {
         const body = {
@@ -147,11 +219,15 @@ export default async function (ctx) {
           signup: $$('input[name=signup]', el).find((r) => r.checked).value,
           max_repos_per_user: +$('#s-repos', el).value,
           max_push_mb: +$('#s-push', el).value,
+          max_storage_mb: +$('#s-storage', el).value,
+          api_rate_per_min: +$('#s-api', el).value,
+          write_rate_per_min: +$('#s-write', el).value,
           announcement: $('#s-ann', el).value.trim(),
         };
         const saved = await send('PUT', '/admin/settings', body);
         state.instance = { name: saved.instance_name, announcement: saved.announcement };
         state.signup = saved.signup === 'open';
+        state.signupMode = saved.signup;
         renderTopbar();
         toast('Settings saved');
       }));

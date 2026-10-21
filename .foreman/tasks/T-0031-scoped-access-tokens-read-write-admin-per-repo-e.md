@@ -62,6 +62,7 @@ README: token levels, deploy tokens and the 2FA-needs-a-token rule
 - 2026-10-21T21:11:21Z created
 - 2026-10-21T21:42:03Z focused
 - 2026-10-21T21:55:25Z done
+- 2026-10-21T21:55:25Z committed 5a67c7a (17 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

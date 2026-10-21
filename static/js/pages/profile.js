@@ -1,5 +1,5 @@
 // User profile: overview with contribution heatmap, repositories, stars.
-import { html, raw, state, get, avatar, safeUrl, day, num, enc, $, $$ } from '../lib.js';
+import { html, raw, state, get, avatar, safeUrl, day, num, enc, $, $$, reportDialog } from '../lib.js';
 import { icon } from '../icons.js';
 import { repoCard } from './explore.js';
 import { eventList } from './home.js';
@@ -55,6 +55,7 @@ function sidebar(u, isMe) {
     <p class="profile-handle muted">@${u.username}${u.is_admin ? html` <span class="tag-private">Admin</span>` : ''}</p>
     ${u.bio ? html`<p class="profile-bio">${u.bio}</p>` : ''}
     ${isMe ? html`<a class="btn" href="/settings" style="width:100%">${icon('edit', 'sm')} Edit profile</a>` : ''}
+    ${state.me && !isMe ? html`<button class="btn ghost sm" id="report-user" style="width:100%">${icon('flag', 'sm')} Report this account</button>` : ''}
     <ul class="profile-facts small">
       ${u.location ? html`<li>${icon('globe', 'sm')}<span>${u.location}</span></li>` : ''}
       ${u.website ? html`<li>${icon('link', 'sm')}<a class="c-accent ellipsis" href="${safeUrl(u.website)}" target="_blank" rel="noopener nofollow ugc">${u.website.replace(/^https?:\/\//, '')}</a></li>` : ''}
@@ -103,6 +104,7 @@ export default async function (ctx) {
     title: u.display_name ? `${u.username} (${u.display_name})` : u.username,
     html: html`<div class="wrap profile">${sidebar(u, isMe)}<section class="profile-main">${tabs}<div class="profile-body">${body}</div></section></div>`,
     mount(el) {
+      $('#report-user', el)?.addEventListener('click', () => reportDialog({ kind: 'user', user: u.username }, 'account'));
       const tabsEl = $('.profile-tabs', el);
       const on = tabsEl.querySelector('.on');
       const bar = tabsEl.querySelector('.bar');

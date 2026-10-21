@@ -368,3 +368,74 @@ fn changed_fields(a: &Settings, b: &Settings) -> String {
     }
     out.join(", ")
 }
+
+// ---------- invites (for invite-only sign-up) ----------
+
+pub async fn invites(State(st): State<AppState>, _a: Admin) -> J<serde_json::Value> {
+    let rows = st
+        .db
+        .call(|c| {
+            let mut s = c.prepare(
+                "SELECT i.id, i.note, i.max_uses, i.uses, i.expires_at, i.created_at, u.username FROM invites i
+                 LEFT JOIN users u ON u.id = i.created_by ORDER BY i.id DESC LIMIT 200",
+            )?;
+            let t = crate::db::now();
+            let v: Vec<serde_json::Value> = s
+                .query_map([], |r| {
+                    let (max, uses, exp): (i64, i64, Option<i64>) = (r.get(2)?, r.get(3)?, r.get(4)?);
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?, "note": r.get::<_, String>(1)?, "max_uses": max, "uses": uses,
+                        "expires_at": exp, "created_at": r.get::<_, i64>(5)?, "created_by": r.get::<_, Option<String>>(6)?,
+                        "live": uses < max && exp.is_none_or(|e| e > t),
+                    }))
+                })?
+                .collect::<Result<_, _>>()?;
+            Ok(v)
+        })
+        .await?;
+    Ok(Json(json!({ "invites": rows })))
+}
+
+#[derive(Deserialize)]
+pub struct InviteReq {
+    #[serde(default)]
+    note: String,
+    #[serde(default = "one")]
+    max_uses: i64,
+    expires_days: Option<i64>,
+}
+
+fn one() -> i64 {
+    1
+}
+
+/// A sign-up link: /signup?invite=<code>. The code is shown once and stored hashed.
+pub async fn create_invite(State(st): State<AppState>, Admin(me): Admin, ip: ClientIp, Json(req): Json<InviteReq>) -> J<serde_json::Value> {
+    if !(1..=1000).contains(&req.max_uses) {
+        return Err(AppError::bad("An invite can be used 1 to 1,000 times"));
+    }
+    if req.expires_days.is_some_and(|d| !(1..=365).contains(&d)) {
+        return Err(AppError::bad("Invites expire after 1 to 365 days, or never"));
+    }
+    let note: String = req.note.trim().chars().take(120).collect();
+    let code = crate::auth::new_secret("").0[..20].to_string();
+    let (h, n2, uid, max) = (crate::auth::sha256_hex(&code), note.clone(), me.id, req.max_uses);
+    let expires = req.expires_days.map(|d| crate::db::now() + d * 86400);
+    st.db
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO invites(code_hash, created_by, note, max_uses, expires_at, created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![h, uid, n2, max, expires, crate::db::now()],
+            )?;
+            Ok(())
+        })
+        .await?;
+    record(&st.db, Event { actor: Some(&me), subject: None, action: "invite_created", detail: format!("{note} ({max} uses)"), ip: &ip.0 }).await;
+    let url = format!("{}/signup?invite={code}", st.cfg.url.trim_end_matches('/'));
+    Ok(Json(json!({ "code": code, "url": url })))
+}
+
+pub async fn delete_invite(State(st): State<AppState>, _a: Admin, Path(id): Path<i64>) -> J<serde_json::Value> {
+    st.db.call(move |c| Ok(c.execute("DELETE FROM invites WHERE id = ?1", [id])?)).await?;
+    ok()
+}

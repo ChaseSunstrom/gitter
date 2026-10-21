@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod bench;
+pub mod ci;
 pub mod db;
 pub mod diff;
 pub mod error;
@@ -40,6 +41,7 @@ pub struct Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignupMode {
     Open,
+    Invite,
     Closed,
 }
 
@@ -57,6 +59,8 @@ pub struct AppState {
     pub setup_code: Arc<std::sync::Mutex<Option<String>>>,
     /// Sign-ins waiting for a two-factor code.
     pub challenges: Arc<security::Challenges>,
+    /// Git transfers in flight per client address.
+    pub transfers: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 impl AppState {
@@ -72,6 +76,7 @@ impl AppState {
             started: db::now(),
             setup_code: Arc::default(),
             challenges: Arc::default(),
+            transfers: Arc::default(),
         }
     }
 }
@@ -95,9 +100,13 @@ pub fn router(st: AppState) -> Router {
             api::router()
                 .layer(DefaultBodyLimit::max(40 * 1024 * 1024))
                 .layer(axum::middleware::from_fn_with_state(st.clone(), api::scope_guard))
+                .layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit))
                 .layer(axum::middleware::from_fn_with_state(st.clone(), web::csrf)),
         )
-        .route("/raw/{owner}/{repo}/{*rest}", get(api::code::raw))
+        .route(
+            "/raw/{owner}/{repo}/{*rest}",
+            get(api::code::raw).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),
+        )
         .route("/assets/{v}/{*path}", get(web::asset))
         .route("/favicon.svg", get(web::favicon))
         .route("/favicon.ico", get(web::favicon))
@@ -107,7 +116,10 @@ pub fn router(st: AppState) -> Router {
         .layer(CompressionLayer::new());
 
     Router::new()
-        .route("/archive/{owner}/{repo}/{*spec}", get(api::code::archive))
+        .route(
+            "/archive/{owner}/{repo}/{*spec}",
+            get(api::code::archive).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),
+        )
         .merge(git_http)
         .merge(app)
         .layer(axum::middleware::from_fn(web::security_headers))

@@ -63,6 +63,7 @@ const P = {
   sparkle: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 17-5-5-9 8"/>',
   terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+  flag: '<path d="M5 21V4M5 4h11l-2 4 2 4H5"/>',
   shield: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6Z"/>',
   zap: '<path d="M13 2 4 14h7l-1 8 9-12h-7Z"/>',
   filter: '<path d="M3 5h18l-7 8v6l-4 2v-8Z"/>',
