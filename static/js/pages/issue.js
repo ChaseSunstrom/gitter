@@ -6,6 +6,7 @@ import { renderMarkdown, preloadLangs } from '../md.js';
 import { mdEditor, mountMdEditor, clearDraft } from '../mdeditor.js';
 import { diffView, mountDiff } from '../diffview.js';
 import { diffReview, reviewBar, mountReview, reviewItems, reviewersBlock } from '../review.js';
+import { annotate, prReport } from '../cireport.js';
 import { refresh, navigate } from '../main.js';
 import { labelChip } from './issues.js';
 
@@ -53,6 +54,7 @@ export default async function (ctx) {
 
   const body = html`<div class="issue-page">
     ${header(meta, data, pd)}
+    ${issue.is_pr ? html`<div id="pr-ci-report" class="pr-ci-report"></div>` : ''}
     ${issue.is_pr ? html`<nav class="tabs pr-tabs" aria-label="Pull request">
       <a href="${prBase}" class="${tab === 'conversation' ? 'on' : ''}">${icon('comment', 'sm')} Conversation <span class="counter">${data.comments.filter((c) => c.kind === 'comment').length}</span></a>
       <a href="${prBase}/commits" class="${tab === 'commits' ? 'on' : ''}">${icon('commit', 'sm')} Commits <span class="counter">${pd.commits.length}</span></a>
@@ -68,8 +70,12 @@ export default async function (ctx) {
       mountRepoHeader(el, meta);
       placeTabBar(el.querySelector('.issue-page'));
       mountHeader(el, api, issue);
+      const ci = issue.is_pr ? prReport(el, { api, base, prBase, sha: pd.head_sha, tab, files: tab === 'files' ? pd.diff.files : null }) : null;
       if (tab === 'files') {
-        mountDiff(el, pd.diff, { key: `${owner}/${repo}#${n}:${pd.head_sha}`, load: (q) => get(`/repos/${owner}/${repo}/pulls/${n}/diff?${q}`).then((x) => x.diff.files[0]), ...(rv ? diffReview(rv, rctx) : {}) });
+        const review = rv ? diffReview(rv, rctx) : {};
+        // Failed tests that name a changed line show under it.
+        const decorate = (f, body, mode) => { review.decorate?.(f, body, mode); annotate(f, body, mode, ci.list); };
+        mountDiff(el, pd.diff, { key: `${owner}/${repo}#${n}:${pd.head_sha}`, load: (q) => get(`/repos/${owner}/${repo}/pulls/${n}/diff?${q}`).then((x) => x.diff.files[0]), ...review, decorate });
       }
       if (tab !== 'commits') mountReview(el.querySelector('.issue-page'), rv, rctx);
       if (tab === 'conversation') mountConversation(el, meta, api, data, mdCtx);

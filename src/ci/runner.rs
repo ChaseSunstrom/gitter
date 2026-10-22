@@ -817,12 +817,19 @@ async fn restore_cache(b: &Backend, l: &Lease, ws: &Path, work: &Path, tx: &mpsc
 /// cache's paths, never outside the workspace (tar's checks: no `..`, no
 /// absolute paths, no writing through symlinks), at most ENTRY_CAP bytes.
 fn unpack_cache(file: &Path, ws: &Path, paths: &[String]) -> std::io::Result<usize> {
+    use std::io::Read;
     let f = std::fs::File::open(file)?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    // The whole stream is capped too: tar reads long-name and PAX headers into memory.
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(f).take(cache::ENTRY_CAP + (64 << 20)));
     tar.set_preserve_permissions(false);
     let (mut n, mut total) = (0, 0u64);
     for e in tar.entries()? {
         let mut e = e?;
+        // Every entry counts: moving past one decompresses it too.
+        total = total.saturating_add(e.header().size()?);
+        if total > cache::ENTRY_CAP {
+            return Err(std::io::Error::other("the cache is over 1 GB"));
+        }
         let kind = e.header().entry_type();
         if !matches!(kind, tar::EntryType::Regular | tar::EntryType::Directory) {
             continue;
@@ -830,10 +837,6 @@ fn unpack_cache(file: &Path, ws: &Path, paths: &[String]) -> std::io::Result<usi
         let rel = e.path()?.to_string_lossy().trim_end_matches('/').to_string();
         if !in_cache(paths, &rel) && !paths.iter().any(|p| p.starts_with(&format!("{rel}/"))) {
             continue;
-        }
-        total += e.header().size()?;
-        if total > cache::ENTRY_CAP {
-            return Err(std::io::Error::other("the cache is over 1 GB"));
         }
         if e.unpack_in(ws)? && kind == tar::EntryType::Regular {
             n += 1;

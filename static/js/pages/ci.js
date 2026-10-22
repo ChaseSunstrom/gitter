@@ -1,5 +1,5 @@
 // CI: the runs of a repository, and one run with its jobs and live, folded logs.
-import { html, raw, esc, get, send, toast, action, timeEl, short, $, $$ } from '../lib.js';
+import { html, raw, esc, get, send, toast, action, timeEl, short, plural, encPath, modal, $, $$ } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader, ciIcon, CI_LABEL as LABEL } from '../repohead.js';
 import { navigate } from '../main.js';
@@ -57,7 +57,7 @@ async function listView(meta, q) {
   const api = repoUrl(meta.owner, meta.name);
   const p = new URLSearchParams({ page: q.get('page') || '1' });
   if (q.get('branch')) p.set('branch', q.get('branch'));
-  const d = await get(`${api}/ci/runs?${p}`, { fresh: true });
+  const [d, flaky] = await Promise.all([get(`${api}/ci/runs?${p}`, { fresh: true }), get(`${api}/ci/flaky`, { fresh: true }).catch(() => ({ tests: [] }))]);
   const base = `/${meta.owner}/${meta.name}`;
   const page = +(q.get('page') || 1);
   const rows = d.runs.map((r) => html`<a class="list-row ci-run" href="${base}/ci/${r.number}">
@@ -72,13 +72,18 @@ async function listView(meta, q) {
   const sample = 'jobs:\n  test:\n    steps:\n      - run: make test\n';
   const empty = html`<div class="box empty">${icon('zap', 'big')}<h3>No runs yet</h3>
     <p>Add <code>.gitter/ci.yml</code> (or just a <code>.gitter/ci.sh</code> script) and push: every push and pull request runs it.</p>
+    ${meta.can_write ? html`<p><button class="btn primary" id="ci-setup">${icon('play', 'sm')} Set up CI</button></p>` : ''}
     <pre class="setup-cmd" style="text-align:left">${sample}</pre></div>`;
+  const flakyBox = flaky.tests.length ? html`<details class="box ci-flaky-box"><summary class="box-head row">${icon('zap', 'sm')}<b class="grow">Flaky tests</b><span class="counter">${flaky.tests.length}</span></summary>
+    <div class="list">${flaky.tests.map((t) => html`<a class="list-row" href="${base}/ci/${t.last_run}"><span class="grow mono small ellipsis">${t.name}</span>
+      <span class="muted small">failed, then passed on the same commit ${plural(t.flips, 'time')} · ${timeEl(t.last_seen)}</span></a>`)}</div></details>` : '';
   const body = html`<div class="stack">
     ${d.enabled ? '' : html`<div class="box box-body row small">${icon('shield', 'sm')}<span class="grow">CI is turned off for this repository's owner on this site. A site admin can change that in Site administration → Settings.</span></div>`}
     <div class="toolbar"><h2 style="font-size:17px" class="grow">CI runs</h2>
       ${q.get('branch') ? html`<a class="pill" href="${base}/ci">${icon('branch', 'sm')} ${q.get('branch')} ${icon('x', 'sm')}</a>` : ''}
       ${d.can_run ? html`<form id="run-form" class="row"><select class="select sm" name="branch" aria-label="Branch to run">${(meta.branches || []).map((b) => html`<option ${b === meta.default_branch ? 'selected' : ''}>${b}</option>`)}</select>
         <button class="btn sm primary" type="submit">${icon('play', 'sm')} Run</button></form>` : ''}</div>
+    ${flakyBox}
     ${d.runs.length ? html`<div class="box list">${rows}</div>` : empty}
     ${page > 1 || page * 30 < d.total ? html`<div class="pager">
       ${page > 1 ? html`<a class="btn" href="${base}/ci?page=${page - 1}">${icon('chev-left', 'sm')} Newer</a>` : ''}
@@ -96,6 +101,7 @@ async function listView(meta, q) {
         const r = await send('POST', `${api}/ci/runs`, { branch: f.branch.value });
         navigate(`${base}/ci/${r.number}`);
       }));
+      $('#ci-setup', el)?.addEventListener('click', () => setupCi(meta));
       // Keep the list fresh while something is running.
       if (live) timer = setTimeout(() => location.pathname === `${base}/ci` && navigate(location.href, { replace: true, scroll: false }), 4000);
     },
@@ -103,7 +109,80 @@ async function listView(meta, q) {
   };
 }
 
+// ---------- Set up CI: a starter pipeline on a new branch, with a pull request ----------
+const TEMPLATES = [
+  ['rust', 'Rust', 'cargo build and test; crates and target cached'],
+  ['node', 'Node.js', 'npm ci and npm test on Node 20 and 22'],
+  ['python', 'Python', 'pytest, with test results on runs and pull requests'],
+  ['go', 'Go', 'go vet and go test; module and build caches'],
+  ['docker', 'Docker', 'build the Dockerfile on a runner with docker'],
+];
+const tplText = {};
+async function template(k) {
+  if (!tplText[k]) {
+    const r = await fetch(new URL(`../../ci-templates/${k}.yml`, import.meta.url));
+    if (!r.ok) throw new Error(`Couldn't load the ${k} template (${r.status})`);
+    tplText[k] = await r.text();
+  }
+  return tplText[k];
+}
+
+function setupCi(meta) {
+  const api = repoUrl(meta.owner, meta.name);
+  return modal({
+    title: 'Set up CI',
+    wide: true,
+    body: html`<p class="muted small">Pick a starting point. It's committed as <code>.gitter/ci.yml</code> on a new branch, with a pull request: its first run shows whether it fits this repository before anything lands on ${meta.default_branch}.</p>
+      <div class="ci-templates" role="radiogroup" aria-label="Templates">${TEMPLATES.map(([k, name, what], i) => html`<label class="ci-template"><input type="radio" name="tpl" value="${k}" ${i === 0 ? 'checked' : ''}><b>${name}</b><span class="muted small">${what}</span></label>`)}</div>
+      <pre class="ci-log ci-tpl-preview" id="tpl-preview">Loading…</pre>`,
+    foot: html`<button class="btn" data-close>Cancel</button><button class="btn primary" id="tpl-go">Open pull request</button>`,
+    onMount(el, close) {
+      const pick = () => el.querySelector('input[name=tpl]:checked').value;
+      const preview = $('#tpl-preview', el);
+      const show = async () => {
+        const k = pick();
+        try { const t = await template(k); if (pick() === k) preview.textContent = t; } catch (e) { preview.textContent = e.message; }
+      };
+      el.addEventListener('change', show);
+      show();
+      const go = $('#tpl-go', el);
+      go.addEventListener('click', action(go, async () => {
+        const k = pick();
+        const branch = `setup-ci-${k}-${Math.random().toString(36).slice(2, 7)}`;
+        await send('POST', `${api}/contents`, { branch: meta.default_branch, new_branch: branch, message: `Set up CI (${k})`, changes: [{ path: '.gitter/ci.yml', content: await template(k) }] });
+        const pr = await send('POST', `${api}/pulls`, {
+          title: 'Set up CI', head: branch, base: meta.default_branch,
+          body: `Adds \`.gitter/ci.yml\` from the ${k} template. The run on this pull request shows whether it works here; edit the file on the branch until it does.`,
+        });
+        close(true);
+        navigate(`/${meta.owner}/${meta.name}/pull/${pr.number}`);
+      }));
+    },
+  });
+}
+
 // ---------- one run ----------
+
+/** The run's test results: counts, coverage, failed and flaky tests. */
+function testsBox(base, run, t) {
+  if (!t || !t.jobs.length) return '';
+  const sum = (k) => t.jobs.reduce((a, j) => a + j[k], 0);
+  const rows = t.results.map((r) => html`<details class="ci-test" ${r.status === 'failed' && t.results.length <= 10 ? 'open' : ''}>
+    <summary>${icon('chev-right', 'sm chev')}${ciIcon(r.status === 'failed' ? 'failure' : 'success')}
+      <span class="grow ellipsis">${r.suite ? html`<span class="muted">${r.suite} › </span>` : ''}${r.name}</span>
+      ${r.flaky ? html`<span class="badge ci-flaky" title="Failed, then passed on the same commit">flaky</span>` : ''}
+      ${r.file ? html`<a class="mono small" href="${base}/blob/${run.sha}/${encPath(r.file)}${r.line ? `#L${r.line}` : ''}">${r.file}${r.line ? `:${r.line}` : ''}</a>` : ''}
+      <span class="muted small hide-sm">${r.job}</span></summary>
+    ${r.message ? html`<pre class="ci-log">${r.message}</pre>` : ''}</details>`);
+  return html`<section class="box ci-tests" aria-label="Test results">
+    <div class="box-head row wrap-ok">${icon('check', 'sm')}<b class="grow">Tests</b>
+      <span class="small">${plural(sum('tests'), 'test')}</span>
+      ${sum('failed') ? html`<span class="small c-red">${sum('failed')} failed</span>` : html`<span class="small c-green">all passed</span>`}
+      ${sum('skipped') ? html`<span class="small muted">${sum('skipped')} skipped</span>` : ''}
+      ${sum('flaky') ? html`<span class="badge ci-flaky">${sum('flaky')} flaky</span>` : ''}
+      ${t.coverage != null ? html`<span class="pill ci-cov" title="Lines covered by the tests">${t.coverage}% coverage</span>` : ''}</div>
+    ${rows}</section>`;
+}
 const SKIPPED = { paths: 'no matching file changed', needs: "a job it needs didn't pass" };
 
 function jobRow(base, run, j, on) {
@@ -142,7 +221,9 @@ function foldHtml(f, job, open) {
 async function runView(meta, number, q) {
   const api = repoUrl(meta.owner, meta.name);
   const base = `/${meta.owner}/${meta.name}`;
-  let run = await get(`${api}/ci/runs/${number}`, { fresh: true });
+  let [run, tests] = await Promise.all([get(`${api}/ci/runs/${number}`, { fresh: true }), get(`${api}/ci/runs/${number}/tests`, { fresh: true }).catch(() => null)]);
+  const finished = () => run.jobs.filter((j) => DONE.has(j.status)).length;
+  let testsAt = finished();
   const pick = () => run.jobs.find((j) => String(j.id) === q.get('job'))
     || run.jobs.find((j) => j.status === 'failure') || run.jobs.find((j) => j.status === 'running') || run.jobs[0];
   let job = pick();
@@ -171,6 +252,7 @@ async function runView(meta, number, q) {
   const body = html`<div class="stack">
     <a class="muted small ci-back" href="${base}/ci">${icon('arrow-left', 'sm')} All runs</a>
     <div id="ci-head">${head()}</div>
+    <div id="ci-tests">${testsBox(base, run, tests)}</div>
     ${run.jobs.length ? html`<div class="ci-split">
       <aside class="box list" id="ci-jobs">${run.jobs.map((j) => jobRow(base, run, j, j === job))}</aside>
       <section class="box ci-job-box" id="ci-job">${jobHead()}<div id="ci-folds"><div class="box-body muted small">Loading the log…</div></div></section>
@@ -250,6 +332,13 @@ async function runView(meta, number, q) {
     const was = job?.status;
     job = run.jobs.find((j) => j.id === job?.id) || pick();
     $('#ci-head', el).innerHTML = head().s;
+    // A job finished: it may have sent test reports.
+    if (finished() !== testsAt) {
+      testsAt = finished();
+      tests = await get(`${api}/ci/runs/${number}/tests`, { fresh: true }).catch(() => tests);
+      if (gone) return;
+      $('#ci-tests', el).innerHTML = testsBox(base, run, tests).s ?? '';
+    }
     const list = $('#ci-jobs', el);
     if (list) list.innerHTML = run.jobs.map((j) => jobRow(base, run, j, j === job).s).join('');
     renderJobHead(el);

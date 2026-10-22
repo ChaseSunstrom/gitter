@@ -1,0 +1,8 @@
+# Docker: build the image from the Dockerfile on every push and pull request.
+# It runs on a runner that has docker (the `docker` label).
+jobs:
+  build:
+    runs-on: [docker]
+    steps:
+      - name: Build the image
+        run: docker build --pull -t "ci-build:$GITTER_SHA" .

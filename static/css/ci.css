@@ -56,3 +56,30 @@
 .ci-back, .ci-head .row > span, .ci-head .row > a { display: inline-flex; align-items: center; gap: 3px; }
 .ci-back { width: max-content; }
 .ci-when > div { display: flex; align-items: center; justify-content: flex-end; gap: 3px; }
+
+/* Test reports, coverage, flaky tests, annotations, Set up CI */
+.ci-test { border-top: 1px solid var(--line); }
+.ci-test > summary { display: flex; align-items: center; gap: 8px; padding: 7px 12px; cursor: pointer; list-style: none; }
+.ci-test > summary::-webkit-details-marker { display: none; }
+.ci-test > summary:hover { background: var(--hover); }
+.ci-test > summary .chev { transition: transform .15s; color: var(--muted); }
+.ci-test[open] > summary .chev { transform: rotate(90deg); }
+.ci-test .ci-log { max-height: 320px; overflow: auto; }
+.ci-flaky { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
+.ci-cov { font-variant-numeric: tabular-nums; }
+.ci-flaky-box > summary { cursor: pointer; list-style: none; }
+.ci-flaky-box > summary::-webkit-details-marker { display: none; }
+.pr-ci-report:empty { display: none; }
+.pr-ci-report { margin-block: 8px; }
+.pr-ci-report .row > span, .pr-ci-report .row > a { display: inline-flex; align-items: center; gap: 3px; }
+tr.ci-ann > td { padding: 6px 10px; background: var(--bg-sunk); }
+.ci-ann-box { border: 1px solid var(--red); border-inline-start-width: 3px; border-radius: 6px; background: var(--red-soft); padding: 6px 10px; font-family: var(--font-ui); white-space: normal; }
+.ci-ann-box .row { gap: 6px; color: var(--ink); }
+.ci-ann-box .ico { color: var(--red); }
+.ci-ann-box pre { margin: 6px 0 0; font: 12px/1.5 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow: auto; color: var(--ink-2); }
+.ci-templates { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-block: 10px; }
+.ci-template { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.ci-template:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.ci-template input { position: absolute; opacity: 0; pointer-events: none; }
+.ci-template:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ci-tpl-preview { max-height: 300px; overflow: auto; border-radius: 6px; padding-inline: 14px; }

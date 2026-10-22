@@ -265,7 +265,7 @@ pub fn parse_junit(data: &[u8]) -> Result<Vec<Case>, String> {
         match ev {
             Ev::Start("testsuite", a) => suites.push(attr(&a, "name").unwrap_or("").to_string()),
             Ev::Start("testcase", a) => {
-                let suite = attr(&a, "classname").map(String::from).or_else(|| suites.last().cloned()).unwrap_or_default();
+                let suite = attr(&a, "classname").map(String::from).or_else(|| suites.last().cloned()).unwrap_or_default().chars().take(500).collect();
                 let case = Case {
                     suite,
                     name: attr(&a, "name").unwrap_or("").chars().take(500).collect(),
@@ -369,24 +369,24 @@ struct Parsed {
 /// Read the archive the runner sent: `junit/…` and `coverage/…` entries, bounded.
 fn unpack(file: &Path) -> std::io::Result<Parsed> {
     let f = std::fs::File::open(file)?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    // The whole stream is capped too: tar reads long-name and PAX headers into memory.
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(f).take(TOTAL_CAP + (1 << 20)));
     let (mut out, mut total, mut n) = (Parsed { cases: vec![], coverage: None }, 0u64, 0);
     for e in tar.entries()? {
-        let e = e?;
+        // A cut-off or broken archive keeps what was read before.
+        let Ok(e) = e else { break };
         n += 1;
+        // Sizes as the headers claim them: moving past an entry decompresses it, read or not.
+        total = total.saturating_add(e.header().size()?);
         if n > MAX_FILES || total > TOTAL_CAP {
             break;
         }
-        if e.header().entry_type() != tar::EntryType::Regular {
+        if e.header().entry_type() != tar::EntryType::Regular || e.header().size()? > FILE_CAP as u64 {
             continue;
         }
         let name = e.path()?.to_string_lossy().into_owned();
         let mut data = Vec::new();
-        e.take(FILE_CAP as u64 + 1).read_to_end(&mut data)?;
-        total += data.len() as u64;
-        if data.len() > FILE_CAP {
-            continue;
-        }
+        e.take(FILE_CAP as u64).read_to_end(&mut data)?;
         if name.starts_with("junit/") {
             // A broken report is skipped: the others still count.
             out.cases.extend(parse_junit(&data).unwrap_or_default());

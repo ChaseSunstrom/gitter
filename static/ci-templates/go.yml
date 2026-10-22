@@ -1,0 +1,15 @@
+# Go: vet and test every package. The module and build caches are kept
+# between runs (go skips folders starting with a dot).
+jobs:
+  test:
+    image: golang:1.23
+    cache:
+      key: go-{{ hash go.sum }}
+      restore-keys: [go-]
+      paths: [.go]
+    steps:
+      - name: Vet and test
+        run: |
+          export GOMODCACHE="$GITTER_WORKSPACE/.go/mod" GOCACHE="$GITTER_WORKSPACE/.go/build"
+          go vet ./...
+          go test ./...

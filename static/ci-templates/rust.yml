@@ -1,0 +1,18 @@
+# Rust: build and test with cargo on every push and pull request.
+# Downloaded crates and the target folder are cached between runs.
+jobs:
+  test:
+    image: rust:1
+    cache:
+      key: cargo-{{ hash Cargo.lock }}
+      restore-keys: [cargo-]
+      paths: [.cargo, target]
+    steps:
+      - name: Build
+        run: |
+          export CARGO_HOME="$GITTER_WORKSPACE/.cargo"
+          cargo build --all-targets
+      - name: Test
+        run: |
+          export CARGO_HOME="$GITTER_WORKSPACE/.cargo"
+          cargo test

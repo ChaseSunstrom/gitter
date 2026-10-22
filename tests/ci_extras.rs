@@ -176,6 +176,12 @@ fn key_templates_and_cache_config() {
         let y = format!("jobs:\n  t:\n    cache:\n      key: k\n      {bad}\n    steps: [x]\n");
         assert!(gitter::ci::config::parse(&y).is_err(), "{bad}");
     }
+    // The Set up CI templates are valid pipelines.
+    for t in ["rust", "node", "python", "go", "docker"] {
+        let src = std::fs::read_to_string(format!("static/ci-templates/{t}.yml")).unwrap();
+        let p = gitter::ci::config::parse(&src).unwrap_or_else(|e| panic!("{t}: {e}"));
+        assert!(p.triggers.push.is_some() && p.triggers.pull_request.is_some(), "{t}");
+    }
     // Specs stored before caches existed still load.
     let old = r#"{"name":"a","key":"a","image":null,"needs":[],"env":{},"paths":[],"timeout_secs":60,"steps":[],"artifacts":[],"runs_on":[]}"#;
     let j: gitter::ci::config::Job = serde_json::from_str(old).unwrap();
@@ -309,8 +315,12 @@ async fn reports_through_a_remote_runner_show_failures_coverage_and_flaky_tests(
     assert_eq!((f["tests"][0]["flips"].as_i64(), f["tests"][0]["last_run"].as_i64()), (Some(1), Some(n)));
     let (_, a) = app.req(&admin, "GET", &format!("/api/repos/root1/r/ci/report?sha={sha}"), None).await;
     assert_eq!(a["annotations"].as_array().map(Vec::len), Some(0), "the passing attempt replaced the failures: {a}");
-    // The cache went up through the runner API, under the run's branch.
+    // The cache went up through the runner API, under the run's branch, and comes back down.
     assert_eq!(caches(&app).await, [("refs/heads/main".to_string(), "c".to_string())]);
+    assert_eq!(app.req(&admin, "POST", &format!("/api/repos/root1/r/ci/runs/{n}/rerun"), Some(json!({ "all": true }))).await.0, StatusCode::OK);
+    assert_eq!(settle(&app).await, "success");
+    let log = last_log(&app).await;
+    assert!(log.contains("Restored 1 file(s) from the cache c.") && !log.contains("Saved"), "{log}");
 }
 
 #[tokio::test]
