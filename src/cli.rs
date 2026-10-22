@@ -35,7 +35,8 @@ const USAGE: &str = "gitter — command-line client
   gitter ci logs RUN [--job NAME]    print a run's logs (follows running jobs)
   gitter ci rerun RUN [--all]        re-run failed jobs (--all: every job)
   gitter ci run [--here]             run .gitter/ci.yml here, no server needed: each job in a fresh
-                                     copy of the work tree (--here: in this folder); exits 1 if a job fails
+                                     copy of the work tree (--here: in this folder, not for image
+                                     jobs); exits 1 if a job fails
 
 The repository is the one whose git remote points at a server you logged in to,
 or -R OWNER/NAME (or -R URL/OWNER/NAME). --json prints the server's answer as JSON.";
@@ -221,6 +222,17 @@ fn git_loud(args: &[&str], auth: Option<&Api>) -> Result<()> {
         bail!("git {} failed", args[0]);
     }
     Ok(())
+}
+
+/// Plain http to anywhere but this machine: the token would cross the network unencrypted.
+fn plain_elsewhere(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    !(host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()))
 }
 
 /// `scheme://host/path` without any `user:password@`.
@@ -427,6 +439,9 @@ fn login(mut cx: Ctx) -> Result<()> {
     let url = cx.a.pos(1).ok_or_else(|| anyhow!("usage: gitter login https://your.gitter.server"))?.trim().trim_end_matches('/').to_string();
     if !(url.starts_with("http://") || url.starts_with("https://")) || url.contains('@') {
         bail!("give the server's address, like https://git.example.com");
+    }
+    if plain_elsewhere(&url) {
+        eprintln!("Warning: {url} is plain http to another machine, so your token crosses the network unencrypted. Use https if the server has it.");
     }
     let token = match cx.a.get("--token").map(String::from).or_else(|| std::env::var("GITTER_TOKEN").ok().filter(|t| !t.is_empty())) {
         Some(t) => t,
@@ -635,6 +650,11 @@ fn branch_arg(b: &str) -> Result<&str> {
 
 fn pr_create(cx: &Ctx) -> Result<()> {
     let (api, r) = cx.repo()?;
+    // The current branch is this folder's: pushing it into some other repository has to be asked for.
+    let elsewhere = cx.remote_repo().is_none_or(|(h, rr)| h != api.base || !rr.eq_ignore_ascii_case(&r));
+    if cx.a.get("--head").is_none() && elsewhere {
+        bail!("this folder's remote doesn't point at {r}, so say which branch to push there: pass --head BRANCH");
+    }
     let head = match cx.a.get("--head") {
         Some(h) => h.to_string(),
         None => git(&["symbolic-ref", "--short", "-q", "HEAD"], None).map_err(|_| anyhow!("not on a branch: switch to one or pass --head"))?,
@@ -849,6 +869,10 @@ fn ci_run(cx: &Ctx) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("there's no {CONFIG_PATH} or {SCRIPT_PATH} in {}", root.display()),
         Err(e) => return Err(e).context(CONFIG_PATH),
     };
+    // A container gets its work tree mounted and its files chowned: never the folder itself.
+    if let Some(j) = pipeline.jobs.iter().find(|j| j.image.is_some()).filter(|_| here) {
+        bail!("job {} runs in an image, which would take over this folder's files: run it without --here (in a copy)", j.name);
+    }
     let sha = git(&["rev-parse", "-q", "--verify", "HEAD"], None).unwrap_or_default();
     let branch = git(&["symbolic-ref", "--short", "-q", "HEAD"], None).unwrap_or_default();
     let folder = root.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
@@ -954,5 +978,15 @@ mod tests {
         assert_eq!(repo_name("alice/proj.git/").as_deref(), Some("alice/proj"));
         assert_eq!(repo_name("alice/proj/extra"), None);
         assert_eq!(repo_name("-x/y"), None);
+    }
+
+    #[test]
+    fn plain_http_is_flagged_unless_it_stays_on_this_machine() {
+        for u in ["http://git.example.com", "http://10.0.0.5:3000", "http://localhost.example.com", "http://[2001:db8::1]:80"] {
+            assert!(plain_elsewhere(u), "{u}");
+        }
+        for u in ["https://git.example.com", "http://localhost:3000", "http://127.0.0.1:8080", "http://127.5.0.1", "http://[::1]:3000", "http://LOCALHOST"] {
+            assert!(!plain_elsewhere(u), "{u}");
+        }
     }
 }

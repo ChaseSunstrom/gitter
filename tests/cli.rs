@@ -129,7 +129,10 @@ async fn login_repo_issue_and_pr_commands_work_against_a_server() {
     std::fs::write(clone.join("f.txt"), "feature\n").unwrap();
     git(&home, &clone, &["add", "f.txt"]);
     git(&home, &clone, &["commit", "-q", "-m", "Add f"]);
-    let out = ok(&home, &clone, &["pr", "create"]);
+    // -R naming a repository this folder's remote doesn't point at: which branch goes there must be said.
+    let (code, _, err) = gitter(&home, &clone, &["pr", "create", "-R", "alice/elsewhere"]);
+    assert!(code != 0 && err.contains("--head"), "{err}");
+    let out = ok(&home, &clone, &["pr", "create", "-R", "alice/proj"]);
     assert!(out.contains("#2"), "{out}");
     let pr = json_of(&ok(&home, &clone, &["pr", "view", "2", "--json"]));
     assert_eq!((pr["issue"]["title"].as_str(), pr["pull"]["head"].as_str()), (Some("Add f"), Some("feature")), "{pr}");
@@ -255,6 +258,12 @@ fn ci_run_plans_and_runs_a_local_pipeline() {
     let dir = local_repo(home, &[(".gitter/ci.yml", "jobs:\n  a:\n    steps: [\"echo ok > here.txt\"]\n")]);
     ok(home, &dir, &["ci", "run", "--here"]);
     assert!(dir.join("here.txt").exists());
+
+    // --here would hand the folder itself to a container (mounted, its files chowned): refused, nothing run.
+    let dir = local_repo(home, &[(".gitter/ci.yml", "jobs:\n  a:\n    image: alpine\n    steps: [\"echo ok > here.txt\"]\n")]);
+    let (code, _, err) = gitter(home, &dir, &["ci", "run", "--here"]);
+    assert!(code != 0 && err.contains("image") && err.contains("--here"), "{err}");
+    assert!(!dir.join("here.txt").exists());
 
     // A broken file says why.
     let dir = local_repo(home, &[(".gitter/ci.yml", "jobs:\n  a:\n    stepz: [x]\n")]);

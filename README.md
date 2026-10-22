@@ -195,7 +195,7 @@ Before the steps, the runner restores the newest cache with that key (`hash` is 
 
 **Set up CI.** On a repository without runs, **Set up CI** on the CI tab offers starter pipelines (Rust, Node.js, Python, Go, Docker), commits the chosen one as `.gitter/ci.yml` on a new branch and opens a pull request, whose run shows whether it fits.
 
-**Run it locally.** `gitter ci run` runs `.gitter/ci.yml` on your machine with the same parser and step runner, no server needed. Jobs run one at a time in `needs` order, and a job whose needs failed is skipped. Each job gets a fresh copy of the work tree as it is now: tracked files and untracked ones that aren't ignored, without `.git`. Use `--here` to run in the folder itself, for example when steps need git history. `HOME` is a fresh folder, and no secrets are set. Triggers, `paths` and `runs-on` don't apply, and jobs with an `image` need docker. It exits 1 when a job fails.
+**Run it locally.** `gitter ci run` runs `.gitter/ci.yml` on your machine with the same parser and step runner, no server needed. Jobs run one at a time in `needs` order, and a job whose needs failed is skipped. Each job gets a fresh copy of the work tree as it is now: tracked files and untracked ones that aren't ignored, without `.git`. Use `--here` to run in the folder itself, for example when steps need git history (not for jobs with an `image`, which would take over the folder's files). `HOME` is a fresh folder, and no secrets are set. Triggers, `paths` and `runs-on` don't apply, and jobs with an `image` need docker. It exits 1 when a job fails.
 
 ## Command-line client
 
@@ -211,7 +211,7 @@ gitter pr list; gitter pr checkout 7; gitter pr merge 7 --method squash
 gitter ci status; gitter ci logs 12        # follows a running job; gitter ci rerun 12
 ```
 
-`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name`. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter <command> --help` lists every command.
+`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name` (`pr create` then also needs `--head BRANCH`, so your current branch isn't pushed somewhere by surprise). Logging in over plain `http://` to another machine warns that the token travels unencrypted. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter <command> --help` lists every command.
 
 ## Webhooks
 
