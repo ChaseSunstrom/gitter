@@ -37,6 +37,10 @@ pub struct Deps {
 
 const MAX_FILES: usize = 50;
 const MAX_FILE: usize = 32 << 20;
+const MAX_TOTAL: usize = 64 << 20;
+/// What one OSV zip may unpack to in all, and how many files it may have.
+const MAX_UNZIPPED: usize = 1 << 30;
+const MAX_ENTRIES: usize = 500_000;
 const MAX_DEPS: usize = 20_000;
 
 /// The lockfiles read, and the OSV ecosystem each one's packages live in.
@@ -275,10 +279,16 @@ pub async fn of_commit(st: &AppState, repo: &Repo, sha: &str) -> R<Deps> {
     paths.sort();
     paths.truncate(MAX_FILES);
     let mut texts = Vec::new();
+    // At most 64 MB of lockfiles in memory for one listing (anyone may ask for a public repo's).
+    let mut budget = MAX_TOTAL;
     for p in paths {
-        let (data, cut) = st.git.run_capped(&repo.path, &["cat-file", "blob", &format!("{sha}:{p}")], MAX_FILE).await?;
+        if budget == 0 {
+            break;
+        }
+        let (data, cut) = st.git.run_capped(&repo.path, &["cat-file", "blob", &format!("{sha}:{p}")], MAX_FILE.min(budget)).await?;
         if !cut {
-            texts.push((p, String::from_utf8_lossy(&data).into_owned()));
+            budget -= data.len().min(budget);
+            texts.push((p, String::from_utf8(data).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())));
         }
     }
     let d = tokio::task::spawn_blocking(move || collect(texts)).await.map_err(AppError::internal)?;
@@ -495,7 +505,12 @@ fn unzip(b: &[u8], mut each: impl FnMut(&str, Vec<u8>)) -> Result<(), String> {
         }
         p = u64at(rec + 48).ok_or_else(bad)?;
     }
+    let (mut unpacked, mut entries) = (0usize, 0usize);
     while b.get(p..).is_some_and(|s| s.starts_with(b"PK\x01\x02")) {
+        entries += 1;
+        if entries > MAX_ENTRIES {
+            return Err(format!("That zip has more than {MAX_ENTRIES} files: import it in parts"));
+        }
         let (method, csize) = (u16at(p + 10).ok_or_else(bad)?, u32at(p + 20).ok_or_else(bad)?);
         let (nlen, elen, clen) = (u16at(p + 28).ok_or_else(bad)?, u16at(p + 30).ok_or_else(bad)?, u16at(p + 32).ok_or_else(bad)?);
         let off = u32at(p + 42).ok_or_else(bad)?;
@@ -513,6 +528,10 @@ fn unzip(b: &[u8], mut each: impl FnMut(&str, Vec<u8>)) -> Result<(), String> {
                 let _ = flate2::read::DeflateDecoder::new(data).take(16 << 20).read_to_end(&mut out);
             }
             _ => continue,
+        }
+        unpacked += out.len();
+        if unpacked > MAX_UNZIPPED {
+            return Err("That zip unpacks to more than 1 GB: import it in parts".into());
         }
         each(&name, out);
     }
@@ -643,12 +662,14 @@ pub fn spdx(base_url: &str, repo: &str, sha: &str, deps: &[Dep], now: i64) -> Va
     let mut packages = vec![json!({
         "SPDXID": "SPDXRef-Repository", "name": repo, "versionInfo": sha,
         "downloadLocation": format!("{base_url}/{repo}.git"), "filesAnalyzed": false,
+        "licenseConcluded": "NOASSERTION", "licenseDeclared": "NOASSERTION", "copyrightText": "NOASSERTION",
     })];
     let mut rel = vec![json!({ "spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-Repository" })];
     for (i, d) in deps.iter().enumerate() {
         let id = format!("SPDXRef-Package-{}", i + 1);
         packages.push(json!({
             "SPDXID": id, "name": d.name, "versionInfo": d.version, "downloadLocation": "NOASSERTION", "filesAnalyzed": false,
+            "licenseConcluded": "NOASSERTION", "licenseDeclared": "NOASSERTION", "copyrightText": "NOASSERTION",
             "externalRefs": [{ "referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl", "referenceLocator": purl(d) }],
         }));
         rel.push(json!({ "spdxElementId": "SPDXRef-Repository", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": id }));

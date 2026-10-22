@@ -19,6 +19,7 @@ COPY --from=build /src/target/release/gitter /usr/local/bin/gitter
 USER gitter
 ENV GITTER_DATA=/data GITTER_ADDR=0.0.0.0:3000
 VOLUME /data
-EXPOSE 3000
+# 2222 is git over SSH, when GITTER_SSH_ADDR=0.0.0.0:2222 is set.
+EXPOSE 3000 2222
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD wget -qO- http://127.0.0.1:3000/healthz || exit 1
 ENTRYPOINT ["/sbin/tini", "--", "gitter"]

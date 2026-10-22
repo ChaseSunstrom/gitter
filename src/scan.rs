@@ -8,12 +8,11 @@
 
 use std::collections::HashSet;
 use std::io::BufRead;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::AppState;
 use crate::auth::User;
@@ -28,6 +27,8 @@ pub const MAX_FINDINGS: usize = 100;
 const MAX_LINE: usize = 64 * 1024;
 /// Most diff output one push or scan reads.
 const HOOK_CAP: u64 = 512 << 20;
+/// How long the hook scans a push before letting the rest through unscanned.
+const HOOK_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 const SCAN_CAP: usize = 64 << 20;
 /// How long an allowance waits for the push or commit that uses it.
 pub const ALLOW_FOR: i64 = 3 * 3600;
@@ -213,6 +214,9 @@ fn random_enough(v: &[u8]) -> bool {
         && ((has(u8::is_ascii_uppercase) && has(u8::is_ascii_lowercase)) || v.len() >= 32)
         && !v.iter().any(|b| b.is_ascii_whitespace())
         && !v.starts_with(b"$")
+        // A URL or a path (`token_uri = https://…/token`), not a secret.
+        && !v.starts_with(b"/")
+        && !v.windows(3).any(|w| w == b"://")
         && !PLACEHOLDERS.iter().any(|p| low.windows(p.len()).any(|w| w == p.as_bytes()))
         // Random hex carries 4 bits a character at most.
         && entropy(v) >= if v.len() >= 32 { 3.0 } else { 3.5 }
@@ -229,11 +233,12 @@ fn assignment(line: &[u8]) -> Option<&[u8]> {
         let mut from = 0;
         while let Some(p) = low[from..].windows(kw.len()).position(|w| w == kw.as_bytes()) {
             let at = from + p;
-            from = at + 1;
             let mut j = at + kw.len();
             while j < line.len() && (word(line[j]) || line[j] == b'-') {
                 j += 1;
             }
+            // Past this name, so a long run of keywords costs one pass, not one per hit.
+            from = j.max(at + 1);
             if j < line.len() && matches!(line[j], b'"' | b'\'') {
                 j += 1;
             }
@@ -276,25 +281,43 @@ fn assignment(line: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// `AKIA…7Q`: the start and the last two characters.
+/// `AKIA…7Q`: enough to recognise it, not to guess the rest (less of shorter ones).
 pub fn mask(secret: &str) -> String {
     let c: Vec<char> = secret.chars().collect();
-    if c.len() < 12 {
-        return format!("{}…", c.iter().take(2).collect::<String>());
+    match c.len() {
+        0..12 => format!("{}…", c.iter().take(2).collect::<String>()),
+        12..20 => format!("{}…{}", c[..3].iter().collect::<String>(), c[c.len() - 1]),
+        _ => format!("{}…{}", c[..4].iter().collect::<String>(), c[c.len() - 2..].iter().collect::<String>()),
     }
-    format!("{}…{}", c[..4].iter().collect::<String>(), c[c.len() - 2..].iter().collect::<String>())
 }
 
-/// What an allowance names: the kind, the file and the secret, hashed.
-pub fn fingerprint(kind: &str, path: &str, secret: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(kind.as_bytes());
-    h.update([0]);
-    h.update(path.as_bytes());
-    h.update([0]);
-    h.update(secret);
-    hex::encode(&h.finalize()[..10])
+/// The key fingerprints are made with (from the server's secret key, so a
+/// fingerprint and a mask can't be checked against guesses offline).
+static FP_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+pub fn set_key(k: &[u8]) {
+    let _ = FP_KEY.set(k.to_vec());
 }
+
+/// The fingerprint key: derived from the server's secret key at startup.
+pub fn fp_key() -> &'static [u8] {
+    FP_KEY.get().map(Vec::as_slice).unwrap_or(b"")
+}
+
+/// What an allowance names: the kind, the file and the secret, keyed-hashed.
+pub fn fingerprint(kind: &str, path: &str, secret: &[u8]) -> String {
+    use hmac::Mac;
+    let mut h = <hmac::Hmac<Sha256> as Mac>::new_from_slice(fp_key()).expect("any key length");
+    h.update(kind.as_bytes());
+    h.update(&[0]);
+    h.update(path.as_bytes());
+    h.update(&[0]);
+    h.update(secret);
+    hex::encode(&h.finalize().into_bytes()[..FINGERPRINT_BYTES])
+}
+
+/// Bytes of a fingerprint (hex: twice as many characters).
+pub const FINGERPRINT_BYTES: usize = 10;
 
 // ---------- scanners ----------
 
@@ -304,17 +327,35 @@ pub struct Scanner {
     pub findings: Vec<Finding>,
     /// Findings past MAX_FINDINGS, not kept.
     pub more: usize,
+    /// Their fingerprints (up to a bound): each still needs an allowance.
+    pub extra: Vec<String>,
     path: String,
     commit: String,
-    /// A private key header waiting for its key material on the next line: (line, header).
-    key: Option<(usize, String)>,
+    /// A private key being read: (its header's line, the header, its base64 so far,
+    /// lines of armor headers seen).
+    key: Option<(usize, String, Vec<u8>, u8)>,
     seen: HashSet<String>,
 }
 
 impl Scanner {
     pub fn file(&mut self, path: &str) {
+        self.end_key();
         self.path = path.to_string();
-        self.key = None;
+    }
+
+    /// The input is over: report a private key still being read.
+    pub fn end(&mut self) {
+        self.end_key();
+    }
+
+    /// A private key is found once its body ends; its fingerprint covers the whole
+    /// body (the first line is the same for every key of a kind).
+    fn end_key(&mut self) {
+        if let Some((at, header, body, _)) = self.key.take()
+            && body.len() >= 20
+        {
+            self.found("Private key", at, header, &body);
+        }
     }
 
     fn found(&mut self, kind: &str, line: usize, masked: String, secret: &[u8]) {
@@ -328,6 +369,9 @@ impl Scanner {
         }
         if self.findings.len() >= MAX_FINDINGS {
             self.more += 1;
+            if self.extra.len() < 100 * MAX_FINDINGS {
+                self.extra.push(fingerprint);
+            }
             return;
         }
         let (kind, path, commit) = (kind.to_string(), self.path.clone(), self.commit.clone());
@@ -337,17 +381,30 @@ impl Scanner {
     /// One added line, numbered as in the new file.
     pub fn line(&mut self, n: usize, text: &[u8]) {
         let text = &text[..text.len().min(MAX_LINE)];
-        if let Some((at, header)) = self.key.take()
-            && at + 1 == n
-            && let Some(m) = key_material(text)
-        {
-            self.found("Private key", at, header, m);
+        if let Some((_, _, body, headers)) = &mut self.key {
+            let t = text.trim_ascii();
+            let base64 = !t.is_empty() && t.iter().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(b));
+            if base64 && body.len() < 64 * 1024 {
+                body.extend_from_slice(t);
+                return;
+            }
+            // Armor headers (`Proc-Type: …`, `Version: …`) and the blank line before the body.
+            if body.is_empty() && *headers < 6 && (t.is_empty() || t.contains(&b':')) {
+                *headers += 1;
+                return;
+            }
+            self.end_key();
         }
         if let Some((header, rest)) = key_header(text) {
             let header = String::from_utf8_lossy(header).into_owned();
             match key_material(rest) {
-                Some(m) => self.found("Private key", n, header, m),
-                None => self.key = Some((n, header)),
+                // All on one line (`"-----BEGIN …-----\nMIIE…\n-----END …"`): the body up to its end.
+                Some(_) => {
+                    let end = rest.windows(9).position(|w| w == b"-----END ").unwrap_or(rest.len());
+                    let body: Vec<u8> = rest[..end].iter().copied().filter(|b| b.is_ascii_alphanumeric() || b"+/=".contains(b)).collect();
+                    self.found("Private key", n, header, &body);
+                }
+                None => self.key = Some((n, header, Vec::new(), 0)),
             }
         }
         let toks = tokens(text);
@@ -407,12 +464,13 @@ impl DiffScan {
         if l.starts_with(b"@@ ") {
             self.in_hunk = true;
             self.line = hunk_start(l).unwrap_or(1);
-            self.scan.key = None;
+            self.scan.end_key();
             return;
         }
         if !self.in_hunk {
             if let Some(p) = l.strip_prefix(b"+++ ") {
-                let p = unquote(p);
+                // Git ends a path that has spaces with a tab.
+                let p = unquote(p.strip_suffix(b"\t").unwrap_or(p));
                 self.scan.file(p.strip_prefix("b/").unwrap_or(&p));
             }
             return;
@@ -483,53 +541,27 @@ fn next_line(r: &mut impl BufRead, out: &mut Vec<u8>, cap: usize) -> std::io::Re
     }
 }
 
-/// Scans diff output; returns the scanner and how many bytes it read (it stops after `cap`).
-pub fn scan_diff(mut r: impl BufRead, cap: u64) -> (Scanner, bool) {
+/// Scans diff output; true when it stopped early (after `cap` bytes, or at `deadline`).
+pub fn scan_diff(mut r: impl BufRead, cap: u64, deadline: Option<std::time::Instant>) -> (Scanner, bool) {
     let mut d = DiffScan::default();
-    let (mut buf, mut read) = (Vec::new(), 0u64);
-    while let Ok(n) = next_line(&mut r, &mut buf, MAX_LINE + 2) {
+    let (mut buf, mut read, mut lines) = (Vec::new(), 0u64, 0u32);
+    let cut = loop {
+        let Ok(n) = next_line(&mut r, &mut buf, MAX_LINE + 2) else { break false };
         if n == 0 {
-            return (d.scan, false);
+            break false;
         }
         read += n as u64;
-        if read > cap {
-            return (d.scan, true);
+        lines = lines.wrapping_add(1);
+        if read > cap || (lines % 1024 == 0 && deadline.is_some_and(|t| std::time::Instant::now() > t)) {
+            break true;
         }
         d.feed(&buf);
-    }
-    (d.scan, false)
+    };
+    d.scan.end();
+    (d.scan, cut)
 }
 
 // ---------- push protection: git pushes ----------
-
-static HOOK_EXE: OnceLock<PathBuf> = OnceLock::new();
-
-/// The program git runs as the pre-receive hook: this one (`gitter pre-receive`),
-/// unless set first (tests point it at the built binary).
-pub fn set_hook_exe(p: impl Into<PathBuf>) {
-    let _ = HOOK_EXE.set(p.into());
-}
-
-fn hook_exe() -> PathBuf {
-    HOOK_EXE.get().cloned().or_else(|| std::env::current_exe().ok()).unwrap_or_else(|| "gitter".into())
-}
-
-const HOOK: &str = "#!/bin/sh\n# Gitter push protection: scans what a push adds for secrets.\nexec \"$GITTER_HOOK_EXE\" pre-receive\n";
-
-/// GITTER_DATA/hooks with the pre-receive hook in it (written when missing or changed).
-fn hooks_dir(data: &Path) -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = data.join("hooks");
-    let file = dir.join("pre-receive");
-    if std::fs::read_to_string(&file).ok().as_deref() != Some(HOOK) {
-        std::fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!(".pre-receive.{}", rand_hex()));
-        std::fs::write(&tmp, HOOK)?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(&tmp, &file)?;
-    }
-    Ok(dir)
-}
 
 fn rand_hex() -> String {
     let mut b = [0u8; 8];
@@ -543,11 +575,13 @@ struct Report {
     blocked: Vec<Finding>,
     /// Allowances the push used.
     allowed: Vec<String>,
+    /// The push was too big (or slow) to scan all of.
+    #[serde(default)]
+    cut: bool,
 }
 
 /// One push's protection: the hook's configuration, and its report afterwards.
 pub struct PushGuard {
-    hooks: PathBuf,
     out: PathBuf,
     allow: Vec<String>,
     url: String,
@@ -557,10 +591,8 @@ pub struct PushGuard {
 
 impl PushGuard {
     pub async fn start(st: &AppState, repo: &Repo, user: &User) -> R<PushGuard> {
-        let hooks = hooks_dir(&st.cfg.data_dir)?;
-        let out = hooks.join(format!("report-{}.json", rand_hex()));
+        let out = crate::protect::hook_dir(st)?.join(format!("report-{}.json", rand_hex()));
         Ok(PushGuard {
-            hooks,
             out,
             allow: allowances(st, repo.id, user.id).await?,
             url: format!("{}/{}/{}/security", st.cfg.url, repo.owner, repo.name),
@@ -569,11 +601,9 @@ impl PushGuard {
         })
     }
 
-    /// Turn the hook on for `git http-backend` (before its subcommand).
+    /// What the hook (`crate::protect::hook_dir`, set up by the caller) needs to scan.
     pub fn apply(&self, cmd: &mut tokio::process::Command) {
-        cmd.arg("-c")
-            .arg(format!("core.hooksPath={}", self.hooks.display()))
-            .env("GITTER_HOOK_EXE", hook_exe())
+        cmd.env("GITTER_SCAN_KEY", hex::encode(fp_key()))
             .env("GITTER_SCAN_ALLOW", self.allow.join(","))
             .env("GITTER_SCAN_OUT", &self.out)
             .env("GITTER_SCAN_URL", &self.url);
@@ -583,6 +613,9 @@ impl PushGuard {
     pub async fn finish(self, st: &AppState) {
         let Ok(text) = tokio::fs::read(&self.out).await else { return };
         let Ok(rep) = serde_json::from_slice::<Report>(&text) else { return };
+        if rep.cut {
+            eprintln!("push protection: a push to repository {} was too big to scan all of", self.repo_id);
+        }
         if let Err(e) = remember(st, self.repo_id, self.user_id, rep.blocked, rep.allowed).await {
             eprintln!("push protection: {}", e.msg);
         }
@@ -596,15 +629,20 @@ impl Drop for PushGuard {
 }
 
 const LOG_ARGS: &[&str] = &[
-    "log", "-p", "-U0", "-M", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-filter=AMR", "--format=%x00%H",
+    "log", "-p", "-U0", "-M", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-filter=AMRT", "--format=%x00%H",
 ];
 
-/// `gitter pre-receive`: run by git while a push waits, with the pushed objects
-/// quarantined. Scans the lines the new commits add; refuses the push (exit 1)
-/// when one holds a secret its pusher hasn't allowed.
-pub fn hook_main() -> i32 {
+/// Push protection, the second half of the pre-receive hook (`protect::pre_receive`),
+/// run while a push waits with its objects quarantined: scans the lines the new
+/// commits add, and refuses the push (exit 1) when one holds a secret its pusher
+/// hasn't allowed.
+pub fn check(input: &str) -> i32 {
+    let Ok(out_path) = std::env::var("GITTER_SCAN_OUT") else { return 0 };
+    if let Some(k) = std::env::var("GITTER_SCAN_KEY").ok().and_then(|k| hex::decode(k).ok()) {
+        set_key(&k);
+    }
     let mut news = Vec::new();
-    for l in std::io::stdin().lock().lines().map_while(Result::ok) {
+    for l in input.lines() {
         let mut p = l.split(' ');
         if let (Some(_old), Some(new)) = (p.next(), p.next())
             && new.len() >= 40
@@ -630,24 +668,34 @@ pub fn hook_main() -> i32 {
         return 1;
     };
     let out = std::io::BufReader::with_capacity(256 * 1024, child.stdout.take().expect("piped stdout"));
-    let (scan, cut) = scan_diff(out, HOOK_CAP);
-    let _ = child.kill();
-    let _ = child.wait();
+    let (scan, cut) = scan_diff(out, HOOK_CAP, Some(std::time::Instant::now() + HOOK_TIME));
+    if cut {
+        let _ = child.kill();
+    }
+    // A git that failed scanned nothing: that's no pass.
+    let read = child.wait().is_ok_and(|s| s.success());
+    if !cut && !read {
+        eprintln!("Push protection couldn't read this push, so it's refused. Try again.");
+        return 1;
+    }
     let allow: HashSet<String> = std::env::var("GITTER_SCAN_ALLOW").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect();
     let (allowed, blocked): (Vec<Finding>, Vec<Finding>) = scan.findings.into_iter().partition(|f| allow.contains(&f.fingerprint));
-    let rep = Report { allowed: allowed.into_iter().map(|f| f.fingerprint).collect(), blocked };
-    if let Ok(path) = std::env::var("GITTER_SCAN_OUT")
-        && let Ok(json) = serde_json::to_vec(&rep)
-    {
-        let _ = std::fs::write(path, json);
+    // Past the findings kept, each still needs its own allowance.
+    let (extra_ok, extra_blocked): (Vec<String>, Vec<String>) = scan.extra.into_iter().partition(|f| allow.contains(f));
+    let ok = blocked.is_empty() && extra_blocked.is_empty();
+    // Allowances are spent only by a push that goes through.
+    let spent = if ok { allowed.into_iter().map(|f| f.fingerprint).chain(extra_ok).collect() } else { vec![] };
+    let rep = Report { allowed: spent, blocked, cut };
+    if let Ok(json) = serde_json::to_vec(&rep) {
+        let _ = std::fs::write(&out_path, json);
     }
     if cut {
-        eprintln!("Push protection scanned the first {} MB of this push.", HOOK_CAP >> 20);
+        eprintln!("Push protection scanned only the first {} MB (or {} seconds) of this push.", HOOK_CAP >> 20, HOOK_TIME.as_secs());
     }
-    if rep.blocked.is_empty() {
+    if ok {
         return 0;
     }
-    eprint!("{}", refusal(&rep.blocked, scan.more, &std::env::var("GITTER_SCAN_URL").unwrap_or_default()));
+    eprint!("{}", refusal(&rep.blocked, extra_blocked.len(), &std::env::var("GITTER_SCAN_URL").unwrap_or_default()));
     1
 }
 
@@ -684,7 +732,7 @@ fn clean(s: &str) -> String {
 /// (against the files at `parent`) are scanned before anything is written.
 /// Findings its author allowed once go through, using up the allowance.
 pub async fn guard_commit(st: &AppState, repo: &Repo, user: &User, parent: Option<&str>, changes: &[Change<'_>]) -> R<()> {
-    let mut sc = Scanner::default();
+    let mut files = Vec::new();
     for ch in changes {
         let Change::Write(path, data, _) = ch else { continue };
         if data[..data.len().min(8000)].contains(&0) {
@@ -698,22 +746,34 @@ pub async fn guard_commit(st: &AppState, repo: &Repo, user: &User, parent: Optio
             }
             None => Vec::new(),
         };
-        sc.file(path);
-        for (n, l) in added_lines(&old, data) {
-            sc.line(n, l);
-        }
+        files.push((path.to_string(), old, data.to_vec()));
     }
-    if sc.findings.is_empty() {
+    // Scanning tens of MB is CPU work: off the async threads.
+    let sc = tokio::task::spawn_blocking(move || {
+        let mut sc = Scanner::default();
+        for (path, old, new) in &files {
+            sc.file(path);
+            for (n, l) in added_lines(old, new) {
+                sc.line(n, l);
+            }
+        }
+        sc.end();
+        sc
+    })
+    .await
+    .map_err(AppError::internal)?;
+    if sc.findings.is_empty() && sc.extra.is_empty() {
         return Ok(());
     }
     let allow = allowances(st, repo.id, user.id).await?;
     let (allowed, blocked): (Vec<Finding>, Vec<Finding>) = sc.findings.into_iter().partition(|f| allow.contains(&f.fingerprint));
-    let used: Vec<String> = allowed.into_iter().map(|f| f.fingerprint).collect();
-    if blocked.is_empty() {
+    let (extra_ok, extra_blocked): (Vec<String>, Vec<String>) = sc.extra.into_iter().partition(|f| allow.contains(f));
+    if blocked.is_empty() && extra_blocked.is_empty() {
+        let used: Vec<String> = allowed.into_iter().map(|f| f.fingerprint).chain(extra_ok).collect();
         return remember(st, repo.id, user.id, Vec::new(), used).await;
     }
     let list: Vec<String> = blocked.iter().map(|f| format!("{}:{} ({})", f.path, f.line, f.kind)).collect();
-    let details = serde_json::json!({ "findings": blocked, "more": sc.more });
+    let details = serde_json::json!({ "findings": blocked, "more": extra_blocked.len() });
     remember(st, repo.id, user.id, blocked, Vec::new()).await?;
     Err(AppError::new(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -767,7 +827,7 @@ pub async fn scan_commit(st: &AppState, repo: &Repo, sha: &str) -> R<(Vec<Findin
     let args = ["diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", crate::git::EMPTY_TREE, sha];
     let (out, cut) = st.git.run_capped(&repo.path, &args, SCAN_CAP).await?;
     let sha = sha.to_string();
-    let (mut scan, _) = tokio::task::spawn_blocking(move || scan_diff(&out[..], u64::MAX)).await.map_err(AppError::internal)?;
+    let (mut scan, _) = tokio::task::spawn_blocking(move || scan_diff(&out[..], u64::MAX, None)).await.map_err(AppError::internal)?;
     for f in &mut scan.findings {
         f.commit = sha.clone();
     }
@@ -784,6 +844,7 @@ mod tests {
         for (i, l) in lines.iter().enumerate() {
             s.line(i + 1, l.as_bytes());
         }
+        s.end();
         s.findings
     }
     fn kinds(lines: &[&str]) -> Vec<String> {
@@ -816,6 +877,29 @@ mod tests {
         assert!(kinds(&[&format!("{}Z", aws())]).is_empty(), "too long");
         assert!(kinds(&["AKIAIOSFODNN7EXAMPLE"]).is_empty(), "the AWS docs' sample");
         assert!(kinds(&[&gtr()[..30]]).is_empty(), "too short");
+    }
+
+    #[test]
+    fn review_cases_hold() {
+        // A long run of keywords costs one pass (it used to rescan each name per hit).
+        let line = format!("={}", "token".repeat(13_000));
+        let t = std::time::Instant::now();
+        assert!(kinds(&[&line]).is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+        // URLs and paths aren't secrets.
+        assert!(kinds(&[r#""token_uri": "https://oauth2.googleapis.com/token3XyZ""#]).is_empty());
+        assert!(kinds(&["TOKEN_PATH=/var/run/secrets/abc123DEF456ghi789"]).is_empty());
+        // Two keys of a kind start alike: each is its own finding, fingerprinted over all of it.
+        let key = |tail: &str| vec!["-----BEGIN OPENSSH PRIVATE KEY-----".to_string(), "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB".into(), tail.into(), "-----END OPENSSH PRIVATE KEY-----".into()];
+        let (a, b) = (key("AAAAMwAAAAtzc2gtZWQyNTUxOQAAACBfirstkey1"), key("AAAAMwAAAAtzc2gtZWQyNTUxOQAAACBsecondky2"));
+        let fa = scan(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        let fb = scan(&b.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!((fa.len(), fb.len()), (1, 1));
+        assert_ne!(fa[0].fingerprint, fb[0].fingerprint);
+        // Armor headers before the body.
+        assert_eq!(kinds(&["-----BEGIN PGP PRIVATE KEY BLOCK-----", "Version: GnuPG v2", "", "lQOYBF1234567890abcdefghijklmnopqrstuv"]), ["Private key"]);
+        // Masks show less of shorter secrets.
+        assert_eq!((mask("abcdefghijklmn").as_str(), mask("short").as_str()), ("abc…n", "sh…"));
     }
 
     #[test]
@@ -870,7 +954,7 @@ mod tests {
             aws = aws(),
             gtr = gtr()
         );
-        let (s, cut) = scan_diff(d.as_bytes(), u64::MAX);
+        let (s, cut) = scan_diff(d.as_bytes(), u64::MAX, None);
         assert!(!cut);
         let got: Vec<(String, usize, String, String)> = s.findings.iter().map(|f| (f.path.clone(), f.line, f.kind.clone(), f.commit[..1].to_string())).collect();
         assert_eq!(
@@ -881,7 +965,7 @@ mod tests {
             ],
             "a +++ line inside a hunk is content; a too-long key isn't one"
         );
-        let (_, cut) = scan_diff(d.as_bytes(), 10);
+        let (_, cut) = scan_diff(d.as_bytes(), 10, None);
         assert!(cut);
     }
 

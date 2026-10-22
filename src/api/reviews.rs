@@ -385,6 +385,10 @@ pub async fn submit(State(st): State<AppState>, Authed(u): Authed, Path((o, n, n
         })
         .await?;
     record_event(&st.db, u.id, Some(r.id), "comment", &issue.title, &num.to_string(), 1).await?;
+    if state == "approved" {
+        let (st2, rid) = (st.clone(), r.id);
+        tokio::spawn(async move { crate::protect::auto_merge(&st2, rid, None).await });
+    }
     Ok(Json(json!({ "id": id, "state": state })))
 }
 
@@ -500,6 +504,7 @@ pub async fn apply(
 ) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
     let (issue, branch, head, _) = pull(&st, &r, num, Some(&u)).await?;
+    crate::protect::direct(&st, &r, &branch, false).await?;
     if issue.state != "open" {
         return Err(AppError::bad("This pull request isn't open"));
     }

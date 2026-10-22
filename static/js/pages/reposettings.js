@@ -25,17 +25,42 @@ function askRecipient(full) {
   });
 }
 
+const ruleText = (r) => [
+  r.require_pr ? 'pull requests only' : 'direct pushes allowed',
+  r.approvals ? `${r.approvals} approval${r.approvals > 1 ? 's' : ''}` : '',
+  r.checks.length ? `checks: ${r.checks.join(', ')}` : '',
+  r.allow_force_push ? 'force-pushes allowed' : 'no force-pushes',
+  r.allow_deletion ? 'can be deleted' : "can't be deleted",
+  r.enforce_admins ? 'admins too' : '',
+].filter(Boolean).join(' · ');
+
+const ruleFields = (r = {}) => html`<div class="field"><label>Branch pattern</label><input class="input mono" name="pattern" value="${r.pattern || ''}" placeholder="main, or release/*" required spellcheck="false"></div>
+  <label class="check small"><input type="checkbox" name="require_pr" ${(r.require_pr ?? true) ? 'checked' : ''}> Changes go through pull requests (no direct pushes or web edits)</label>
+  <div class="row wrap-ok" style="gap:12px;align-items:flex-start">
+    <div class="field" style="width:180px"><label>Approvals needed</label><input class="input" type="number" min="0" max="10" name="approvals" value="${r.approvals || 0}"><span class="hint">From people with write access.</span></div>
+    <div class="field grow"><label>Checks that must pass</label><input class="input mono" name="checks" value="${(r.checks || []).join(', ')}" placeholder="test, lint" spellcheck="false"><span class="hint">CI job names or commit status contexts, comma-separated.</span></div></div>
+  <label class="check small"><input type="checkbox" name="allow_force_push" ${r.allow_force_push ? 'checked' : ''}> Allow force-pushes</label>
+  <label class="check small"><input type="checkbox" name="allow_deletion" ${r.allow_deletion ? 'checked' : ''}> Allow deleting the branch</label>
+  <label class="check small"><input type="checkbox" name="enforce_admins" ${r.enforce_admins ? 'checked' : ''}> Apply to admins too (otherwise they can bypass)</label>`;
+
+const readRule = (f) => ({
+  pattern: f.pattern.value.trim(), require_pr: f.require_pr.checked, approvals: +f.approvals.value || 0,
+  checks: f.checks.value.split(',').map((s) => s.trim()).filter(Boolean),
+  allow_force_push: f.allow_force_push.checked, allow_deletion: f.allow_deletion.checked, enforce_admins: f.enforce_admins.checked,
+});
+
 export default async function (ctx) {
   const meta = await loadRepo(ctx.params.owner, ctx.params.repo);
   if (!meta.can_admin) throw Object.assign(new Error('Only admins of this repository can change its settings'), { status: 403 });
   const api = repoUrl(meta.owner, meta.name);
   const full = `${meta.owner}/${meta.name}`;
-  const [access, deploy, secrets, hooks, offer] = await Promise.all([
+  const [access, deploy, secrets, hooks, offer, rules] = await Promise.all([
     get(`${api}/collaborators`, { fresh: true }),
     get(`${api}/deploy-tokens`, { fresh: true }).then((d) => d.tokens),
     get(`${api}/ci/secrets`, { fresh: true }).then((d) => d.secrets),
     get(`${api}/hooks`, { fresh: true }).then((d) => d.hooks),
     get(`${api}/transfer`, { fresh: true }).then((d) => d.offer),
+    get(`${api}/branch-rules`, { fresh: true }).then((d) => d.rules),
   ]);
   const body = html`<div class="mid stack" style="max-width:820px">
     <form class="box" id="general"><div class="box-head"><b>General</b></div><div class="box-body settings-sec">
@@ -60,6 +85,13 @@ export default async function (ctx) {
           <div class="small muted">${c.text}${c.added_by ? ` · added by ${c.added_by}` : ''}</div></div>
         <select class="select" data-role="${c.username}" aria-label="Role for ${c.username}" style="max-width:160px">${ROLES.map(([v, t]) => html`<option value="${v}" ${v === c.role ? 'selected' : ''}>${t}</option>`)}</select>
         <button class="btn sm danger" data-remove="${c.username}">Remove</button></div>`)}</div>` : html`<p class="muted small">No collaborators yet. Add someone to let them in.</p>`}
+    </div></div>
+
+    <div class="box" id="rules"><div class="box-head"><b>Branch rules</b></div><div class="box-body stack">
+      <p class="muted small">Protect the branches matching a pattern (<code>*</code> within a part of the name, <code>**</code> across parts). Rules apply to git pushes, web edits and merges alike.</p>
+      ${rules.length ? html`<div class="list">${rules.map((r) => html`<div class="list-row"><div class="grow"><b class="mono">${r.pattern}</b><div class="small muted">${ruleText(r)}</div></div>
+        <button class="btn sm" data-rule-edit="${r.id}">Edit</button><button class="btn sm danger" data-rule-del="${r.id}" data-name="${r.pattern}">Delete</button></div>`)}</div>` : ''}
+      <details><summary class="btn sm">Add a rule</summary><form id="rule-form" class="stack" style="margin-top:12px">${ruleFields()}<div><button class="btn primary" type="submit">Add rule</button></div></form></details>
     </div></div>
 
     <div class="box" id="deploy"><div class="box-head"><b>Deploy tokens</b></div><div class="box-body stack">
@@ -160,6 +192,37 @@ export default async function (ctx) {
         try { await send('DELETE', `${api}/collaborators/${encodeURIComponent(b.dataset.remove)}`); } catch (x) { return toast(x.message, 'err'); }
         toast(`Removed ${b.dataset.remove}`);
         navigate(location.pathname, { replace: true, scroll: false });
+      });
+      const rf = $('#rule-form', el);
+      rf.addEventListener('submit', action(rf.querySelector('button'), async (e) => {
+        e.preventDefault();
+        await send('POST', `${api}/branch-rules`, readRule(rf));
+        toast('Rule added');
+        navigate(location.pathname, { replace: true, scroll: false });
+      }));
+      $('#rules', el).addEventListener('click', async (e) => {
+        const del = e.target.closest('[data-rule-del]');
+        const edit = e.target.closest('[data-rule-edit]');
+        if (del) {
+          if (!(await confirmDialog({ title: `Remove the rule for ${del.dataset.name}?`, text: 'Those branches lose its protection right away.', ok: 'Remove', danger: true }))) return;
+          try { await send('DELETE', `${api}/branch-rules/${del.dataset.ruleDel}`); } catch (x) { return toast(x.message, 'err'); }
+          toast('Rule removed');
+          navigate(location.pathname, { replace: true, scroll: false });
+        } else if (edit) {
+          const r = rules.find((x) => String(x.id) === edit.dataset.ruleEdit);
+          const saved = await modal({
+            title: `Rule for ${r.pattern}`, wide: true,
+            body: html`<form id="rule-edit" class="stack">${ruleFields(r)}</form>`,
+            foot: html`<button class="btn" data-close>Cancel</button><button class="btn primary" data-ok>Save</button>`,
+            onMount(m, close) {
+              const f = m.querySelector('#rule-edit');
+              const go = action(m.querySelector('[data-ok]'), async () => { await send('PUT', `${api}/branch-rules/${r.id}`, readRule(f)); close(true); });
+              m.querySelector('[data-ok]').addEventListener('click', go);
+              f.addEventListener('submit', (ev) => { ev.preventDefault(); go(ev); });
+            },
+          });
+          if (saved) { toast('Rule saved'); navigate(location.pathname, { replace: true, scroll: false }); }
+        }
       });
       const dt = $('#dt-form', el);
       dt.addEventListener('submit', action(dt.querySelector('button'), async () => {

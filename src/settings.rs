@@ -37,6 +37,24 @@ pub struct Settings {
     /// Jobs the runner built into the server runs at once (0 turns it off).
     #[serde(default = "default_builtin_jobs")]
     pub builtin_runner_jobs: u32,
+    /// CPUs and memory (MB) each job's container may use (0 = no limit).
+    #[serde(default = "default_ci_cpus")]
+    pub ci_cpus: u32,
+    #[serde(default = "default_ci_memory")]
+    pub ci_memory_mb: u32,
+    /// Whether job containers may reach the network (a job can still turn it off).
+    #[serde(default = "default_true")]
+    pub ci_network: bool,
+}
+
+fn default_ci_cpus() -> u32 {
+    2
+}
+fn default_ci_memory() -> u32 {
+    4096
+}
+fn default_true() -> bool {
+    true
 }
 
 fn default_ci() -> String {
@@ -75,6 +93,9 @@ impl Settings {
             write_rate_per_min: default_write_rate(),
             ci: default_ci(),
             builtin_runner_jobs: default_builtin_jobs(),
+            ci_cpus: default_ci_cpus(),
+            ci_memory_mb: default_ci_memory(),
+            ci_network: true,
         }
     }
 
@@ -99,6 +120,9 @@ impl Settings {
         }
         if !matches!(self.ci.as_str(), "off" | "admins" | "everyone") {
             return Err(AppError::bad("CI must be off, admins or everyone"));
+        }
+        if self.ci_cpus > 256 || self.ci_memory_mb > 1_048_576 || (1..64).contains(&self.ci_memory_mb) {
+            return Err(AppError::bad("Job limits: up to 256 CPUs, and 64 MB to 1 TB of memory (0 means no limit)"));
         }
         if self.builtin_runner_jobs > 64 {
             return Err(AppError::bad("The built-in runner runs at most 64 jobs at once"));

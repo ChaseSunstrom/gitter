@@ -4,6 +4,7 @@ pub mod bench;
 pub mod ci;
 pub mod cli;
 pub mod db;
+pub mod demo;
 pub mod deps;
 pub mod diff;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod hooks;
 pub mod langs;
 pub mod lfs;
 pub mod net;
+pub mod protect;
 pub mod ops;
 pub mod registry;
 pub mod repo;
@@ -20,6 +22,7 @@ pub mod security;
 pub mod settings;
 pub mod signing;
 pub mod smart_http;
+pub mod ssh;
 pub mod validate;
 pub mod web;
 pub mod webhooks;
@@ -80,6 +83,8 @@ pub struct AppState {
     pub hook_wake: Arc<tokio::sync::Notify>,
     /// Page views and clones counted in memory until the next flush.
     pub traffic: Arc<api::insights::Traffic>,
+    /// How git over SSH clone URLs start (`ssh://git@host:2222/`); unset while it's off.
+    pub ssh_url: Arc<std::sync::OnceLock<String>>,
 }
 
 impl AppState {
@@ -87,6 +92,14 @@ impl AppState {
         let git = git::Git::new(cfg.data_dir.join("repos"), cfg.data_dir.join("home"), 64);
         let settings = Arc::new(settings::Live::new(settings::Settings::from_config(&cfg)));
         let cfg_dir = cfg.data_dir.clone();
+        let key = security::server_key(&cfg_dir).unwrap_or_else(|e| panic!("can't read or create {}/secret.key: {e}", cfg_dir.display()));
+        // Push protection's fingerprints are keyed by the server's secret (not the key itself).
+        {
+            use hmac::Mac;
+            let mut m = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).expect("any key length");
+            m.update(b"gitter scan fingerprints");
+            scan::set_key(&m.finalize().into_bytes());
+        }
         AppState {
             db,
             git,
@@ -97,11 +110,12 @@ impl AppState {
             setup_code: Arc::default(),
             challenges: Arc::default(),
             transfers: Arc::default(),
-            key: Arc::new(security::server_key(&cfg_dir).unwrap_or_else(|e| panic!("can't read or create {}/secret.key: {e}", cfg_dir.display()))),
+            key: Arc::new(key),
             ci_wake: Arc::default(),
             signing: Arc::new(signing::Signing::new(cfg_dir.join("gpg"))),
             hook_wake: Arc::default(),
             traffic: Arc::default(),
+            ssh_url: Arc::default(),
         }
     }
 }
@@ -144,6 +158,7 @@ pub fn router(st: AppState) -> Router {
         .route("/favicon.svg", get(web::favicon))
         .route("/favicon.ico", get(web::favicon))
         .route("/robots.txt", get(web::robots))
+        .route("/manifest.webmanifest", get(web::manifest))
         .route("/healthz", get(api::admin::healthz))
         .fallback(get(web::index))
         // Binary downloads (release files, raw binaries) gain little from gzip and

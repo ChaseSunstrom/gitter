@@ -24,7 +24,6 @@ fn pem() -> String {
 
 /// A test server on a real port, for the git CLI.
 async fn serve(app: &App) -> String {
-    gitter::scan::set_hook_exe(env!("CARGO_BIN_EXE_gitter"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let router = app.router.clone();

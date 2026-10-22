@@ -227,6 +227,7 @@ pub async fn show(
         "releases": releases, "latest_release": latest_release,
         "fork_of": parent, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
+        "ssh_url": st.ssh_url.get().map(|b| format!("{b}{}/{}.git", r.owner, r.name)),
     })))
 }
 
@@ -607,10 +608,11 @@ pub async fn delete_branch(
     if q.name == r.default_branch {
         return Err(AppError::bad("You can't delete the default branch"));
     }
+    crate::protect::direct(&st, &r, &q.name, true).await?;
     st.git
         .delete_ref(&r.path, &format!("refs/heads/{}", q.name))
         .await?;
-    crate::hooks::forget_agent_branches(&st, r.id, vec![q.name.clone()]).await;
+    crate::hooks::forget_branches(&st, r.id, vec![q.name.clone()]).await;
     touch(&st.db, r.id, false).await?;
     ok()
 }

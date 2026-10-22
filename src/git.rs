@@ -684,22 +684,23 @@ impl Git {
         base: &str,
         head: &str,
     ) -> R<Result<String, Vec<String>>> {
-        let o = self
-            .run(
-                repo,
-                &[
-                    "merge-tree",
-                    "--write-tree",
-                    "--name-only",
-                    "--no-messages",
-                    "-z",
-                    base,
-                    head,
-                ],
-                None,
-                &[],
-            )
-            .await?;
+        self.merge_tree_at(repo, None, base, head).await
+    }
+
+    /// `merge_tree` with an explicit merge base: `merge_base = C, ours = T,
+    /// theirs = C^` applies the inverse of C on top of T (a revert).
+    pub async fn merge_tree_at(
+        &self,
+        repo: &Path,
+        merge_base: Option<&str>,
+        base: &str,
+        head: &str,
+    ) -> R<Result<String, Vec<String>>> {
+        let mb = merge_base.map(|m| format!("--merge-base={m}"));
+        let mut args = vec!["merge-tree", "--write-tree", "--name-only", "--no-messages", "-z"];
+        args.extend(mb.as_deref());
+        args.extend([base, head]);
+        let o = self.run(repo, &args, None, &[]).await?;
         let text = o.text();
         let mut parts = text.split('\0').filter(|s| !s.is_empty());
         let tree = parts.next().unwrap_or("").trim().to_string();

@@ -3,7 +3,7 @@ import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, a
 import { icon } from '../icons.js';
 import { refresh, renderTopbar, setTheme, getTheme, SKINS, getSkin, setSkin } from '../main.js';
 
-const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Account'], ['repositories', 'repo', 'Repositories'], ['security', 'lock', 'Security'], ['tokens', 'key', 'Access tokens'], ['signing', 'edit', 'Signing keys'], ['appearance', 'sun', 'Appearance']];
+const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Account'], ['repositories', 'repo', 'Repositories'], ['security', 'lock', 'Security'], ['tokens', 'key', 'Access tokens'], ['ssh', 'terminal', 'SSH keys'], ['signing', 'edit', 'Signing keys'], ['appearance', 'sun', 'Appearance']];
 
 function nav(tab) {
   return html`<nav class="settings-nav" aria-label="Settings">${TABS.map(([k, ic, label]) =>
@@ -143,6 +143,25 @@ function signingTab(keys) {
   </div>`;
 }
 
+function sshTab(r) {
+  return html`<div class="stack settings-form">
+    <h2>SSH keys</h2>
+    <p class="muted">Clone, fetch and push over SSH with these keys, without a password or token. Paste a public key (the <code>.pub</code> file, e.g. <code>~/.ssh/id_ed25519.pub</code>); make one with <code>ssh-keygen -t ed25519</code>.</p>
+    ${r.enabled ? '' : html`<div class="box"><div class="box-body small muted">${icon('lock', 'sm')} Git over SSH is off on this server: the site admin turns it on with <code>GITTER_SSH_ADDR</code>. Until then, use HTTPS.</div></div>`}
+    <form id="ssh-form" class="box"><div class="box-body stack">
+      <div class="field"><label for="ssh-title">Title <span class="muted">(optional)</span></label><input class="input" id="ssh-title" name="title" maxlength="80" placeholder="e.g. laptop"></div>
+      <div class="field"><label for="ssh-key">Public key</label><textarea class="textarea mono" id="ssh-key" name="key" rows="3" required spellcheck="false" placeholder="ssh-ed25519 AAAA…"></textarea>
+        <span class="hint">Ed25519, ECDSA or RSA (2048 bits or more). A key can belong to one account only.</span></div>
+      <div class="row"><button class="btn primary" type="submit">${icon('plus', 'sm')} Add key</button></div>
+    </div></form>
+    ${r.keys.length ? html`<div class="box list">${r.keys.map((k) => html`<div class="list-row ssh-key">
+        ${icon('key', 'muted')}<div class="grow"><b>${k.title}</b>
+          <div class="small muted"><code class="mono">${k.fingerprint}</code> · added ${timeEl(k.created_at)} · ${k.last_used ? html`last used ${timeEl(k.last_used)}` : 'never used'}</div></div>
+        <button class="btn sm danger" data-ssh-del="${k.id}" data-name="${k.title}">${icon('trash', 'sm')} Remove</button></div>`)}</div>`
+      : html`<div class="box empty small">${icon('key', 'big')}<h3>No SSH keys yet</h3><p>Add one to use git over SSH.</p></div>`}
+  </div>`;
+}
+
 function securityTab(sec, log) {
   const tfa = sec.two_factor
     ? html`<div class="box"><div class="box-body row">${icon('check', 'c-green')}<div class="grow"><b>Two-factor authentication is on</b>
@@ -209,6 +228,7 @@ export default async function (ctx) {
   if (tab === 'profile') { const m = await get('/me', { fresh: true }); inner = profileTab(m.profile, m.storage); }
   else if (tab === 'tokens') inner = tokensTab(await get('/me/tokens', { fresh: true }));
   else if (tab === 'signing') inner = signingTab((await get('/me/signing-keys', { fresh: true })).keys);
+  else if (tab === 'ssh') inner = sshTab(await get('/me/ssh-keys', { fresh: true }));
   else if (tab === 'account') { exp = (await get('/me/export', { fresh: true })).export; inner = accountTab(exp); }
   else if (tab === 'repositories') {
     const [tr, trash] = await Promise.all([get('/me/transfers', { fresh: true }), get('/me/trash', { fresh: true })]);
@@ -311,6 +331,25 @@ export default async function (ctx) {
           if (!ok) return;
           try { await send('DELETE', `/me/signing-keys/${b.dataset.skDel}`); } catch (err) { return toast(err.message, 'err'); }
           toast('Signing key removed');
+          refresh();
+        });
+      }
+      const sf = $('#ssh-form', el);
+      if (sf) {
+        sf.addEventListener('submit', action(sf.querySelector('[type=submit]'), async () => {
+          const f = Object.fromEntries(new FormData(sf));
+          if (!f.key.trim()) return;
+          await send('POST', '/me/ssh-keys', { title: f.title, key: f.key });
+          toast('SSH key added');
+          refresh();
+        }));
+        $('.settings-body', el).addEventListener('click', async (e) => {
+          const b = e.target.closest('[data-ssh-del]');
+          if (!b) return;
+          const ok = await confirmDialog({ title: `Remove “${b.dataset.name}”?`, text: 'Git over SSH with this key will stop working immediately.', ok: 'Remove key', danger: true });
+          if (!ok) return;
+          try { await send('DELETE', `/me/ssh-keys/${b.dataset.sshDel}`); } catch (err) { return toast(err.message, 'err'); }
+          toast('SSH key removed');
           refresh();
         });
       }

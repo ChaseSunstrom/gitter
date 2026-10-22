@@ -51,6 +51,8 @@ usage:
                                restore a backup into GITTER_DATA (- for stdin; --force moves existing data aside)
   gitter doctor [--fsck]       check git, storage, database and repositories
   gitter bench [--check]       time the main pages on a seeded throwaway instance (--check enforces budgets)
+  gitter demo                  seed an empty GITTER_DATA with sample people, repositories, issues, pull requests,
+                               CI runs and a wiki, then start the server
   gitter runner --url URL --token TOKEN [--labels a,b] [--jobs N] [--work DIR]
                                run CI jobs for a Gitter server on this machine (token from Site administration → Runners;
                                or set GITTER_RUNNER_TOKEN)
@@ -67,14 +69,14 @@ client (like gh; `gitter <command> --help` for each):
 Settings come from environment variables; see the README.";
 
 fn main() -> anyhow::Result<()> {
+    // Git runs this binary as a repository's pre-receive hook (a link named so).
+    if std::env::args_os().next().is_some_and(|a| std::path::Path::new(&a).file_name().is_some_and(|f| f == "pre-receive")) {
+        std::process::exit(gitter::protect::pre_receive());
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("serve");
     if matches!(cmd, "login" | "repo" | "issue" | "pr" | "ci") {
         return gitter::cli::main(&args);
-    }
-    // Run by git as the push-protection hook (GITTER_DATA/hooks/pre-receive), not by people.
-    if cmd == "pre-receive" {
-        std::process::exit(gitter::scan::hook_main());
     }
     let cfg = config();
     match cmd {
@@ -131,6 +133,15 @@ fn main() -> anyhow::Result<()> {
         }
         "bench" => tokio::runtime::Runtime::new()?
             .block_on(gitter::bench::run(args.iter().any(|a| a == "--check"))),
+        "demo" => {
+            let mut cfg = cfg;
+            // A demo has a known admin: only this machine reaches it unless GITTER_ADDR says otherwise.
+            if std::env::var_os("GITTER_ADDR").is_none() {
+                cfg.addr = "127.0.0.1:3000".into();
+            }
+            tokio::runtime::Runtime::new()?.block_on(gitter::demo::run(&cfg))?;
+            serve(cfg)
+        }
         "--version" | "-V" | "version" => {
             println!("gitter {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -166,6 +177,8 @@ async fn runner(url: String, token: String, extra: Vec<String>, jobs: usize, wor
 
 #[tokio::main]
 async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
+    // The git hook links to this binary: take its path now, while it still names this file.
+    let _ = gitter::protect::HOOK_EXE.set(std::env::current_exe()?);
     for d in ["repos", "home"] {
         std::fs::create_dir_all(cfg.data_dir.join(d))?;
     }
@@ -198,6 +211,17 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         Ok(0) => {}
         Ok(n) => println!("sealed {n} two-factor secret(s) with the server key"),
         Err(e) => eprintln!("sealing two-factor secrets: {}", e.msg),
+    }
+    // Git over SSH, when asked for. GITTER_SSH_PORT is the port clone URLs show, if it's mapped to another.
+    if let Ok(ssh_addr) = std::env::var("GITTER_SSH_ADDR")
+        && !ssh_addr.trim().is_empty()
+    {
+        let port = match env("GITTER_SSH_PORT", "").as_str() {
+            "" => None,
+            p => Some(p.parse::<u16>().map_err(|_| anyhow::anyhow!("GITTER_SSH_PORT must be a port number, not {p:?}"))?),
+        };
+        let bound = gitter::ssh::start(&st, ssh_addr.trim(), port).await?;
+        println!("git over SSH on {bound}");
     }
     tokio::spawn(gitter::ci::upkeep(st.clone()));
     tokio::spawn(gitter::api::lifecycle::upkeep(st.clone()));

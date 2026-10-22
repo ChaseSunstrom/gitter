@@ -31,6 +31,8 @@ export default async function (ctx) {
   const same = !head || head === base;
   const d = same ? null : await get(`${repoUrl(owner, repo)}/compare?base=${enc(base)}&head=${enc(head)}`);
   const can = !!state.me && d && d.ahead > 0 && meta.branches.includes(head) && meta.branches.includes(base);
+  // The repository's pull request template (.gitter/pull_request_template.md) starts the description.
+  const prTemplate = can ? (await get(`${repoUrl(owner, repo)}/issue-templates`).catch(() => ({}))).pull || '' : '';
   const title = d?.commits.length === 1 ? d.commits[0].subject : humanize(head || '');
 
   const pickers = html`<div class="box compare-bar"><div class="box-body row wrap-ok">
@@ -56,7 +58,7 @@ export default async function (ctx) {
   } else {
     const form = can ? html`<form class="box pr-form" id="pr-form"><div class="box-body stack">
       <div class="row">${avatar(state.me.username, 32)}<input class="input lg-input" name="title" value="${title}" maxlength="256" required aria-label="Pull request title"></div>
-      ${mdEditor({ id: 'pr-body', placeholder: 'Describe what this changes and why', rows: 6 })}
+      ${mdEditor({ id: 'pr-body', value: prTemplate, placeholder: 'Describe what this changes and why', rows: 6 })}
       <div class="row" style="justify-content:flex-end"><button class="btn primary" type="submit">${icon('pr', 'sm')} Create pull request</button></div>
     </div></form>` : !state.me ? html`<div class="box"><div class="box-body row">${icon('pr')}<span class="grow">Sign in to open a pull request.</span><a class="btn primary" href="/login?next=${encodeURIComponent(location.pathname)}">Sign in</a></div></div>` : '';
     main = html`<div class="stack">
@@ -67,7 +69,7 @@ export default async function (ctx) {
           <a class="grow ellipsis" href="${root}/commit/${c.sha}">${c.subject}</a>
           <span class="muted small hide-sm">${c.author_name} · ${timeEl(c.commit_time)}</span>
           <a class="sha" href="${root}/commit/${c.sha}">${short(c.sha)}</a></div>`)}</div></div>
-      ${diffView(d.diff, { owner, repo, sha: d.head_sha })}
+      ${diffView(d.diff, { owner, repo, sha: d.head_sha, base: d.merge_base || d.base_sha })}
     </div>`;
   }
 

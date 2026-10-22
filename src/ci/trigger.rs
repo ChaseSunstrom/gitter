@@ -106,11 +106,13 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
                 Ok(p) => queue::create_run(c, &run, &p.jobs, &skip)?.1,
                 Err(e) => queue::create_failed_run(c, &run, &e)?,
             };
+            // An agent's run also waits for a person to approve it (they read what it will run).
             c.execute(
                 "UPDATE ci_runs SET agent = COALESCE(?1, (SELECT agent FROM agent_branches WHERE repo_id = ?2 AND branch = ?4))
                  WHERE repo_id = ?2 AND number = ?3",
                 rusqlite::params![agent, repo_id, n, branch],
             )?;
+            c.execute("UPDATE ci_runs SET approval = 'needed' WHERE repo_id = ?1 AND number = ?2 AND agent IS NOT NULL AND status = 'queued'", rusqlite::params![repo_id, n])?;
             Ok(n)
         })
         .await?;
@@ -173,7 +175,7 @@ async fn on_branch(st: &AppState, repo: &Repo, actor_id: i64, u: &RefUpdate, bra
 /// A pull request was opened: run its pipeline for the files it changes.
 /// `repo` carries the opener's access: only people who can push start runs
 /// (a run gets the repository's secrets).
-pub async fn on_pull_opened(st: &AppState, repo: &Repo, actor_id: i64, number: i64, head: &str, base: &str) -> R<()> {
+pub async fn on_pull_opened(st: &AppState, repo: &Repo, _opener: i64, number: i64, head: &str, base: &str) -> R<()> {
     if !repo.can_write || !enabled(st, repo.owner_id).await {
         return Ok(());
     }
@@ -191,7 +193,14 @@ pub async fn on_pull_opened(st: &AppState, repo: &Repo, actor_id: i64, number: i
     };
     let files = changed(st, &repo.path, from.as_deref(), &head_sha).await;
     if wants(&f, base, &files) {
-        let s = Start { event: "pull_request", refname: format!("refs/heads/{head}"), sha: head_sha, pr_number: Some(number), actor_id: Some(actor_id), files };
+        // The run is the head branch's code, so it's on behalf of whoever last pushed it,
+        // not whoever opened the pull request (an admin opening one doesn't vouch for it).
+        let (id, b) = (repo.id, head.to_string());
+        let pusher: Option<i64> = st
+            .db
+            .call(move |c| Ok(c.query_row("SELECT user_id FROM branch_pushers WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![id, b], |r| r.get(0)).optional()?))
+            .await?;
+        let s = Start { event: "pull_request", refname: format!("refs/heads/{head}"), sha: head_sha, pr_number: Some(number), actor_id: pusher, files };
         start(st, repo, pipeline, s).await?;
     }
     Ok(())
@@ -254,7 +263,13 @@ async fn scheduled(st: &AppState, repo: &Repo) -> R<()> {
     let refname = format!("refs/heads/{}", repo.default_branch);
     let Some(sha) = st.git.resolve(&repo.path, &refname).await? else { return Ok(()) };
     if let Some(p) = pipeline_at(st, &repo.path, &sha).await? {
-        let s = Start { event: "schedule", refname, sha, pr_number: None, actor_id: None, files: None };
+        // A scheduled run is on behalf of whoever last moved the branch.
+        let (id, b) = (repo.id, repo.default_branch.clone());
+        let actor_id: Option<i64> = st
+            .db
+            .call(move |c| Ok(c.query_row("SELECT user_id FROM branch_pushers WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![id, b], |r| r.get(0)).optional()?))
+            .await?;
+        let s = Start { event: "schedule", refname, sha, pr_number: None, actor_id, files: None };
         start(st, repo, p, s).await?;
     }
     Ok(())

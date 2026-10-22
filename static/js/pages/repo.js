@@ -65,6 +65,7 @@ function emptyRepo(meta) {
       <div class="row wrap-ok">
         <input class="input mono" readonly value="${url}" style="max-width:520px" aria-label="Clone URL">
         <button class="btn" data-copy="${url}" data-copy-label="Clone URL copied">${icon('copy', 'sm')} Copy</button>
+        ${meta.ssh_url ? html`<button class="btn" data-copy="${meta.ssh_url}" data-copy-label="SSH URL copied">${icon('copy', 'sm')} Copy SSH URL</button>` : ''}
         ${meta.can_write ? html`<a class="btn" href="${base}/new/main">${icon('file', 'sm')} Create a file</a><a class="btn" href="${base}/upload/main">${icon('upload', 'sm')} Upload files</a>` : ''}
       </div>
       <div class="setup-grid">
@@ -190,10 +191,10 @@ async function treeView(meta, rev, path, rootTree) {
   };
 }
 
-/** Drag files onto the tree to start an upload commit. */
+/** Drag files anywhere on a code page (the tree or a file) to start an upload commit into that folder. */
 function setupDrop(el, meta, rev, path) {
-  if (!meta.can_write) return;
-  const box = el.querySelector('.files-box');
+  if (!meta.can_write || !meta.branches.includes(rev)) return;
+  const box = el.querySelector('.files-box, .file-box');
   if (!box) return;
   let depth = 0;
   el.addEventListener('dragenter', (e) => { if (e.dataTransfer?.types?.includes('Files')) { depth++; box.classList.add('drop-on'); } });
@@ -240,11 +241,20 @@ async function blobView(meta, rev, path) {
   const raw_ = `/raw/${meta.owner}/${meta.name}/${encPath(d.sha)}/${encPath(path)}`;
   const isMd = /\.(md|markdown|mdx)$/i.test(path);
   const plain = new URLSearchParams(location.search).get('plain') === '1';
-  d.preview = isMd || /\.svg$/i.test(path);
+  // Rich viewers (tables, notebooks, 3D, PDF, media) come in only for files that have one.
+  const V = /\.(csv|tsv|ipynb|stl|pdf|mp3|wav|ogg|oga|opus|flac|m4a|aac|mp4|m4v|webm|ogv|mov)$/i.test(path) ? await import('../viewers.js') : null;
+  const kind = V?.kindOf(path);
+  d.preview = isMd || /\.svg$/i.test(path) || (!!kind && d.content != null);
   d.showCode = plain && d.preview;
   const lang = langOf(path);
-  let content;
-  if (d.image && !d.showCode && d.lfs?.stored !== false) {
+  const viewOpts = { path, content: d.content, raw: raw_, size: d.lfs ? d.lfs.size : d.size, md: { owner: meta.owner, repo: meta.name, rev, dir: path.split('/').slice(0, -1).join('/') } };
+  let content, viewer = null;
+  if (kind && !d.showCode && d.lfs?.stored !== false && (V.textual(kind) ? d.content != null : true)) {
+    try { content = await V.render(kind, viewOpts); viewer = kind; } catch { /* doesn't parse: show it as code */ }
+  }
+  if (viewer) {
+    // `content` is the viewer's
+  } else if (d.image && !d.showCode && d.lfs?.stored !== false) {
     content = html`<div class="image-view"><img src="${raw_}" alt="${path}"></div>`;
   } else if (d.too_large) {
     content = html`<div class="empty">${icon('file', 'big')}<h3>This file is too big to show here</h3><a class="btn" href="${raw_}">View raw</a></div>`;
@@ -271,6 +281,8 @@ async function blobView(meta, rev, path) {
     mount(el) {
       mountRepoHeader(el, meta);
       mountRefPicker(el, meta, rev, (r) => `${base}/blob/${encPath(r)}/${encPath(path)}`);
+      if (viewer) V.mount(viewer, el, viewOpts);
+      setupDrop(el, meta, rev, viewOpts.md.dir);
       const code = el.querySelector('#code');
       mountLineSelection(code);
       if (code) highlightInto(code, d.content, lang);

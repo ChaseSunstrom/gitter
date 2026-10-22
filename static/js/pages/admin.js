@@ -166,6 +166,12 @@ async function settings() {
       <label><input type="radio" name="ci" value="admins" ${s.ci === 'admins' ? 'checked' : ''}><span><b>Admins' repositories</b><br><span class="muted small">Jobs run the repository's code. On the built-in runner that's the server itself, with access to its data folder.</span></span></label>
       <label><input type="radio" name="ci" value="everyone" ${s.ci === 'everyone' ? 'checked' : ''}><span><b>Everyone</b><br><span class="muted small">Any account's pushes run jobs, on separate runners only: the built-in runner still takes just admins' repositories. Use disposable runner machines.</span></span></label></div></div>
     <div class="field" style="width:220px"><label for="s-builtin">Jobs the built-in runner runs at once</label><input id="s-builtin" class="input" type="number" min="0" max="64" value="${s.builtin_runner_jobs}"><span class="hint">0 turns it off (use separate runners).</span></div>
+    <div class="row wrap-ok" style="gap:16px;align-items:flex-start">
+      <div class="field" style="width:160px"><label for="s-cpus">CPUs per job</label><input id="s-cpus" class="input" type="number" min="0" max="256" value="${s.ci_cpus}"><span class="hint">0: no limit.</span></div>
+      <div class="field" style="width:180px"><label for="s-mem">Memory per job (MB)</label><input id="s-mem" class="input" type="number" min="0" max="1048576" value="${s.ci_memory_mb}"><span class="hint">0: no limit.</span></div>
+      <label class="check" style="margin-top:26px"><input type="checkbox" id="s-net" ${s.ci_network ? 'checked' : ''}> Jobs may use the network</label>
+    </div>
+    <p class="hint">Limits apply to jobs that run in a container (they name an <code>image</code>). Containers never get the host's docker socket or new privileges.</p>
     <div class="field"><label for="s-ann">Announcement</label><input id="s-ann" class="input" value="${s.announcement}" maxlength="280" placeholder="e.g. Maintenance on Sunday 10:00 UTC">
       <span class="hint">Shown at the top of every page. Leave empty to hide it.</span></div>
     <div><button class="btn primary" id="s-save">Save settings</button></div>
@@ -277,6 +283,9 @@ export default async function (ctx) {
           max_lfs_mb: +$('#s-lfs', el).value,
           ci: $$('input[name=ci]', el).find((r) => r.checked)?.value || 'admins',
           builtin_runner_jobs: +$('#s-builtin', el).value,
+          ci_cpus: +$('#s-cpus', el).value,
+          ci_memory_mb: +$('#s-mem', el).value,
+          ci_network: $('#s-net', el).checked,
           announcement: $('#s-ann', el).value.trim(),
         };
         const saved = await send('PUT', '/admin/settings', body);

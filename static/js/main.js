@@ -29,6 +29,8 @@ const ROUTES = [
   ['/:owner/:repo/pulls', 'issues', { kind: 'pr' }], ['/:owner/:repo/pull/:n', 'issue', { kind: 'pr', tab: 'conversation' }],
   ['/:owner/:repo/pull/:n/:tab', 'issue', { kind: 'pr' }],
   ['/:owner/:repo/ci', 'ci'], ['/:owner/:repo/ci/:n', 'ci'],
+  ['/:owner/:repo/milestones', 'milestones', { view: 'list' }], ['/:owner/:repo/milestones/new', 'milestones', { view: 'edit' }],
+  ['/:owner/:repo/milestone/:n', 'milestones', { view: 'show' }], ['/:owner/:repo/milestone/:n/edit', 'milestones', { view: 'edit' }],
   ['/:owner/:repo/labels', 'labels'], ['/:owner/:repo/settings', 'reposettings'],
   ['/:owner/:repo/settings/hooks/new', 'webhook', { create: true }], ['/:owner/:repo/settings/hooks/:id', 'webhook'],
   ['/:owner/:repo/insights', 'insights'], ['/:owner/:repo/search', 'search'], ['/:owner/:repo/security', 'security'],
