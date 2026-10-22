@@ -93,7 +93,7 @@ function tokensTab({ tokens, agent_tools: tools = [] }) {
   return html`<div class="stack settings-form">
     <h2>Personal access tokens</h2>
     <p class="muted">Tokens work like passwords for git over HTTPS and for the API. Give each one a name so you know where it's used, and delete any you no longer need.
-      An <b>agent token</b> lets an AI agent work through Gitter's MCP server at <code>/mcp</code>, only in the repositories and with the tools you pick. It can't change settings, see secrets or tokens, commit to default branches or merge, and what it does is marked as an agent's.</p>
+      An <b>agent token</b> lets an AI agent work through Gitter's MCP server at <code>/mcp</code>, only in the repositories and with the tools you pick. It can't change settings, see secrets or tokens, commit outside the branches agents start, or merge; its CI runs get no secrets and never run on this server, and what it does is marked as an agent's.</p>
     <form id="token-form" class="box"><div class="box-body stack">
       <div class="field"><label for="tk-name">Name</label><input class="input" id="tk-name" name="name" placeholder="What's this token for? e.g. laptop" maxlength="80" required></div>
       <div class="grid-2">

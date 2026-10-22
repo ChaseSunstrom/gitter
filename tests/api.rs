@@ -2802,6 +2802,10 @@ async fn collaborators_get_exactly_their_role() {
     let (_, acc) = app.req(&bob, "GET", "/api/repos/alice/p/collaborators", None).await;
     assert!(acc["access"].to_string().contains("can do everything"), "{acc}");
     assert_eq!(acc["collaborators"][0]["username"], "bob");
+    // No token, not even a full-access one, adds collaborators: a leaked token mustn't leave access behind.
+    let (_, t) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "full" }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "PUT", "/api/repos/alice/p/collaborators/root1", &t, Some(json!({ "role": "admin" }))).await, StatusCode::FORBIDDEN);
     // Removing them revokes access; bad roles and organizations are refused.
     assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "god" }))).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/p/collaborators/bob", None).await.0, StatusCode::OK);
@@ -3210,30 +3214,462 @@ async fn mcp_agent_tokens_only_reach_their_repos_and_tools() {
 }
 
 #[tokio::test]
-async fn mcp_agent_ci_runs_get_no_secrets() {
+async fn mcp_agent_ci_runs_get_no_secrets_and_never_the_builtin_runner() {
     let app = App::new();
     let root = app.signup("root1").await;
     app.req(&root, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
     let (s, _) = app.req(&root, "PUT", "/api/repos/root1/r/ci/secrets/TOKEN", Some(json!({ "value": "hunter2-secret" }))).await;
     assert_eq!(s, StatusCode::OK);
-    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
     let t = agent_token(&app, &root, &["root1/r"], &["commit_files", "list_ci_runs", "get_ci_run", "get_ci_log"]).await;
-    let ci = "jobs:\n  build:\n    steps: [\"echo token=[$TOKEN] $(echo $TOKEN | base64)\"]\n";
-    let (e, txt) = tool(&app, &t, "commit_files", json!({ "repo": "root1/r", "branch": "main", "new_branch": "agent/ci", "message": "CI", "files": [{ "path": ".gitter/ci.yml", "content": ci }] })).await;
+    let ci = json!([{ "path": ".gitter/ci.yml", "content": "jobs:\n  build:\n    steps: [\"echo token=[$TOKEN]\"]\n" }]);
+    let (e, txt) = tool(&app, &t, "commit_files", json!({ "repo": "root1/r", "branch": "main", "new_branch": "agent/ci", "message": "CI", "files": ci })).await;
     assert!(!e, "{txt}");
-    for _ in 0..300 {
-        let s: String = app.state.db.call(|c| Ok(c.query_row("SELECT status FROM ci_runs", [], |r| r.get(0))?)).await.unwrap_or_default();
-        if matches!(s.as_str(), "success" | "failure") {
-            break;
+    // A person's push to the agent's branch runs the agent's workflow too, so it's marked the same.
+    let fixup = json!({ "branch": "agent/ci", "message": "Fixup", "changes": [{ "path": "a.txt", "content": "a\n" }] });
+    assert_eq!(app.req(&root, "POST", "/api/repos/root1/r/contents", Some(fixup)).await.0, StatusCode::OK);
+    let agents: Vec<Option<String>> = app
+        .state
+        .db
+        .call(|c| Ok(c.prepare("SELECT agent FROM ci_runs ORDER BY number")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?))
+        .await
+        .unwrap();
+    assert_eq!(agents, [Some("helper".to_string()), Some("helper".to_string())]);
+    let runner = |builtin: bool| {
+        let st = app.state.clone();
+        async move {
+            st.db
+                .call(move |c| {
+                    c.execute("INSERT INTO ci_runners (name, builtin, created_at) VALUES ('r', ?1, 0)", [builtin])?;
+                    Ok(c.last_insert_rowid())
+                })
+                .await
+                .unwrap()
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let (builtin, own) = (runner(true).await, runner(false).await);
+    // The built-in runner is the server itself: it never runs code an agent wrote.
+    assert!(gitter::ci::jobs::claim(&app.state, builtin, vec![], true).await.unwrap().is_none(), "agent runs stay off the server");
+    let human = json!({ "branch": "main", "new_branch": "people", "message": "CI", "changes": [{ "path": ".gitter/ci.yml", "content": "jobs:\n  b:\n    steps: [\"true\"]\n" }] });
+    assert_eq!(app.req(&root, "POST", "/api/repos/root1/r/contents", Some(human)).await.0, StatusCode::OK);
+    let lease = gitter::ci::jobs::claim(&app.state, builtin, vec![], true).await.unwrap().expect("a person's run");
+    assert_eq!((lease.run_number, lease.secrets.len()), (3, 1), "a person's own branch runs with secrets");
+    // Another runner may take agent runs, without secrets.
+    for n in [1, 2] {
+        let lease = gitter::ci::jobs::claim(&app.state, own, vec![], false).await.unwrap().expect("agent run");
+        assert_eq!((lease.run_number, lease.secrets.len()), (n, 0));
+        let (e, log) = tool(&app, &t, "get_ci_log", json!({ "repo": "root1/r", "job_id": lease.job_id })).await;
+        assert!(!e && log.contains("gets no CI secrets"), "{log}");
     }
-    let (e, txt) = tool(&app, &t, "get_ci_run", json!({ "repo": "root1/r", "number": 1 })).await;
-    let v: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
-    assert!(!e && v["status"] == "success", "{txt}");
-    let job = v["jobs"][0]["id"].as_i64().unwrap();
-    assert!(!tool(&app, &t, "list_ci_runs", json!({ "repo": "root1/r" })).await.0);
-    let (e, log) = tool(&app, &t, "get_ci_log", json!({ "repo": "root1/r", "job_id": job })).await;
-    assert!(!e && log.contains("token=[]") && log.contains("gets no CI secrets"), "a run an agent started gets no secrets: {log}");
-    assert!(!log.contains("aHVudGVy"), "{log}");
+}
+
+#[tokio::test]
+async fn mcp_agents_commit_only_to_branches_agents_created() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos/alice/p/branches", Some(json!({ "name": "release", "from": "main" }))).await;
+    let t = agent_token(&app, &alice, &["alice/p"], &["commit_files"]).await;
+    let commit = |branch: &str, new: Option<&str>| {
+        let mut a = json!({ "repo": "alice/p", "branch": branch, "message": "m", "files": [{ "path": "x.txt", "content": "x\n" }] });
+        if let Some(n) = new {
+            a["new_branch"] = json!(n);
+        }
+        a
+    };
+    let (e, txt) = tool(&app, &t, "commit_files", commit("release", None)).await;
+    assert!(e && txt.contains("branches an agent created"), "a person's branch is off limits: {txt}");
+    assert!(!tool(&app, &t, "commit_files", commit("main", Some("agent/a"))).await.0);
+    let (e, txt) = tool(&app, &t, "commit_files", commit("agent/a", None)).await;
+    assert!(!e, "its own branch takes more commits: {txt}");
+    // Deleted and made again by a person, the name is theirs.
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/p/branches?name=agent/a", None).await.0, StatusCode::OK);
+    app.req(&alice, "POST", "/api/repos/alice/p/branches", Some(json!({ "name": "agent/a", "from": "main" }))).await;
+    assert!(tool(&app, &t, "commit_files", commit("agent/a", None)).await.0, "a person's new branch under an old name");
+    // Agents can't fill a repository with branches.
+    app.state
+        .db
+        .call(|c| {
+            for i in 0..100 {
+                c.execute("INSERT INTO agent_branches (repo_id, branch, agent, created_at) VALUES (1, ?1, 'helper', 0)", [format!("b{i}")])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (e, txt) = tool(&app, &t, "commit_files", commit("main", Some("agent/z"))).await;
+    assert!(e && txt.contains("100 branches"), "{txt}");
+}
+
+// ---------- insights: commit graph, file history, traffic (T-0053)
+
+/// Run git against a bare repository as a push would, returning trimmed stdout.
+fn insights_git(repo: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg(format!("--git-dir={}", repo.display()))
+        .args(["-c", "user.name=a", "-c", "user.email=a@b.c"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+async fn insights_write(app: &App, c: &Client, repo: &str, branch: &str, msg: &str, changes: Value) {
+    let (s, e) = app
+        .req(c, "POST", &format!("/api/repos/{repo}/contents"), Some(json!({ "branch": branch, "message": msg, "changes": changes })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{msg}: {e}");
+}
+
+/// Every row's lines join up with the rows around it: what leaves the bottom of
+/// one row (pass + down) is what enters the top of the next (pass + up).
+fn insights_check_lanes(rows: &[Value], mut active: Vec<i64>) -> Vec<i64> {
+    let lanes = |v: &Value| -> Vec<i64> { v.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect() };
+    for r in rows {
+        let (lane, pass, up, down) = (r["lane"].as_i64().unwrap(), lanes(&r["pass"]), lanes(&r["up"]), lanes(&r["down"]));
+        let mut top: Vec<i64> = pass.iter().chain(&up).copied().collect();
+        top.sort();
+        top.dedup();
+        active.sort();
+        assert_eq!(top, active, "row {} starts where the last ended: {r}", r["sha"]);
+        assert!(up.is_empty() || up.contains(&lane), "lines from above meet at the dot: {r}");
+        assert!(!pass.contains(&lane), "nothing passes through the dot: {r}");
+        active = pass.iter().chain(&down).copied().collect();
+        active.sort();
+        active.dedup();
+    }
+    active
+}
+
+#[tokio::test]
+async fn insights_graph_lanes_cover_branches_and_merges() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "g", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos/alice/g/branches", Some(json!({ "name": "side", "from": "main" }))).await;
+    insights_write(&app, &alice, "alice/g", "side", "Side work", json!([{ "path": "side.txt", "content": "s\n" }])).await;
+    insights_write(&app, &alice, "alice/g", "main", "Main work", json!([{ "path": "main.txt", "content": "m\n" }])).await;
+    let repo = app.state.git.repo_path(1);
+    let (m, s) = (insights_git(&repo, &["rev-parse", "main"]), insights_git(&repo, &["rev-parse", "side"]));
+    let merge = insights_git(&repo, &["commit-tree", &format!("{m}^{{tree}}"), "-p", &m, "-p", &s, "-m", "Merge side"]);
+    insights_git(&repo, &["update-ref", "refs/heads/main", &merge]);
+    // An unmerged branch shows up too: the graph spans every branch.
+    app.req(&alice, "POST", "/api/repos/alice/g/branches", Some(json!({ "name": "wip", "from": "side" }))).await;
+    insights_write(&app, &alice, "alice/g", "wip", "Unfinished", json!([{ "path": "wip.txt", "content": "w\n" }])).await;
+
+    let (st, d) = app.req(&alice, "GET", "/api/repos/alice/g/graph", None).await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let rows = d["commits"].as_array().unwrap();
+    let subjects: Vec<&str> = rows.iter().map(|r| r["subject"].as_str().unwrap()).collect();
+    assert_eq!(rows.len(), 5, "{subjects:?}");
+    for want in ["Merge side", "Side work", "Main work", "Unfinished", "Initial commit"] {
+        assert!(subjects.contains(&want), "{want} in {subjects:?}");
+    }
+    let merge_row = rows.iter().find(|r| r["subject"] == "Merge side").unwrap();
+    let down = merge_row["down"].as_array().unwrap();
+    assert_eq!(down.len(), 2, "a merge leaves on two lines: {merge_row}");
+    assert_ne!(down[0], down[1]);
+    assert_eq!(merge_row["parents"].as_array().unwrap().len(), 2);
+    let end = insights_check_lanes(rows, vec![]);
+    assert!(end.is_empty(), "every line ends at the root commit: {end:?}");
+    assert!(rows.last().unwrap()["down"].as_array().unwrap().is_empty(), "the root has no parent line");
+    assert!(d["width"].as_i64().unwrap() >= 2);
+    assert_eq!(d["has_more"], false);
+
+    // Pages carry the lanes over: page 2 starts with the lines page 1 left open.
+    let (_, p1) = app.req(&alice, "GET", "/api/repos/alice/g/graph?per=2", None).await;
+    let (_, p2) = app.req(&alice, "GET", "/api/repos/alice/g/graph?per=2&page=2", None).await;
+    assert_eq!(p1["has_more"], true);
+    let open = insights_check_lanes(p1["commits"].as_array().unwrap(), vec![]);
+    assert!(!open.is_empty());
+    insights_check_lanes(p2["commits"].as_array().unwrap(), open);
+    assert_eq!(p2["commits"][0]["sha"], rows[2]["sha"]);
+
+    // Private repositories stay private; filters don't apply to the all-branches graph.
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "hid", "private": true, "readme": true }))).await;
+    let bob = app.signup("bob").await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/hid/graph", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&Client::default(), "GET", "/api/repos/alice/hid/graph", None).await.0, StatusCode::NOT_FOUND);
+    let (s, e) = app.req(&alice, "GET", "/api/repos/alice/g/graph?page=500", None).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(e["commits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn insights_file_history_follows_renames() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "h", "readme": true }))).await;
+    let text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+    insights_write(&app, &alice, "alice/h", "main", "Add notes", json!([{ "path": "docs/a.txt", "content": text }])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Edit notes", json!([{ "path": "docs/a.txt", "content": format!("{text}eight\n") }])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Unrelated", json!([{ "path": "other.txt", "content": "x\n" }])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Rename notes", json!([
+        { "path": "docs/a.txt", "delete": true }, { "path": "b.txt", "content": format!("{text}eight\n") }
+    ])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Edit renamed", json!([{ "path": "b.txt", "content": format!("{text}eight\nnine\n") }])).await;
+
+    let (s, d) = app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=b.txt", None).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    let v = d["versions"].as_array().unwrap();
+    let got: Vec<(&str, &str, &str)> = v
+        .iter()
+        .map(|x| (x["commit"]["subject"].as_str().unwrap(), x["status"].as_str().unwrap(), x["path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("Edit renamed", "modified", "b.txt"),
+            ("Rename notes", "renamed", "b.txt"),
+            ("Edit notes", "modified", "docs/a.txt"),
+            ("Add notes", "added", "docs/a.txt"),
+        ]
+    );
+    assert_eq!(v[1]["old_path"], "docs/a.txt");
+    assert_eq!(d["has_more"], false);
+    // Each version's diff loads through the commit view, renames paired up.
+    let sha = v[1]["commit"]["sha"].as_str().unwrap();
+    let (_, c) = app.req(&alice, "GET", &format!("/api/repos/alice/h/commit/{sha}?path=b.txt&old=docs/a.txt"), None).await;
+    assert_eq!(c["diff"]["files"].as_array().unwrap().len(), 1, "{c}");
+    let (_, p) = app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=b.txt&per=3&page=2", None).await;
+    assert_eq!(p["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(p["versions"][0]["commit"]["subject"], "Add notes");
+
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=", None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=../x", None).await.0, StatusCode::BAD_REQUEST);
+    let (_, none) = app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=nope.txt", None).await;
+    assert_eq!(none["versions"].as_array().unwrap().len(), 0);
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "hid", "private": true, "readme": true }))).await;
+    let bob = app.signup("bob").await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/hid/history?path=README.md", None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn insights_traffic_counts_for_admins_only() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "pub", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "priv", "private": true, "readme": true }))).await;
+    let view = |path: &str, referrer: &str| json!({ "path": path, "referrer": referrer });
+    for (c, p, r) in [
+        (&anon, "/", "https://news.example.com/item?id=1"),
+        (&bob, "/blob/main/README.md", "https://news.example.com/other"),
+        (&alice, "/blob/main/README.md", "http://test.local/alice"),
+    ] {
+        let (s, e) = app.req(c, "POST", "/api/repos/alice/pub/traffic/view", Some(view(p, r))).await;
+        assert_eq!(s, StatusCode::OK, "{e}");
+    }
+    // Junk is dropped, not stored: a path off the repository, an over-long one.
+    app.req(&anon, "POST", "/api/repos/alice/pub/traffic/view", Some(view(&"/x".repeat(400), "javascript:alert(1)"))).await;
+    // A clone (or fetch) starts with the upload-pack ref advertisement.
+    let refs = Request::get("/alice/pub.git/info/refs?service=git-upload-pack").body(Body::empty()).unwrap();
+    assert_eq!(app.router.clone().oneshot(refs).await.unwrap().status(), StatusCode::OK);
+
+    let (s, t) = app.req(&alice, "GET", "/api/repos/alice/pub/traffic", None).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let days = t["days"].as_array().unwrap();
+    assert_eq!(days.len(), 14);
+    let today = days.last().unwrap();
+    assert_eq!((today["views"].as_i64(), today["clones"].as_i64()), (Some(4), Some(1)), "{t}");
+    assert_eq!(today["unique_views"], 1, "the same address is one visitor: {t}");
+    assert_eq!(today["unique_clones"], 1);
+    assert_eq!(t["views"], 4);
+    assert_eq!(t["referrers"], json!([{ "name": "news.example.com", "count": 2 }]), "own-site and junk referrers are skipped");
+    assert_eq!(t["paths"][0], json!({ "name": "/blob/main/README.md", "count": 2 }), "{t}");
+    assert!(t["paths"].as_array().unwrap().iter().all(|p| p["name"].as_str().unwrap().len() <= 200));
+    // A day's list filled with junk early doesn't lock out a page that's actually visited.
+    for i in 0..110 {
+        app.req(&anon, "POST", "/api/repos/alice/pub/traffic/view", Some(view(&format!("/tree/junk{i}"), ""))).await;
+    }
+    for _ in 0..3 {
+        app.req(&anon, "POST", "/api/repos/alice/pub/traffic/view", Some(view("/issues", ""))).await;
+    }
+    let (_, t2) = app.req(&alice, "GET", "/api/repos/alice/pub/traffic", None).await;
+    assert!(t2["paths"].as_array().unwrap().iter().any(|p| p["name"] == "/issues"), "{t2}");
+    // Stored by repository id, with no address in it.
+    let leaked: i64 = app
+        .state
+        .db
+        .call(|c| Ok(c.query_row("SELECT count(*) FROM traffic_visitors WHERE hash LIKE '%unknown%' OR hash LIKE '%127.0.0.1%'", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(leaked, 0);
+
+    // Readers and strangers get nothing; private repositories don't count outsiders.
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/pub/traffic", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&anon, "GET", "/api/repos/alice/pub/traffic", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(app.req(&bob, "POST", "/api/repos/alice/priv/traffic/view", Some(view("/", ""))).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/priv/traffic", None).await.0, StatusCode::NOT_FOUND);
+    let (_, p) = app.req(&alice, "GET", "/api/repos/alice/priv/traffic", None).await;
+    assert_eq!(p["views"], 0);
+    // An admin collaborator sees it, and it follows a rename.
+    app.req(&alice, "PUT", "/api/repos/alice/pub/collaborators/bob", Some(json!({ "role": "admin" }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/pub/traffic", None).await.0, StatusCode::OK);
+    let (s, e) = app.req(&alice, "PATCH", "/api/repos/alice/pub", Some(json!({ "name": "renamed" }))).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/renamed/traffic", None).await.1["views"], 117, "4 views above, 113 more here");
+    // A trashed repository is gone: no counting, no report.
+    app.req(&alice, "DELETE", "/api/repos/alice/renamed", Some(json!({ "confirm": "alice/renamed" }))).await;
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/renamed/traffic", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&anon, "POST", "/api/repos/alice/renamed/traffic/view", Some(view("/", ""))).await.0, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------- code review
+
+/// Commit `content` to `path` on `branch` (or a new branch from it) through the web-edit API.
+async fn put_file(app: &App, c: &Client, branch: &str, new_branch: Option<&str>, path: &str, content: &str) -> String {
+    let mut body = json!({ "branch": branch, "message": format!("Write {path}"), "changes": [{ "path": path, "content": content }] });
+    if let Some(nb) = new_branch {
+        body["new_branch"] = json!(nb);
+    }
+    let (s, v) = app.req(c, "POST", "/api/repos/alice/r/contents", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    v["sha"].as_str().unwrap().to_string()
+}
+
+/// alice/r with a.txt on main and a pull request #1 from `feat` changing it.
+async fn review_fixture(app: &App, alice: &Client) {
+    app.req(alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    put_file(app, alice, "main", None, "a.txt", "one\ntwo\nthree\n").await;
+    put_file(app, alice, "main", Some("feat"), "a.txt", "one\nTWO\nthree\nfour\n").await;
+    let (s, v) = app.req(alice, "POST", "/api/repos/alice/r/pulls", Some(json!({ "title": "Shout", "head": "feat", "base": "main" }))).await;
+    assert_eq!((s, v["number"].as_i64()), (StatusCode::OK, Some(1)), "{v}");
+}
+
+fn threads(v: &Value) -> Vec<Value> {
+    v["threads"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn review_threads_states_and_outdated_comments() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    review_fixture(&app, &alice).await;
+    let pr = "/api/repos/alice/r/pulls/1";
+
+    // A single comment on a line is visible to everyone at once.
+    let (s, c1) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 2, "body": "Why shout?" }))).await;
+    assert_eq!(s, StatusCode::OK, "{c1}");
+    let c1 = c1["id"].as_i64().unwrap();
+    // Comments in a pending review are only for their author until it's submitted.
+    let (s, v) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "start_line": 3, "line": 4, "body": "A range", "pending": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(threads(&app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1).len(), 1);
+    let (_, mine) = app.req(&bob, "GET", &format!("{pr}/reviews"), None).await;
+    assert_eq!((threads(&mine).len(), mine["pending"]["comments"].as_i64()), (2, Some(1)), "{mine}");
+    let t = threads(&mine).into_iter().find(|t| t["line"] == 4).unwrap();
+    assert_eq!((t["start_line"].as_i64(), t["original"].as_str()), (Some(3), Some("three\nfour")), "{t}");
+    // Anchors must exist in the pull request's files.
+    for bad in [json!({ "path": "a.txt", "side": "new", "line": 99, "body": "x" }), json!({ "path": "nope.txt", "side": "new", "line": 1, "body": "x" }),
+        json!({ "path": "a.txt", "side": "up", "line": 1, "body": "x" }), json!({ "path": "a.txt", "side": "new", "line": 2, "start_line": 3, "body": "x" }),
+        json!({ "path": "a.txt", "side": "new", "line": 1, "body": "" })] {
+        assert_eq!(app.req(&bob, "POST", &format!("{pr}/comments"), Some(bad.clone())).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(app.req(&Client::default(), "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 1, "body": "x" }))).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "README.md", "side": "new", "line": 1, "body": "x" }))).await.0, StatusCode::BAD_REQUEST, "only files the PR changes");
+    // Nobody else can see, or reply to, a pending thread.
+    let hidden = threads(&mine).into_iter().find(|t| t["line"] == 4).unwrap()["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments"), Some(json!({ "in_reply_to": hidden, "body": "peek" }))).await.0, StatusCode::BAD_REQUEST);
+
+    // A pending review can be thrown away; the review then has nothing pending.
+    let (_, tmp) = app.req(&carol, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 1, "body": "draft", "pending": true }))).await;
+    assert!(tmp["id"].is_i64());
+    assert_eq!(app.req(&carol, "DELETE", &format!("{pr}/reviews/pending"), None).await.0, StatusCode::OK);
+    assert!(app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1["pending"].is_null());
+    // Reviews: the author can't approve their own; the latest decision per reviewer counts.
+    assert_eq!(app.req(&alice, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "comment" }))).await.0, StatusCode::OK, "the pending comment is enough");
+    assert_eq!(threads(&app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1).len(), 2, "submitted comments are public");
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "comment" }))).await.0, StatusCode::BAD_REQUEST, "an empty review");
+    let (s, v) = app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "request_changes", "body": "Please don't shout" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "request_changes" }))).await.0, StatusCode::BAD_REQUEST, "say what to change");
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    assert_eq!(all["summary"]["changes_requested"], json!(["bob"]), "{all}");
+    let (_, list) = app.req(&carol, "GET", "/api/repos/alice/r/issues?kind=pr&state=open", None).await;
+    assert_eq!(list["items"][0]["review_state"], "changes_requested", "{list}");
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::OK);
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    assert_eq!((all["summary"]["approved"].clone(), all["summary"]["changes_requested"].clone()), (json!(["bob"]), json!([])), "{all}");
+    let (_, issue) = app.req(&carol, "GET", pr.replace("/pulls/", "/issues/").as_str(), None).await;
+    assert_eq!(issue["issue"]["review_state"], "approved", "{issue}");
+
+    // Replies join the thread; the PR's author, the thread's author and writers resolve it.
+    assert_eq!(app.req(&alice, "POST", &format!("{pr}/comments"), Some(json!({ "in_reply_to": c1, "body": "For emphasis" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{c1}/resolve"), Some(json!({ "resolved": true }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "POST", &format!("{pr}/comments/{c1}/resolve"), Some(json!({ "resolved": true }))).await.0, StatusCode::OK);
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    let t1 = threads(&all).into_iter().find(|t| t["id"] == c1).unwrap();
+    assert_eq!((t1["comments"].as_array().unwrap().len(), t1["resolved_by"].as_str()), (2, Some("alice")), "{t1}");
+    // Edits are the author's; deleting a thread's first comment takes the thread.
+    assert_eq!(app.req(&carol, "PATCH", &format!("{pr}/comments/{c1}"), Some(json!({ "body": "pwned" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", &format!("{pr}/comments/{c1}"), Some(json!({ "body": "Why shout, though?" }))).await.0, StatusCode::OK);
+
+    // A push that changes a commented line makes that comment outdated; others stay put.
+    put_file(&app, &alice, "feat", None, "a.txt", "one\nTwo!\nthree\nfour\n").await;
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    let by_line = |l: i64| threads(&all).into_iter().find(|t| t["line"] == l).unwrap();
+    assert_eq!((by_line(2)["outdated"].as_bool(), by_line(4)["outdated"].as_bool()), (Some(true), Some(false)), "{all}");
+    assert_eq!(app.req(&bob, "DELETE", &format!("{pr}/comments/{c1}"), None).await.0, StatusCode::OK);
+    assert_eq!(threads(&app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1).len(), 1);
+}
+
+#[tokio::test]
+async fn review_suggestions_apply_as_commits() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    review_fixture(&app, &alice).await;
+    app.req(&alice, "PUT", "/api/repos/alice/r/collaborators/carol", Some(json!({ "role": "write" }))).await;
+    let pr = "/api/repos/alice/r/pulls/1";
+    let suggest = |line: i64, text: &str| json!({ "path": "a.txt", "side": "new", "line": line, "body": format!("Try:\n```suggestion\n{text}\n```") });
+    let (_, s1) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(suggest(2, "Two"))).await;
+    let s1 = s1["id"].as_i64().unwrap();
+    let (_, s2) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(suggest(3, "Three"))).await;
+    let s2 = s2["id"].as_i64().unwrap();
+    let (_, plain) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 1, "body": "no suggestion" }))).await;
+
+    // What the applier saw: the comment's updated_at, so an edit since is refused.
+    let seen = |id: i64| {
+        let app = &app;
+        let carol = carol.clone();
+        async move {
+            let (_, all) = app.req(&carol, "GET", "/api/repos/alice/r/pulls/1/reviews", None).await;
+            let t = threads(&all).into_iter().find(|t| t["id"] == id).unwrap();
+            json!({ "updated_at": t["comments"][0]["updated_at"] })
+        }
+    };
+    // Only people who can push to the head branch apply suggestions.
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/comments/{s1}/apply"), Some(seen(s1).await)).await.0, StatusCode::FORBIDDEN);
+    let pid = plain["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{pid}/apply"), Some(seen(pid).await)).await.0, StatusCode::BAD_REQUEST, "nothing to apply");
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{s1}/apply"), Some(json!({ "updated_at": 1 }))).await.0, StatusCode::CONFLICT, "edited since it was read");
+    let (s, v) = app.req(&carol, "POST", &format!("{pr}/comments/{s1}/apply"), Some(seen(s1).await)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, text, _) = raw_get(&app, "/raw/alice/r/feat/a.txt").await;
+    assert_eq!(text, "one\nTwo\nthree\nfour\n");
+    let (_, all) = app.req(&bob, "GET", &format!("{pr}/reviews"), None).await;
+    let t = threads(&all).into_iter().find(|t| t["id"] == s1).unwrap();
+    assert_eq!(t["resolved_by"], "carol", "applying resolves the thread: {t}");
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{s1}/apply"), Some(seen(s1).await)).await.0, StatusCode::CONFLICT, "applied already");
+    // A suggestion whose lines changed since is refused rather than applied on top.
+    let s2_seen = seen(s2).await;
+    put_file(&app, &alice, "feat", None, "a.txt", "one\nTwo\n3\nfour\n").await;
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{s2}/apply"), Some(s2_seen)).await.0, StatusCode::CONFLICT);
+    // Only the suggested lines change: a CRLF file keeps its line endings.
+    put_file(&app, &alice, "feat", None, "w.txt", "x\r\ny\r\nz\r\n").await;
+    let (s, w) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "w.txt", "side": "new", "line": 2, "body": "```suggestion\nY\n```" }))).await;
+    assert_eq!(s, StatusCode::OK, "{w}");
+    let wid = w["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{wid}/apply"), Some(seen(wid).await)).await.0, StatusCode::OK);
+    let (_, text, _) = raw_get(&app, "/raw/alice/r/feat/w.txt").await;
+    assert_eq!(text, "x\r\nY\r\nz\r\n");
 }

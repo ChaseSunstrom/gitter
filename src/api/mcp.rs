@@ -26,6 +26,8 @@ const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const CALLS_PER_MIN: u32 = 120;
 /// The most of one reply handed back to the agent.
 const MAX_TEXT: usize = 256 * 1024;
+/// Ends a reply cut at `MAX_TEXT`, so a partial file or list never passes for the whole.
+const TRUNCATED: &str = "\n[truncated: the reply was over 256 KB; ask for less, such as one path or page]";
 /// The most repositories one agent token may be given.
 pub const MAX_REPOS: usize = 20;
 
@@ -304,9 +306,11 @@ async fn call(st: &AppState, u: &User, agent: &Agent, parts: &Parts, params: &Va
         crate::security::record(&st.db, e).await;
     }
     let mut text = text;
-    if name == "get_ci_log" && text.len() >= MAX_TEXT {
+    if name == "get_ci_log"
+        && let Some(t) = text.strip_suffix(TRUNCATED)
+    {
         let next = int(&args, "offset")?.unwrap_or(0) + MAX_TEXT as i64;
-        text.push_str(&format!("\n[more: call again with offset {next}]"));
+        text = format!("{t}\n[more: call again with offset {next}]");
     }
     Ok(result(false, text))
 }
@@ -335,17 +339,27 @@ async fn through_api(st: &AppState, u: &User, parts: &Parts, method: Method, pat
         Ok(r) => r,
         Err(never) => match never {},
     };
-    let status = resp.status();
+    let mut status = resp.status();
     let mut stream = resp.into_body().into_data_stream();
     let mut buf = Vec::new();
-    while let Some(Ok(chunk)) = stream.next().await {
+    let mut cut = false;
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            status = StatusCode::BAD_GATEWAY;
+            break;
+        };
         buf.extend_from_slice(&chunk);
-        if buf.len() >= MAX_TEXT {
+        if buf.len() > MAX_TEXT {
             buf.truncate(MAX_TEXT);
+            cut = true;
             break;
         }
     }
-    (status, String::from_utf8_lossy(&buf).into_owned())
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if cut {
+        text.push_str(TRUNCATED);
+    }
+    (status, text)
 }
 
 /// The token's repositories that its user can still read.

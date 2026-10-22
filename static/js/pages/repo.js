@@ -223,7 +223,7 @@ function fileToolbar(meta, rev, path, d, mode) {
     <div class="btn-group">
       <a class="btn sm" href="${raw}" target="_blank" rel="noopener">Raw</a>
       ${mode !== 'blame' && !d.binary ? html`<a class="btn sm hide-sm" href="${base}/blame/${encPath(rev)}/${encPath(path)}">Blame</a>` : ''}
-      <a class="btn sm hide-sm" href="${base}/commits/${encPath(rev)}/${encPath(path)}">History</a>
+      <a class="btn sm hide-sm" href="${base}/history/${encPath(rev)}/${encPath(path)}">History</a>
     </div>
     ${d.content != null ? html`<button class="btn sm icon" id="copy-file" title="Copy file contents" aria-label="Copy file contents">${icon('copy', 'sm')}</button>` : ''}
     <a class="btn sm icon" href="${raw}" download="${path.split('/').pop()}" title="Download" aria-label="Download">${icon('download', 'sm')}</a>

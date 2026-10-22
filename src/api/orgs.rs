@@ -109,7 +109,7 @@ pub struct RoleReq {
 /// Add a collaborator or change their role (the repository's admins).
 pub async fn set_collaborator(
     State(st): State<AppState>,
-    Authed(u): Authed,
+    Sudo(u): Sudo,
     ip: ClientIp,
     Path((o, n, who)): Path<(String, String, String)>,
     Json(req): Json<RoleReq>,

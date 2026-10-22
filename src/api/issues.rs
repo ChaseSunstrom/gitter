@@ -22,14 +22,14 @@ pub struct Label {
 
 #[derive(Serialize)]
 pub struct IssueRow {
-    id: i64,
+    pub(super) id: i64,
     number: i64,
-    title: String,
+    pub(super) title: String,
     body: String,
-    state: String,
-    is_pr: bool,
+    pub(super) state: String,
+    pub(super) is_pr: bool,
     author: String,
-    author_id: i64,
+    pub(super) author_id: i64,
     created_at: i64,
     updated_at: i64,
     closed_at: Option<i64>,
@@ -41,11 +41,19 @@ pub struct IssueRow {
     hidden: bool,
     /// The agent token that opened it for `author`, if one did.
     agent: Option<String>,
+    /// Pull requests: "approved" or "changes_requested" by reviewers' latest decisions.
+    review_state: Option<String>,
 }
 
 const ISSUE_SELECT: &str = "SELECT i.id, i.number, i.title, i.body, i.state, i.is_pr, u.username, i.author_id, i.created_at,
     i.updated_at, i.closed_at, (SELECT count(*) FROM comments c WHERE c.issue_id = i.id AND c.kind = 'comment'),
-    p.head_branch, p.base_branch, i.hidden, i.agent
+    p.head_branch, p.base_branch, i.hidden,
+    CASE WHEN i.is_pr = 0 THEN NULL
+    WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.issue_id = i.id AND v.state = 'changes_requested' AND NOT EXISTS (
+        SELECT 1 FROM reviews x WHERE x.issue_id = v.issue_id AND x.author_id = v.author_id AND x.state IN ('approved', 'changes_requested')
+        AND (x.submitted_at > v.submitted_at OR (x.submitted_at = v.submitted_at AND x.id > v.id)))) THEN 'changes_requested'
+    WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.issue_id = i.id AND v.state = 'approved') THEN 'approved' END,
+    i.agent
     FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id";
 
 fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
@@ -66,7 +74,8 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
         head: r.get(12)?,
         base: r.get(13)?,
         hidden: r.get::<_, i64>(14)? != 0,
-        agent: r.get(15)?,
+        review_state: r.get(15)?,
+        agent: r.get(16)?,
     })
 }
 
@@ -268,7 +277,7 @@ pub async fn create(
 
 /// An issue or PR by number, as `viewer` may see it (moderator-hidden ones only
 /// for their author and admins).
-async fn load_issue(st: &AppState, r: &Repo, number: i64, viewer: Option<&User>) -> R<IssueRow> {
+pub(super) async fn load_issue(st: &AppState, r: &Repo, number: i64, viewer: Option<&User>) -> R<IssueRow> {
     let rid = r.id;
     let (vid, admin) = (viewer.map(|u| u.id).unwrap_or(-1), viewer.is_some_and(|u| u.is_admin));
     let i = st.db
@@ -349,9 +358,22 @@ type PullRow = (
     Option<i64>,
 );
 
+/// A PR's head branch and the head and base shas its diff shows (the branches
+/// while it's open, the recorded shas after), without merge checks.
+pub(super) async fn pull_shas(st: &AppState, r: &Repo, issue: &IssueRow) -> R<(String, Option<String>, Option<String>)> {
+    let iid = issue.id;
+    let (head_b, base_b, head0, base0): (String, String, Option<String>, Option<String>) = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT head_branch, base_branch, head_sha, base_sha FROM pulls WHERE issue_id = ?1", [iid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
+        .await?;
+    let head = st.git.resolve(&r.path, &format!("refs/heads/{head_b}")).await?;
+    let base = st.git.resolve(&r.path, &format!("refs/heads/{base_b}")).await?;
+    Ok(if issue.state == "open" { (head_b, head.or(head0), base.or(base0)) } else { (head_b, head0.or(head), base0.or(base)) })
+}
+
 /// Head/base state of a PR: mergeable, conflicts, or merged. Marks a PR merged
 /// when its head was merged into the base outside Gitter (e.g. a manual push).
-async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -> R<serde_json::Value> {
+pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -> R<serde_json::Value> {
     let iid = issue.id;
     let (head_b, base_b, head_sha0, base_sha0, merged_sha, merged_by, merged_at): PullRow = st
         .db

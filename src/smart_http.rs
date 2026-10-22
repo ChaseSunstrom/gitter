@@ -184,6 +184,13 @@ async fn serve_inner(
     }
 
     let is_post = req.method() == Method::POST;
+    // A clone or fetch starts with this advertisement; CI runners fetching a job don't count.
+    if service_path == "info/refs"
+        && !push
+        && !crate::auth::basic_secret(&headers).is_some_and(|s| s.starts_with(crate::ci::queue::JOB_TOKEN_PREFIX))
+    {
+        st.traffic.record(repo.id, "clone", &ip, None, None);
+    }
     // A push is a change like any other for the per-account rate limit.
     let rate = st.settings.get().write_rate_per_min;
     if push

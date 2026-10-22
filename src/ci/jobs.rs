@@ -29,14 +29,15 @@ pub fn artifact_path(data: &Path, job: i64) -> PathBuf {
 /// Claim a job for a runner: the attempt starts with an empty log and no
 /// artifacts, and carries the repository's secrets. Nothing is handed out
 /// while CI is off; the built-in runner (the server itself) and the "admins"
-/// setting only take jobs of repositories owned by admins.
+/// setting only take jobs of repositories owned by admins, and the built-in
+/// runner never takes a run started by an agent's changes.
 pub async fn claim(st: &AppState, runner_id: i64, labels: Vec<String>, builtin: bool) -> R<Option<Lease>> {
     let mode = st.settings.get().ci;
     if mode == "off" {
         return Ok(None);
     }
     let admins_only = builtin || mode != "everyone";
-    let Some(mut lease) = st.db.call(move |c| Ok(queue::claim(c, runner_id, &labels, admins_only)?)).await? else {
+    let Some(mut lease) = st.db.call(move |c| Ok(queue::claim(c, runner_id, &labels, admins_only, builtin)?)).await? else {
         return Ok(None);
     };
     let data = &st.cfg.data_dir;

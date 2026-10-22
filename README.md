@@ -3,8 +3,10 @@
 Fast, simple git hosting. One Rust binary serves the web app, the API and git over HTTPS, and keeps its state in SQLite plus plain bare repositories.
 
 - **Code:** browse repositories, view files with syntax colors and linkable line ranges, blame, history, search, download archives.
+- **Insights:** Commits → Graph draws every branch with its merges, lane by lane. A file's History button steps through each version of it, following renames, with a slider and the diff of each. The Insights tab shows contributors, weekly commit activity and languages, and to the repository's admins its traffic: views and clones (fetches count too) per day for two weeks, unique visitors, referring sites and popular pages.
 - **Releases:** publish a version from a tag (or a new tag at a branch), with markdown notes, files to download (with download counts) and the source code as zip and tar.gz. Drafts stay with the maintainers, pre-releases are marked, and the repository page shows the latest release.
 - **Collaboration:** issues, labels, pull requests with server-side merge (merge commit, squash or fast-forward), comments in markdown, stars and forks.
+- **Code review:** click a line number in a pull request's Files changed (shift-click for a range) to comment there. Comments form threads with replies that can be resolved; ones whose lines changed since are marked outdated. Gather comments into a review and submit it as Approve, Request changes or Comment (not on your own pull request); the latest decision of each reviewer shows on the pull request and in the list. A ```` ```suggestion ```` block proposes replacement lines, and anyone who can push applies it as a commit with one click (refused if those lines changed meanwhile).
 - **Teams:** add collaborators to a repository as Read (see and clone), Write (push, manage issues and pull requests) or Admin (settings, access, deploy tokens, CI secrets), and see in plain words who can do what in Settings → Who has access. Organizations own repositories for a group: owners manage everything, and members get the organization's base permission (none, read or write) on all of its repositories. An organization shares its creator's repository limit and storage quota, and who belongs to it is visible to its members only. Write access includes running CI: pushes run the repository's pipelines with its secrets, so give Write to people you'd trust with those.
 - **Wikis, discussions, snippets:** every repository has a markdown wiki with page history (its own git repository, private when the repo is) and a discussions forum with General, Q&A, Ideas and Announcements categories, marked answers and upvotes. Snippets share a few files, public or secret (only the link finds it), with every edit kept as a revision.
 - **Editing:** edit, create, rename, delete and upload files in the browser, committing straight to a branch or to a new branch for a pull request.
@@ -148,6 +150,24 @@ Turning CI off stops new runs, re-runs and queued jobs.
 
 **Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts are deleted 30 days after their job, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
 
+**Run it locally.** `gitter ci run` runs `.gitter/ci.yml` on your machine with the same parser and step runner, no server needed. Jobs run one at a time in `needs` order, and a job whose needs failed is skipped. Each job gets a fresh copy of the work tree as it is now: tracked files and untracked ones that aren't ignored, without `.git`. Use `--here` to run in the folder itself, for example when steps need git history. `HOME` is a fresh folder, and no secrets are set. Triggers, `paths` and `runs-on` don't apply, and jobs with an `image` need docker. It exits 1 when a job fails.
+
+## Command-line client
+
+The same `gitter` binary is a client for any Gitter server, like `gh`:
+
+```sh
+gitter login https://git.example.com       # asks for an access token (or --token, or GITTER_TOKEN)
+gitter repo create notes --private && gitter repo clone alice/notes && cd notes
+gitter issue create --title "Crash on start" --body "…"
+git switch -c fix && git commit -am "Fix the crash"
+gitter pr create                           # pushes the branch first, then opens the pull request
+gitter pr list; gitter pr checkout 7; gitter pr merge 7 --method squash
+gitter ci status; gitter ci logs 12        # follows a running job; gitter ci rerun 12
+```
+
+`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name`. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter <command> --help` lists every command.
+
 ## Webhooks
 
 A repository's admins add webhooks under **Settings → Webhooks** (signed in on the web, with a recent password confirmation). Each event is a `POST` of JSON to the payload URL with these headers:
@@ -191,8 +211,8 @@ or `claude mcp add --transport http gitter https://git.example.com/mcp --header 
 Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_issues`, `get_issue`, `create_issue`, `comment`, `open_pull_request`, `list_ci_runs`, `get_ci_run`, `get_ci_log` and `commit_files`. Each call is an ordinary API request made as you, so the agent can never do more than you can, and less:
 
 - It reaches only the repositories you picked (not even other public ones) and only the tools you ticked.
-- It can't change settings, collaborators or webhooks, see CI secrets, tokens or your account, merge pull requests, or commit to a default branch: `commit_files` goes to another branch (or a new one), then `open_pull_request`.
-- A CI run an agent starts (by committing or opening a pull request) gets no CI secrets, since the agent writes the workflow and reads the log. A later push by a person runs with secrets as usual.
+- It can't change settings, collaborators or webhooks, see CI secrets, tokens or your account, or merge pull requests. `commit_files` starts a new branch (`new_branch`) or adds to one an agent started, never the default branch or a person's branch; then `open_pull_request`. Agents hold at most 100 branches per repository (deleting one frees its place).
+- Any CI run of an agent's branch, whoever pushed, gets no CI secrets, since the agent wrote the workflow and reads the log, and the built-in runner (the server itself) never takes it: it waits for a runner you registered. Once a person merges the work, it runs like anyone's.
 - The token works only at `/mcp`: not for git, the REST API or the web.
 - It has its own rate limit (120 calls a minute) and its changes count apart from yours.
 - Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".
@@ -234,6 +254,7 @@ Behind nginx or Caddy, set `GITTER_URL` to the public address. Requests whose `O
 - Passwords use Argon2id. Login and sign-up are rate limited.
 - User markdown is sanitized with DOMPurify, and the app ships a strict Content Security Policy.
 - Raw files are served as inert text or images inside a sandboxing CSP.
+- Traffic stores no addresses: a visitor is a hash of the address with a random salt that changes every day and is never written down, so it can't be traced back or followed across days. Only the referring site's host is kept, and traffic older than 14 days is deleted.
 
 ## Development
 

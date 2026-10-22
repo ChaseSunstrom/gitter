@@ -71,7 +71,8 @@ export default async function (ctx) {
       ${stateIcon(it)}
       <div class="grow" style="min-width:0">
         <div class="issue-line"><a class="issue-title" href="${href}">${it.title}</a>
-          ${it.labels.map((l) => labelChip(l, link({ label: l.name })))}</div>
+          ${it.labels.map((l) => labelChip(l, link({ label: l.name })))}
+          ${it.review_state === 'approved' ? html`<span class="pill open small" title="Approved by a reviewer">${icon('check', 'sm')} Approved</span>` : it.review_state === 'changes_requested' ? html`<span class="pill closed small" title="A reviewer asked for changes">Changes requested</span>` : ''}</div>
         <div class="muted small">#${it.number} ${verb} ${timeEl(when)} by <a href="${link({ author: it.author })}">${it.author}</a> ${agentBadge(it.agent, it.author)}
           ${it.is_pr && it.head ? html`<span class="hide-sm"> · ${icon('branch', 'sm inline')} ${it.head} → ${it.base}</span>` : ''}</div>
       </div>
