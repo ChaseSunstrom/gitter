@@ -886,16 +886,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn tmp_self_scan() {
-        let out = std::process::Command::new("git").args(["diff", "-U0", "--no-color", crate::git::EMPTY_TREE, "HEAD"]).output().unwrap().stdout;
-        let (s, _) = scan_diff(&out[..], u64::MAX);
-        for f in &s.findings {
-            eprintln!("FOUND {}:{} {} {}", f.path, f.line, f.kind, f.masked);
-        }
-    }
-
-    #[test]
     fn added_lines_skip_what_was_there() {
         let got = added_lines(b"a\nb\nc\n", b"a\nb\nnew\nc\nb\n");
         assert_eq!(got, [(3, &b"new"[..]), (5, &b"b"[..])]);
