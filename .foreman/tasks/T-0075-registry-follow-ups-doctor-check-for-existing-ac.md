@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T03:19:50Z
-updated: 2026-10-22T20:47:50Z
+updated: 2026-10-22T22:55:47Z
 ---
 # Registry follow-ups: doctor check for existing accounts named v2 or mcp (shadowed by route
 ## Raw request
@@ -27,4 +27,5 @@ updated: 2026-10-22T20:47:50Z
 ## Log
 - 2026-10-22T03:19:50Z created
 - 2026-10-22T20:47:50Z also: an existing account named 'import' is now shadowed by the /import page (T-0090 reserved the name); the doctor check should list it with v2 and mcp
+- 2026-10-22T22:55:47Z doctor check also for accounts named 'preview' (reserved by T-0018 for /preview/<token>/)
 ## Follow-ups captured

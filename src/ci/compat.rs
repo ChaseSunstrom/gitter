@@ -530,6 +530,9 @@ fn gh_job(key: &str, job: &Map<String, Value>, wenv: &Map<String, Value>, wdefau
     if let Some(t) = job.get("timeout-minutes").and_then(Value::as_u64) {
         out.insert("timeout".into(), json!(t.clamp(1, 360)));
     }
+    if let Some(e) = environment(job.get("environment"), notes) {
+        out.insert("environment".into(), e);
+    }
     if let Some(Value::Object(m)) = job.get("strategy").and_then(|s| s.get("matrix")) {
         let mut axes = Map::new();
         for (k, v) in m {
@@ -612,6 +615,35 @@ fn gh_job(key: &str, job: &Map<String, Value>, wenv: &Map<String, Value>, wdefau
         out.insert("artifacts".into(), json!(artifacts));
     }
     Value::Object(out)
+}
+
+/// A GitHub or GitLab job's `environment:` (a name, or name and url), as Gitter's: names and
+/// URLs built from expressions or variables are left out, with a note.
+fn environment(v: Option<&Value>, notes: &mut Vec<String>) -> Option<Value> {
+    let (name, url) = match v? {
+        Value::String(s) => (s.clone(), String::new()),
+        Value::Object(m) => {
+            // GitLab's stop, prepare, verify and access jobs name an environment without deploying to it.
+            if m.get("action").map(text).is_some_and(|a| a != "start") {
+                return None;
+            }
+            (m.get("name").map(text).unwrap_or_default(), m.get("url").map(text).unwrap_or_default())
+        }
+        _ => return None,
+    };
+    let dynamic = |s: &str| s.contains('$');
+    if dynamic(&name) || !crate::api::deploy::env_name(&name) {
+        push_note(notes, format!("environment: {name} (only a plain name deploys here)"));
+        return None;
+    }
+    let mut e = Map::new();
+    e.insert("name".into(), json!(name));
+    if dynamic(&url) || !(url.is_empty() || crate::validate::web_link(&url)) {
+        push_note(notes, format!("environment url {url}"));
+    } else if !url.is_empty() {
+        e.insert("url".into(), json!(url));
+    }
+    Some(Value::Object(e))
 }
 
 /// An image name Gitter can use (matrix values are filled in later), or None.
@@ -869,6 +901,9 @@ pub fn gitlab(src: &str, default_branch: &str) -> Result<Pipeline, String> {
             }
             Some(n) => push_note(&mut notes, format!("parallel: {} (it runs once)", text(n))),
             None => {}
+        }
+        if let Some(e) = environment(j.get("environment"), &mut notes) {
+            o.insert("environment".into(), e);
         }
         if let Some(Value::Object(a)) = j.get("artifacts") {
             let paths = workspace_paths(lines(a.get("paths")), "artifact", &mut notes);
@@ -1215,6 +1250,19 @@ mod tests {
 
     fn job<'a>(p: &'a Pipeline, key: &str) -> &'a config::Job {
         p.jobs.iter().find(|j| j.key == key).unwrap_or_else(|| panic!("no job {key}: {:?}", p.jobs.iter().map(|j| &j.key).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn environments_come_across_when_they_are_plain() {
+        let gh = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: { name: production, url: https://example.com }\n    steps: [{ run: echo hi }]\n  pr:\n    runs-on: ubuntu-latest\n    environment: preview-${{ github.event.number }}\n    steps: [{ run: echo hi }]\n";
+        let p = github(&[(".github/workflows/ci.yml".into(), gh.into())]).unwrap().unwrap();
+        assert_eq!(job(&p, "deploy").environment, Some(config::Environment { name: "production".into(), url: "https://example.com".into() }));
+        assert_eq!(job(&p, "pr").environment, None, "a name made by an expression stays out");
+        let gl = "deploy:\n  script: [echo hi]\n  environment: staging\nreview:\n  script: [echo hi]\n  environment:\n    name: review/$CI_COMMIT_REF_SLUG\nstop:\n  script: [echo bye]\n  environment: { name: staging, action: stop }\n";
+        let p = gitlab(gl, "main").unwrap();
+        assert_eq!(job(&p, "deploy").environment.as_ref().map(|e| e.name.as_str()), Some("staging"));
+        assert_eq!(job(&p, "review").environment, None);
+        assert_eq!(job(&p, "stop").environment, None, "stopping an environment isn't deploying to it");
     }
 
     fn all_runs(j: &config::Job) -> String {

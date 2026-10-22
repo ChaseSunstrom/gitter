@@ -455,6 +455,25 @@ done
 [ "$(jq_ 'd["annotations"][0]["path"] + ":" + str(d["annotations"][0]["line"])')" = "src/lib.rs:3" ] || fail "failures as annotations for the pull request: $BODY"
 ok "CI extras: JUnit results with file:line, coverage, flaky tests, caches with default-branch fallback, PR annotations"
 
+# --- deployments: an environment with a branch rule, a recorded deployment, a pull request preview (left for the UI check)
+api POST /repos '{"name":"site","readme":true}'
+api PUT /repos/alice/site/environments '{"name":"production","url":"https://example.com","branches":"main"}'
+api POST /repos/alice/site/deployments '{"environment":"production","ref":"main","status":"success","url":"https://example.com"}'
+api POST /repos/alice/site/contents '{"branch":"main","message":"CI","changes":[{"path":".gitter/ci.yml","content":"jobs:\n  web:\n    preview: public\n    steps: [\"mkdir -p public && cp README.md public/index.html\"]\n"}]}'
+api POST /repos/alice/site/contents '{"branch":"main","new_branch":"feature","message":"Change","changes":[{"path":"f.txt","content":"f\n"}]}'
+EXPECT=403 api POST /repos/alice/site/deployments '{"environment":"production","ref":"feature"}'
+api POST /repos/alice/site/pulls '{"title":"Preview me","body":"","head":"feature","base":"main"}'
+for _ in $(seq 300); do
+  api GET "/repos/alice/site/deployments?pr=1"
+  [ "$(jq_ 'len(d["deployments"]) > 0 and d["deployments"][0]["status"] == "success"')" = True ] && break
+  sleep 0.2
+done
+PREVIEW=$(jq_ 'd["deployments"][0]["preview"]')
+[ "${PREVIEW#/preview/}" != "$PREVIEW" ] || fail "a pull request preview: $BODY"
+curl -sf "$BASE$PREVIEW" | grep -q "site" || fail "the preview is served"
+curl -sI "$BASE$PREVIEW" | grep -qi "^content-security-policy: sandbox allow-scripts" || fail "the preview is sandboxed"
+ok "deployments: an environment's branch rule, a recorded deployment, a pull request preview served sandboxed"
+
 # --- rename and transfer with redirects, trash with restore, data export, self-delete
 moved() { curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE$1"; }
 api POST /repos '{"name":"old-name","readme":true}'

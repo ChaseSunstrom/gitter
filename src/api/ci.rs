@@ -344,7 +344,7 @@ pub async fn statuses(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n)
 
 // ---------------------------------------------------------------- secrets
 
-fn secret_name(s: &str) -> bool {
+pub(crate) fn secret_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))

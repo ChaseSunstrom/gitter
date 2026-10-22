@@ -9,6 +9,7 @@ import { diffReview, reviewBar, mountReview, reviewItems, reviewersBlock } from 
 import { annotate, prReport } from '../cireport.js';
 import { refresh, navigate } from '../main.js';
 import { labelChip } from './issues.js';
+import { depIcon, depLink } from './deployments.js';
 
 const STATE_TEXT = { open: 'Open', closed: 'Closed', merged: 'Merged' };
 
@@ -296,16 +297,33 @@ function conversation(meta, data, pd, mdCtx, rv) {
   return html`<div class="split issue-split">
     <div class="timeline">
       ${items}
-      ${issue.is_pr ? html`<div class="tl-item tl-merge">${mergeBox(meta, data, pd)}</div>` : ''}
+      ${issue.is_pr ? html`<div class="tl-item" id="pr-deploys" hidden></div><div class="tl-item tl-merge">${mergeBox(meta, data, pd)}</div>` : ''}
       ${composer}
     </div>
     ${sidebar(meta, data, rv)}
   </div>`;
 }
 
+/** The pull request's deployments: the newest in each environment (its preview first). */
+async function mountDeploys(el, meta, api, issue) {
+  const box = $('#pr-deploys', el);
+  if (!box) return;
+  const d = await get(`${api}/deployments?pr=${issue.number}`, { fresh: true }).catch(() => null);
+  const seen = new Set();
+  const latest = (d?.deployments || []).filter((x) => !seen.has(x.environment) && seen.add(x.environment));
+  if (!latest.length) return;
+  latest.sort((a, b) => b.environment.startsWith('preview/') - a.environment.startsWith('preview/'));
+  box.innerHTML = html`<div class="box"><div class="box-head row"><b class="grow">${icon('globe', 'sm')} Deployments</b>
+      <a class="small" href="/${meta.owner}/${meta.name}/deployments">All deployments</a></div>
+    <div class="list">${latest.map((x) => html`<div class="list-row">${depIcon(x.status)}<div class="grow"><b>${x.environment}</b>
+      <div class="small muted">${x.ref} · ${short(x.sha)} · ${timeEl(x.updated_at)}${x.description ? html` · ${x.description}` : ''}</div></div>${depLink(x)}</div>`)}</div></div>`.s;
+  box.hidden = false;
+}
+
 function mountConversation(el, meta, api, data, mdCtx) {
   const { issue } = data;
   mountMdEditor(el, mdCtx);
+  if (issue.is_pr) mountDeploys(el, meta, api, issue);
   mountSubscribe(el, `${api}/issues/${issue.number}/subscription`);
 
   // Composer: comment, and optionally close/reopen in the same step.

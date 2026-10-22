@@ -157,6 +157,15 @@ pub fn router(st: AppState) -> Router {
             "/raw/snippets/{id}/{*rest}",
             get(api::snippets::raw).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),
         )
+        .route("/preview/{token}", get(api::preview::bare))
+        .route(
+            "/preview/{token}/",
+            get(api::preview::index).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),
+        )
+        .route(
+            "/preview/{token}/{*rest}",
+            get(api::preview::serve).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),
+        )
         .route("/assets/{v}/{*path}", get(web::asset))
         .route("/favicon.svg", get(web::favicon))
         .route("/favicon.ico", get(web::favicon))
