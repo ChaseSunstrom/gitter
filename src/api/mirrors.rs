@@ -27,7 +27,7 @@ pub struct MirrorReq {
     direction: Option<String>,
     url: Option<String>,
     username: Option<String>,
-    /// Missing or empty keeps the current one (an empty username drops both).
+    /// Missing or empty keeps the current one (a new URL forgets it).
     password: Option<String>,
     interval_minutes: Option<i64>,
     allow_private: Option<bool>,
@@ -185,7 +185,7 @@ pub async fn update(
     let username = req.username.as_deref().map(check_username).transpose()?;
     let secret = req.password.as_deref().filter(|p| !p.is_empty()).map(|p| sealed(&st, p)).transpose()?;
     // A new remote doesn't get the old one's password.
-    let drop_secret = secret.is_none() && (moved || username.as_deref() == Some(""));
+    let drop_secret = secret.is_none() && moved;
     let interval = req.interval_minutes.map(check_interval).transpose()?;
     let (rid, url2) = (r.id, url.clone());
     st.db

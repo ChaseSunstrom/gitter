@@ -33,8 +33,9 @@ pub const MAX_INTERVAL: i64 = 7 * 86400;
 pub const MAX_BACKOFF: i64 = 86400;
 /// A fetch or push that takes longer is stopped.
 const TIMEOUT: Duration = Duration::from_secs(1800);
-/// A sync taken by a server that stopped mid-way is tried again after this (past TIMEOUT).
-const LEASE: i64 = 2400;
+/// A sync taken by a server that stopped mid-way is tried again after this (past TIMEOUT
+/// and the commit-graph refresh after a fetch).
+const LEASE: i64 = 3600;
 /// Syncs running at once.
 const PARALLEL: usize = 4;
 /// Characters of git's complaint kept as the last error.

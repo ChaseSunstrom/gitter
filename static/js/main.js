@@ -33,6 +33,7 @@ const ROUTES = [
   ['/:owner/:repo/milestone/:n', 'milestones', { view: 'show' }], ['/:owner/:repo/milestone/:n/edit', 'milestones', { view: 'edit' }],
   ['/:owner/:repo/labels', 'labels'], ['/:owner/:repo/settings', 'reposettings'],
   ['/:owner/:repo/settings/hooks/new', 'webhook', { create: true }], ['/:owner/:repo/settings/hooks/:id', 'webhook'],
+  ['/:owner/:repo/settings/mirrors', 'mirrors'],
   ['/:owner/:repo/insights', 'insights'], ['/:owner/:repo/search', 'search'], ['/:owner/:repo/security', 'security'],
   ['/:owner/:repo/wiki', 'wiki', { view: 'page' }], ['/:owner/:repo/wiki/_new', 'wiki', { view: 'edit', create: true }],
   ['/:owner/:repo/wiki/:page', 'wiki', { view: 'page' }], ['/:owner/:repo/wiki/:page/edit', 'wiki', { view: 'edit' }],
