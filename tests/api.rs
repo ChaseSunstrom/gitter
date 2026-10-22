@@ -1918,7 +1918,12 @@ async fn signed_commits_gpg_keys_verify_once_registered() {
         let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": armored, "signature": sig }))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{why}: {e}");
     }
-    let k = add_gpg_signing_key(&app, &alice, &armored, &fpr, &env).await;
+    // A signer whose clock is off (here the signature predates the key by ten minutes) still
+    // proves it: the challenge, fresh and used once, is what dates the signature.
+    let back = (gitter::db::now() - 600).to_string();
+    let skewed = run_tool("gpg", &["--batch", "--armor", "--detach-sign", "--ignore-time-conflict", "--faked-system-time", &back, "-u", &fpr], &env, Some(challenge.as_bytes()));
+    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": armored, "signature": skewed }))).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
     assert_eq!((k["kind"].as_str(), k["fingerprint"].as_str()), (Some("gpg"), Some(fpr.as_str())));
     assert!(k["proved_at"].is_i64(), "{k}");
     let after = commit_verification(&app, &alice, &good).await;
@@ -2092,6 +2097,64 @@ async fn signing_keys_need_proof_of_possession() {
     let v = commit_verification(&app, &alice, &signed).await;
     assert_eq!((v["status"].as_str(), v["proved"].as_bool()), (Some("verified"), Some(false)), "{v}");
     assert!(v["reason"].as_str().unwrap().contains("proof"), "{v}");
+}
+
+#[tokio::test]
+async fn signing_challenges_last_until_they_expire_and_work_once() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let challenge = || {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await.1["challenge"].as_str().unwrap().to_string() }
+    };
+    let set_expiry = |at: i64| app.state.db.call(move |c| Ok(c.execute("UPDATE signing_challenges SET expires_at = ?1", [at])?));
+    // Another tab asking (the settings page asks on every view) doesn't replace one being signed.
+    let first = challenge().await;
+    set_expiry(gitter::db::now() + 60).await.unwrap();
+    assert_eq!(challenge().await, first, "kept until it expires");
+
+    // Tokens can't ask for one or add a key: only a browser session can.
+    let mk = |body: Value| {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", "/api/me/tokens", Some(body)).await.1["token"].as_str().unwrap().to_string() } // pragma: allowlist secret
+    };
+    let read = mk(json!({ "name": "ro", "scope": "read" })).await;
+    let agent = agent_token(&app, &alice, &["alice/r"], &["read_file"]).await;
+    let add = json!({ "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFxsPyhOovC3igNqTo8u07KB2pQB9asL+9wpOgr9jf9G t", "signature": "x" });
+    for t in [&read, &agent] {
+        assert_eq!(bearer(&app, "POST", "/api/me/signing-keys/challenge", t, None).await, StatusCode::FORBIDDEN);
+        assert_eq!(bearer(&app, "POST", "/api/me/signing-keys", t, Some(add.clone())).await, StatusCode::FORBIDDEN);
+    }
+
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: SSH proof checks skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (k1, k2) = (dir.path().join("k1"), dir.path().join("k2"));
+    for k in [&k1, &k2] {
+        run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", k.to_str().unwrap()], &[], None);
+    }
+    let body = |k: &std::path::Path, text: &str| {
+        json!({ "key": std::fs::read_to_string(k.with_extension("pub")).unwrap(), "signature": ssh_sign(k, text, "gitter") })
+    };
+    // Expired: refused, and the next ask gives a new one.
+    set_expiry(gitter::db::now() - 1).await.unwrap();
+    let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(body(&k1, &first))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    let text = challenge().await;
+    assert_ne!(text, first, "an expired challenge is replaced");
+    // One challenge signed by two keys, sent at once: only one of them gets in.
+    let (a, b) = tokio::join!(
+        app.req(&alice, "POST", "/api/me/signing-keys", Some(body(&k1, &text))),
+        app.req(&alice, "POST", "/api/me/signing-keys", Some(body(&k2, &text)))
+    );
+    let mut codes = [a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::BAD_REQUEST], "{a:?} {b:?}");
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    assert_eq!(mine["keys"].as_array().unwrap().len(), 1, "{mine}");
 }
 
 #[tokio::test]

@@ -655,12 +655,13 @@ pub async fn list_signing_keys(State(st): State<AppState>, Authed(u): Authed) ->
     Ok(Json(json!({ "keys": keys })))
 }
 
-/// How long a signing key challenge lasts, and when a fresh one replaces it (seconds).
+/// How long a signing key challenge lasts (seconds).
 const CHALLENGE_TTL: i64 = 3600;
-const CHALLENGE_RENEW: i64 = 600;
+const NO_CHALLENGE: &str = "There's no challenge to sign, or it has run out (they last an hour). Get a new one and sign that.";
 
 /// The text to sign, with the key being added, to prove holding it. The account keeps one
-/// at a time: asking again gives the same one (two tabs agree) until it's nearly over.
+/// at a time: asking again gives the same one until it expires or is used, so a page shown
+/// in another tab doesn't replace the one being signed.
 pub async fn signing_key_challenge(State(st): State<AppState>, Authed(u): Authed) -> J<serde_json::Value> {
     let mut b = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
@@ -673,7 +674,7 @@ pub async fn signing_key_challenge(State(st): State<AppState>, Authed(u): Authed
             let cur: Option<(String, i64)> = c
                 .query_row("SELECT challenge, expires_at FROM signing_challenges WHERE user_id = ?1", [u.id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
-            if let Some((text, exp)) = cur.filter(|(_, exp)| exp - at > CHALLENGE_RENEW) {
+            if let Some((text, exp)) = cur.filter(|(_, exp)| *exp > at) {
                 return Ok((text, exp));
             }
             c.execute(
@@ -726,9 +727,7 @@ pub async fn add_signing_key(
             Ok(c.query_row(q, rusqlite::params![uid, now()], |r| r.get(0)).optional()?)
         })
         .await?;
-    let Some(challenge) = challenge else {
-        return Err(AppError::bad("There's no challenge to sign, or it has run out (they last an hour). Get a new one and sign that."));
-    };
+    let Some(challenge) = challenge else { return Err(AppError::bad(NO_CHALLENGE)) };
     crate::signing::prove(&st, &k, &challenge, &req.signature).await?;
     let (kind, fp, key) = (k.kind, k.fingerprint.clone(), k.key.clone());
     let row = st
@@ -742,8 +741,11 @@ pub async fn add_signing_key(
                 return Err(AppError::bad("You have 50 signing keys already. Remove some first."));
             }
             let at = now();
-            // Used once: the signature can't add the key again later.
-            c.execute("DELETE FROM signing_challenges WHERE user_id = ?1 AND challenge = ?2", rusqlite::params![uid, challenge])?;
+            // Used once, and only by the first of two requests carrying it: the signature can't add a key again.
+            let q = "DELETE FROM signing_challenges WHERE user_id = ?1 AND challenge = ?2 AND expires_at > ?3";
+            if c.execute(q, rusqlite::params![uid, challenge, at])? != 1 {
+                return Err(AppError::bad(NO_CHALLENGE));
+            }
             c.execute(
                 "INSERT INTO signing_keys(user_id, kind, title, key, fingerprint, created_at, proved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                 rusqlite::params![uid, kind, title, key, fp, at],

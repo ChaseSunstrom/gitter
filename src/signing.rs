@@ -235,13 +235,13 @@ impl Signing {
     }
 
     /// gpg's status lines for detached signature `sig` over `payload`, against the keyring at `home`.
-    async fn gpg_verify(&self, git: &Git, home: &Path, payload: &[u8], sig: &str) -> Result<String, Fail> {
+    /// `extra` options go before `--verify`.
+    async fn gpg_verify(&self, git: &Git, home: &Path, payload: &[u8], sig: &str, extra: &[&str]) -> Result<String, Fail> {
         let file = self.sig_file(sig).await?;
         let (f, h) = (file.0.to_string_lossy(), home.to_string_lossy());
-        let args = [
-            "--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--no-auto-key-retrieve", "--trust-model", "always", "--status-fd", "1",
-            "--verify", &f, "-",
-        ];
+        let mut args = vec!["--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--no-auto-key-retrieve", "--trust-model", "always", "--status-fd", "1"];
+        args.extend(extra);
+        args.extend(["--verify", &f, "-"]);
         let o = self.tool(git, "gpg", &args, payload, self.timeout).await?;
         let status = String::from_utf8_lossy(&o.stdout).into_owned();
         // No verdict at all and a failed exit: gpg itself broke (a locked keyring...). Not cached.
@@ -265,15 +265,7 @@ impl Signing {
                     .await
                     .map_err(|_| Fail::Broken)?;
                 // ponytail: one import of every key; a few minutes allowed. Chunk it if instances get huge.
-                // Leftovers of checks and key parsing a crash cut short.
-                if let Ok(rd) = std::fs::read_dir(&self.home) {
-                    for e in rd.flatten() {
-                        let n = e.file_name().to_string_lossy().into_owned();
-                        if n.starts_with("sig-") || n.starts_with("parse-") {
-                            let _ = std::fs::remove_dir_all(e.path()).or_else(|_| std::fs::remove_file(e.path()));
-                        }
-                    }
-                }
+                clean_leftovers(&self.home);
                 if !keys.is_empty() {
                     self.gpg_import(&st.git, &self.home, keys.join("\n").as_bytes(), Duration::from_secs(300)).await?;
                 }
@@ -317,7 +309,7 @@ impl Signing {
             return Ok((Outcome::Bad, None, None));
         }
         self.sync(st).await?;
-        let status = self.gpg_verify(&st.git, &self.home, payload, sig).await?;
+        let status = self.gpg_verify(&st.git, &self.home, payload, sig, &[]).await?;
         let (outcome, fpr) = parse_gpg(&status);
         let (Outcome::Good, Some(primary), Some(sub)) = (outcome, &fpr, signing_subkey(&status)) else { return Ok((outcome, fpr, None)) };
         // ponytail: one more gpg run per good GPG check (they're memoised); memo per key if it shows.
@@ -351,6 +343,27 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Remove the signature files and scratch homes that checks and key parsing a crash cut short.
+/// Only old ones: a request running now may still be using its own.
+fn clean_leftovers(home: &Path) {
+    let Ok(rd) = std::fs::read_dir(home) else { return };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(600));
+        if old && (n.starts_with("sig-") || n.starts_with("parse-")) {
+            let _ = std::fs::remove_dir_all(e.path()).or_else(|_| std::fs::remove_file(e.path()));
+        }
+    }
+}
+
+/// Memoise check `c` under `key`, stamped with the time it's stored (a page's checks can
+/// take a while, and a timeout's minute starts when it's found).
+fn remember(memo: &crate::git::Memo, key: String, mut c: Check) -> Check {
+    c.at = crate::db::now();
+    memo.put(key, &c);
+    c
 }
 
 fn random_hex() -> String {
@@ -393,8 +406,10 @@ fn only_signature_packets(armored: &str) -> bool {
     // Armor headers ("Version: ..."), then a blank line, then base64 up to the "=CRC" line.
     let mut body = String::new();
     let mut in_headers = true;
+    let mut ended = false;
     for l in lines.by_ref() {
         if l.starts_with("-----END") {
+            ended = true;
             break;
         }
         if in_headers {
@@ -410,6 +425,10 @@ fn only_signature_packets(armored: &str) -> bool {
             continue;
         }
         body.push_str(l);
+    }
+    // Nothing but blank lines after the end: no second armor block riding along.
+    if !ended || lines.any(|l| !l.is_empty()) {
+        return false;
     }
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body) else { return false };
     let mut rest = &bytes[..];
@@ -600,7 +619,8 @@ pub async fn prove(st: &AppState, k: &NewKey, challenge: &str, sig: &str) -> R<(
         async {
             let scratch = s.scratch()?;
             s.gpg_import(&st.git, &scratch.0, k.key.as_bytes(), s.timeout).await?;
-            Ok(parse_gpg(&s.gpg_verify(&st.git, &scratch.0, challenge.as_bytes(), &sig).await?))
+            // A signer's clock that's off doesn't matter here: the one-use challenge dates the signature.
+            Ok(parse_gpg(&s.gpg_verify(&st.git, &scratch.0, challenge.as_bytes(), &sig, &["--ignore-time-conflict"]).await?))
         }
         .await
     };
@@ -655,8 +675,8 @@ async fn try_verify(st: &AppState, r: &Repo, shas: &[&str]) -> R<HashMap<String,
         match split_signature(&raw) {
             Some((payload, sig)) => todo.push((sha, payload, sig, committer_email)),
             None => {
-                let c = Check { outcome: Outcome::Unsigned, kind: String::new(), fingerprint: None, committer_email, keyring: ver, expires: None, at: now };
-                st.git.memo.put(key(&sha), &c);
+                let c = Check { outcome: Outcome::Unsigned, kind: String::new(), fingerprint: None, committer_email, keyring: ver, expires: None, at: 0 };
+                let c = remember(&st.git.memo, key(&sha), c);
                 checks.insert(sha, Ok(c));
             }
         }
@@ -675,8 +695,8 @@ async fn try_verify(st: &AppState, r: &Repo, shas: &[&str]) -> R<HashMap<String,
     for (sha, res, committer_email) in done {
         match res {
             Ok((outcome, kind, fingerprint, expires)) => {
-                let c = Check { outcome, kind: kind.into(), fingerprint, committer_email, keyring: ver, expires, at: now };
-                st.git.memo.put(key(&sha), &c);
+                let c = Check { outcome, kind: kind.into(), fingerprint, committer_email, keyring: ver, expires, at: 0 };
+                let c = remember(&st.git.memo, key(&sha), c);
                 checks.insert(sha, Ok(c));
             }
             // Not memoised: the tool may be installed, or work, next time.
@@ -921,6 +941,11 @@ mod tests {
         assert!(!only_signature_packets(&arm(&[0xc2, 9, 1])), "length past the end");
         assert!(!only_signature_packets(&arm(&[])));
         assert!(only_signature_packets("-----BEGIN PGP SIGNATURE-----\nVersion: x\n\nwgMBAgM=\n=x\n-----END PGP SIGNATURE-----"));
+        let one = arm(&[0xc2, 3, 1, 2, 3]);
+        assert!(only_signature_packets(&format!("{one}\n  \n")), "blank lines after the end are fine");
+        assert!(!only_signature_packets(&format!("{one}{}", arm(&[0xc4, 1, 0]))), "a second armor block");
+        assert!(!only_signature_packets(&format!("{one}trailing text")));
+        assert!(!only_signature_packets("-----BEGIN PGP SIGNATURE-----\n\nwgMBAgM=\n"), "no end line");
         assert_eq!(parse_gpg("[GNUPG:] PLAINTEXT 62 0\n[GNUPG:] GOODSIG 4B9A Alice\n[GNUPG:] VALIDSIG S x\n").0, Outcome::Bad);
     }
 
@@ -953,6 +978,53 @@ mod tests {
         assert!(!fresh(&t, 3, 1000 + 60), "tried again after a minute");
         assert!(!fresh(&check(Outcome::TimedOut, "gpg", None), 4, 1001), "or once the keyring changes");
         assert_eq!(verdict(&t, &[]).status, "unknown", "never shown as Bad");
+    }
+
+    #[test]
+    fn checks_are_stamped_when_they_are_stored() {
+        // A page whose checks ran past a minute: the timeout found at the end is fresh, not
+        // already stale because it carries the time the page started.
+        let memo = crate::git::Memo::default();
+        let started = crate::db::now() - 120;
+        let stored = remember(&memo, "k".into(), check(Outcome::TimedOut, "ssh", None));
+        assert!(fresh(&stored, 3, crate::db::now()));
+        assert!(fresh(&memo.get::<Check>("k").unwrap(), 3, crate::db::now()));
+        assert!(stored.at >= started + 120);
+    }
+
+    #[test]
+    fn a_proved_owner_takes_a_key_over_from_ones_who_only_pasted_it() {
+        let user = |id, name: &str| User { id, username: name.into(), display_name: String::new(), email: format!("{name}@x.io"), is_admin: false, limits: None };
+        let owners = vec![("ssh".to_string(), user(1, "carol"), false), ("ssh".to_string(), user(2, "alice"), true)];
+        let mut c = check(Outcome::Good, "ssh", None);
+        c.committer_email = "carol@x.io".into();
+        let v = verdict(&c, &owners);
+        assert_eq!((v.status.as_str(), v.signer.as_deref(), v.proved), ("unverified", Some("alice"), true), "{v:?}");
+        c.committer_email = "alice@x.io".into();
+        let v = verdict(&c, &owners);
+        assert_eq!((v.status.as_str(), v.signer.as_deref(), v.proved), ("verified", Some("alice"), true), "{v:?}");
+        // Nobody proved it: the pasted key still counts, shown as not proved.
+        c.committer_email = "carol@x.io".into();
+        let v = verdict(&c, &owners[..1]);
+        assert_eq!((v.status.as_str(), v.signer.as_deref(), v.proved), ("verified", Some("carol"), false), "{v:?}");
+    }
+
+    #[test]
+    fn leftovers_are_removed_only_once_they_are_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for n in ["sig-old", "sig-new", "keep"] {
+            std::fs::write(dir.path().join(n), "x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("parse-old")).unwrap();
+        for n in ["sig-old", "keep"] {
+            std::fs::File::options().write(true).open(dir.path().join(n)).unwrap().set_modified(old).unwrap();
+        }
+        std::fs::File::open(dir.path().join("parse-old")).unwrap().set_modified(old).unwrap();
+        clean_leftovers(dir.path());
+        let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["keep", "sig-new"], "a request's files still in use stay");
     }
 
     #[tokio::test]
