@@ -125,8 +125,9 @@ function tokensTab({ tokens, agent_tools: tools = [] }) {
   </div>`;
 }
 
-function signingTab(keys) {
+function signingTab(keys, ch) {
   const me = state.me;
+  const text = ch.challenge;
   return html`<div class="stack settings-form">
     <h2>Signing keys</h2>
     <p class="muted">Commits you sign with one of these keys show as <b>Verified</b> when their committer email is your account's email
@@ -135,10 +136,18 @@ function signingTab(keys) {
       <div class="field"><label for="sk-title">Title <span class="muted">(optional)</span></label><input class="input" id="sk-title" name="title" maxlength="80" placeholder="e.g. laptop"></div>
       <div class="field"><label for="sk-key">Public key</label><textarea class="textarea mono" id="sk-key" name="key" rows="4" required spellcheck="false" placeholder="ssh-ed25519 AAAA… or -----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>
         <span class="hint">To sign with an SSH key: <code>git config gpg.format ssh</code>, <code>git config user.signingkey ~/.ssh/id_ed25519.pub</code>, then <code>git commit -S</code>.</span></div>
+      <div class="field"><label for="sk-sig">Signature</label>
+        <p class="small muted">Prove the key is yours: sign this text with it (it works once, for an hour) and paste the signature.</p>
+        <code class="mono small" id="sk-challenge">${text}</code>
+        <span class="hint">SSH: <code>printf '%s' '${text}' | ssh-keygen -Y sign -n ${ch.ssh_namespace} -f ~/.ssh/id_ed25519</code><br>
+          GPG: <code>printf '%s' '${text}' | gpg --armor --detach-sign -u you@example.com</code></span>
+        <textarea class="textarea mono" id="sk-sig" name="signature" rows="4" required spellcheck="false" placeholder="-----BEGIN SSH SIGNATURE----- or -----BEGIN PGP SIGNATURE-----"></textarea></div>
       <div class="row"><button class="btn primary" type="submit">${icon('plus', 'sm')} Add key</button></div>
     </div></form>
     ${keys.length ? html`<div class="box list">${keys.map((k) => html`<div class="list-row signing-key">
         ${icon('key', 'muted')}<div class="grow"><b>${k.title}</b> <span class="pill">${k.kind === 'ssh' ? 'SSH' : 'GPG'}</span>
+          ${k.proved_at ? html`<span class="pill" title="You signed a challenge with it when adding it">Proved</span>`
+            : html`<span class="pill muted" title="Added before keys needed a signature proving you hold them. Remove it and add it again to prove it.">Not proved</span>`}
           <div class="small muted"><code class="mono">${k.fingerprint}</code> · added ${timeEl(k.created_at)}</div></div>
         <button class="btn sm danger" data-sk-del="${k.id}" data-name="${k.title}">${icon('trash', 'sm')} Remove</button></div>`)}</div>`
       : html`<div class="box empty small">${icon('key', 'big')}<h3>No signing keys yet</h3><p>Add one to have your signed commits show as Verified.</p></div>`}
@@ -246,7 +255,10 @@ export default async function (ctx) {
   let inner, exp = null, timer;
   if (tab === 'profile') { const m = await get('/me', { fresh: true }); inner = profileTab(m.profile, m.storage); }
   else if (tab === 'tokens') inner = tokensTab(await get('/me/tokens', { fresh: true }));
-  else if (tab === 'signing') inner = signingTab((await get('/me/signing-keys', { fresh: true })).keys);
+  else if (tab === 'signing') {
+    const [r, ch] = await Promise.all([get('/me/signing-keys', { fresh: true }), send('POST', '/me/signing-keys/challenge')]);
+    inner = signingTab(r.keys, ch);
+  }
   else if (tab === 'ssh') inner = sshTab(await get('/me/ssh-keys', { fresh: true }));
   else if (tab === 'account') {
     const [e, ids] = await Promise.all([get('/me/export', { fresh: true }), get('/me/identities', { fresh: true })]);
@@ -343,8 +355,8 @@ export default async function (ctx) {
       if (sk) {
         sk.addEventListener('submit', action(sk.querySelector('[type=submit]'), async () => {
           const f = Object.fromEntries(new FormData(sk));
-          if (!f.key.trim()) return;
-          await send('POST', '/me/signing-keys', { title: f.title, key: f.key });
+          if (!f.key.trim() || !f.signature.trim()) return;
+          await send('POST', '/me/signing-keys', { title: f.title, key: f.key, signature: f.signature });
           toast('Signing key added');
           refresh();
         }));

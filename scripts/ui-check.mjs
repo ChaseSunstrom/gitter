@@ -146,7 +146,7 @@ if ((await (await ctx.request.get(BASE + '/api/me/ssh-keys')).json()).keys.lengt
 // Signed commits (e2e.sh pushes one when ssh-keygen is installed): the key is listed in
 // settings; the list, the commit page and blame show Verified, and the badge says why.
 if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.length) {
-  await visit(ctx, '/settings/signing', ['Signing keys', 'e2e laptop', 'SSH']);
+  await visit(ctx, '/settings/signing', ['Signing keys', 'e2e laptop', 'SSH', 'Proved']);
   const log = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json()).commits;
   const signed = log.find((c) => c.subject === 'Signed commit')?.sha;
   const page = await ctx.newPage();

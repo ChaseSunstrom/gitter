@@ -1055,6 +1055,17 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX deployments_job ON deployments(job_id);
     CREATE INDEX deployments_pull ON deployments(repo_id, pr_number);
     "#,
+    // v33: proof of possession for signing keys. Adding one needs a signature, made with it,
+    // over the account's current challenge (one at a time, used once); proved_at is NULL for
+    // keys added before that was asked.
+    r#"
+    ALTER TABLE signing_keys ADD COLUMN proved_at INTEGER;
+    CREATE TABLE signing_challenges (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        challenge TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 impl Db {
