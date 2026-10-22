@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: user
 created: 2026-10-21T23:41:28Z
-updated: 2026-10-22T00:09:43Z
+updated: 2026-10-22T00:37:48Z
 builder: 2026-10-22T00:08:43Z
 builder_proc: archbox-hardened|pid:[4026531836]|3700487|2540304
 lane: /home/chase/projects/gitter/.claude/worktrees/agent-a0efd8bed424f13ba
@@ -17,6 +17,9 @@ base: 77c5dcb1a94fdc95a072a36f99074ac1192d6bd5
 base_tree: 16e8c4254b3866eb127fff4691d6e5b0208bdf15
 plan0_at: 2026-10-22T00:09:43Z
 plan0_scope: []
+inferred_deps: [T-0010]
+inferred_why: T-0010: named in its request
+group: import, mirroring, and releases
 ---
 # Releases with assets (from T-0010)
 ## Raw request
@@ -33,13 +36,23 @@ GitHub-style releases. A release names a tag (an existing one, or a new tag at a
 ## Risks and rollback
 ## Execution prompt
 ## Steps
-1. [ ] schema + API: releases (tag, title, notes markdown, draft, prerelease, author), assets (name, size, content type, downloads) under GITTER_DATA/releases/<release id>/; writers create/edit/delete, readers see published  <- CURRENT
-2. [ ] tags: create the tag at a chosen commit or branch when it doesn't exist (annotated, by update-ref with an expected old value); deleting a release keeps the tag
-3. [ ] assets: streaming upload with the storage quota (STORAGE_USED gains release asset bytes), per-file cap = max_lfs_mb, download counts, safe Content-Disposition, private repos stay private
-4. [ ] UI: Releases tab (list, release page with notes, assets, source archives), new/edit form with tag picker, latest release in the repo sidebar; backup/restore/verify include releases/
+1. [x] schema + API: releases (tag, title, notes markdown, draft, prerelease, author), assets (name, size, content type, downloads) under GITTER_DATA/releases/<release id>/; writers create/edit/delete, readers see published
+2. [x] tags: create the tag at a chosen commit or branch when it doesn't exist (annotated, by update-ref with an expected old value); deleting a release keeps the tag
+3. [x] assets: streaming upload with the storage quota (STORAGE_USED gains release asset bytes), per-file cap = max_lfs_mb, download counts, safe Content-Disposition, private repos stay private
+4. [x] UI: Releases tab (list, release page with notes, assets, source archives), new/edit form with tag picker, latest release in the repo sidebar; backup/restore/verify include releases/
 ## Resume here
 ## Docs impact
 ## Verification evidence
+- (ac 1) `cargo test -q --test api releases 2>&1 | tail -15` → ✗ exit 1 · test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 35 filtered out; finished in 1.25s / error: test failed, to rerun pass `--test api` [ran] [tree 06ccc11fd183] (2026-10-22T00:17:21Z)
+- (step 1) `cargo test -q --lib asset_names 2>&1 | tail -3` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 52 filtered out; finished in 0.00s [ran] [tree 78b86db2aa78] (2026-10-22T00:24:11Z)
+- (step 1) `cargo test -q --test api releases` → exit 0 · .. / test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 2.55s [ran] [tree 78b86db2aa78] (2026-10-22T00:24:19Z)
+- (step 2) `cargo test -q --test api releases_from_tags` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.95s [ran] [tree 78b86db2aa78] (2026-10-22T00:24:23Z)
+- (step 3) `cargo test -q --test api releases_assets` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 2.55s [ran] [tree 78b86db2aa78] (2026-10-22T00:24:26Z)
+- (step 4) `cargo test -q 2>&1 | grep -E "test result|FAILED|panicked|failures" | head -20` → exit 0 · test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.78s / test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s [ran] [tree 3527903c92d9] (2026-10-22T00:28:50Z)
+- (ac 1) `cargo test -q --test api releases 2>&1 | grep -E "panicked|test result" -A3 | head -20` → ✗ exit 1 · test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 35 filtered out; finished in 3.46s / error: test failed, to rerun pass `--test api` [ran] [tree 8e0fcf024ff0] (2026-10-22T00:32:22Z)
+- (step 1) `cargo test -q --test api releases` → exit 0 · .. / test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 3.61s [ran] [tree e46605a90357] (2026-10-22T00:37:37Z)
+- (step 2) `cargo test -q --test api releases_from_tags` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 1.43s [ran] [tree e46605a90357] (2026-10-22T00:37:42Z)
+- (step 3) `cargo test -q --test api releases_assets` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 3.30s [ran] [tree e46605a90357] (2026-10-22T00:37:48Z)
 ## Log
 - 2026-10-21T23:41:28Z created
 - 2026-10-22T00:08:43Z builder brief: /home/chase/.claude/foreman/state/projects/gitter-588bc6/audits/T-0044.builder.md

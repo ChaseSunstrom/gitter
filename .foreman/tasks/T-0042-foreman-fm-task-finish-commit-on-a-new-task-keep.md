@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-21T22:49:11Z
 updated: 2026-10-21T22:49:11Z
+group: Foreman tooling and canary failures
 ---
 # Foreman: fm task finish --commit on a new task keeps refusing 'audit missing: self (files
 ## Raw request

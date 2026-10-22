@@ -336,6 +336,34 @@ const MIGRATIONS: &[&str] = &[
         last_minute INTEGER NOT NULL DEFAULT 0
     );
     "#,
+    // v10: organizations and collaborators. An org is a users row that can't sign in.
+    r#"
+    ALTER TABLE users ADD COLUMN is_org INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE orgs (
+        id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        -- What members get on every org repository: none, read or write.
+        base_role TEXT NOT NULL DEFAULT 'read',
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE org_members (
+        org_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL DEFAULT 'member',
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (org_id, user_id)
+    );
+    CREATE INDEX org_members_user ON org_members(user_id);
+    CREATE TABLE repo_collaborators (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, user_id)
+    );
+    CREATE INDEX repo_collaborators_user ON repo_collaborators(user_id);
+    "#,
 ];
 
 impl Db {

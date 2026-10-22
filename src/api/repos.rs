@@ -27,6 +27,8 @@ pub const DEFAULT_LABELS: &[(&str, &str)] = &[
 #[derive(Deserialize)]
 pub struct CreateReq {
     name: String,
+    /// An organization to create it in (default: yourself).
+    owner: Option<String>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -44,21 +46,23 @@ async fn insert_repo(
     forked_from: Option<i64>,
 ) -> R<i64> {
     let max = st.settings.get().max_repos_per_user;
-    if !owner.is_admin
-        && let Err(wait) = st.limiter.check(&format!("create:{}", owner.id), 30, 3600)
+    // An organization's repositories count toward its creator's limits.
+    let oid = owner.id;
+    let (payer, admin) = st.db.call(move |c| Ok(crate::repo::payer(c, oid)?)).await?;
+    if !admin
+        && let Err(wait) = st.limiter.check(&format!("create:{payer}"), 30, 3600)
     {
         return Err(AppError::slow_down("You've created a lot of repositories in the last hour. Try again later.", wait));
     }
-    let (oid, admin, n, d) = (
-        owner.id,
-        owner.is_admin,
-        name.to_string(),
-        description.to_string(),
-    );
+    let (n, d) = (name.to_string(), description.to_string());
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
-            let count: i64 = tx.query_row("SELECT count(*) FROM repos WHERE owner_id = ?1", [oid], |r| r.get(0))?;
+            let count: i64 = tx.query_row(
+                "SELECT count(*) FROM repos WHERE owner_id IN (SELECT ?1 UNION ALL SELECT id FROM orgs WHERE created_by = ?1)",
+                [payer],
+                |r| r.get(0),
+            )?;
             if count >= max && !admin {
                 return Err(AppError::bad(format!("You've reached the limit of {max} repositories")));
             }
@@ -103,7 +107,30 @@ pub async fn create(
     if description.chars().count() > 350 {
         return Err(AppError::bad("Keep the description under 350 characters"));
     }
-    let id = insert_repo(&st, &u, &name, &description, req.private, None).await?;
+    // In an organization, the org owns it: its quota, its name.
+    let owner = match req.owner.as_deref().filter(|o| !o.eq_ignore_ascii_case(&u.username)) {
+        None => u.clone(),
+        Some(org) => {
+            let o = org.to_string();
+            let found: Option<User> = st
+                .db
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT id, username, display_name, email, is_admin FROM users WHERE username = ?1 AND is_org = 1",
+                        [&o],
+                        User::from_row,
+                    )
+                    .optional()?)
+                })
+                .await?;
+            let org = found.ok_or_else(|| AppError::bad("No organization with that name"))?;
+            if !crate::api::orgs::can_create_in(&st, org.id, &u).await? {
+                return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "You can't create repositories in that organization"));
+            }
+            org
+        }
+    };
+    let id = insert_repo(&st, &owner, &name, &description, req.private, None).await?;
     let path = st.git.repo_path(id);
     if let Err(e) = init_repo(&st, &u, id, &name, &description, req.readme).await {
         drop_row(&st, id).await;
@@ -111,7 +138,7 @@ pub async fn create(
         return Err(e);
     }
     record_event(&st.db, u.id, Some(id), "create", &name, "", 1).await?;
-    Ok(Json(json!({ "owner": u.username, "name": name })))
+    Ok(Json(json!({ "owner": owner.username, "name": name })))
 }
 
 async fn init_repo(
@@ -200,7 +227,7 @@ pub async fn show(
         "updated_at": r.updated_at, "pushed_at": r.pushed_at, "language": language,
         "empty": branches.is_empty(), "branches": branches, "tags": tags,
         "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
-        "fork_of": parent, "can_write": r.can_write, "is_owner": r.is_owner, "hidden": r.hidden,
+        "fork_of": parent, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
     })))
 }
@@ -222,7 +249,7 @@ pub async fn update(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<UpdateReq>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    let r = Repo::administrable(&st, v.as_ref(), &owner, &name).await?;
     let visibility = req.private.filter(|p| *p != r.private);
     // Publishing a private repo can't be undone (people may clone it), so it needs a fresh password.
     if visibility.is_some() && !fresh {
@@ -332,7 +359,7 @@ pub async fn remove(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<DeleteReq>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     if !req.confirm.eq_ignore_ascii_case(&r.full_name()) {
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
@@ -616,7 +643,7 @@ pub async fn deploy_tokens(
     Authed(u): Authed,
     Path((owner, name)): Path<(String, String)>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     let rid = r.id;
     let rows = st
         .db
@@ -641,7 +668,7 @@ pub async fn create_deploy_token(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<DeployReq>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     let t = super::account::TokenReq::deploy(req.name, req.write, req.expires_days);
     let raw = super::account::issue_token(&st, &u, &ip.0, t, Some((r.id, r.full_name()))).await?;
     Ok(Json(json!({ "token": raw })))
@@ -653,7 +680,7 @@ pub async fn delete_deploy_token(
     ip: ClientIp,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     let rid = r.id;
     let gone: Option<String> = st
         .db

@@ -1,5 +1,5 @@
 // Create a repository.
-import { html, state, send, $, action, avatar } from '../lib.js';
+import { html, state, get, send, $, action, avatar } from '../lib.js';
 import { icon } from '../icons.js';
 import { navigate } from '../main.js';
 
@@ -16,9 +16,11 @@ function nameError(n) {
 /** Suggest a valid name from free text: "My Cool App!" -> "my-cool-app". */
 const suggest = (s) => s.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '').replace(/-+$/, '').replace(/\.{2,}/g, '.').slice(0, 100);
 
-export default async function () {
+export default async function (ctx) {
   const me = state.me;
   if (!me) return { redirect: '/login?next=/new' };
+  const orgs = (await get('/me/orgs', { fresh: true }).catch(() => ({ orgs: [] }))).orgs.filter((o) => o.can_create);
+  const want = ctx.query.get('owner');
   return {
     title: 'New repository',
     html: html`<div class="wrap narrow new-repo">
@@ -26,7 +28,9 @@ export default async function () {
       <p class="muted">A repository holds your project's files and their full history.</p>
       <form id="new-repo" class="stack" novalidate>
         <div class="owner-name">
-          <div class="field"><label>Owner</label><div class="owner-chip">${avatar(me.username, 20)}<b>${me.username}</b></div></div>
+          ${orgs.length ? html`<div class="field"><label for="repo-owner">Owner</label><select class="select" id="repo-owner">
+            <option value="${me.username}">${me.username}</option>${orgs.map((o) => html`<option value="${o.name}" ${o.name === want ? 'selected' : ''}>${o.name}</option>`)}</select></div>`
+          : html`<div class="field"><label>Owner</label><div class="owner-chip">${avatar(me.username, 20)}<b>${me.username}</b></div></div>`}
           <span class="owner-slash">/</span>
           <div class="field grow"><label for="repo-name">Repository name</label>
             <input class="input" id="repo-name" name="name" autocomplete="off" spellcheck="false" autofocus required maxlength="100"></div>
@@ -36,9 +40,9 @@ export default async function () {
           <input class="input" id="repo-desc" name="description" maxlength="350" autocomplete="off"></div>
         <fieldset class="vis-cards"><legend class="label">Visibility</legend>
           <label class="vis-card"><input type="radio" name="vis" value="public" checked>
-            <span class="vis-icon">${icon('globe')}</span><span><b>Public</b><span class="muted small">Anyone can see and clone it. Only you can push.</span></span></label>
+            <span class="vis-icon">${icon('globe')}</span><span><b>Public</b><span class="muted small">Anyone can see and clone it. Only people you give access can push.</span></span></label>
           <label class="vis-card"><input type="radio" name="vis" value="private">
-            <span class="vis-icon">${icon('lock')}</span><span><b>Private</b><span class="muted small">Only you can see it. It won't appear in search or on your profile for others.</span></span></label>
+            <span class="vis-icon">${icon('lock')}</span><span><b>Private</b><span class="muted small">Only people you give access can see it. It won't appear in search for anyone else.</span></span></label>
         </fieldset>
         <label class="check box readme-check"><input type="checkbox" name="readme" checked>
           <span><b>Add a README</b><span class="muted small" style="display:block">Start with a first commit so you can clone it right away.</span></span></label>
@@ -52,6 +56,8 @@ export default async function () {
       const msg = $('#name-msg', el);
       const btn = $('#create-btn', el);
       const err = $('#form-err', el);
+      const owner = () => $('#repo-owner', el)?.value || me.username;
+      $('#repo-owner', el)?.addEventListener('change', () => check());
       const check = () => {
         const v = name.value.trim();
         const e = nameError(v);
@@ -72,7 +78,7 @@ export default async function () {
           }
         } else {
           msg.className = 'hint small';
-          msg.textContent = v ? `Your repository will live at ${location.host}/${me.username}/${v}` : 'Short and memorable works best.';
+          msg.textContent = v ? `Your repository will live at ${location.host}/${owner()}/${v}` : 'Short and memorable works best.';
         }
       };
       name.addEventListener('input', check);
@@ -80,7 +86,7 @@ export default async function () {
         err.hidden = true;
         const f = new FormData(form);
         try {
-          const r = await send('POST', '/repos', { name: name.value.trim(), description: String(f.get('description') || '').trim(), private: f.get('vis') === 'private', readme: f.get('readme') === 'on' });
+          const r = await send('POST', '/repos', { owner: owner(), name: name.value.trim(), description: String(f.get('description') || '').trim(), private: f.get('vis') === 'private', readme: f.get('readme') === 'on' });
           navigate(`/${r.owner}/${r.name}`);
         } catch (e) { err.textContent = e.message; err.hidden = false; }
       }));

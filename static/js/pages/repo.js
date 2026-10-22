@@ -86,7 +86,7 @@ git push -u origin main</pre><button class="btn sm" data-copy="echo &quot;# ${me
 function aboutSide(meta, langs) {
   return html`<aside class="repo-side stack">
     <div><div class="section-title">About</div>
-      ${meta.description ? html`<p class="about-desc">${meta.description}</p>` : html`<p class="muted small">No description${meta.can_write ? html` — <a class="c-accent" href="/${meta.owner}/${meta.name}/settings">add one</a>` : ''}.</p>`}
+      ${meta.description ? html`<p class="about-desc">${meta.description}</p>` : html`<p class="muted small">No description${meta.can_admin ? html` — <a class="c-accent" href="/${meta.owner}/${meta.name}/settings">add one</a>` : ''}.</p>`}
       ${meta.website ? html`<a class="row c-accent small" href="${safeUrl(meta.website)}" rel="noopener nofollow ugc" target="_blank" style="margin-top:8px">${icon('link', 'sm')}<span class="ellipsis">${meta.website.replace(/^https?:\/\//, '')}</span></a>` : ''}
       <div class="side-stats">
         <a href="/${meta.owner}/${meta.name}/insights">${icon('star', 'sm')} <b>${num(meta.stars)}</b> ${meta.stars === 1 ? 'star' : 'stars'}</a>

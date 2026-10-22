@@ -648,7 +648,15 @@ pub async fn profile(
             )?;
             let heat: Vec<(String, i64)> = hs.query_map([id, since], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let ev = events(c, "e.user_id = ?", vec![Value::Integer(id)], v.as_ref(), 30)?;
-            Ok(json!({ "user": p, "repos": repos, "stars": stars, "heatmap": heat, "events": ev }))
+            let is_org: bool = c.query_row("SELECT is_org FROM users WHERE id = ?1", [id], |r| r.get(0))?;
+            // Someone's organizations are shown to themselves, site admins and fellow members.
+            let (vid, vadmin) = v.as_ref().map_or((-1, false), |u| (u.id, u.is_admin));
+            let mut q = c.prepare(
+                "SELECT u.username FROM org_members m JOIN users u ON u.id = m.org_id WHERE m.user_id = ?1
+                 AND (?1 = ?2 OR ?3 OR EXISTS (SELECT 1 FROM org_members f WHERE f.org_id = m.org_id AND f.user_id = ?2)) ORDER BY u.username",
+            )?;
+            let orgs: Vec<String> = q.query_map(rusqlite::params![id, vid, vadmin], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            Ok(json!({ "user": p, "is_org": is_org, "orgs": orgs, "repos": repos, "stars": stars, "heatmap": heat, "events": ev }))
         })
         .await?;
     Ok(Json(out))
@@ -688,9 +696,17 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
                 return Ok(json!({ "events": ev, "repos": [], "trending": trending }));
             };
             // Through VISIBLE, so a deploy token (one repo only) doesn't list the owner's private repos.
-            let mut p = vec![Value::Integer(u.id)];
+            // Yours, plus those shared with you (VISIBLE drops org repos the base role doesn't open).
+            let mut p = vec![Value::Integer(u.id), Value::Integer(u.id), Value::Integer(u.id)];
             p.extend(visible_params(Some(&u)));
-            let mine = repo_cards(c, &format!("WHERE r.owner_id = ? AND {VISIBLE} ORDER BY r.updated_at DESC LIMIT 100"), p)?;
+            let mine = repo_cards(
+                c,
+                &format!(
+                    "WHERE (r.owner_id = ? OR r.id IN (SELECT repo_id FROM repo_collaborators WHERE user_id = ?) OR r.owner_id IN (SELECT org_id FROM org_members WHERE user_id = ?))
+                     AND {VISIBLE} ORDER BY r.updated_at DESC LIMIT 100"
+                ),
+                p,
+            )?;
             let ev = events(
                 c,
                 "e.user_id = ? OR e.repo_id IN (SELECT repo_id FROM stars WHERE user_id = ?) OR e.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)",

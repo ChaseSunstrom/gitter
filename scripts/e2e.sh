@@ -188,6 +188,33 @@ JAR="$JAR_A"
 git clone -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/secret.git" "$TMP/secret" || fail "owner clones private"  # pragma: allowlist secret
 ok "owner clones private repo with token"
 
+# --- collaborators and organizations
+api PUT /repos/alice/secret/collaborators/bob '{"role":"write"}'
+BOB_AUTH="Authorization: Basic $(printf '%s' 'bob:another horse' | base64)" # pragma: allowlist secret
+git clone -q -c http.extraHeader="$BOB_AUTH" "http://127.0.0.1:$PORT/alice/secret.git" "$TMP/bob-secret" || fail "collaborator clones private repo"
+(cd "$TMP/bob-secret" && echo hi >bob.txt && git add bob.txt && git -c user.name=bob -c user.email=bob@example.com commit -qm "From bob" \
+  && git -c http.extraHeader="$BOB_AUTH" push -q origin HEAD) || fail "collaborator with write pushes"
+JAR="$TMP/jar2"
+api GET /repos/alice/secret
+[ "$(jq_ 'd["can_write"], d["can_admin"]')" = "True False" ] || fail "collaborator role: $BODY"
+EXPECT=403 api PATCH /repos/alice/secret '{"description":"x"}'
+JAR="$JAR_A"
+api GET /repos/alice/secret/collaborators
+jq_ 'd["access"]' | grep -q bob || fail "access list names the collaborator"
+api POST /orgs '{"name":"acme","display_name":"Acme Inc"}'
+api POST /repos '{"name":"tools","owner":"acme","private":true,"readme":true}'
+JAR="$TMP/jar2"
+EXPECT=404 api GET /repos/acme/tools
+JAR="$JAR_A"
+api PUT /orgs/acme/members/bob '{"role":"member"}'
+JAR="$TMP/jar2"
+api GET /repos/acme/tools
+[ "$(jq_ 'd["can_write"]')" = False ] || fail "org members get the base role (read)"
+JAR="$JAR_A"
+api GET /users/acme
+[ "$(jq_ 'd["is_org"]')" = True ] || fail "org profile"
+ok "collaborators push with their role; organizations own repos and share them with members"
+
 api GET /admin/overview
 [ "$(jq_ 'd["users"]')" = 2 ] || fail "admin overview"
 JAR_KEEP="$JAR"; JAR="$TMP/jar2"

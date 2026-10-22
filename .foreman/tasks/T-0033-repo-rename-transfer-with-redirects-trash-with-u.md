@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T21:11:21Z
-updated: 2026-10-22T00:09:22Z
+updated: 2026-10-22T00:43:00Z
 builder: 2026-10-22T00:08:38Z
 builder_proc: archbox-hardened|pid:[4026531836]|3700487|2540304
 lane: /home/chase/projects/gitter/.claude/worktrees/agent-a9e62c8d122156171
@@ -35,14 +35,21 @@ Redirects: (a) a repo_redirects table checked when Repo::load misses [chosen: on
 ## Risks and rollback
 ## Execution prompt
 ## Steps
-1. [ ] redirects table + resolution in Repo::load fallback (web/API 301, git served in place)  <- CURRENT
-2. [ ] transfer offers: create/accept/decline/expire, quota + repo count checks, audit
-3. [ ] trash: soft delete, listing/access exclusion, restore, purge in upkeep, LFS collect on purge, backups include trash/
-4. [ ] data export job + download; self-delete with Sudo
-5. [ ] UI: Settings → Repositories (offers, recently deleted), Account (export, delete) + tests
+1. [x] redirects table + resolution in Repo::load fallback (web/API 301, git served in place)
+2. [x] transfer offers: create/accept/decline/expire, quota + repo count checks, audit
+3. [x] trash: soft delete, listing/access exclusion, restore, purge in upkeep, LFS collect on purge, backups include trash/
+4. [x] data export job + download; self-delete with Sudo
+5. [x] UI: Settings → Repositories (offers, recently deleted), Account (export, delete) + tests
 ## Resume here
 ## Docs impact
 ## Verification evidence
+- (step 1) `cargo test -q 2>&1 | grep -E "test result|FAILED|panicked|failed|warning" | head -30` → exit 0 · test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.56s / test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:41Z)
+- (step 1) `cargo test -q --test api rename_transfer` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.37s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:47Z)
+- (step 2) `cargo test -q --test api rename_transfer` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.42s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:53Z)
+- (step 3) `cargo test -q --test api trash` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 3.20s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:56Z)
+- (step 4) `cargo test -q --test api export_and_self_delete` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 1.61s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:59Z)
+- (step 4) `cargo test -q --test api export_and_self_delete` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 1.51s [ran] [tree e6e9bb916028] (2026-10-22T00:42:41Z)
+- (step 5) `cargo test -q --lib reconcile 2>&1 | tail -4` → exit 0 · ... / test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.04s [ran] [tree ffea2b0d0d43] (2026-10-22T00:43:00Z)
 ## Log
 - 2026-10-21T21:11:21Z created
 - 2026-10-21T23:40:52Z set tier=M
