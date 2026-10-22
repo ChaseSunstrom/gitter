@@ -777,7 +777,6 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
     await page.goto(BASE + '/alice/reports/ci/1', { waitUntil: 'networkidle' });
     run = await page.locator('.ci-tests').innerText();
     await page.goto(BASE + '/alice/reports/ci', { waitUntil: 'networkidle' });
-    await page.click('.ci-flaky-box > summary');
     list = await page.locator('.ci-flaky-box').innerText();
     await page.goto(BASE + '/alice/reports/pull/1/files', { waitUntil: 'networkidle' });
     await page.waitForSelector('tr.ci-ann', { timeout: 5000 });

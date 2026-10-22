@@ -446,7 +446,12 @@ LAST=$(jq_ 'd["runs"][0]["number"]')
 SHA=$(jq_ 'd["runs"][0]["sha"]')
 api GET "/repos/alice/reports/ci/runs/$LAST"
 curl -sf -b "$JAR" "$BASE/api/repos/alice/reports/ci/jobs/$(jq_ 'd["jobs"][0]["id"]')/log" | grep -q 'from the cache deps-' || fail "a branch restores the default branch's cache"
-api GET "/repos/alice/reports/ci/report?sha=$SHA"
+# (Opening a pull request right after a push can start a second run of it: wait for the newest.)
+for _ in $(seq 50); do
+  api GET "/repos/alice/reports/ci/report?sha=$SHA"
+  [ "$(jq_ 'len(d["annotations"])')" != 0 ] && break
+  sleep 0.2
+done
 [ "$(jq_ 'd["annotations"][0]["path"] + ":" + str(d["annotations"][0]["line"])')" = "src/lib.rs:3" ] || fail "failures as annotations for the pull request: $BODY"
 ok "CI extras: JUnit results with file:line, coverage, flaky tests, caches with default-branch fallback, PR annotations"
 

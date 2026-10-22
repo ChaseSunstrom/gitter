@@ -41,8 +41,11 @@ pub fn path(data: &Path, id: i64) -> PathBuf {
     data.join("ci/cache").join(format!("{id}.tar.gz"))
 }
 
-/// The `{{ … }}` parts of a template: (text before, the words inside), and the rest.
-fn parts(t: &str) -> Result<(Vec<(&str, Vec<&str>)>, &str), String> {
+/// (text before, the words inside) per `{{ … }}`, and the text after the last.
+type Parts<'a> = (Vec<(&'a str, Vec<&'a str>)>, &'a str);
+
+/// The `{{ … }}` parts of a template.
+fn parts(t: &str) -> Result<Parts<'_>, String> {
     let (mut out, mut rest) = (Vec::new(), t);
     while let Some(i) = rest.find("{{") {
         let close = rest[i..].find("}}").ok_or("a {{ isn't closed with }}")?;

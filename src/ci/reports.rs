@@ -259,7 +259,8 @@ pub fn parse_junit(data: &[u8]) -> Result<Vec<Case>, String> {
     }
     let src = std::str::from_utf8(data).map_err(|_| "the report isn't UTF-8")?;
     // The case being read, its failure's message attribute, and its failure text.
-    let (mut cases, mut suites, mut cur): (Vec<Case>, Vec<String>, Option<(Case, String, String)>) = (vec![], vec![], None);
+    let mut cur: Option<(Case, String, String)> = None;
+    let (mut cases, mut suites): (Vec<Case>, Vec<String>) = (vec![], vec![]);
     let mut capture = false;
     events(src, |ev| {
         match ev {

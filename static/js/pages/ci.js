@@ -74,7 +74,7 @@ async function listView(meta, q) {
     <p>Add <code>.gitter/ci.yml</code> (or just a <code>.gitter/ci.sh</code> script) and push: every push and pull request runs it.</p>
     ${meta.can_write ? html`<p><button class="btn primary" id="ci-setup">${icon('play', 'sm')} Set up CI</button></p>` : ''}
     <pre class="setup-cmd" style="text-align:left">${sample}</pre></div>`;
-  const flakyBox = flaky.tests.length ? html`<details class="box ci-flaky-box"><summary class="box-head row">${icon('zap', 'sm')}<b class="grow">Flaky tests</b><span class="counter">${flaky.tests.length}</span></summary>
+  const flakyBox = flaky.tests.length ? html`<details class="box ci-flaky-box" open><summary class="box-head row">${icon('zap', 'sm')}<b class="grow">Flaky tests</b><span class="counter">${flaky.tests.length}</span></summary>
     <div class="list">${flaky.tests.map((t) => html`<a class="list-row" href="${base}/ci/${t.last_run}"><span class="grow mono small ellipsis">${t.name}</span>
       <span class="muted small">failed, then passed on the same commit ${plural(t.flips, 'time')} · ${timeEl(t.last_seen)}</span></a>`)}</div></details>` : '';
   const body = html`<div class="stack">
