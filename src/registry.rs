@@ -393,6 +393,7 @@ async fn route(st: AppState, req: Request) -> O<Response> {
         (Method::PATCH, Op::Upload(id)) => {
             let uid = need_write(&repo, &user)?;
             let _slot = slot(&st, &ip).ok_or_else(busy)?;
+            let _busy = Busy::take(&id)?;
             let size = append(&st, &repo, uid, &id, &headers, body).await?;
             Ok(accepted(&img, &id, size, StatusCode::ACCEPTED))
         }
@@ -587,9 +588,8 @@ async fn end_session(st: &AppState, id: &str) {
 }
 
 /// Add a request's body to upload `id`, where its Content-Range (if any) says it
-/// goes. Returns the upload's size after it.
+/// goes. Returns the upload's size after it. The caller holds its `Busy`.
 async fn append(st: &AppState, repo: &Repo, uid: i64, id: &str, headers: &HeaderMap, body: Body) -> O<u64> {
-    let _busy = Busy::take(id)?;
     let size = session(st, repo, uid, id).await?;
     if let Some(range) = headers.get(header::CONTENT_RANGE) {
         let start = range.to_str().ok().map(|r| r.trim_start_matches("bytes ").split(['-', '/']).next().unwrap_or("").trim().to_string());
@@ -620,8 +620,9 @@ async fn finish_upload(st: &AppState, repo: &Repo, uid: i64, img: &Image, id: &s
     if !valid_digest(d) {
         return Err(bad_digest());
     }
-    let size = append(st, repo, uid, id, headers, body).await?;
+    // Held from the last bytes through the hash and the move, so nothing is added in between.
     let _busy = Busy::take(id)?;
+    let size = append(st, repo, uid, id, headers, body).await?;
     let path = upload_path(st, id);
     let p = path.clone();
     let hash = tokio::task::spawn_blocking(move || sha256_file(&p)).await.map_err(AppError::internal)?;
