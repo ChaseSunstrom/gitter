@@ -419,6 +419,22 @@ fn hv(s: &str) -> HeaderValue {
     HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
+/// The manifest kinds accepted (and so the only Content-Types a manifest is served with).
+const MANIFEST_TYPES: &[&str] = &[
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.artifact.manifest.v1+json",
+];
+
+/// Stored bytes are pushers' content served from this origin: never sniffed,
+/// never run as a page.
+fn stored(h: &mut HeaderMap) {
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'"));
+}
+
 fn bad_digest() -> Oci {
     oci(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "The digest is invalid, or the content doesn't match it (only sha256 is supported)")
 }
@@ -439,9 +455,11 @@ async fn get_blob(st: &AppState, repo: &Repo, d: &str, head: bool, ip: &str) -> 
     let mut r = body.into_response();
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
     h.insert("docker-content-digest", hv(d));
     h.insert(header::ETAG, hv(&format!("\"{d}\"")));
+    stored(h);
     Ok(r)
 }
 
@@ -645,10 +663,13 @@ async fn get_manifest(st: &AppState, repo: &Repo, img: &Image, reference: &str, 
     let len = bytes.len();
     let mut r = if head { Body::empty() } else { Body::from(bytes) }.into_response();
     let h = r.headers_mut();
+    // Rows hold only MANIFEST_TYPES; anything else is served as plain bytes.
+    let media = if MANIFEST_TYPES.contains(&media.as_str()) { media } else { "application/octet-stream".into() };
     h.insert(header::CONTENT_TYPE, hv(&media));
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
     h.insert("docker-content-digest", hv(&d));
     h.insert(header::ETAG, hv(&format!("\"{d}\"")));
+    stored(h);
     Ok(r)
 }
 
@@ -691,8 +712,11 @@ async fn put_manifest(st: &AppState, repo: &Repo, user: &Option<User>, img: &Ima
     let media = declared
         .filter(|t| !t.is_empty())
         .or_else(|| v["mediaType"].as_str().map(String::from))
-        .filter(|t| t.len() <= 255 && t.contains('/') && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"/.+-_".contains(&b)))
         .ok_or_else(|| invalid("Say what kind of manifest this is (Content-Type)"))?;
+    // Served back with this Content-Type from this origin, so only real manifest kinds.
+    if !MANIFEST_TYPES.contains(&media.as_str()) {
+        return Err(invalid("Only OCI and Docker image manifests and indexes are supported"));
+    }
     let (children, blobs) = references(&v).ok_or_else(|| invalid("The manifest must name its layers, config or manifests by sha256 digest"))?;
     let d = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
     let tag = if reference.starts_with("sha256:") {
@@ -946,6 +970,7 @@ pub async fn generic_get(State(st): State<AppState>, Viewer(v): Viewer, ip: Clie
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
     // `file` is letters, digits and .-_+ only, so it's safe in the header as is.
     h.insert(header::CONTENT_DISPOSITION, hv(&format!("attachment; filename=\"{file}\"")));
+    stored(h);
     Ok(resp)
 }
 

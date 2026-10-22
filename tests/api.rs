@@ -3140,6 +3140,46 @@ async fn registry_pushes_and_pulls_images_with_chunked_and_monolithic_uploads() 
 }
 
 #[tokio::test]
+async fn registry_never_serves_pushed_bytes_as_a_page() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "app" }))).await;
+    let pw = basic("alice", "correct horse");
+    let page = b"<script>alert(document.cookie)</script>".to_vec();
+    assert_eq!(push_blob(&app, "alice/app", &pw, &page).await, StatusCode::CREATED);
+    let config = b"{}".to_vec();
+    assert_eq!(push_blob(&app, "alice/app", &pw, &config).await, StatusCode::CREATED);
+    // A manifest declared as HTML (by header or by its mediaType) is refused.
+    let mut html = serde_json::from_slice::<Value>(&image_manifest(&config, &[&page])).unwrap();
+    html["mediaType"] = json!("text/html");
+    let html = html.to_string().into_bytes();
+    for ct in [&[("content-type", "text/html")][..], &[]] {
+        let (s, _, b) = reg(&app, "PUT", "/v2/alice/app/manifests/x", Some(&pw), ct, html.clone()).await;
+        assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "MANIFEST_INVALID"), "{ct:?}");
+    }
+    let manifest = image_manifest(&config, &[&page]);
+    assert_eq!(reg(&app, "PUT", "/v2/alice/app/manifests/x", Some(&pw), &[("content-type", OCI_MANIFEST)], manifest).await.0, StatusCode::CREATED);
+    // Blobs, manifests and package files: never sniffed, sandboxed, blobs as downloads.
+    let safe = |h: &axum::http::HeaderMap| {
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(h["content-security-policy"], "sandbox; default-src 'none'");
+    };
+    let (s, h, _) = reg(&app, "GET", &format!("/v2/alice/app/blobs/{}", digest(&page)), None, &[], vec![]).await;
+    assert_eq!((s, h["content-type"].to_str().unwrap(), h["content-disposition"].to_str().unwrap()), (StatusCode::OK, "application/octet-stream", "attachment"));
+    safe(&h);
+    let (_, h, _) = reg(&app, "GET", "/v2/alice/app/manifests/x", None, &[], vec![]).await;
+    assert_eq!(h["content-type"], OCI_MANIFEST);
+    safe(&h);
+    let t = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "ci" }))).await.1["token"].as_str().unwrap().to_string();
+    let url = "/api/repos/alice/app/packages/generic/web/1/index.html";
+    assert_eq!(reg(&app, "PUT", url, Some(&format!("Bearer {t}")), &[], page.clone()).await.0, StatusCode::OK);
+    let (_, h, _) = reg(&app, "GET", url, None, &[], vec![]).await;
+    assert_eq!(h["content-type"], "application/octet-stream");
+    assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment"));
+    safe(&h);
+}
+
+#[tokio::test]
 async fn registry_access_follows_the_repository() {
     let app = App::new();
     let alice = app.signup("alice").await;
