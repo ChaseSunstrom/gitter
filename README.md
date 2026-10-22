@@ -204,7 +204,8 @@ Before the steps, the runner restores the newest cache with that key (`hash` is 
 The same `gitter` binary is a client for any Gitter server, like `gh`:
 
 ```sh
-gitter login https://git.example.com       # asks for an access token (or --token, or GITTER_TOKEN)
+gitter login https://git.example.com       # asks for an access token, not echoed (or --token, or GITTER_TOKEN)
+gitter auth setup-git                      # plain git push/pull to that server now uses the login
 gitter repo create notes --private && gitter repo clone alice/notes && cd notes
 gitter issue create --title "Crash on start" --body "…"
 git switch -c fix && git commit -am "Fix the crash"
@@ -213,7 +214,7 @@ gitter pr list; gitter pr checkout 7; gitter pr merge 7 --method squash
 gitter ci status; gitter ci logs 12        # follows a running job; gitter ci rerun 12
 ```
 
-`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name` (`pr create` then also needs `--head BRANCH`, so your current branch isn't pushed somewhere by surprise). Logging in over plain `http://` to another machine warns that the token travels unencrypted. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter <command> --help` lists every command.
+`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name` (`pr create` then also needs `--head BRANCH`, so your current branch isn't pushed somewhere by surprise). Logging in over plain `http://` to another machine warns that the token travels unencrypted. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter auth setup-git` sets git's credential helper (in `~/.gitconfig`, one per logged-in server, replacing any other helper for it) to `gitter auth git-credential SERVER`, which hands git that server's saved token, so plain `git push` works too; the token stays in gitter's config only. Run it again after logging in to another server (`gitter login` reminds you). The token prompt reads with echo off and puts the terminal back on Ctrl-C; where echo can't be turned off it refuses, so use `--token`, `GITTER_TOKEN` or a pipe. `gitter <command> --help` lists every command; a flag a command doesn't take is refused with that command's usage.
 
 ## Webhooks
 

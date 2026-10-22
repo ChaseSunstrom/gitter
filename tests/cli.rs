@@ -40,7 +40,8 @@ fn cmd(program: &str, home: &Path, cwd: &Path) -> Command {
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("GITTER_TOKEN")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // The test's own global config (`gitter auth setup-git` writes there), never the real ~/.gitconfig.
+        .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_AUTHOR_NAME", "Alice")
         .env("GIT_AUTHOR_EMAIL", "alice@example.com")
@@ -52,6 +53,21 @@ fn cmd(program: &str, home: &Path, cwd: &Path) -> Command {
         }
     }
     c
+}
+
+/// Like `gitter`, with `input` on its stdin.
+fn gitter_in(home: &Path, cwd: &Path, args: &[&str], input: &str) -> (i32, String, String) {
+    use std::io::Write;
+    let mut child = cmd(env!("CARGO_BIN_EXE_gitter"), home, cwd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 fn git(home: &Path, cwd: &Path, args: &[&str]) -> String {
@@ -155,6 +171,227 @@ async fn login_repo_issue_and_pr_commands_work_against_a_server() {
 
     ok(&home, &clone, &["pr", "merge", "2"]);
     assert_eq!(json_of(&ok(&home, &clone, &["pr", "view", "2", "--json"]))["issue"]["state"], "merged");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_git_lets_plain_git_clone_and_push() {
+    let app = App::new();
+    let url = serve(&app).await;
+    let tok = token(&app, "alice").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    let (code, _, err) = gitter(&home, &home, &["auth", "setup-git"]);
+    assert!(code != 0 && err.contains("login"), "nothing to set up before a login: {err}");
+    let (_, _, err) = gitter(&home, &home, &["login", &url, "--token", &tok]);
+    assert!(!err.contains("setup-git"), "no hint before setup-git was ever run: {err}");
+    ok(&home, &home, &["repo", "create", "secret", "--private", "--readme"]);
+    let remote = format!("{url}/alice/secret.git");
+    // Before setup-git, plain git has no credentials for the private repository.
+    let out = cmd("git", &home, &home).args(["clone", "-q", &remote, "before"]).output().unwrap();
+    assert!(!out.status.success());
+
+    let out = ok(&home, &home, &["auth", "setup-git"]);
+    assert!(out.contains(&url), "{out}");
+    ok(&home, &home, &["auth", "setup-git"]); // a second run doesn't add a second helper
+    let key = format!("credential.{url}.helper");
+    let out = cmd("git", &home, &home).args(["config", "--global", "--get-all", &key]).output().unwrap();
+    let helpers: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect();
+    assert!(helpers.len() == 2 && helpers[0].is_empty() && helpers[1].contains("auth git-credential"), "an empty reset, then gitter's: {helpers:?}");
+
+    git(&home, &home, &["clone", "-q", &remote, "plain"]);
+    let clone = home.join("plain");
+    assert!(clone.join("README.md").exists());
+    assert!(!git(&home, &clone, &["config", "--get", "remote.origin.url"]).contains(&tok), "no token in the remote URL");
+    std::fs::write(clone.join("x.txt"), "x\n").unwrap();
+    git(&home, &clone, &["add", "x.txt"]);
+    git(&home, &clone, &["commit", "-q", "-m", "x"]);
+    git(&home, &clone, &["push", "-q", "origin", "main"]);
+    let gitconfig = std::fs::read_to_string(home.join(".gitconfig")).unwrap();
+    assert!(!gitconfig.contains(&tok), "the token stays out of git's files: {gitconfig}");
+
+    // The helper itself: answers only for a logged-in server and a matching user; store and erase do nothing.
+    let host = url.strip_prefix("http://").unwrap();
+    let (code, out, _) = gitter_in(&home, &home, &["auth", "git-credential", "get"], &format!("protocol=http\nhost={host}\n\n"));
+    assert_eq!(code, 0);
+    assert_eq!(out, format!("username=x-access-token\npassword={tok}\n"));
+    for other in [
+        "protocol=http\nhost=elsewhere.example\n\n".to_string(),
+        format!("protocol=https\nhost={host}\n\n"),
+        format!("protocol=http\nhost={host}\nusername=bob\n\n"),
+    ] {
+        let (code, out, _) = gitter_in(&home, &home, &["auth", "git-credential", "get"], &other);
+        assert!(code == 0 && out.is_empty(), "{other:?}: {out}");
+    }
+    let (_, out, _) = gitter_in(&home, &home, &["auth", "git-credential", "get"], &format!("protocol=http\nhost={host}\nusername=alice\n\n"));
+    assert!(out.contains(&tok), "the logged-in user's own name is fine: {out}");
+    for verb in ["store", "erase"] {
+        let (code, out, _) = gitter_in(&home, &home, &["auth", "git-credential", verb], &format!("protocol=http\nhost={host}\nusername=x\npassword=y\n\n"));
+        assert!(code == 0 && out.is_empty(), "{verb}: {out}");
+    }
+    let cfg = home.join(".config/gitter/config.json");
+    let mut saved = json_of(&std::fs::read_to_string(&cfg).unwrap());
+    assert_eq!(saved["hosts"][&url]["token"], tok.as_str(), "erase leaves the login alone");
+
+    // Over 64 KiB of input: no answer (not a cut-off last line).
+    let big = format!("protocol=http\nhost={host}\nx={}\n\n", "a".repeat(70 << 10));
+    let (code, out, _) = gitter_in(&home, &home, &["auth", "git-credential", "get"], &big);
+    assert!(code == 0 && out.is_empty(), "{out}");
+
+    // Two logins on one host (the second under a path): each helper entry answers only with its own token.
+    let sub = format!("{url}/sub");
+    let tok2 = "gtr_subpathtoken"; // pragma: allowlist secret
+    saved["hosts"][&sub] = json!({ "user": "alice", "token": tok2 });
+    std::fs::write(&cfg, saved.to_string()).unwrap();
+    let ask = |server: &str, path: Option<&str>| {
+        let input = format!("protocol=http\nhost={host}\n{}\n", path.map(|p| format!("path={p}\n")).unwrap_or_default());
+        let mut args = vec!["auth", "git-credential"];
+        if !server.is_empty() {
+            args.push(server);
+        }
+        args.push("get");
+        let (code, out, err) = gitter_in(&home, &home, &args, &input);
+        assert_eq!(code, 0, "{err}");
+        out
+    };
+    let answer = |t: &str| format!("username=x-access-token\npassword={t}\n");
+    assert_eq!(ask("", None), "", "the old helper form is ambiguous on a shared host: no answer");
+    assert_eq!(ask(&url, None), answer(&tok));
+    assert_eq!(ask(&sub, None), answer(tok2));
+    assert_eq!(ask(&sub, Some("sub/x.git")), answer(tok2));
+    assert_eq!(ask(&sub, Some("alice/x.git")), "", "outside its path");
+    assert_eq!(ask(&sub, Some("subway/x.git")), "", "a path prefix is whole segments");
+    assert_eq!(ask("http://elsewhere.example", None), "", "not a logged-in server");
+    // And through git itself, with both helpers set up.
+    ok(&home, &home, &["auth", "setup-git"]);
+    let fill = |u: &str| {
+        let out = gitter_like_git_fill(&home, u);
+        out.lines().find_map(|l| l.strip_prefix("password=").map(String::from)).unwrap_or_default()
+    };
+    assert_eq!(fill(&format!("{url}/other.git")), tok);
+    assert_eq!(fill(&format!("{sub}/x.git")), tok2);
+
+    // A login to another server after setup-git: a hint to run it again.
+    let url2 = serve(&app).await;
+    let (code, _, err) = gitter(&home, &home, &["login", &url2, "--token", &tok]);
+    assert!(code == 0 && err.contains("gitter auth setup-git"), "{err}");
+}
+
+/// `git credential fill` for `url`: what git's helpers answer.
+fn gitter_like_git_fill(home: &Path, url: &str) -> String {
+    use std::io::Write;
+    let mut child = cmd("git", home, home)
+        .args(["credential", "fill"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(format!("url={url}\n\n").as_bytes()).unwrap();
+    String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_prompt_hides_the_token_and_reads_a_piped_one() {
+    let app = App::new();
+    let url = serve(&app).await;
+    let tok = token(&app, "alice").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+
+    // Piped: read as is.
+    let (code, out, err) = gitter_in(&home, &home, &["login", &url], &format!("{tok}\n"));
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("alice"), "{out}");
+
+    // On a terminal (script(1) gives it one): what's typed isn't echoed back.
+    if !Command::new("script").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped the terminal half: script(1) from util-linux isn't installed");
+        return;
+    }
+    std::fs::remove_file(home.join(".config/gitter/config.json")).unwrap();
+    let line = format!("'{}' login '{url}'", env!("CARGO_BIN_EXE_gitter"));
+    let (ok_exit, seen) = on_terminal(&home, &line, &format!("{tok}\n"));
+    assert!(ok_exit && seen.contains("Logged in"), "{seen}");
+    assert!(seen.contains("Paste") && !seen.contains(&tok), "the token was echoed: {seen}");
+
+    // Ctrl-C at the prompt: echo is back on afterwards (the shell traps INT so it carries on to check).
+    let line = format!(
+        "trap true INT; '{}' login '{url}'; echo \"EXIT=$?\"; if stty -a | grep -qw -- -echo; then echo ECHO-OFF; else echo ECHO-ON; fi",
+        env!("CARGO_BIN_EXE_gitter")
+    );
+    let (_, seen) = on_terminal(&home, &line, "\x03");
+    assert!(seen.contains("EXIT=130") && seen.contains("ECHO-ON"), "{seen}");
+}
+
+/// Runs the shell `line` on a terminal, types `input` once it shows the token prompt: (exited 0, all it showed).
+fn on_terminal(home: &Path, line: &str, input: &str) -> (bool, String) {
+    use std::io::{Read, Write};
+    let mut child = cmd("script", home, home)
+        .args(["-q", "-e", "-c", line, "/dev/null"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("script(1) from util-linux");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
+    };
+    // The prompt comes once echo is off: type only then.
+    for _ in 0..200 {
+        if seen.lock().unwrap().contains("Paste") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    for _ in 0..200 {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let status = child.wait().unwrap();
+    drop(stdin);
+    reader.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    (status.success(), seen)
+}
+
+#[test]
+fn a_flag_a_command_does_not_take_is_refused_with_its_usage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    for (args, usage) in [
+        (&["repo", "list", "--title", "x"][..], "gitter repo list"),
+        (&["ci", "run", "--job", "x"][..], "gitter ci run"),
+        (&["issue", "list", "--body", "x"][..], "gitter issue list"),
+        (&["pr", "checkout", "1", "--json"][..], "gitter pr view|checkout N"),
+        (&["login", "http://127.0.0.1:1", "--json"][..], "gitter login URL"),
+        (&["auth", "setup-git", "-R", "a/b"][..], "gitter auth setup-git"),
+        (&["repo", "view", "--bogus"][..], "gitter repo view"),
+    ] {
+        let (code, _, err) = gitter(home, home, args);
+        assert!(code != 0 && err.contains("doesn't take") && err.contains(usage), "{args:?}: {err}");
+    }
+    // Not the whole list: just the command's own lines.
+    let (_, _, err) = gitter(home, home, &["repo", "list", "--title", "x"]);
+    assert!(!err.contains("gitter issue"), "{err}");
+    // A mistyped --token=… names the flag, not the value after it.
+    let (code, _, err) = gitter(home, home, &["login", "http://127.0.0.1:1", "--tokens=SECRETVALUE"]); // pragma: allowlist secret
+    assert!(code != 0 && err.contains("--tokens") && !err.contains("SECRETVALUE"), "{err}");
 }
 
 /// Wait for the newest run to finish.

@@ -18,6 +18,8 @@ use crate::validate;
 const USAGE: &str = "gitter — command-line client
 
   gitter login URL [--token T]       save the server and an access token (or set GITTER_TOKEN; asks when neither)
+  gitter auth setup-git              let plain git clone/pull/push use your logins (a git credential helper)
+  gitter auth git-credential get     what git runs for that (store and erase do nothing)
   gitter repo create NAME [--description D] [--private] [--readme] [--owner ORG]
   gitter repo clone OWNER/NAME [DIR]
   gitter repo list [OWNER]
@@ -44,6 +46,50 @@ or -R OWNER/NAME (or -R URL/OWNER/NAME). --json prints the server's answer as JS
 const BOOL_FLAGS: &[&str] = &["--json", "--private", "--readme", "--delete-branch", "--all", "--here", "--help"];
 const VALUE_FLAGS: &[&str] = &["-R", "--repo", "--token", "--title", "--body", "--state", "--base", "--head", "--method", "--description", "--owner", "--job"];
 
+/// Each command and the flags it takes (--help: all of them). `login`'s second word is the URL.
+const COMMANDS: &[(&str, &str, &[&str])] = &[
+    ("login", "", &["--token"]),
+    ("auth", "setup-git", &[]),
+    ("auth", "git-credential", &[]),
+    ("repo", "create", &["--description", "--private", "--readme", "--owner", "--json"]),
+    ("repo", "clone", &[]),
+    ("repo", "list", &["--json"]),
+    ("repo", "view", &["-R", "--repo", "--json"]),
+    ("issue", "list", &["-R", "--repo", "--json", "--state"]),
+    ("pr", "list", &["-R", "--repo", "--json", "--state"]),
+    ("issue", "create", &["-R", "--repo", "--json", "--title", "--body"]),
+    ("issue", "view", &["-R", "--repo", "--json"]),
+    ("pr", "view", &["-R", "--repo", "--json"]),
+    ("issue", "close", &["-R", "--repo", "--json"]),
+    ("issue", "comment", &["-R", "--repo", "--json", "--body"]),
+    ("pr", "create", &["-R", "--repo", "--json", "--title", "--body", "--base", "--head"]),
+    ("pr", "checkout", &["-R", "--repo"]),
+    ("pr", "merge", &["-R", "--repo", "--json", "--method", "--delete-branch"]),
+    ("ci", "status", &["-R", "--repo", "--json"]),
+    ("ci", "logs", &["-R", "--repo", "--job"]),
+    ("ci", "rerun", &["-R", "--repo", "--json", "--all"]),
+    ("ci", "run", &["--here"]),
+];
+
+/// The USAGE lines of `gitter cmd sub` (with their continuation lines).
+fn usage_of(cmd: &str, sub: &str) -> String {
+    let mut out = vec![];
+    let mut on = false;
+    for l in USAGE.lines() {
+        let t = l.trim_start();
+        if let Some(rest) = t.strip_prefix("gitter ") {
+            let w: Vec<&str> = rest.split_whitespace().collect();
+            on = w.first() == Some(&cmd) && (cmd == "login" || w.get(1).is_some_and(|s| s.split('|').any(|x| x == sub)));
+        } else if t.is_empty() || l.len() - t.len() <= 2 {
+            on = false;
+        }
+        if on {
+            out.push(l);
+        }
+    }
+    out.join("\n")
+}
+
 struct Args {
     pos: Vec<String>,
     flags: BTreeMap<String, String>,
@@ -69,7 +115,8 @@ impl Args {
                 };
                 a.flags.insert(k.into(), v);
             } else if s.starts_with('-') && s != "-" {
-                bail!("unknown option {s} (see gitter {} --help)", raw.first().map_or("", |s| s.as_str()));
+                // Refused by main with the command's usage (no command takes it).
+                a.flags.insert(s.clone(), String::new());
             } else {
                 a.pos.push(s.clone());
             }
@@ -409,12 +456,23 @@ pub fn main(raw: &[String]) -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
+    let (c0, c1) = (a.pos(0).unwrap_or(""), if a.pos(0) == Some("login") { "" } else { a.pos(1).unwrap_or("") });
+    let Some((_, _, takes)) = COMMANDS.iter().find(|(c, s, _)| *c == c0 && *s == c1) else {
+        bail!("unknown command `gitter {c0} {c1}`\n\n{USAGE}");
+    };
+    if let Some(f) = a.flags.keys().find(|f| !takes.contains(&f.as_str())) {
+        // Only the name: a mistyped `--tokens=…` mustn't print the secret after it.
+        let f = f.split('=').next().unwrap_or("");
+        bail!("gitter {c0}{} doesn't take {f}\n\nusage:\n{}", if c1.is_empty() { String::new() } else { format!(" {c1}") }, usage_of(c0, c1));
+    }
     // `ci run` needs no server, so no config either (a missing HOME or a broken file doesn't matter).
     let local = a.pos(0) == Some("ci") && a.pos(1) == Some("run");
     let cx = Ctx { cfg: if local { Config::default() } else { load()? }, a };
     let sub = cx.a.pos(1).unwrap_or("");
     match (cx.a.pos(0).unwrap_or(""), sub) {
         ("login", _) => login(cx),
+        ("auth", "setup-git") => setup_git(&cx),
+        ("auth", "git-credential") => git_credential(&cx),
         ("repo", "create") => repo_create(&cx),
         ("repo", "clone") => repo_clone(&cx),
         ("repo", "list") => repo_list(&cx),
@@ -445,12 +503,7 @@ fn login(mut cx: Ctx) -> Result<()> {
     }
     let token = match cx.a.get("--token").map(String::from).or_else(|| std::env::var("GITTER_TOKEN").ok().filter(|t| !t.is_empty())) {
         Some(t) => t,
-        None => {
-            eprint!("Paste an access token for {url} (Settings → Access tokens; the input is shown): ");
-            let mut t = String::new();
-            std::io::stdin().read_line(&mut t)?;
-            t
-        }
+        None => read_token(&url)?,
     };
     let token = token.trim().to_string();
     if token.is_empty() {
@@ -460,8 +513,214 @@ fn login(mut cx: Ctx) -> Result<()> {
     let user = me["user"]["username"].as_str().ok_or_else(|| anyhow!("{url} didn't accept that token"))?.to_string();
     println!("Logged in to {url} as {}", clean(&user, false));
     cx.cfg.hosts.insert(url.clone(), Host { user, token });
-    cx.cfg.default = url;
-    save(&cx.cfg)
+    cx.cfg.default = url.clone();
+    save(&cx.cfg)?;
+    // setup-git was run for other servers, not this one.
+    let ours: Vec<String> = global_config(&["--get-regexp", r"^credential\..*\.helper$"])
+        .iter()
+        .filter_map(|e| e.split_once('\n').filter(|(_, v)| v.contains("auth git-credential")).map(|(k, _)| k.to_string()))
+        .collect();
+    if !ours.is_empty() && !ours.contains(&format!("credential.{url}.helper")) {
+        eprintln!("To let plain git use this login too, run `gitter auth setup-git` again.");
+    }
+    Ok(())
+}
+
+/// `git config --global --null ARGS…`: its entries (empty when there are none or git fails).
+fn global_config(args: &[&str]) -> Vec<String> {
+    let mut a = vec!["config", "--global", "--null"];
+    a.extend(args);
+    match git_cmd(&a, None).stdin(Stdio::null()).stderr(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).split_terminator('\0').map(String::from).collect(),
+        _ => vec![],
+    }
+}
+
+/// The most read from stdin for a token or a credential request.
+const INPUT_LIMIT: usize = 64 << 10;
+
+/// One line from stdin; on a terminal, typed with echo off.
+fn read_token(url: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Read};
+    let echo = if std::io::stdin().is_terminal() { Some(hide_echo()?) } else { None };
+    // The prompt comes after echo is off, so nothing typed at it shows.
+    let note = if echo.is_some() { "; it isn't shown as you type" } else { "" };
+    eprint!("Paste an access token for {url} (Settings → Access tokens{note}): ");
+    let mut t = String::new();
+    let read = std::io::stdin().lock().take(INPUT_LIMIT as u64 + 1).read_line(&mut t);
+    if let Some(e) = echo {
+        drop(e);
+        eprintln!();
+    }
+    read?;
+    if t.len() > INPUT_LIMIT {
+        bail!("that's too long for a token");
+    }
+    Ok(t)
+}
+
+/// The terminal's settings from before `hide_echo`, put back once (when dropped, or on a signal).
+type Saved = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+fn restore_tty(saved: &Saved) {
+    if let Some(s) = saved.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = Command::new("stty").arg(s).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+}
+
+struct Echo(Saved);
+
+impl Drop for Echo {
+    fn drop(&mut self) {
+        restore_tty(&self.0);
+    }
+}
+
+/// Turns echo off on the terminal on stdin. Until the guard is dropped, Ctrl-C, SIGTERM and SIGHUP put the
+/// terminal back and exit (130, 143, 129); after it, they still exit (the handlers stay for the rest of the run).
+fn hide_echo() -> Result<Echo> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let refuse = || anyhow!("can't turn off echo on this terminal, so the token would show: pass --token, set GITTER_TOKEN, or pipe it in");
+    let out = Command::new("stty").arg("-g").stdin(Stdio::inherit()).stderr(Stdio::null()).output().map_err(|_| refuse())?;
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || state.is_empty() || !state.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
+        return Err(refuse());
+    }
+    let saved: Saved = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
+    // The handlers before echo goes off, so no signal lands in between.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_io().build()?;
+    let (mut int, mut term, mut hup) = {
+        let _in = rt.enter();
+        (signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?, signal(SignalKind::hangup())?)
+    };
+    let on_signal = saved.clone();
+    std::thread::spawn(move || {
+        let code = rt.block_on(async {
+            tokio::select! {
+                _ = int.recv() => 130,
+                _ = term.recv() => 143,
+                _ = hup.recv() => 129,
+            }
+        });
+        restore_tty(&on_signal);
+        eprintln!();
+        std::process::exit(code);
+    });
+    let guard = Echo(saved);
+    if !Command::new("stty").arg("-echo").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) {
+        return Err(refuse());
+    }
+    Ok(guard)
+}
+
+/// Points git's credential helper for every logged-in server at `gitter auth git-credential`.
+fn setup_git(cx: &Ctx) -> Result<()> {
+    if cx.cfg.hosts.is_empty() {
+        bail!("log in first: gitter login https://your.gitter.server");
+    }
+    let exe = std::env::current_exe().context("can't find the gitter program")?;
+    let exe = exe.to_str().ok_or_else(|| anyhow!("gitter's path isn't UTF-8: {}", exe.display()))?;
+    // git runs a `!` helper through the shell. Each server's entry names it, so it answers only with that login.
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    let mut failed = vec![];
+    for host in cx.cfg.hosts.keys() {
+        match set_helper(&format!("credential.{host}.helper"), &format!("!{} auth git-credential {}", quote(exe), quote(host))) {
+            Ok(()) => println!("git now uses your gitter login for {host}"),
+            Err(e) => {
+                eprintln!("can't set git's credential helper for {host}: {e:#}");
+                failed.push(host.as_str());
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("git isn't set up for {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// Makes `key` exactly ["", helper]: the empty value first drops helpers from other settings (like gh), and a
+/// rerun leaves the same two. If the second step fails, the old values are put back, never just the reset.
+fn set_helper(key: &str, helper: &str) -> Result<()> {
+    let old = global_config(&["--get-all", key]);
+    git(&["config", "--global", "--replace-all", key, ""], None)?;
+    if let Err(e) = git(&["config", "--global", "--add", key, helper], None) {
+        let _ = git(&["config", "--global", "--unset-all", key], None);
+        for v in &old {
+            let _ = git(&["config", "--global", "--add", key, v], None);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// "scheme", "host[:port]", "path" (no leading slash) of a server URL.
+fn url_parts(u: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, rest) = u.split_once("://")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((scheme, authority, path))
+}
+
+/// git's credential helper protocol, as `gitter auth git-credential [SERVER] get|store|erase`: `get` answers with
+/// SERVER's saved token when git asks about that server; `store` and `erase` do nothing. Without SERVER (what
+/// setup-git wrote before), only when exactly one login is on that scheme and host, and it has no path.
+fn git_credential(cx: &Ctx) -> Result<()> {
+    use std::io::{BufRead, Read};
+    let (server, verb) = match cx.a.pos(2) {
+        Some(s) if s.contains("://") => (Some(s), cx.a.pos(3)),
+        v => (None, v),
+    };
+    let mut q: BTreeMap<String, String> = BTreeMap::new();
+    let mut input = std::io::stdin().lock().take(INPUT_LIMIT as u64 + 1);
+    let mut total = 0;
+    loop {
+        let mut line = String::new();
+        let n = input.read_line(&mut line)?;
+        total += n;
+        if total > INPUT_LIMIT {
+            return Ok(()); // cut off: no answer rather than one from a partial line
+        }
+        let line = line.strip_suffix('\n').unwrap_or(&line);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            q.insert(k.to_string(), v.to_string());
+        }
+    }
+    if verb != Some("get") {
+        return Ok(());
+    }
+    let (Some(proto), Some(host)) = (q.get("protocol"), q.get("host")) else { return Ok(()) };
+    let on_host = |k: &str| url_parts(k).is_some_and(|(s, a, _)| s == proto && a.eq_ignore_ascii_case(host));
+    let key = match server {
+        Some(s) => s,
+        None => {
+            let mut m = cx.cfg.hosts.keys().filter(|k| on_host(k));
+            match (m.next(), m.next()) {
+                (Some(k), None) if url_parts(k).is_some_and(|(_, _, p)| p.is_empty()) => k.as_str(),
+                _ => return Ok(()),
+            }
+        }
+    };
+    let Some(h) = cx.cfg.hosts.get(key) else { return Ok(()) };
+    let Some((_, _, p)) = url_parts(key).filter(|_| on_host(key)) else { return Ok(()) };
+    // With credential.useHttpPath git sends the path: it must be under the server's.
+    if let Some(x) = q.get("path").map(|x| x.trim_start_matches('/'))
+        && !p.is_empty()
+        && x != p
+        && !x.starts_with(&format!("{p}/"))
+    {
+        return Ok(());
+    }
+    if q.get("username").is_some_and(|u| u != "x-access-token" && !u.eq_ignore_ascii_case(&h.user)) {
+        return Ok(());
+    }
+    // A hand-edited config can't inject more lines into git's answer.
+    if h.token.is_empty() || h.token.contains(['\n', '\r', '\0']) {
+        return Ok(());
+    }
+    println!("username=x-access-token\npassword={}", h.token);
+    Ok(())
 }
 
 fn repo_create(cx: &Ctx) -> Result<()> {
@@ -978,6 +1237,14 @@ mod tests {
         assert_eq!(repo_name("alice/proj.git/").as_deref(), Some("alice/proj"));
         assert_eq!(repo_name("alice/proj/extra"), None);
         assert_eq!(repo_name("-x/y"), None);
+    }
+
+    #[test]
+    fn every_command_has_a_usage_line() {
+        for (c, s, _) in COMMANDS {
+            let u = usage_of(c, s);
+            assert!(u.trim_start().starts_with(&format!("gitter {c}")), "gitter {c} {s} has no usage line");
+        }
     }
 
     #[test]
