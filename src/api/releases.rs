@@ -238,7 +238,7 @@ async fn check_target(st: &AppState, r: &Repo, raw: &str) -> R<(String, String)>
 }
 
 /// Point `refs/tags/<tag>` at a new annotated tag of commit `sha`, unless the tag appears meanwhile.
-async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title: &str) -> R<()> {
+pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title: &str) -> R<()> {
     crate::mirrors::refuse_writes(r)?;
     let (name, email) = u.signature();
     // mktag checks the object strictly: no angle brackets or line breaks in the name, no NULs.
@@ -246,10 +246,17 @@ async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title
     let name = if name.trim().is_empty() { u.username.clone() } else { name.trim().to_string() };
     let obj = format!("object {sha}\ntype commit\ntag {tag}\ntagger {name} <{email}> {} +0000\n\n{}\n", now(), title.replace('\0', ""));
     let oid = st.git.ok_env(&r.path, &["mktag"], Some(obj.as_bytes()), &[]).await?;
-    st.git
-        .update_ref(&r.path, &format!("refs/tags/{tag}"), &oid, None)
-        .await
-        .map_err(|_| AppError::conflict("That tag was just created by someone else. Try again."))?;
+    let refname = format!("refs/tags/{tag}");
+    let o = st.git.run(&r.path, &["update-ref", &refname, &oid, crate::git::EMPTY_OID], None, &[]).await?;
+    if o.code != 0 {
+        // Only a tag that's there now was made meanwhile; anything else (`v1` in the way of `v1/rc`, a stale lock) is an error of its own.
+        let there = st.git.run(&r.path, &["show-ref", "--verify", "--quiet", &refname], None, &[]).await?.code == 0;
+        return Err(if there {
+            AppError::conflict("That tag was just created by someone else. Try again.")
+        } else {
+            AppError::internal(format!("{}: update-ref {refname}: {}", r.full_name(), String::from_utf8_lossy(&o.stderr).trim()))
+        });
+    }
     crate::mirrors::changed(st, r.id).await;
     Ok(())
 }
