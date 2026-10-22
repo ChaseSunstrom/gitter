@@ -44,6 +44,7 @@ const r = await ctx.request.post(BASE + '/api/auth/login', { headers: { Origin: 
 if (!r.ok()) { console.log('✗ login failed', r.status()); process.exit(1); }
 const sha = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json()).commits.at(-1).sha;
 const snip = (await (await ctx.request.get(BASE + '/api/snippets')).json()).items[0].id;
+const hook = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/hooks')).json()).hooks[0];
 
 const pages = [
   ['/', ['Your repositories']],
@@ -69,7 +70,9 @@ const pages = [
   ['/alice/hello/issues/new', []],
   ['/alice/hello/insights', ['Alice']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
-  ['/alice/hello/settings', ['Danger zone', 'CI secrets']],
+  ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues']],
+  [`/alice/hello/settings/hooks/${hook.id}`, ['Payload URL', 'Recent deliveries', 'ping', 'issues', 'Delivered', 'Send a ping']],
+  ['/alice/hello/settings/hooks/new', ['Add webhook', 'Payload URL', 'Allow private addresses']],
   ['/alice/hello/ci', ['CI runs', 'Add CI', '#1']],
   ['/alice/hello/ci/1', ['Add CI', 'build', 'test', 'Say hello', 'Set up job', 'Passed']],
   ['/admin/runners', ['Runners', 'built-in', 'Add a runner']],
@@ -177,6 +180,40 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   const all = await page.locator('.dfile .dtable tr.add').count();
   if (errors.length || first > 1100 || all !== 5000) { failed++; console.log(`✗ big diff: first chunk ${first} rows, ${all} added rows after scrolling`, errors); }
   else console.log(`  ok big diff loads on demand (${first} rows first, ${all} after scrolling)`);
+  await page.close();
+}
+
+// Webhooks: add one with the form, open its ping in the delivery log, redeliver it.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const steps = [];
+  try {
+    await page.goto(BASE + '/alice/hello/settings/hooks/new', { waitUntil: 'networkidle' });
+    await page.fill('#h-url', hook.url + '/from-browser');
+    await page.fill('#h-secret', 'browser-secret');
+    await page.check('input[name=which][value=some]');
+    await page.check('input[name=ev][value=push]');
+    await page.check('#h-private');
+    await page.click('#hook-form button[type=submit]');
+    await page.waitForURL(/\/settings\/hooks\/\d+$/);
+    steps.push('added');
+    for (let i = 0; i < 25 && !(await page.locator('.hook-delivery', { hasText: 'Delivered' }).count()); i++) {
+      await page.waitForTimeout(200);
+      await page.reload({ waitUntil: 'networkidle' });
+    }
+    await page.locator('.hook-delivery summary', { hasText: 'ping' }).first().click();
+    await page.locator('.hook-delivery[open] [data-redeliver]').waitFor({ timeout: 5000 });
+    const shown = await page.locator('.hook-delivery[open]').innerText();
+    if (!shown.includes('X-Gitter-Signature-256') || !shown.includes('"hook"')) throw new Error('delivery details missing: ' + shown.slice(0, 300));
+    steps.push('read its ping');
+    await page.click('.hook-delivery[open] [data-redeliver]');
+    await page.locator('.hook-delivery .pill', { hasText: 'Redelivery' }).waitFor({ timeout: 5000 });
+    steps.push('redelivered it');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || steps.length < 3) { failed++; console.log('✗ webhook form and delivery log', steps, errors); }
+  else console.log(`  ok webhook ${steps.join(', ')} in the browser`);
   await page.close();
 }
 

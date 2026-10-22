@@ -1,5 +1,5 @@
-//! Things that happen after a branch moves (git push, web edits, merges).
-//! CI (T-0006) plugs in here.
+//! Things that happen after a branch moves (git push, web edits, merges):
+//! CI runs and webhooks start here.
 
 use crate::AppState;
 use crate::auth::User;
@@ -15,6 +15,7 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     st.git.maintain_soon(repo.path.clone());
     refresh_size(st, repo.id).await;
     crate::ci::trigger::on_push(st, repo, user.id, updates).await;
+    crate::webhooks::push(st, repo, user.id, updates).await;
 }
 
 /// Record how much disk a repository uses (for storage quotas and the admin page).

@@ -1663,3 +1663,277 @@ async fn snippets_and_wikis_count_toward_storage() {
     let (s, e) = app.req(&bob, "POST", "/api/repos/bob/r/wiki", Some(json!({ "name": "Home", "content": "z".repeat(100_000) }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
 }
+
+// ---------------------------------------------------------------- webhooks
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(std::collections::HashMap<String, String>, String)>>>;
+
+/// A local HTTP server that records each request (lower-cased headers, body)
+/// and answers with the status in `status` (302 points somewhere else).
+struct Receiver {
+    url: String,
+    seen: Seen,
+    status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+}
+
+impl Receiver {
+    fn new() -> Receiver {
+        use std::io::{BufRead, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/hook", l.local_addr().unwrap().port());
+        let (seen, status): (Seen, _) = (Default::default(), std::sync::Arc::new(std::sync::atomic::AtomicU16::new(200)));
+        let (s2, st2) = (seen.clone(), status.clone());
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                let mut r = std::io::BufReader::new(conn.try_clone().unwrap());
+                let (mut line, mut head) = (String::new(), std::collections::HashMap::new());
+                r.read_line(&mut line).unwrap();
+                loop {
+                    line.clear();
+                    r.read_line(&mut line).unwrap();
+                    let Some((k, v)) = line.trim_end().split_once(':') else { break };
+                    head.insert(k.to_ascii_lowercase(), v.trim().to_string());
+                }
+                let mut body = vec![0; head.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0)];
+                r.read_exact(&mut body).unwrap();
+                s2.lock().unwrap().push((head, String::from_utf8_lossy(&body).into_owned()));
+                let code = st2.load(std::sync::atomic::Ordering::SeqCst);
+                let to = if code == 302 { "Location: http://127.0.0.1:9/elsewhere\r\n" } else { "" };
+                let _ = write!(&conn, "HTTP/1.1 {code} Hi\r\n{to}Content-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        Receiver { url, seen, status }
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.seen.lock().unwrap().iter().map(|(h, _)| h["x-gitter-event"].clone()).collect()
+    }
+
+    fn last(&self) -> (std::collections::HashMap<String, String>, Value) {
+        let (h, b) = self.seen.lock().unwrap().last().cloned().unwrap();
+        (h, serde_json::from_str(&b).unwrap())
+    }
+}
+
+/// (status, attempts, seconds until the next try) of the newest delivery.
+async fn newest_delivery(app: &App) -> (String, i64, Option<i64>) {
+    app.state
+        .db
+        .call(|c| Ok(c.query_row("SELECT status, attempts, next_at - strftime('%s','now') FROM webhook_deliveries ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?))
+        .await
+        .unwrap()
+}
+
+async fn make_due(app: &App) {
+    app.state.db.call(|c| Ok(c.execute("UPDATE webhook_deliveries SET next_at = 0 WHERE next_at IS NOT NULL", [])?)).await.unwrap();
+}
+
+#[tokio::test]
+async fn webhook_deliveries_are_signed_logged_retried_and_redelivered() {
+    use hmac::Mac;
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "s3cret", "events": ["issues", "push", "pull_request"], "allow_private": true });
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_i64().unwrap();
+
+    // A ping on create, signed with the secret.
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping"]);
+    let (h, body) = rx.seen.lock().unwrap()[0].clone();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    assert_eq!(h["x-gitter-signature-256"], format!("sha256={}", hex::encode(mac.finalize().into_bytes())));
+    assert_eq!(h["x-gitter-delivery"].len(), 36, "a uuid");
+    assert_eq!(h["content-type"], "application/json");
+    let ping: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((ping["hook"]["id"].as_i64(), ping["repository"]["full_name"].as_str()), (Some(id), Some("root1/r")));
+    assert_eq!(ping["sender"]["username"], "root1");
+
+    // Issues, a comment it didn't ask for, a web commit (push), a pull request and its merge.
+    app.req(&admin, "POST", "/api/repos/root1/r/issues", Some(json!({ "title": "Bug", "body": "It breaks" }))).await;
+    app.req(&admin, "POST", "/api/repos/root1/r/issues/1/comments", Some(json!({ "body": "On it", "state": "closed" }))).await;
+    let change = json!({ "branch": "main", "new_branch": "fix", "message": "Fix the bug", "changes": [{ "path": "fix.txt", "content": "fixed" }] });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(change)).await.0, StatusCode::OK);
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Fix", "head": "fix", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    // Deliveries go out in parallel, so look them up rather than rely on their order.
+    let got = |event: &str, action: &str| -> Value {
+        let seen = rx.seen.lock().unwrap();
+        let all = seen.iter().filter(|(h, _)| h["x-gitter-event"] == event).map(|(_, b)| serde_json::from_str::<Value>(b).unwrap());
+        all.filter(|p| action.is_empty() || p["action"] == action).last().unwrap_or_else(|| panic!("no {event} {action}"))
+    };
+    let mut events = rx.events();
+    events.sort();
+    assert_eq!(events, ["issues", "issues", "ping", "pull_request", "push"], "no issue_comment: it wasn't asked for");
+    let opened = got("issues", "opened");
+    assert_eq!((opened["issue"]["title"].as_str(), opened["issue"]["body"].as_str()), (Some("Bug"), Some("It breaks")));
+    assert_eq!(got("issues", "closed")["issue"]["state"], "closed");
+    let push = got("push", "");
+    assert_eq!((push["ref"].as_str(), push["created"].as_bool()), (Some("refs/heads/fix"), Some(true)));
+    assert_eq!(push["head_commit"]["message"], "Fix the bug");
+    assert_eq!(got("pull_request", "opened")["pull_request"]["head"], "fix");
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls/2/merge", Some(json!({ "method": "merge" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events().len(), 7);
+    assert_eq!(got("pull_request", "merged")["pull_request"]["merged"], true);
+    assert_eq!(got("push", "")["ref"], "refs/heads/main");
+
+    // The log: newest first, with what was sent and what came back.
+    let (s, v) = app.req(&admin, "GET", &format!("/api/repos/root1/r/hooks/{id}"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let log = v["deliveries"].as_array().unwrap();
+    assert_eq!(log.len(), 7);
+    assert!(log.iter().all(|d| d["status"] == "ok" && d["response_code"] == 200), "{log:?}");
+    let ping_id = log.last().unwrap()["id"].as_i64().unwrap();
+    let (_, d) = app.req(&admin, "GET", &format!("/api/repos/root1/r/hooks/{id}/deliveries/{ping_id}"), None).await;
+    assert_eq!(d["request_headers"]["X-Gitter-Event"], "ping");
+    assert_eq!(d["payload"].as_str().unwrap(), body);
+    assert_eq!(d["response_body"], "ok");
+    assert!(v["hook"].get("secret").is_none(), "the secret is never shown");
+
+    // A failing receiver: retried after 1 m, 5 m, 30 m, 2 h and 6 h, then given up.
+    rx.status.store(500, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(app.req(&admin, "POST", &format!("/api/repos/root1/r/hooks/{id}/ping"), None).await.0, StatusCode::OK);
+    for (i, wait) in [60, 300, 1800, 7200, 21600].into_iter().enumerate() {
+        gitter::webhooks::tick(&app.state).await;
+        let (status, attempts, next) = newest_delivery(&app).await;
+        assert_eq!((status.as_str(), attempts), ("pending", i as i64 + 1));
+        assert!(next.is_some_and(|n| (wait - 5..=wait).contains(&n)), "retry {i} after {next:?}, want {wait}");
+        gitter::webhooks::tick(&app.state).await;
+        assert_eq!(newest_delivery(&app).await.1, i as i64 + 1, "not before it's due");
+        make_due(&app).await;
+    }
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(newest_delivery(&app).await, ("failed".into(), 6, None));
+    let guids: Vec<String> = rx.seen.lock().unwrap()[7..].iter().map(|(h, _)| h["x-gitter-delivery"].clone()).collect();
+    assert!(guids.len() == 6 && guids.iter().all(|g| *g == guids[0]), "retries keep the delivery id: {guids:?}");
+
+    // Redeliver once the receiver works again.
+    rx.status.store(200, std::sync::atomic::Ordering::SeqCst);
+    let (_, v) = app.req(&admin, "GET", &format!("/api/repos/root1/r/hooks/{id}"), None).await;
+    let failed = v["deliveries"][0]["id"].as_i64().unwrap();
+    let (s, v) = app.req(&admin, "POST", &format!("/api/repos/root1/r/hooks/{id}/deliveries/{failed}/redeliver"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(newest_delivery(&app).await.0, "ok");
+    assert_eq!(rx.last().0["x-gitter-delivery"], guids[0]);
+
+    // Deliveries live in the database: a restarted server sends what was queued.
+    app.req(&admin, "POST", "/api/repos/root1/r/issues", Some(json!({ "title": "After restart" }))).await;
+    let restarted = gitter::AppState::new((*app.state.cfg).clone(), app.state.db.clone());
+    gitter::webhooks::tick(&restarted).await;
+    assert_eq!(rx.last().1["issue"]["title"], "After restart");
+
+    // Turned off: nothing is sent; deleted: its log goes with it.
+    let (s, v) = app.req(&admin, "PATCH", &format!("/api/repos/root1/r/hooks/{id}"), Some(json!({ "active": false }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    app.req(&admin, "POST", "/api/repos/root1/r/issues", Some(json!({ "title": "Quiet" }))).await;
+    let before = rx.seen.lock().unwrap().len();
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.seen.lock().unwrap().len(), before);
+    assert_eq!(app.req(&admin, "DELETE", &format!("/api/repos/root1/r/hooks/{id}"), None).await.0, StatusCode::OK);
+    let left: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT count(*) FROM webhook_deliveries", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn webhook_private_addresses_are_refused_unless_an_admin_allows_them() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    let bob = app.signup("bob").await;
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let rx = Receiver::new();
+    const SECRET: &str = "plain-secret-value";
+    let create = |url: &str, private: bool| json!({ "url": url, "secret": SECRET, "events": ["*"], "allow_private": private });
+
+    // Bad URLs, and the admin-only switch.
+    for bad in ["ftp://example.com/", "https://u:p@example.com/", "not a url", "http:///x"] {
+        let (s, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(bad, false))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let (s, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(&rx.url, true))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(json!({ "url": rx.url, "events": ["*"] }))).await.0, StatusCode::BAD_REQUEST, "a secret is required");
+    assert_eq!(app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(json!({ "url": rx.url, "secret": "k", "events": ["nope"] }))).await.0, StatusCode::BAD_REQUEST);
+
+    // By default 127.0.0.1 and localhost are never contacted.
+    let (s, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(&rx.url, false))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_i64().unwrap();
+    let local = rx.url.replace("127.0.0.1", "localhost");
+    let (_, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(&local, false))).await;
+    let id2 = v["id"].as_i64().unwrap();
+    gitter::webhooks::tick(&app.state).await;
+    assert!(rx.events().is_empty(), "nothing reached the receiver");
+    for h in [id, id2] {
+        let (_, v) = app.req(&bob, "GET", &format!("/api/repos/bob/r/hooks/{h}"), None).await;
+        let d = &v["deliveries"][0];
+        assert_eq!(d["status"], "pending", "{d}");
+        assert!(d["error"].as_str().unwrap().contains("private or reserved address"), "{d}");
+        assert!(d["response_code"].is_null());
+    }
+    // The secret is sealed at rest.
+    let raw: Vec<u8> = app.state.db.call(move |c| Ok(c.query_row("SELECT secret FROM webhooks WHERE id = ?1", [id], |r| r.get(0))?)).await.unwrap();
+    assert!(!raw.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()), "sealed");
+    assert_eq!(gitter::security::open(&app.state.key, &raw).as_deref(), Some(SECRET.as_bytes()));
+
+    // Others can't see or change the hooks, nor can limited tokens (URLs can hold credentials);
+    // only the admin can allow private addresses.
+    let tok = app.req(&bob, "POST", "/api/me/tokens", Some(json!({ "name": "w", "scope": "write", "repo": "bob/r" }))).await.1["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "GET", "/api/repos/bob/r/hooks", &tok, None).await, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&app, "POST", &format!("/api/repos/bob/r/hooks/{id}/ping"), &tok, None).await, StatusCode::FORBIDDEN);
+    let carol = app.signup("carol").await;
+    assert_eq!(app.req(&carol, "GET", "/api/repos/bob/r/hooks", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&carol, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "active": false }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "allow_private": true }))).await.0, StatusCode::FORBIDDEN);
+    let (s, v) = app.req(&admin, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "allow_private": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    make_due(&app).await;
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping"], "allowed now (the localhost hook still isn't)");
+
+    // A redirect is a reply, not followed.
+    rx.status.store(302, std::sync::atomic::Ordering::SeqCst);
+    app.req(&bob, "POST", &format!("/api/repos/bob/r/hooks/{id}/ping"), None).await;
+    gitter::webhooks::tick(&app.state).await;
+    let (_, v) = app.req(&bob, "GET", &format!("/api/repos/bob/r/hooks/{id}"), None).await;
+    assert_eq!((v["deliveries"][0]["response_code"].as_i64(), v["deliveries"][0]["status"].as_str()), (Some(302), Some("pending")));
+
+    // The owner changing the URL drops the admin's permission.
+    let moved = format!("{}/v2", rx.url);
+    let (s, v) = app.req(&bob, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "url": moved }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = app.req(&bob, "GET", &format!("/api/repos/bob/r/hooks/{id}"), None).await;
+    assert_eq!((v["hook"]["url"].as_str(), v["hook"]["allow_private"].as_bool()), (Some(moved.as_str()), Some(false)));
+}
+
+#[tokio::test]
+async fn webhook_ci_runs_are_announced_once_when_they_finish() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["ci_run"], "allow_private": true });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await.0, StatusCode::OK);
+    gitter::webhooks::tick(&app.state).await;
+    let commit = |path: &str, content: &str| json!({ "branch": "main", "message": "CI", "changes": [{ "path": path, "content": content }] });
+    // A broken pipeline fails at once; a good one is cancelled.
+    app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(commit(".gitter/ci.yml", "jobs:\n  a:\n    stepz: [x]\n"))).await;
+    app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(commit(".gitter/ci.yml", "jobs:\n  a:\n    steps: [echo]\n"))).await;
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping", "ci_run"], "the queued run isn't finished");
+    let (_, p) = rx.last();
+    assert_eq!((p["action"].as_str(), p["run"]["number"].as_i64(), p["run"]["status"].as_str()), (Some("completed"), Some(1), Some("failure")));
+    assert_eq!(p["sender"]["username"], "root1");
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/ci/runs/2/cancel", None).await.0, StatusCode::OK);
+    gitter::webhooks::tick(&app.state).await;
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping", "ci_run", "ci_run"]);
+    assert_eq!(rx.last().1["run"]["status"], "cancelled");
+}
