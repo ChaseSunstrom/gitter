@@ -209,18 +209,25 @@ pub fn evict(c: &Connection, repo: i64, cap: u64) -> rusqlite::Result<Vec<i64>> 
 
 /// The archive to restore for job `job`, if any: (its key, its file).
 pub async fn find(st: &AppState, job: i64, key: String, restore: Vec<String>) -> R<Option<(String, PathBuf)>> {
+    let data = st.cfg.data_dir.clone();
     let hit = st
         .db
         .call(move |c| {
             let s = scope(c, job)?;
             let hit = lookup(c, &s, &key, &restore)?;
             if let Some((id, _)) = &hit {
+                // A row whose file is gone (a crash before it was placed, a restored backup)
+                // goes too, or it would hold that key forever.
+                if !path(&data, *id).exists() {
+                    c.execute("DELETE FROM ci_caches WHERE id = ?1", [id])?;
+                    return Ok(None);
+                }
                 c.execute("UPDATE ci_caches SET used_at = ?2 WHERE id = ?1", params![id, now()])?;
             }
             Ok(hit)
         })
         .await?;
-    Ok(hit.map(|(id, k)| (k, path(&st.cfg.data_dir, id))).filter(|(_, p)| p.exists()))
+    Ok(hit.map(|(id, k)| (k, path(&st.cfg.data_dir, id))))
 }
 
 /// Keep `file` as job `job`'s cache under `key` (moving or copying it), unless

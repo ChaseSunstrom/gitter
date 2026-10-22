@@ -28,6 +28,10 @@ const MAX_ELEMENTS: usize = 1_000_000;
 const MAX_MESSAGE: usize = 4000;
 /// Rows kept per job (failed and flaky tests; passing ones are only counted).
 const MAX_ROWS: usize = 1000;
+/// Test cases kept from one job's reports (enough for any real suite; past it a report is noise).
+const MAX_CASES: usize = 50_000;
+/// Flaky tests remembered per repository (the oldest seen go first).
+const MAX_FLAKY: i64 = 1000;
 
 enum Ev<'a> {
     Start(&'a str, Vec<(&'a str, String)>),
@@ -315,6 +319,9 @@ pub fn parse_junit(data: &[u8]) -> Result<Vec<Case>, String> {
                             _ => {}
                         }
                     }
+                    if cases.len() >= MAX_CASES {
+                        return false;
+                    }
                     cases.push(c);
                 }
             }
@@ -363,6 +370,8 @@ pub fn parse_coverage(data: &[u8]) -> Option<(f64, f64)> {
 
 /// What an upload held.
 struct Parsed {
+    /// Report files that couldn't be read, with why.
+    broken: Vec<String>,
     cases: Vec<Case>,
     coverage: Option<(f64, f64)>,
 }
@@ -372,7 +381,7 @@ fn unpack(file: &Path) -> std::io::Result<Parsed> {
     let f = std::fs::File::open(file)?;
     // The whole stream is capped too: tar reads long-name and PAX headers into memory.
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(f).take(TOTAL_CAP + (1 << 20)));
-    let (mut out, mut total, mut n) = (Parsed { cases: vec![], coverage: None }, 0u64, 0);
+    let (mut out, mut total, mut n) = (Parsed { broken: vec![], cases: vec![], coverage: None }, 0u64, 0);
     for e in tar.entries()? {
         // A cut-off or broken archive keeps what was read before.
         let Ok(e) = e else { break };
@@ -389,8 +398,11 @@ fn unpack(file: &Path) -> std::io::Result<Parsed> {
         let mut data = Vec::new();
         e.take(FILE_CAP as u64).read_to_end(&mut data)?;
         if name.starts_with("junit/") {
-            // A broken report is skipped: the others still count.
-            out.cases.extend(parse_junit(&data).unwrap_or_default());
+            // A broken report is skipped (and said so in the job's log): the others still count.
+            match parse_junit(&data) {
+                Ok(cases) => out.cases.extend(cases.into_iter().take(MAX_CASES.saturating_sub(out.cases.len()))),
+                Err(e) => out.broken.push(format!("{name}: {e}")),
+            }
         } else if name.starts_with("coverage/")
             && let Some((h, f)) = parse_coverage(&data)
         {
@@ -405,7 +417,17 @@ fn unpack(file: &Path) -> std::io::Result<Parsed> {
 /// failed tests, and passing tests that failed before on this commit (flaky).
 pub async fn store(st: &AppState, job: i64, file: &Path) -> R<()> {
     let f = file.to_path_buf();
-    let parsed = tokio::task::spawn_blocking(move || unpack(&f)).await.map_err(AppError::internal)?.map_err(|_| AppError::bad("Couldn't read the reports"))?;
+    let mut parsed = tokio::task::spawn_blocking(move || unpack(&f)).await.map_err(AppError::internal)?.map_err(|_| AppError::bad("Couldn't read the reports"))?;
+    if parsed.cases.len() >= MAX_CASES {
+        parsed.broken.push(format!("only the first {MAX_CASES} test cases are kept"));
+    }
+    let mut note = String::new();
+    for b in std::mem::take(&mut parsed.broken) {
+        note.push_str(&format!("\x1b[33mReports: {b}\x1b[0m\n"));
+    }
+    if !note.is_empty() {
+        let _ = super::jobs::append_log(st, job, note.as_bytes()).await;
+    }
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -415,13 +437,13 @@ pub async fn store(st: &AppState, job: i64, file: &Path) -> R<()> {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
             let mut cases = parsed.cases;
-            {
-                let mut before = tx.prepare_cached(
-                    "SELECT EXISTS (SELECT 1 FROM ci_test_results WHERE repo_id = ?1 AND sha = ?2 AND job = ?3 AND suite = ?4 AND name = ?5 AND status = 'failed')",
-                )?;
-                for c in cases.iter_mut().filter(|c| c.status == "passed") {
-                    c.flaky = c.flaky || before.query_row(params![repo, sha, job_name, c.suite, c.name], |r| r.get(0))?;
-                }
+            // What failed before on this commit and job, in one query (a pass of one of those is a flake).
+            let failed: std::collections::HashSet<(String, String)> = tx
+                .prepare_cached("SELECT suite, name FROM ci_test_results WHERE repo_id = ?1 AND sha = ?2 AND job = ?3 AND status = 'failed'")?
+                .query_map(params![repo, sha, job_name], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            for c in cases.iter_mut().filter(|c| c.status == "passed") {
+                c.flaky = c.flaky || failed.contains(&(c.suite.clone(), c.name.clone()));
             }
             // This attempt replaces the job's earlier ones (they were only needed for the check above).
             tx.execute("DELETE FROM ci_test_results WHERE job_id = ?1", [job])?;
@@ -448,6 +470,10 @@ pub async fn store(st: &AppState, job: i64, file: &Path) -> R<()> {
                 }
             }
             drop((ins, mark));
+            tx.execute(
+                "DELETE FROM ci_flaky_tests WHERE repo_id = ?1 AND rowid NOT IN (SELECT rowid FROM ci_flaky_tests WHERE repo_id = ?1 ORDER BY last_seen DESC LIMIT ?2)",
+                params![repo, MAX_FLAKY],
+            )?;
             tx.commit()?;
             Ok(())
         })

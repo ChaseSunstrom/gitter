@@ -37,6 +37,10 @@ async function overview() {
       </div></div>
     <div class="box"><div class="box-head"><b>Newest accounts</b><span class="grow"></span><a class="btn sm" href="/admin/users">All accounts</a></div>
       <div class="list">${o.recent_users.map((u) => html`<a class="list-row" href="/${u.username}">${avatar(u.username, 22)}<b>${u.username}</b><span class="grow"></span><span class="muted small">joined ${timeEl(u.created_at)}</span></a>`)}</div></div>
+    ${o.failing_mirrors.length ? html`<div class="box" id="failing-mirrors"><div class="box-head"><b>Failing mirrors</b><span class="grow"></span><span class="muted small">Retried with longer waits, up to once a day</span></div>
+      <div class="list">${o.failing_mirrors.map((m) => html`<a class="list-row" href="/${m.owner}/${m.name}/settings/mirrors">${icon(m.direction === 'pull' ? 'download' : 'upload', 'muted')}<span class="grow" style="min-width:0"><b>${m.owner}/${m.name}</b>
+        <span class="muted small"> · ${m.direction === 'pull' ? 'from' : 'to'} <span class="mono">${m.url}</span> · failed ${m.failures} times${m.last_tried_at ? html`, last ${timeEl(m.last_tried_at)}` : ''}</span>
+        <div class="small c-red ellipsis">${m.last_error}</div></span></a>`)}</div></div>` : ''}
     ${trash.repos.length ? html`<div class="box" id="trash"><div class="box-head"><b>Recently deleted repositories</b><span class="grow"></span><span class="muted small">Each is deleted for good 7 days after it was deleted</span></div>
       <div class="list">${trash.repos.map((r) => html`<div class="list-row">${icon('trash', 'muted')}<span class="grow"><b>${r.owner}/${r.name}</b>
         <span class="muted small"> · deleted ${timeEl(r.deleted_at)} · gone for good ${timeEl(r.purge_at)}</span></span>

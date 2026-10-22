@@ -12,6 +12,8 @@ pub mod git;
 pub mod hooks;
 pub mod langs;
 pub mod lfs;
+pub mod mergequeue;
+pub mod mirrors;
 pub mod net;
 pub mod protect;
 pub mod ops;

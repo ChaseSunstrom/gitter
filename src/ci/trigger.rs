@@ -108,7 +108,9 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
             };
             // An agent's run also waits for a person to approve it (they read what it will run).
             c.execute(
-                "UPDATE ci_runs SET agent = COALESCE(?1, (SELECT agent FROM agent_branches WHERE repo_id = ?2 AND branch = ?4))
+                "UPDATE ci_runs SET agent = COALESCE(?1, (SELECT agent FROM agent_branches WHERE repo_id = ?2 AND branch = ?4),
+                     (SELECT a.agent FROM agent_branches a JOIN pulls p ON p.head_branch = a.branch JOIN issues i ON i.id = p.issue_id
+                      WHERE a.repo_id = ?2 AND i.repo_id = ?2 AND i.number = ci_runs.pr_number))
                  WHERE repo_id = ?2 AND number = ?3",
                 rusqlite::params![agent, repo_id, n, branch],
             )?;
@@ -195,12 +197,46 @@ pub async fn on_pull_opened(st: &AppState, repo: &Repo, _opener: i64, number: i6
     if wants(&f, base, &files) {
         // The run is the head branch's code, so it's on behalf of whoever last pushed it,
         // not whoever opened the pull request (an admin opening one doesn't vouch for it).
-        let (id, b) = (repo.id, head.to_string());
-        let pusher: Option<i64> = st
-            .db
-            .call(move |c| Ok(c.query_row("SELECT user_id FROM branch_pushers WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![id, b], |r| r.get(0)).optional()?))
-            .await?;
-        let s = Start { event: "pull_request", refname: format!("refs/heads/{head}"), sha: head_sha, pr_number: Some(number), actor_id: pusher, files };
+        let s = Start { event: "pull_request", refname: format!("refs/heads/{head}"), sha: head_sha, pr_number: Some(number), actor_id: pusher(st, repo.id, head).await?, files };
+        start(st, repo, pipeline, s).await?;
+    }
+    Ok(())
+}
+
+/// Who last pushed `branch` (its runs are on their behalf).
+async fn pusher(st: &AppState, repo_id: i64, branch: &str) -> R<Option<i64>> {
+    let b = branch.to_string();
+    st.db
+        .call(move |c| Ok(c.query_row("SELECT user_id FROM branch_pushers WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![repo_id, b], |r| r.get(0)).optional()?))
+        .await
+}
+
+/// A merge queue's commit: a pull request merged onto its target branch's tip.
+pub struct Queued<'a> {
+    pub entry: i64,
+    pub number: i64,
+    pub head: &'a str,
+    pub base: &'a str,
+    pub base_sha: &'a str,
+    pub sha: &'a str,
+}
+
+/// Run the pipeline on a merge queue's commit, as the pull request's own runs
+/// would be (on behalf of whoever last pushed its branch).
+pub async fn on_queue(st: &AppState, repo: &Repo, q: Queued<'_>) -> R<()> {
+    if !enabled(st, repo.owner_id).await {
+        return Ok(());
+    }
+    let Some(pipeline) = pipeline_at(st, &repo.path, q.sha).await? else { return Ok(()) };
+    let wanted = match &pipeline {
+        Ok(p) => p.triggers.pull_request.clone(),
+        Err(_) => Some(Filter::default()),
+    };
+    let Some(f) = wanted else { return Ok(()) };
+    let files = changed(st, &repo.path, Some(q.base_sha), q.sha).await;
+    if wants(&f, q.base, &files) {
+        let refname = format!("{}/{}", crate::mergequeue::REF_PREFIX, q.entry);
+        let s = Start { event: "merge_queue", refname, sha: q.sha.into(), pr_number: Some(q.number), actor_id: pusher(st, repo.id, q.head).await?, files };
         start(st, repo, pipeline, s).await?;
     }
     Ok(())

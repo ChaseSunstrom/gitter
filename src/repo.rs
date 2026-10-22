@@ -27,6 +27,8 @@ pub struct Repo {
     pub pushed_at: Option<i64>,
     /// Hidden by a moderator: only the owner and admins can see it.
     pub hidden: bool,
+    /// A pull mirror: read-only here (`mirrors::refuse_writes`).
+    pub mirror: bool,
     #[serde(skip)]
     pub path: PathBuf,
     #[serde(skip)]
@@ -55,7 +57,8 @@ const ROLE_SQL: &str = "SELECT max(level) FROM (
         FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE m.org_id = ?3 AND m.user_id = ?2)";
 
 pub const REPO_SELECT: &str = "SELECT r.id, r.owner_id, u.username, r.name, r.description, r.website, r.is_private,
-    r.default_branch, r.forked_from, r.created_at, r.updated_at, r.pushed_at, r.hidden FROM repos r JOIN users u ON u.id = r.owner_id";
+    r.default_branch, r.forked_from, r.created_at, r.updated_at, r.pushed_at, r.hidden,
+    EXISTS(SELECT 1 FROM mirrors m WHERE m.repo_id = r.id AND m.direction = 'pull') FROM repos r JOIN users u ON u.id = r.owner_id";
 
 pub fn row_to_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
     Ok(Repo {
@@ -72,6 +75,7 @@ pub fn row_to_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
         updated_at: r.get(10)?,
         pushed_at: r.get(11)?,
         hidden: r.get::<_, i64>(12)? != 0,
+        mirror: r.get(13)?,
         path: PathBuf::new(),
         can_read: false,
         can_write: false,
@@ -390,6 +394,7 @@ mod tests {
             updated_at: 0,
             pushed_at: None,
             hidden: false,
+            mirror: false,
             path: PathBuf::new(),
             can_read: false,
             can_write: false,

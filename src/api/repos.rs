@@ -218,6 +218,7 @@ pub async fn show(
     let parent = parent
         .filter(|p| !p.2)
         .map(|p| json!({ "owner": p.0, "name": p.1 }));
+    let mirror = if r.mirror { crate::mirrors::badge(&st, r.id, r.can_admin).await? } else { serde_json::Value::Null };
     Ok(Json(json!({
         "owner": r.owner, "name": r.name, "description": r.description, "website": r.website,
         "private": r.private, "default_branch": r.default_branch, "created_at": r.created_at,
@@ -225,7 +226,7 @@ pub async fn show(
         "empty": branches.is_empty(), "branches": branches, "tags": tags,
         "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
         "releases": releases, "latest_release": latest_release,
-        "fork_of": parent, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
+        "fork_of": parent, "mirror": mirror, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
         "ssh_url": st.ssh_url.get().map(|b| format!("{b}{}/{}.git", r.owner, r.name)),
     })))
@@ -269,6 +270,10 @@ pub async fn update(
         && !(w.starts_with("https://") || w.starts_with("http://"))
     {
         return Err(AppError::bad("Website must start with https:// or http://"));
+    }
+    if req.default_branch.is_some() {
+        // A pull mirror's default branch follows its remote.
+        crate::mirrors::refuse_writes(&r)?;
     }
     if let Some(b) = &req.default_branch
         && (!validate::ref_name(b)
@@ -571,6 +576,7 @@ pub async fn create_branch(
     Json(req): Json<BranchReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    crate::mirrors::refuse_writes(&r)?;
     if !validate::ref_name(&req.name) {
         return Err(AppError::bad("That isn't a valid branch name"));
     }
@@ -587,6 +593,7 @@ pub async fn create_branch(
         .await
         .map_err(|_| AppError::conflict("A branch with that name already exists"))?;
     touch(&st.db, r.id, false).await?;
+    crate::mirrors::changed(&st, r.id).await;
     Ok(Json(json!({ "name": req.name, "sha": sha })))
 }
 
@@ -602,6 +609,7 @@ pub async fn delete_branch(
     Query(q): Query<NameQ>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    crate::mirrors::refuse_writes(&r)?;
     if !validate::ref_name(&q.name) {
         return Err(AppError::bad("That isn't a valid branch name"));
     }
@@ -614,6 +622,7 @@ pub async fn delete_branch(
         .await?;
     crate::hooks::forget_branches(&st, r.id, vec![q.name.clone()]).await;
     touch(&st.db, r.id, false).await?;
+    crate::mirrors::changed(&st, r.id).await;
     ok()
 }
 

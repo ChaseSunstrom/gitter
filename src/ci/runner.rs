@@ -327,12 +327,18 @@ enum Msg {
 }
 
 /// Send output on in order, batched, with every secret value replaced by ***.
-async fn pump(b: Arc<Backend>, l: Lease, mut rx: mpsc::Receiver<Msg>) {
-    // Whole values, and each line of multi-line ones (output arrives line by line).
+/// The values a job's output never shows: each secret whole, and each line of
+/// multi-line ones (output arrives line by line), longest first so a value
+/// containing another is masked whole.
+fn secret_values(l: &Lease) -> Vec<String> {
     let mut secrets: Vec<String> = l.secrets.iter().flat_map(|s| std::iter::once(s.1.clone()).chain(s.1.lines().map(String::from))).filter(|v| v.trim().len() >= 3).collect();
-    // Longest first, so a value containing another is masked whole.
     secrets.sort_by_key(|v| std::cmp::Reverse(v.len()));
     secrets.dedup();
+    secrets
+}
+
+async fn pump(b: Arc<Backend>, l: Lease, mut rx: mpsc::Receiver<Msg>) {
+    let secrets = secret_values(&l);
     let mask = |data: &[u8]| -> Vec<u8> {
         let mut s = String::from_utf8_lossy(data).into_owned();
         for v in &secrets {
@@ -710,7 +716,7 @@ async fn pack_artifacts(b: &Backend, l: &Lease, ws: &Path, work: &Path, tx: &mps
     let (ws2, out2, globs) = (ws.to_path_buf(), out.clone(), l.job.artifacts.clone());
     let packed = tokio::task::spawn_blocking(move || {
         let files = walk(&ws2, |rel| any_glob(&globs, &[rel.to_string()]), usize::MAX)?;
-        pack(files, &out2, super::jobs::ARTIFACT_CAP)
+        pack(files, &out2, super::jobs::ARTIFACT_CAP, &[])
     })
     .await
     .map_err(std::io::Error::other)
@@ -733,18 +739,33 @@ async fn pack_artifacts(b: &Backend, l: &Lease, ws: &Path, work: &Path, tx: &mps
 
 /// Write `files` (path, name in the archive) to a .tar.gz at `out`, stopping
 /// before their sizes pass `cap`. (files written, whether some were left out)
-fn pack(files: Vec<(PathBuf, String)>, out: &Path, cap: u64) -> std::io::Result<(usize, bool)> {
+/// Pack `files` into a .tar.gz at `out`, up to `cap` bytes. With `mask`, each
+/// file's text has those values replaced by *** (reports are shown like logs).
+fn pack(files: Vec<(PathBuf, String)>, out: &Path, cap: u64, mask: &[String]) -> std::io::Result<(usize, bool)> {
     let f = std::fs::File::create(out)?;
     let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(f, flate2::Compression::fast()));
     tar.follow_symlinks(false);
     let (mut total, mut cut, mut n) = (0u64, false, 0);
     for (p, name) in files {
-        total += std::fs::symlink_metadata(&p)?.len();
+        let meta = std::fs::symlink_metadata(&p)?;
+        total += meta.len();
         if total > cap {
             cut = true;
             break;
         }
-        tar.append_path_with_name(&p, name)?;
+        if mask.is_empty() || !meta.is_file() {
+            tar.append_path_with_name(&p, name)?;
+        } else {
+            let mut text = String::from_utf8_lossy(&std::fs::read(&p)?).into_owned();
+            for v in mask {
+                text = text.replace(v.as_str(), "***");
+            }
+            let mut h = tar::Header::new_gnu();
+            h.set_size(text.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, name, text.as_bytes())?;
+        }
         n += 1;
     }
     tar.into_inner()?.finish()?;
@@ -755,7 +776,7 @@ fn pack(files: Vec<(PathBuf, String)>, out: &Path, cap: u64) -> std::io::Result<
 /// or not the steps passed (failed tests are the point).
 async fn send_reports(b: &Backend, l: &Lease, ws: &Path, work: &Path, tx: &mpsc::Sender<Msg>) {
     let out = work.join(format!("job-{}-reports.tar.gz", l.job_id));
-    let (ws2, out2, junit, cov) = (ws.to_path_buf(), out.clone(), l.job.reports.clone(), l.job.coverage.clone());
+    let (ws2, out2, junit, cov, secrets) = (ws.to_path_buf(), out.clone(), l.job.reports.clone(), l.job.coverage.clone(), secret_values(l));
     let packed = tokio::task::spawn_blocking(move || {
         let matches = |globs: &[String], rel: &str| globs.iter().any(|g| glob(g, rel));
         let files = walk(&ws2, |rel| matches(&junit, rel) || matches(&cov, rel), 1_000_000)?;
@@ -763,7 +784,7 @@ async fn send_reports(b: &Backend, l: &Lease, ws: &Path, work: &Path, tx: &mpsc:
             let kind = if matches(&junit, &rel) { "junit" } else { "coverage" };
             (p, format!("{kind}/{rel}"))
         });
-        pack(named.collect(), &out2, super::reports::UPLOAD_CAP)
+        pack(named.collect(), &out2, super::reports::UPLOAD_CAP, &secrets)
     })
     .await
     .map_err(std::io::Error::other)
@@ -852,7 +873,7 @@ async fn save_cache(b: &Backend, l: &Lease, ws: &Path, work: &Path, tx: &mpsc::S
     let (ws2, out2, paths) = (ws.to_path_buf(), out.clone(), c.paths.clone());
     let packed = tokio::task::spawn_blocking(move || {
         let files = walk(&ws2, |rel| in_cache(&paths, rel), 1_000_000)?;
-        pack(files, &out2, cache::ENTRY_CAP)
+        pack(files, &out2, cache::ENTRY_CAP, &[])
     })
     .await
     .map_err(std::io::Error::other)
@@ -931,4 +952,57 @@ pub async fn builtin(st: AppState) {
     let runner = Runner { backend: Arc::new(Backend::Local { st: st.clone(), runner_id: id }), labels, work: st.cfg.data_dir.join("ci/work") };
     let (s, wake) = (st.clone(), st.ci_wake.clone());
     serve(runner, move || s.settings.get().builtin_runner_jobs as usize, Some(wake)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tar entry with any name (the tar crate refuses to write unsafe ones itself).
+    fn raw(b: &mut tar::Builder<flate2::write::GzEncoder<std::fs::File>>, name: &str, kind: tar::EntryType, link: Option<&str>, data: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_entry_type(kind);
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        if let Some(l) = link {
+            h.as_gnu_mut().unwrap().linkname[..l.len()].copy_from_slice(l.as_bytes());
+        }
+        h.set_cksum();
+        b.append(&h, data).unwrap();
+    }
+
+    #[test]
+    fn a_cache_archive_only_unpacks_plain_files_inside_its_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let file = dir.path().join("c.tar.gz");
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(std::fs::File::create(&file).unwrap(), flate2::Compression::fast()));
+        raw(&mut b, "keep/../../evil", tar::EntryType::Regular, None, b"x");
+        raw(&mut b, "/keep/abs", tar::EntryType::Regular, None, b"x");
+        raw(&mut b, "keep/link", tar::EntryType::Symlink, Some("/etc"), b"");
+        raw(&mut b, "keep/hard", tar::EntryType::Link, Some("/etc/passwd"), b"");
+        raw(&mut b, "other/x", tar::EntryType::Regular, None, b"x");
+        raw(&mut b, "keep/ok", tar::EntryType::Regular, None, b"fine");
+        b.into_inner().unwrap().finish().unwrap();
+        assert_eq!(unpack_cache(&file, &ws, &["keep".to_string()]).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(ws.join("keep/ok")).unwrap(), "fine");
+        for gone in [dir.path().join("evil"), ws.join("keep/link"), ws.join("keep/hard"), ws.join("other/x"), ws.join("keep/abs")] {
+            assert!(std::fs::symlink_metadata(&gone).is_err(), "{} was written", gone.display());
+        }
+    }
+
+    #[test]
+    fn reports_are_packed_with_secrets_masked() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("r.xml");
+        std::fs::write(&src, "<failure message=\"token s3cr3t-value here\"/>").unwrap();
+        let out = dir.path().join("r.tar.gz");
+        assert_eq!(pack(vec![(src, "junit/r.xml".into())], &out, 1 << 20, &["s3cr3t-value".to_string()]).unwrap(), (1, false));
+        let mut a = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(&out).unwrap()));
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut a.entries().unwrap().next().unwrap().unwrap(), &mut text).unwrap();
+        assert_eq!(text, "<failure message=\"token *** here\"/>");
+    }
 }

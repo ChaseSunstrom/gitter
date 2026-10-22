@@ -600,6 +600,14 @@ ok "secret scan on demand; Cargo.lock's smallvec flagged by an imported OSV advi
 (cd "$V" && printf 'export TOKEN=gtr_%s\n' aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9f >ci.sh && git add ci.sh && git commit -qm "CI" \
   && ! git push -q origin main 2>/dev/null && git reset -q --hard HEAD~1) || fail "a Gitter token should be refused too"
 
+# --- mirrors: the server's own loop syncs a pull mirror of hello, which then refuses changes
+api POST /repos '{"name":"hello-mirror"}'
+api POST /repos/alice/hello-mirror/mirrors "{\"direction\":\"pull\",\"url\":\"$BASE/alice/hello.git\",\"allow_private\":true,\"interval_minutes\":60}"
+for _ in $(seq 60); do api GET /repos/alice/hello-mirror; [ "$(jq_ 'd["empty"]')" = False ] && break; sleep 0.5; done
+[ "$(jq_ 'd["mirror"]["url"]')" = "$BASE/alice/hello.git" ] && [ "$(jq_ 'd["empty"]')" = False ] || fail "pull mirror sync: $BODY"
+EXPECT=403 api POST /repos/alice/hello-mirror/contents '{"branch":"main","message":"x","changes":[{"path":"x.txt","content":"x"}]}'
+ok "pull mirror syncs in the background and is read-only"
+
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")
 [ "$code" = 200 ] && grep -q '<html' "$TMP/index.html" || fail "SPA route"

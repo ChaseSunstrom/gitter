@@ -696,7 +696,7 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
                 artifacts: strings(m.get("artifacts").unwrap_or(&Value::Null), &format!("jobs.{key}.artifacts"))?,
                 runs_on: strings(m.get("runs-on").unwrap_or(&Value::Null), &format!("jobs.{key}.runs-on"))?,
                 network,
-                cache: cache.as_ref().map(|c| Cache { key: interpolate(&c.key, combo), ..c.clone() }),
+                cache: cache.as_ref().map(|c| Cache { key: interpolate(&c.key, combo), restore_keys: c.restore_keys.iter().map(|r| interpolate(r, combo)).collect(), ..c.clone() }),
                 reports: reports.clone(),
                 coverage: coverage.clone(),
             });

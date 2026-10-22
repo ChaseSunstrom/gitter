@@ -777,10 +777,109 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX osv_affected_pkg ON osv_affected(ecosystem, name);
     CREATE INDEX osv_affected_vuln ON osv_affected(vuln_id);
     "#,
-    // CI caches (trust: 0 an agent's run wrote it, 1 a person's, 2 an admin's), test reports, flaky tests.
+    // v24: the merge queue. An entry is tested on a commit made on top of the base
+    // (kept at refs/gitter-queue/<id>); it lands only if that exact commit passes.
+    r#"
+    ALTER TABLE branch_rules ADD COLUMN merge_queue INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE merge_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        issue_id INTEGER NOT NULL UNIQUE REFERENCES issues(id) ON DELETE CASCADE,
+        base TEXT NOT NULL,
+        method TEXT NOT NULL,
+        added_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        head_sha TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'queued',
+        test_sha TEXT,
+        tested_base TEXT,
+        started_at INTEGER,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX merge_queue_repo ON merge_queue(repo_id, base, id);
+    "#,
+    // v25: notifications, one row per thread per person (`thread` is "issue:<id>",
+    // "discussion:<id>" or "run:<id>"; the id columns make rows go with their thread, so a
+    // reused id never inherits them). thread_subscriptions are explicit choices
+    // (subscribed 0 = unsubscribed); repo_watches levels are 'watching' or 'ignoring'
+    // or 'participating' (the owner's default is watching, everyone else's participating).
+    r#"
+    CREATE TABLE notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        thread TEXT NOT NULL,
+        issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
+        discussion_id INTEGER REFERENCES discussions(id) ON DELETE CASCADE,
+        run_id INTEGER REFERENCES ci_runs(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        unread INTEGER NOT NULL DEFAULT 1,
+        done INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(user_id, thread)
+    );
+    CREATE INDEX notifications_inbox ON notifications(user_id, done, unread, updated_at);
+    -- The inbox sorts read and unread together.
+    CREATE INDEX notifications_recent ON notifications(user_id, done, updated_at);
+    -- For the cascades: without them every deleted repo, issue, discussion, run or account scans the table.
+    CREATE INDEX notifications_repo ON notifications(repo_id);
+    CREATE INDEX notifications_issue ON notifications(issue_id);
+    CREATE INDEX notifications_discussion ON notifications(discussion_id);
+    CREATE INDEX notifications_run ON notifications(run_id);
+    CREATE INDEX notifications_actor ON notifications(actor_id);
+    CREATE TABLE thread_subscriptions (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        thread TEXT NOT NULL,
+        issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
+        discussion_id INTEGER REFERENCES discussions(id) ON DELETE CASCADE,
+        subscribed INTEGER NOT NULL,
+        PRIMARY KEY(user_id, thread)
+    );
+    CREATE INDEX thread_subscriptions_thread ON thread_subscriptions(thread);
+    CREATE INDEX thread_subscriptions_issue ON thread_subscriptions(issue_id);
+    CREATE INDEX thread_subscriptions_discussion ON thread_subscriptions(discussion_id);
+    CREATE TABLE repo_watches (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        level TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(user_id, repo_id)
+    );
+    CREATE INDEX repo_watches_repo ON repo_watches(repo_id, level);
+    "#,
+    // v26: repository mirrors. A pull mirror (at most one per repository, which is then
+    // read-only here) fetches its remote's branches and tags every interval_secs; push
+    // mirrors push this repository's to their remote after each change. The row is its own queue:
+    // next_at is when to sync next (NULL: nothing waiting), running_until a lease on a
+    // sync in progress, so a burst of pushes is one mirror push.
+    r#"
+    CREATE TABLE mirrors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        direction TEXT NOT NULL CHECK (direction IN ('pull', 'push')),
+        url TEXT NOT NULL,
+        username TEXT NOT NULL DEFAULT '',
+        -- The password or token, sealed with GITTER_DATA/secret.key; NULL for none.
+        secret BLOB,
+        -- Set by a site admin only: may reach loopback and private addresses.
+        allow_private INTEGER NOT NULL DEFAULT 0,
+        interval_secs INTEGER NOT NULL DEFAULT 28800,
+        next_at INTEGER,
+        running_until INTEGER,
+        failures INTEGER NOT NULL DEFAULT 0,
+        last_ok_at INTEGER,
+        last_tried_at INTEGER,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX mirrors_one_pull ON mirrors(repo_id) WHERE direction = 'pull';
+    CREATE INDEX mirrors_repo ON mirrors(repo_id);
+    CREATE INDEX mirrors_due ON mirrors(next_at);
+    "#,
+    // v27: CI caches (trust: 0 an agent's run wrote it, 1 a person's, 2 an admin's), test reports, flaky tests.
     r#"
     CREATE TABLE ci_caches (
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
         ref TEXT NOT NULL,
         trust INTEGER NOT NULL,

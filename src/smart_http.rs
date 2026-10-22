@@ -162,6 +162,9 @@ pub async fn open(st: &AppState, user: Option<&User>, owner: &str, name: &str, p
     if push && !repo.can_write {
         return Err(AppError::new(StatusCode::FORBIDDEN, "You don't have push access to this repository"));
     }
+    if push {
+        crate::mirrors::refuse_writes(&repo)?;
+    }
     Ok(repo)
 }
 
@@ -208,6 +211,8 @@ pub async fn transfer_command(
     let mut cmd = st.git.command(None);
     // The current push limit overrides whatever was stored when the repo was created.
     cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
+    // The merge queue's test commits are the server's own: not shown, not pushable.
+    cmd.arg("-c").arg(format!("transfer.hideRefs={}", crate::mergequeue::REF_PREFIX));
     let mut guard = None;
     if receives {
         // The pre-receive hook: branch rules binding the pusher, then push protection.
@@ -455,7 +460,7 @@ fn parse_cgi_headers(b: &[u8]) -> (StatusCode, Vec<(String, String)>) {
     (status, out)
 }
 
-async fn ref_map(st: &AppState, repo: &Repo) -> Result<HashMap<String, String>, AppError> {
+pub async fn ref_map(st: &AppState, repo: &Repo) -> Result<HashMap<String, String>, AppError> {
     let out = st
         .git
         .ok(
@@ -469,6 +474,8 @@ async fn ref_map(st: &AppState, repo: &Repo) -> Result<HashMap<String, String>, 
             l.split_once(' ')
                 .map(|(a, b)| (a.to_string(), b.to_string()))
         })
+        // The merge queue's own refs aren't anyone's push.
+        .filter(|(name, _)| !name.starts_with(crate::mergequeue::REF_PREFIX))
         .collect())
 }
 

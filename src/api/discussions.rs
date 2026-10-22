@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::issues::check_text;
+use super::notifications::{Thread, notify};
 use super::{ClientIp, J, ok};
 use crate::AppState;
 use crate::auth::{Authed, Viewer};
@@ -140,8 +141,8 @@ pub async fn create(
     if !st.limiter.allow(&format!("discussion:{}", u.id), 30, 3600) {
         return Err(AppError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "You're starting discussions very quickly. Try again later."));
     }
-    let (rid, uid) = (r.id, u.id);
-    let number = st
+    let (rid, uid, text) = (r.id, u.id, req.body.clone());
+    let (id, number) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -150,10 +151,12 @@ pub async fn create(
                 "INSERT INTO discussions(repo_id, number, category, author_id, title, body, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
                 rusqlite::params![rid, num, cat, uid, req.title.trim(), req.body, now()],
             )?;
+            let id = tx.last_insert_rowid();
             tx.commit()?;
-            Ok(num)
+            Ok((id, num))
         })
         .await?;
+    notify(&st, r.id, Thread::Discussion(id), u.id, &text).await;
     Ok(Json(json!({ "number": number })))
 }
 
@@ -286,7 +289,7 @@ pub async fn comment(
     if !st.limiter.allow(&format!("comment:{}", u.id), 60, 600) {
         return Err(AppError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "You're commenting very quickly. Try again in a few minutes."));
     }
-    let (did, uid) = (d.id, u.id);
+    let (did, uid, text) = (d.id, u.id, body.clone());
     let id = st
         .db
         .call(move |c| {
@@ -302,6 +305,7 @@ pub async fn comment(
             Ok(id)
         })
         .await?;
+    notify(&st, r.id, Thread::Discussion(did), u.id, &text).await;
     Ok(Json(json!({ "id": id })))
 }
 

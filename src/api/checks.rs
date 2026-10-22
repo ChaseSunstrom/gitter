@@ -44,9 +44,9 @@ pub async fn create_rule(State(st): State<AppState>, Authed(u): Authed, ClientIp
                 return Ok(Err(AppError::bad(format!("A repository has at most {} branch rules", protect::MAX_RULES))));
             }
             let n = c.execute(
-                "INSERT OR IGNORE INTO branch_rules (repo_id, pattern, require_pr, approvals, checks, allow_force_push, allow_deletion, enforce_admins, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![id, rl.pattern, rl.require_pr, rl.approvals, serde_json::to_string(&rl.checks).unwrap_or_default(), rl.allow_force_push, rl.allow_deletion, rl.enforce_admins, now()],
+                "INSERT OR IGNORE INTO branch_rules (repo_id, pattern, require_pr, approvals, checks, allow_force_push, allow_deletion, enforce_admins, merge_queue, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10, ?9)",
+                params![id, rl.pattern, rl.require_pr, rl.approvals, serde_json::to_string(&rl.checks).unwrap_or_default(), rl.allow_force_push, rl.allow_deletion, rl.enforce_admins, now(), rl.merge_queue],
             )?;
             if n == 0 {
                 return Ok(Err(AppError::conflict("There's already a rule for that pattern")));
@@ -72,9 +72,9 @@ pub async fn update_rule(
         .db
         .call(move |c| {
             Ok(c.execute(
-                "UPDATE OR IGNORE branch_rules SET pattern = ?3, require_pr = ?4, approvals = ?5, checks = ?6, allow_force_push = ?7, allow_deletion = ?8, enforce_admins = ?9
+                "UPDATE OR IGNORE branch_rules SET pattern = ?3, require_pr = ?4, approvals = ?5, checks = ?6, allow_force_push = ?7, allow_deletion = ?8, enforce_admins = ?9, merge_queue = ?10
                  WHERE id = ?1 AND repo_id = ?2",
-                params![rid, id, rl.pattern, rl.require_pr, rl.approvals, serde_json::to_string(&rl.checks).unwrap_or_default(), rl.allow_force_push, rl.allow_deletion, rl.enforce_admins],
+                params![rid, id, rl.pattern, rl.require_pr, rl.approvals, serde_json::to_string(&rl.checks).unwrap_or_default(), rl.allow_force_push, rl.allow_deletion, rl.enforce_admins, rl.merge_queue],
             )?)
         })
         .await?;
@@ -157,7 +157,10 @@ pub async fn post_status(State(st): State<AppState>, Authed(u): Authed, Path((o,
         })
         .await??;
     let (st2, rid) = (st.clone(), r.id);
-    tokio::spawn(async move { protect::auto_merge(&st2, rid, Some(sha)).await });
+    tokio::spawn(async move {
+        protect::auto_merge(&st2, rid, Some(sha)).await;
+        crate::mergequeue::advance(&st2, rid).await;
+    });
     Ok(Json(json!({ "context": context, "state": req.state, "description": description, "target_url": url })))
 }
 
@@ -192,18 +195,27 @@ pub async fn set_auto_merge(State(st): State<AppState>, Authed(u): Authed, Path(
     }
     // Armed for the head as it is now: a newer push by someone else disarms it.
     let (id, uid, m) = (r.id, u.id, req.method.clone());
-    let head: Option<String> = st
+    let head: Option<(String, bool)> = st
         .db
         .call(move |c| {
-            Ok(c.query_row(
-                "SELECT p.head_branch FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.number = ?2 AND i.is_pr = 1 AND i.state = 'open'",
-                params![id, num],
-                |x| x.get(0),
-            )
-            .optional()?)
+            let Some((head, base)) = c
+                .query_row(
+                    "SELECT p.head_branch, p.base_branch FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.number = ?2 AND i.is_pr = 1 AND i.state = 'open'",
+                    params![id, num],
+                    |x| Ok((x.get::<_, String>(0)?, x.get::<_, String>(1)?)),
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let queued = protect::effective(&protect::load(c, id)?, &base).is_some_and(|x| x.merge_queue);
+            Ok(Some((head, queued)))
         })
         .await?;
-    let Some(branch) = head else { return Err(AppError::conflict("That pull request isn't open")) };
+    let Some((branch, queued)) = head else { return Err(AppError::conflict("That pull request isn't open")) };
+    if queued {
+        return Err(AppError::conflict("This branch uses a merge queue: add the pull request to the queue instead"));
+    }
     let sha = st.git.resolve(&r.path, &format!("refs/heads/{branch}")).await?.ok_or_else(|| AppError::conflict("The source branch is gone"))?;
     let n = st
         .db

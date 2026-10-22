@@ -101,6 +101,7 @@ pub async fn revert(
     Json(req): Json<RevertReq>,
 ) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    crate::mirrors::refuse_writes(&r)?;
     let mut undo = match (req.sha.as_deref(), req.pull) {
         (Some(sha), None) => of_commit(&st, &r, sha).await?,
         (None, Some(num)) => of_pull(&st, &r, &u, num).await?,

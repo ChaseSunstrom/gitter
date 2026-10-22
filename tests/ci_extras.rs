@@ -166,11 +166,12 @@ fn key_templates_and_cache_config() {
     assert!(cache::check_key("deps-{{ hash").is_err());
     assert!(cache::check_key("").is_err());
     let p = gitter::ci::config::parse(
-        "jobs:\n  t:\n    matrix: { v: [1, 2] }\n    cache:\n      key: k-${{ matrix.v }}-{{ hash a }}\n      paths: [target/, .cargo]\n    reports: [\"junit/*.xml\"]\n    coverage: lcov.info\n    steps: [x]\n",
+        "jobs:\n  t:\n    matrix: { v: [1, 2] }\n    cache:\n      key: k-${{ matrix.v }}-{{ hash a }}\n      paths: [target/, .cargo]\n      restore-keys: [k-${{ matrix.v }}-]\n    reports: [\"junit/*.xml\"]\n    coverage: lcov.info\n    steps: [x]\n",
     )
     .unwrap();
     let c = p.jobs[1].cache.clone().unwrap();
     assert_eq!((c.key.as_str(), c.paths.clone()), ("k-2-{{ hash a }}", vec!["target".to_string(), ".cargo".into()]));
+    assert_eq!(c.restore_keys, ["k-2-"], "restore keys get the matrix values too");
     assert_eq!((p.jobs[0].reports.clone(), p.jobs[0].coverage.clone()), (vec!["junit/*.xml".to_string()], vec!["lcov.info".to_string()]));
     for bad in ["paths: [/etc]", "paths: [../x]", "paths: [\"~/.cargo\"]", "paths: []", "paths: [.git]"] {
         let y = format!("jobs:\n  t:\n    cache:\n      key: k\n      {bad}\n    steps: [x]\n");
@@ -337,4 +338,43 @@ async fn the_runner_api_refuses_reports_and_caches_without_the_jobs_token() {
             .unwrap();
         assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
+}
+
+#[tokio::test]
+async fn reports_hide_secrets_say_what_they_skipped_and_a_lost_cache_file_is_replaced() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let repo_id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM repos", [], |r| r.get(0))?)).await.unwrap();
+    let sealed = gitter::security::seal(&app.state.key, b"s3cr3t-value");
+    app.state
+        .db
+        .call(move |c| Ok(c.execute("INSERT INTO ci_secrets(repo_id, name, value, updated_at) VALUES (?1, 'API_KEY', ?2, 0)", rusqlite::params![repo_id, sealed])?))
+        .await
+        .unwrap();
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    let script = "mkdir -p out keep && echo k > keep/f
+printf '<testsuite name=\"s\"><testcase name=\"leaks\"><failure message=\"token %s\"/></testcase></testsuite>' \"$API_KEY\" > out/a.xml
+printf '\\377\\376' > out/b.xml
+";
+    commit(&app, &admin, "root1/r", "main", None, "gen.sh", script).await;
+    let config = "jobs:\n  test:\n    reports: [\"out/*.xml\"]\n    cache:\n      key: c\n      paths: [keep]\n    steps:\n      - run: sh gen.sh\n";
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", config).await;
+    assert_eq!(settle(&app).await, "success");
+    let (_, t) = app.req(&admin, "GET", "/api/repos/root1/r/ci/runs/1/tests", None).await;
+    let msg = t["results"][0]["message"].as_str().unwrap_or_default().to_string();
+    assert!(msg.contains("token ***") && !t.to_string().contains("s3cr3t-value"), "{t}");
+    let log = last_log(&app).await;
+    assert!(log.contains("Reports: junit/out/b.xml: "), "{log}");
+    // The cache's file goes missing (a restored backup): the key is saved again, not stuck.
+    let c = caches(&app).await;
+    assert_eq!(c.len(), 1);
+    let id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM ci_caches", [], |r| r.get(0))?)).await.unwrap();
+    std::fs::remove_file(cache::path(&app.state.cfg.data_dir, id)).unwrap();
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/ci/runs/1/rerun", Some(json!({ "all": true }))).await.0, StatusCode::OK);
+    assert_eq!(settle(&app).await, "success");
+    let log = last_log(&app).await;
+    assert!(log.contains("No cache for c yet."), "{log}");
+    let id2: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM ci_caches", [], |r| r.get(0))?)).await.unwrap();
+    assert!(id2 != id && cache::path(&app.state.cfg.data_dir, id2).exists(), "saved again under a new id");
 }

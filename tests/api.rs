@@ -4333,3 +4333,157 @@ async fn protection_merges_wait_for_checks_and_approvals_and_auto_merge() {
     let (_, page, _) = raw_get(&app, "/alice/secret").await;
     assert!(!page.contains("og:title"), "nothing about private repositories");
 }
+
+// ---------- merge queue (T-0017)
+
+#[tokio::test]
+async fn merge_queue_lands_in_order_ejects_failures_and_retests() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "q", "readme": true }))).await;
+    app.req(&alice, "PUT", "/api/repos/alice/q/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    let rule = json!({ "pattern": "main", "require_pr": false, "checks": ["build"], "merge_queue": true });
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/q/branch-rules", Some(rule)).await.0, StatusCode::OK);
+    let pr = |name: &'static str| {
+        let (app, bob) = (&app, bob.clone());
+        async move {
+            let c = json!({ "branch": "main", "new_branch": name, "message": name, "changes": [{ "path": format!("{name}.txt"), "content": "x\n" }] });
+            app.req(&bob, "POST", "/api/repos/alice/q/contents", Some(c)).await;
+            let (_, p) = app.req(&bob, "POST", "/api/repos/alice/q/pulls", Some(json!({ "title": name, "head": name, "base": "main" }))).await;
+            p["number"].as_i64().unwrap()
+        }
+    };
+    let queue = |n: i64| format!("/api/repos/alice/q/pulls/{n}/queue");
+    let status = |sha: String, state: &'static str| {
+        let (app, bob) = (&app, bob.clone());
+        async move { app.req(&bob, "POST", &format!("/api/repos/alice/q/statuses/{sha}"), Some(json!({ "state": state, "context": "build" }))).await.0 }
+    };
+    // The first entry once it's testing (and the test commit), waiting for the queue to get there.
+    let testing = |n: i64| {
+        let (app, carol) = (&app, carol.clone());
+        async move {
+            for _ in 0..50 {
+                let (_, l) = app.req(&carol, "GET", "/api/repos/alice/q/merge-queue", None).await;
+                let first = &l["entries"][0];
+                if first["number"] == n && first["state"] == "testing" {
+                    return first["test_sha"].as_str().unwrap().to_string();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("#{n} never reached the front of the queue");
+        }
+    };
+    let state = |n: i64, notes: usize| {
+        let (app, carol) = (&app, carol.clone());
+        async move {
+            for _ in 0..50 {
+                let (_, i) = app.req(&carol, "GET", &format!("/api/repos/alice/q/issues/{n}"), None).await;
+                // Merged, or taken out (with a note saying why).
+                let out = i["comments"].as_array().unwrap().iter().filter(|c| c["kind"] == "dequeued").count() > notes;
+                if i["issue"]["state"] != "open" || (out && i["pull"]["queue"].is_null()) {
+                    return i;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("#{n} stayed in the queue");
+        }
+    };
+    let main = || async {
+        let (_, b) = app.req(&carol, "GET", "/api/repos/alice/q/branches", None).await;
+        b["branches"].as_array().unwrap().iter().find(|x| x["name"] == "main").unwrap()["sha"].as_str().unwrap().to_string()
+    };
+    let (one, two, three) = (pr("one").await, pr("two").await, pr("three").await);
+
+    // A branch with a queue isn't merged into directly, and readers can't queue.
+    for body in [json!({}), json!({ "bypass_rules": true })] {
+        let (s, e) = app.req(&bob, "POST", &format!("/api/repos/alice/q/pulls/{one}/merge"), Some(body)).await;
+        assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("merge queue"), "only admins skip the queue: {e}");
+    }
+    assert_eq!(app.req(&carol, "POST", &queue(one), Some(json!({ "method": "merge" }))).await.0, StatusCode::FORBIDDEN);
+    for n in [one, two, three] {
+        assert_eq!(app.req(&bob, "POST", &queue(n), Some(json!({ "method": "merge" }))).await.0, StatusCode::OK);
+    }
+    assert_eq!(app.req(&bob, "POST", &queue(two), Some(json!({}))).await.0, StatusCode::CONFLICT, "already queued");
+    let (_, l) = app.req(&carol, "GET", "/api/repos/alice/q/merge-queue", None).await;
+    let order: Vec<(i64, i64, &str)> = l["entries"].as_array().unwrap().iter().map(|x| (x["number"].as_i64().unwrap(), x["position"].as_i64().unwrap(), x["state"].as_str().unwrap())).collect();
+    assert_eq!(order, vec![(one, 1, "testing"), (two, 2, "queued"), (three, 3, "queued")], "{l}");
+    let (_, i) = app.req(&carol, "GET", &format!("/api/repos/alice/q/issues/{two}"), None).await;
+    assert_eq!(i["pull"]["queue"]["position"], 2, "{i}");
+
+    // The first lands as the very commit that passed, then the next is tested on top.
+    let t1 = testing(one).await;
+    assert_ne!(t1, main().await);
+    assert_eq!(status(t1.clone(), "pending").await, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(testing(one).await, t1, "waits while build is pending");
+    assert_eq!(status(t1.clone(), "success").await, StatusCode::OK);
+    let i1 = state(one, 0).await;
+    assert_eq!(i1["issue"]["state"], "merged", "{i1}");
+    assert_eq!(main().await, t1);
+    // A failure takes it out, with the reason on its timeline; the one behind it goes on.
+    let t2 = testing(two).await;
+    assert_eq!(status(t2, "failure").await, StatusCode::OK);
+    let i = state(two, 0).await;
+    assert_eq!(i["issue"]["state"], "open");
+    let note = i["comments"].as_array().unwrap().iter().find(|c| c["kind"] == "dequeued").expect("a note on why");
+    assert!(note["body"].as_str().unwrap().contains("build failed"), "{note}");
+    // The branch moving under the one being tested means testing again on its new tip.
+    let t3 = testing(three).await;
+    // (A queue means pull requests only, whatever the rule says; the owner isn't bound.)
+    let c = json!({ "branch": "main", "message": "direct", "changes": [{ "path": "direct.txt", "content": "d\n" }] });
+    assert_eq!(app.req(&bob, "POST", "/api/repos/alice/q/contents", Some(c.clone())).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/q/contents", Some(c)).await.0, StatusCode::OK);
+    let mut t3b = t3.clone();
+    for _ in 0..50 {
+        t3b = testing(three).await;
+        if t3b != t3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_ne!(t3b, t3, "retested on the new tip");
+    assert_eq!(status(t3, "success").await, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(testing(three).await, t3b, "a pass on the old commit doesn't count");
+    assert_eq!(status(t3b.clone(), "success").await, StatusCode::OK);
+    assert_eq!(state(three, 0).await["issue"]["state"], "merged");
+    assert_eq!(main().await, t3b);
+
+    // A push to a queued pull request takes it out; so does asking.
+    let four = pr("four").await;
+    let (s, e) = app.req(&bob, "PUT", &format!("/api/repos/alice/q/pulls/{four}/auto-merge"), Some(json!({ "method": "merge" }))).await;
+    assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("merge queue"), "{e}");
+    assert_eq!(app.req(&bob, "POST", &queue(four), Some(json!({ "method": "squash" }))).await.0, StatusCode::OK);
+    let t4 = testing(four).await;
+    // The test commit's ref is the server's own: clients don't see it.
+    let url = format!("{}/alice/q.git", protection_serve(&app).await);
+    let refs = tokio::task::spawn_blocking(move || std::process::Command::new("git").args(["ls-remote", &url]).env("GIT_TERMINAL_PROMPT", "0").output().unwrap()).await.unwrap();
+    let refs = String::from_utf8_lossy(&refs.stdout).into_owned();
+    assert!(refs.contains("refs/heads/four") && !refs.contains("gitter-queue") && !refs.contains(&t4), "{refs}");
+    let more = json!({ "branch": "four", "message": "more", "changes": [{ "path": "four.txt", "content": "y\n" }] });
+    app.req(&bob, "POST", "/api/repos/alice/q/contents", Some(more)).await;
+    let i = state(four, 0).await;
+    assert!(i["comments"].as_array().unwrap().iter().any(|c| c["kind"] == "dequeued" && c["body"].as_str().unwrap().contains("source branch changed")), "{i}");
+    assert_eq!(app.req(&bob, "POST", &queue(four), Some(json!({ "method": "squash" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&carol, "DELETE", &queue(four), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "DELETE", &queue(four), None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "DELETE", &queue(four), None).await.0, StatusCode::NOT_FOUND);
+    let (_, l) = app.req(&carol, "GET", "/api/repos/alice/q/merge-queue", None).await;
+    assert_eq!(l["entries"], json!([]), "{l}");
+    // Fast-forward isn't offered; the owner may skip the line, and it's in the security log.
+    let five = pr("five").await;
+    assert_eq!(app.req(&bob, "POST", &queue(five), Some(json!({ "method": "ff" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&alice, "POST", &format!("/api/repos/alice/q/pulls/{five}/merge"), Some(json!({}))).await.0, StatusCode::CONFLICT);
+    assert_eq!(app.req(&alice, "POST", &format!("/api/repos/alice/q/pulls/{five}/merge"), Some(json!({ "bypass_rules": true }))).await.0, StatusCode::OK);
+    let (_, log) = app.req(&alice, "GET", "/api/me/audit", None).await;
+    assert!(log.to_string().contains("skipped the merge queue"), "{log}");
+    // A branch without a queue says so.
+    let c = json!({ "branch": "main", "new_branch": "dev", "message": "dev", "changes": [{ "path": "dev.txt", "content": "x\n" }] });
+    app.req(&bob, "POST", "/api/repos/alice/q/contents", Some(c)).await;
+    let (_, p) = app.req(&bob, "POST", "/api/repos/alice/q/pulls", Some(json!({ "title": "to dev", "head": "four", "base": "dev" }))).await;
+    let (s, e) = app.req(&bob, "POST", &queue(p["number"].as_i64().unwrap()), Some(json!({}))).await;
+    assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("doesn't use a merge queue"), "{e}");
+}
