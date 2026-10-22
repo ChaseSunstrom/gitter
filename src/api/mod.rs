@@ -22,6 +22,7 @@ pub mod webhooks;
 pub mod wiki;
 pub mod mcp;
 pub mod notifications;
+pub mod oauth;
 pub mod revert;
 
 use std::net::SocketAddr;
@@ -50,6 +51,13 @@ pub fn router() -> Router<AppState> {
         .route("/auth/logout", post(account::logout))
         .route("/auth/login/2fa", post(account::login_2fa))
         .route("/auth/reauth", post(security::reauth))
+        .route("/auth/providers", get(oauth::public_list))
+        .route("/auth/oauth/callback", get(oauth::callback))
+        .route("/auth/oauth/{slug}/start", post(oauth::start))
+        .route("/me/identities", get(oauth::identities))
+        .route("/me/identities/{id}", delete(oauth::unlink))
+        .route("/admin/oauth-providers", get(oauth::list).post(oauth::create))
+        .route("/admin/oauth-providers/{id}", patch(oauth::update).delete(oauth::remove))
         .route("/me/security", get(security::overview))
         .route("/me/audit", get(security::my_log))
         .route("/me/2fa/setup", post(security::setup))
@@ -357,7 +365,7 @@ async fn in_its_repo(st: &AppState, l: &crate::auth::Limits, parts: &Parts) -> b
 }
 
 /// Account-level routes no limited token may touch, even to read.
-const ACCOUNT_ROUTES: &[&str] = &["/admin", "/me/tokens", "/me/security", "/me/audit", "/me/2fa", "/me/sessions", "/me/password", "/me/export", "/me/trash", "/me/transfers", "/auth"];
+const ACCOUNT_ROUTES: &[&str] = &["/admin", "/me/tokens", "/me/security", "/me/audit", "/me/2fa", "/me/sessions", "/me/password", "/me/identities", "/me/export", "/me/trash", "/me/transfers", "/auth"];
 
 fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -> bool {
     if ACCOUNT_ROUTES.iter().any(|p| path == *p || path.starts_with(&format!("{p}/"))) {

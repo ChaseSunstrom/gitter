@@ -990,5 +990,98 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   else console.log('  ok long commit messages and wide READMEs stay in the main column; repo tabs fit or go in More');
 }
 
+// Sign in with a provider: a mock OpenID Connect provider added on the admin page; its button
+// on the sign-in page signs a new account up, Settings → Security lists it, and with no password
+// the confirm dialog offers only the provider, which comes back to the page.
+{
+  const http = await import('node:http');
+  const crypto = await import('node:crypto');
+  const codes = new Map(), tokens = new Set();
+  const b64 = (s) => Buffer.from(s).toString('base64url');
+  let ISS = '';
+  const idp = http.createServer(async (req, res) => {
+    const u = new URL(req.url, ISS);
+    const reply = (code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (u.pathname === '/.well-known/openid-configuration') {
+      return reply(200, { issuer: ISS, authorization_endpoint: ISS + '/authorize', token_endpoint: ISS + '/token', userinfo_endpoint: ISS + '/userinfo' });
+    }
+    if (u.pathname === '/authorize') {
+      // Approves at once, like a provider that remembers the person.
+      const code = crypto.randomUUID();
+      codes.set(code, { challenge: u.searchParams.get('code_challenge'), nonce: u.searchParams.get('nonce') });
+      res.writeHead(302, { location: `${u.searchParams.get('redirect_uri')}?code=${code}&state=${encodeURIComponent(u.searchParams.get('state'))}` });
+      return res.end();
+    }
+    if (u.pathname === '/token') {
+      let body = '';
+      for await (const c of req) body += c;
+      const f = new URLSearchParams(body), c = codes.get(f.get('code'));
+      codes.delete(f.get('code'));
+      const pkce = crypto.createHash('sha256').update(f.get('code_verifier') || '').digest('base64url');
+      if (!c || pkce !== c.challenge || f.get('client_secret') !== 'e2e-secret') return reply(400, { error: 'invalid_grant' });
+      const now = Math.floor(Date.now() / 1000), at = crypto.randomUUID();
+      tokens.add(at);
+      const claims = { iss: ISS, aud: 'e2e-client', sub: 'sso-1', exp: now + 300, iat: now, auth_time: now, nonce: c.nonce };
+      return reply(200, { access_token: at, token_type: 'Bearer', id_token: `${b64('{"alg":"RS256"}')}.${b64(JSON.stringify(claims))}.c2ln` });
+    }
+    if (u.pathname === '/userinfo' && tokens.has((req.headers.authorization || '').replace('Bearer ', ''))) {
+      return reply(200, { sub: 'sso-1', preferred_username: 'sso-sam', email: 'sam@sso.test', email_verified: true });
+    }
+    reply(404, {});
+  });
+  await new Promise((r) => idp.listen(0, '127.0.0.1', r));
+  ISS = `http://127.0.0.1:${idp.address().port}`;
+  execFileSync('python3', ['-c', 'import sqlite3,sys,time; c=sqlite3.connect(sys.argv[1]); c.execute("UPDATE sessions SET verified_at = ?", (int(time.time()),)); c.commit()', process.env.GITTER_DB]);
+  const page = await ctx.newPage();
+  const errors = [], steps = [];
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const sam = await browser.newContext();
+  try {
+    await page.goto(BASE + '/admin/sign-in', { waitUntil: 'networkidle' });
+    await page.selectOption('#pv-kind', 'oidc');
+    await page.fill('#pv-name', 'Company SSO');
+    await page.fill('#pv-base', ISS);
+    await page.fill('#pv-id', 'e2e-client');
+    await page.fill('#pv-secret', 'e2e-secret');
+    await page.check('#provider-form input[name=allow_private]');
+    await page.click('#provider-form button[type=submit]');
+    await page.locator('#providers .list-row', { hasText: 'Company SSO' }).waitFor({ timeout: 5000 });
+    steps.push('added on the admin page');
+
+    const sp = await sam.newPage();
+    // The 403 (confirm first) and 400 (last way to sign in) below are the refusals this check expects.
+    sp.on('console', (m) => { if (m.type() === 'error' && !/status of (403|400)/.test(m.text())) errors.push('sam: ' + m.text()); });
+    sp.on('pageerror', (e) => errors.push('sam: ' + String(e)));
+    await sp.goto(BASE + '/login?next=/settings/security', { waitUntil: 'networkidle' });
+    await Promise.all([sp.waitForURL(BASE + '/settings/security', { timeout: 10000 }), sp.click('[data-oauth="company-sso"]')]);
+    await sp.waitForSelector('#sign-in-methods', { timeout: 5000 });
+    const me = await (await sam.request.get(BASE + '/api/me')).json();
+    if (me.user?.username !== 'sso-sam') throw new Error(`signed in as ${me.user?.username}`);
+    const methods = await sp.locator('#sign-in-methods').innerText();
+    if (!methods.includes('Linked as sso-sam') || !methods.includes('Not set')) throw new Error(`sign-in methods: ${methods}`);
+    steps.push('signed up through the button');
+
+    // With the confirmation aged, unlinking asks to confirm, through the provider only.
+    execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("UPDATE sessions SET verified_at = 0 WHERE user_id = (SELECT id FROM users WHERE username = \'sso-sam\')"); c.commit()', process.env.GITTER_DB]);
+    await sp.click('[data-unlink]');
+    await sp.click('.modal [data-ok]');
+    await sp.waitForSelector('[data-ra-oauth="company-sso"]', { timeout: 5000 });
+    if (await sp.locator('#ra-pw').isVisible()) throw new Error('asked for a password the account does not have');
+    await Promise.all([sp.waitForURL(BASE + '/settings/security', { timeout: 10000 }), sp.click('[data-ra-oauth="company-sso"]')]);
+    await sp.waitForSelector('#sign-in-methods', { timeout: 5000 });
+    // Confirmed: the unlink now reaches the last-method rule instead of a password prompt.
+    await sp.click('[data-unlink]');
+    await sp.click('.modal [data-ok]');
+    await sp.locator('.toast', { hasText: 'only way to sign in' }).waitFor({ timeout: 5000 });
+    steps.push('confirmed through the provider');
+  } catch (e) { errors.push(String(e)); }
+  await sam.close();
+  idp.close();
+  if (errors.length || steps.length < 3) { failed++; console.log('✗ sign in with a provider', { steps, errors }); }
+  else console.log(`  ok sign-in provider ${steps.join(', ')}`);
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

@@ -1,5 +1,5 @@
 // Account settings: profile, account (password, export, delete), repositories (transfers, trash), access tokens, appearance.
-import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName, bytes, plural } from '../lib.js';
+import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName, bytes, plural, busy, startOAuth } from '../lib.js';
 import { icon } from '../icons.js';
 import { refresh, renderTopbar, setTheme, getTheme, SKINS, getSkin, setSkin } from '../main.js';
 
@@ -29,14 +29,16 @@ function profileTab(p, storage) {
   </form>`;
 }
 
-function accountTab(exp) {
+function accountTab(exp, hasPassword) {
   return html`<form id="pw-form" class="stack settings-form" novalidate>
-    <h2>Change password</h2>
-    <div class="field"><label for="current">Current password</label><input class="input" id="current" name="current" type="password" autocomplete="current-password" required></div>
+    <h2>${hasPassword ? 'Change password' : 'Set a password'}</h2>
+    ${hasPassword
+      ? html`<div class="field"><label for="current">Current password</label><input class="input" id="current" name="current" type="password" autocomplete="current-password" required></div>`
+      : html`<p class="muted">You sign in through a linked account. A password lets you sign in without it, and with git over HTTPS.</p>`}
     <div class="field"><label for="new">New password</label><input class="input" id="new" name="new" type="password" autocomplete="new-password" minlength="8" required><span class="hint">At least 8 characters.</span></div>
     <div class="field"><label for="confirm">Confirm new password</label><input class="input" id="confirm" name="confirm" type="password" autocomplete="new-password" required></div>
     <p class="field-err" id="pw-err" role="alert" hidden></p>
-    <div class="row"><button class="btn primary" type="submit">Update password</button></div>
+    <div class="row"><button class="btn primary" type="submit">${hasPassword ? 'Update password' : 'Set password'}</button></div>
   </form>
   <div class="stack settings-form" style="margin-top:28px">
     <h2>Export your data</h2>
@@ -162,7 +164,23 @@ function sshTab(r) {
   </div>`;
 }
 
-function securityTab(sec, log) {
+/** Password and linked sign-in accounts (GitHub, GitLab, OpenID Connect), when an admin added providers. */
+function methodsView(ids, providers) {
+  const linked = new Map(ids.identities.map((i) => [i.provider.slug, i]));
+  const row = (p, i) => html`<div class="list-row">${icon('key', 'muted')}<div class="grow"><b>${p.name}</b>
+      <div class="small muted">${i ? html`Linked${i.login ? html` as ${i.login}` : ''} ${timeEl(i.created_at)}${i.provider.enabled ? '' : ' · turned off by an admin'}` : 'Not linked'}</div></div>
+      ${i ? html`<button class="btn sm" data-unlink="${i.id}" data-name="${p.name}" aria-label="Unlink ${p.name}">Unlink</button>` : html`<button class="btn sm" data-link="${p.slug}" aria-label="Link ${p.name}">Link</button>`}</div>`;
+  const rows = providers.map((p) => { const i = linked.get(p.slug); linked.delete(p.slug); return row(p, i); });
+  // Accounts at providers an admin turned off still show, so they can be unlinked.
+  for (const i of linked.values()) rows.push(row(i.provider, i));
+  if (!rows.length) return '';
+  return html`<h2>Sign-in methods</h2>
+    <div class="box list" id="sign-in-methods"><div class="list-row">${icon('lock', 'muted')}<div class="grow"><b>Password</b>
+      <div class="small muted">${ids.has_password ? 'Set' : 'Not set: you sign in through a linked account'}</div></div>
+      <a class="btn sm" href="/settings/account">${ids.has_password ? 'Change' : 'Set a password'}</a></div>${rows}</div>`;
+}
+
+function securityTab(sec, log, ids, providers) {
   const tfa = sec.two_factor
     ? html`<div class="box"><div class="box-body row">${icon('check', 'c-green')}<div class="grow"><b>Two-factor authentication is on</b>
         <div class="small muted">Signing in needs your password and a code from your app. ${sec.recovery_left} of 10 recovery codes left.</div></div>
@@ -178,6 +196,7 @@ function securityTab(sec, log) {
       <span class="grow"><b>${auditLabel(e.action)}</b>${e.detail ? html` <span class="muted">· ${e.detail}</span>` : ''}${e.actor && e.actor !== state.me.username ? html` <span class="muted">by ${e.actor}</span>` : ''}</span>
       <span class="muted nowrap">${e.ip ? e.ip + ' · ' : ''}${timeEl(e.created_at)}</span></div>`);
   return html`<div class="stack settings-form">
+    ${methodsView(ids, providers)}
     <h2>Two-factor authentication</h2>
     ${tfa}<div id="tfa-flow"></div>
     <h2>Where you're signed in</h2>
@@ -229,14 +248,18 @@ export default async function (ctx) {
   else if (tab === 'tokens') inner = tokensTab(await get('/me/tokens', { fresh: true }));
   else if (tab === 'signing') inner = signingTab((await get('/me/signing-keys', { fresh: true })).keys);
   else if (tab === 'ssh') inner = sshTab(await get('/me/ssh-keys', { fresh: true }));
-  else if (tab === 'account') { exp = (await get('/me/export', { fresh: true })).export; inner = accountTab(exp); }
+  else if (tab === 'account') {
+    const [e, ids] = await Promise.all([get('/me/export', { fresh: true }), get('/me/identities', { fresh: true })]);
+    exp = e.export;
+    inner = accountTab(exp, ids.has_password);
+  }
   else if (tab === 'repositories') {
     const [tr, trash] = await Promise.all([get('/me/transfers', { fresh: true }), get('/me/trash', { fresh: true })]);
     inner = reposTab(tr, trash);
   }
   else if (tab === 'security') {
-    const [sec, log] = await Promise.all([get('/me/security', { fresh: true }), get('/me/audit', { fresh: true })]);
-    inner = securityTab(sec, log);
+    const [sec, log, ids, prov] = await Promise.all([get('/me/security', { fresh: true }), get('/me/audit', { fresh: true }), get('/me/identities', { fresh: true }), get('/auth/providers')]);
+    inner = securityTab(sec, log, ids, prov.providers);
   }
   else inner = appearanceTab();
   const me = state.me;
@@ -270,10 +293,11 @@ export default async function (ctx) {
           const fail = (m) => { err.textContent = m; err.hidden = false; };
           if (f.new.length < 8) return fail('Use at least 8 characters for your new password');
           if (f.new !== f.confirm) return fail("The new passwords don't match");
-          try { await send('POST', '/me/password', { current: f.current, new: f.new }); }
+          try { await send('POST', '/me/password', { current: f.current || '', new: f.new }); }
           catch (e) { return fail(e.message); }
           pw.reset();
-          toast('Password updated');
+          toast(f.current === undefined ? 'Password set' : 'Password updated');
+          if (f.current === undefined) refresh();
         }));
       }
       const tf = $('#token-form', el);
@@ -436,6 +460,17 @@ function mountSecurity(el) {
         if (!(await confirmDialog({ title: 'Turn off two-factor authentication?', text: 'Signing in will only need your password again, and your recovery codes will stop working.', ok: 'Turn off', danger: true }))) return;
         await send('POST', '/me/2fa/disable');
         toast('Two-factor authentication is off');
+        refresh();
+      } else if (t.closest('[data-link]')) {
+        const b = t.closest('[data-link]');
+        busy(b, true);
+        // Stays busy while the browser leaves for the provider.
+        try { await startOAuth(b.dataset.link, 'link'); } catch (x) { busy(b, false); throw x; }
+      } else if (t.closest('[data-unlink]')) {
+        const b = t.closest('[data-unlink]');
+        if (!(await confirmDialog({ title: `Unlink ${b.dataset.name}?`, text: `You won't be able to sign in with ${b.dataset.name} until you link it again.`, ok: 'Unlink', danger: true }))) return;
+        await send('DELETE', `/me/identities/${b.dataset.unlink}`);
+        toast(`Unlinked ${b.dataset.name}`);
         refresh();
       } else if (t.closest('[data-revoke]')) {
         await send('DELETE', `/me/sessions/${t.closest('[data-revoke]').dataset.revoke}`);

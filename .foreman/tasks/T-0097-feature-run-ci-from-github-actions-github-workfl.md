@@ -69,6 +69,7 @@ README: GitHub Actions and GitLab CI files section; YAML subset now lists anchor
 - 2026-10-22T18:30:07Z set approved=True
 - 2026-10-22T18:30:15Z focused
 - 2026-10-22T19:03:16Z done
+- 2026-10-22T19:03:16Z committed fa9c197 (14 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses config::parse (split into parse_value) for validation, matrix and limits, trigger::wants for filters, the cache key templates ({{ hash … }}, {{ os }}), artifacts and JUnit reports, and the YAML subset parser (extended with anchors, aliases and << merges, with an alias expansion budget). No YAML or workflow crate: the subset parser plus a translator is smaller than adapting serde_yaml output and keeps the attack surface known.

@@ -213,9 +213,13 @@ pub fn short_agent(ua: &str) -> String {
 
 #[derive(Deserialize)]
 pub struct ReauthReq {
+    #[serde(default)]
     password: String,
     #[serde(default)]
     code: String,
+    /// From confirming through a sign-in provider: stands in for the password.
+    #[serde(default)]
+    challenge: String,
 }
 
 /// Confirm the password (and 2FA code) to unlock dangerous actions for a few minutes.
@@ -234,7 +238,11 @@ pub async fn reauth(
     if !st.limiter.allow(&key, 10, 600) {
         return Err(AppError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes."));
     }
-    if password_login(&st.db, &u.username, &req.password).await?.is_none() {
+    if !req.challenge.is_empty() {
+        if st.challenges.attempt(&req.challenge) != Some(u.id) {
+            return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "That confirmation expired. Start again."));
+        }
+    } else if password_login(&st.db, &u.username, &req.password).await?.is_none() {
         return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "That password isn't right"));
     }
     if crate::auth::has_2fa(&st.db, u.id).await? {
@@ -247,6 +255,7 @@ pub async fn reauth(
         }
     }
     st.limiter.reset(&key);
+    st.challenges.finish(&req.challenge);
     let h = sess.hash;
     st.db
         .call(move |c| Ok(c.execute("UPDATE sessions SET verified_at = ?1 WHERE token_hash = ?2", rusqlite::params![now(), h])?))

@@ -70,15 +70,36 @@ export async function send(method, url, body) {
   return r;
 }
 
+/** Send the browser to a sign-in provider; it comes back to `next` (this page by default). */
+export async function startOAuth(slug, mode, extra = {}) {
+  const here = new URL(location.href);
+  for (const k of ['oauth_error', 'reauth_challenge', 'challenge']) here.searchParams.delete(k);
+  const r = await send('POST', `/auth/oauth/${enc(slug)}/start`, { mode, next: here.pathname + here.search, ...extra });
+  location.assign(r.url);
+}
+
+/** After coming back from a provider: show its error, or ask for the 2FA code that finishes a confirmation. */
+export function afterOAuth() {
+  const u = new URL(location.href);
+  const err = u.searchParams.get('oauth_error'), challenge = u.searchParams.get('reauth_challenge');
+  if (!challenge && (!err || /^\/(login|signup)$/.test(u.pathname))) return;
+  u.searchParams.delete('oauth_error'); u.searchParams.delete('reauth_challenge');
+  history.replaceState(history.state, '', u.pathname + u.search + u.hash);
+  if (err) toast(err, 'err');
+  if (challenge) reauth(challenge);
+}
+
 let reauthing = null;
-/** Ask for the password (and a 2FA code when the account has one). Resolves true when confirmed. */
-function reauth() {
+/** Ask for the password (and a 2FA code when the account has one), or a confirmation through a
+ * linked sign-in provider. Resolves true when confirmed. With `challenge` (back from a provider), only the code. */
+function reauth(challenge = '') {
   reauthing ??= modal({
     title: 'Confirm it’s you',
-    body: html`<p class="muted">This is a sensitive action. Enter your password to continue; you won’t be asked again for a few minutes.</p>
+    body: html`<p class="muted" id="ra-why" aria-live="polite">${challenge ? 'Enter the code from your authenticator app to finish confirming.' : 'This is a sensitive action. Enter your password to continue; you won’t be asked again for a few minutes.'}</p>
       <form id="ra-form" class="stack" novalidate>
-        <div class="field"><label for="ra-pw">Password</label><input class="input" id="ra-pw" type="password" autocomplete="current-password" autofocus></div>
-        <div class="field" id="ra-code-f" hidden><label for="ra-code">Authentication code</label><input class="input" id="ra-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456, or a recovery code"></div>
+        <div class="field" id="ra-pw-f" ${challenge ? 'hidden' : ''}><label for="ra-pw">Password</label><input class="input" id="ra-pw" type="password" autocomplete="current-password" autofocus></div>
+        <div class="row wrap-ok" id="ra-oauth" hidden></div>
+        <div class="field" id="ra-code-f" ${challenge ? '' : 'hidden'}><label for="ra-code">Authentication code</label><input class="input" id="ra-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456, or a recovery code"></div>
         <p class="field-err" id="ra-err" role="alert" hidden></p>
       </form>`,
     foot: html`<button class="btn" data-close>Cancel</button><button class="btn primary" data-ok>Confirm</button>`,
@@ -89,7 +110,7 @@ function reauth() {
         busy(ok, true);
         err.hidden = true;
         try {
-          await request('POST', '/auth/reauth', { password: el.querySelector('#ra-pw').value, code: el.querySelector('#ra-code').value });
+          await request('POST', '/auth/reauth', { password: el.querySelector('#ra-pw').value, code: el.querySelector('#ra-code').value, challenge });
           close(true);
         } catch (x) {
           err.textContent = x.message; err.hidden = false;
@@ -98,6 +119,22 @@ function reauth() {
       };
       ok.addEventListener('click', submit);
       el.querySelector('#ra-form').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(e); });
+      if (challenge) return el.querySelector('#ra-code').focus();
+      // An account without a password confirms through a linked provider instead.
+      request('GET', '/me/identities').then((m) => {
+        if (m.has_password) return;
+        const linked = m.identities.filter((i) => i.provider.enabled);
+        const box = el.querySelector('#ra-oauth');
+        box.innerHTML = linked.map((i) => html`<button type="button" class="btn" data-ra-oauth="${i.provider.slug}">Confirm with ${i.provider.name}</button>`.s).join('');
+        box.hidden = !linked.length;
+        el.querySelector('#ra-pw-f').hidden = true; ok.hidden = true;
+        el.querySelector('#ra-why').textContent = 'This is a sensitive action. Confirm with the account you sign in with; you’ll come back here, then try again.';
+        box.querySelector('button')?.focus();
+        box.addEventListener('click', (e) => {
+          const b = e.target.closest('[data-ra-oauth]');
+          if (b) { busy(b, true); startOAuth(b.dataset.raOauth, 'reauth').catch((x) => { busy(b, false); err.textContent = x.message; err.hidden = false; }); }
+        });
+      }).catch((x) => { err.textContent = x.message; err.hidden = false; });
     },
   }).finally(() => { reauthing = null; });
   return reauthing;
@@ -304,6 +341,8 @@ const AUDIT = {
   admin_granted: 'Made someone an admin', admin_revoked: 'Removed someone’s admin rights',
   user_suspended: 'Suspended an account', user_unsuspended: 'Restored an account', user_deleted: 'Deleted an account',
   settings_changed: 'Changed site settings', invite_created: 'Created an invite link',
+  identity_linked: 'Linked a sign-in account', identity_unlinked: 'Unlinked a sign-in account',
+  oauth_provider_added: 'Added a sign-in provider', oauth_provider_changed: 'Changed a sign-in provider', oauth_provider_removed: 'Removed a sign-in provider',
   moderation_dismiss: 'Dismissed a report', moderation_hide: 'Hid reported content', moderation_unhide: 'Unhid content', moderation_suspend: 'Suspended a reported account',
   wiki_page_deleted: 'Deleted a wiki page', discussion_deleted: 'Deleted a discussion', discussion_reply_deleted: 'Removed a reply in a discussion', snippet_deleted: 'Deleted a snippet', release_deleted: 'Deleted a release',
   ci_secret_set: 'Set a CI secret', ci_secret_deleted: 'Deleted a CI secret', ci_runner_created: 'Added a CI runner', ci_runner_deleted: 'Removed a CI runner',

@@ -1,9 +1,9 @@
 // Site administration: overview, accounts, security log and instance settings.
-import { html, state, get, send, bytes, num, timeEl, avatar, toast, action, confirmDialog, debounce, auditLabel, $, $$ } from '../lib.js';
+import { html, state, get, send, bytes, num, timeEl, avatar, toast, action, confirmDialog, debounce, auditLabel, plural, modal, $, $$ } from '../lib.js';
 import { icon } from '../icons.js';
 import { navigate, refresh, renderTopbar } from '../main.js';
 
-const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['reports', 'flag', 'Reports'], ['audit', 'shield', 'Security log'], ['runners', 'zap', 'CI runners'], ['settings', 'settings', 'Settings']];
+const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['reports', 'flag', 'Reports'], ['audit', 'shield', 'Security log'], ['runners', 'zap', 'CI runners'], ['sign-in', 'key', 'Sign-in'], ['settings', 'settings', 'Settings']];
 
 function uptime(s) {
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
@@ -130,6 +130,58 @@ async function runners() {
   </div>`;
 }
 
+const KIND = { github: 'GitHub', gitlab: 'GitLab', oidc: 'OpenID Connect' };
+const ADDRESS = { github: 'https://github.com', gitlab: 'https://gitlab.com', oidc: 'https://id.example.com' };
+
+/** The fields of a provider; `p` when editing (the secret stays unless a new one is typed). */
+function providerFields(p, id = 'pv') {
+  const kind = p?.kind || 'github';
+  return html`<div class="grid-2">
+      ${p ? '' : html`<div class="field"><label for="${id}-kind">Kind</label><select class="select" id="${id}-kind" name="kind">
+        ${Object.entries(KIND).map(([k, v]) => html`<option value="${k}">${v}</option>`)}</select></div>`}
+      <div class="field"><label for="${id}-name">Button name</label><input class="input" id="${id}-name" name="name" maxlength="60" value="${p?.name || ''}" placeholder="${KIND[kind]}"></div>
+    </div>
+    <div class="field"><label for="${id}-base">Address</label><input class="input mono" id="${id}-base" name="base_url" value="${p?.base_url || ''}" placeholder="${ADDRESS[kind]}">
+      <span class="hint">GitHub Enterprise or self-managed GitLab: its address. OpenID Connect: the issuer URL (Gitter reads its discovery document).</span></div>
+    <div class="grid-2">
+      <div class="field"><label for="${id}-id">Client ID</label><input class="input mono" id="${id}-id" name="client_id" value="${p?.client_id || ''}" autocomplete="off" required></div>
+      <div class="field"><label for="${id}-secret">Client secret</label><input class="input mono" id="${id}-secret" name="client_secret" type="password" autocomplete="new-password" placeholder="${p ? 'Unchanged' : ''}" ${p ? '' : 'required'}></div>
+    </div>
+    <label class="check"><input type="checkbox" name="allow_signup" ${!p || p.allow_signup ? 'checked' : ''}><span>New accounts: anyone with an account there can sign up here (while sign-up is open)</span></label>
+    <label class="check"><input type="checkbox" name="allow_private" ${p?.allow_private ? 'checked' : ''}><span>On a private network: allow private addresses and plain http://</span></label>`;
+}
+
+function providerBody(form) {
+  const f = Object.fromEntries(new FormData(form));
+  const body = { name: f.name?.trim() || undefined, base_url: f.base_url?.trim() || undefined, client_id: f.client_id?.trim(), client_secret: f.client_secret,
+    allow_signup: !!form.allow_signup.checked, allow_private: !!form.allow_private.checked };
+  // The short name in sign-in URLs, from the button name: "Company SSO" → company-sso.
+  if (f.kind) { body.kind = f.kind; body.slug = (body.name || KIND[f.kind]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || f.kind; }
+  return body;
+}
+
+async function signin() {
+  const d = await get('/admin/oauth-providers', { fresh: true });
+  return html`<div class="stack">
+    <div class="box" id="providers"><div class="box-head"><b>Sign-in providers</b><span class="grow"></span><span class="muted small">Sign in with an account elsewhere</span></div>
+      <div class="list">${d.providers.length ? d.providers.map((p) => html`<div class="list-row" data-provider="${p.id}" data-name="${p.name}">${icon('key', 'sm muted')}
+        <div class="grow"><b>${p.name}</b> <span class="pill">${KIND[p.kind] || p.kind}</span>${p.enabled ? '' : html` <span class="pill">Off</span>`}
+          <div class="small muted">${p.base_url} · ${plural(p.identities, 'linked account')} · ${p.allow_signup ? 'new accounts allowed' : 'existing accounts only'}</div></div>
+        <button class="btn sm" data-prov="edit" aria-label="Edit ${p.name}">Edit</button>
+        <button class="btn sm" data-prov="toggle" data-on="${p.enabled ? '1' : ''}" aria-label="${p.enabled ? 'Turn off' : 'Turn on'} ${p.name}">${p.enabled ? 'Turn off' : 'Turn on'}</button>
+        <button class="btn sm icon danger" data-prov="delete" aria-label="Remove ${p.name}">${icon('trash', 'sm')}</button></div>`)
+        : html`<div class="list-row muted small">None yet: people sign in with a password.</div>`}</div></div>
+    <div class="box"><div class="box-head"><b>Add a provider</b></div><div class="box-body stack">
+      <p class="muted small">Register an OAuth application with the provider (GitHub: Settings → Developer settings → OAuth Apps; GitLab: Preferences → Applications with the <code>read_user</code> scope; or your OpenID Connect provider), with this callback URL:</p>
+      <div class="row"><input class="input mono" readonly value="${d.callback_url}" aria-label="Callback URL"><button class="btn" type="button" data-copy="${d.callback_url}" data-copy-label="Callback URL copied">Copy</button></div>
+      <form class="stack" id="provider-form" novalidate>${providerFields(null)}
+        <p class="field-err" id="pv-err" role="alert" hidden></p>
+        <div class="row"><button class="btn primary" type="submit">Add provider</button></div></form>
+      <p class="muted small">People are matched by the provider's account id, never by email. Someone who already has an account here links the provider under Settings → Security.</p>
+    </div></div>
+  </div>`;
+}
+
 async function invitesBox() {
   const d = await get('/admin/invites', { fresh: true });
   return html`<div class="box" id="invites"><div class="box-head"><b>Invite links</b><span class="grow"></span><span class="muted small">For invite-only sign-up</span></div>
@@ -192,7 +244,7 @@ export default async function (ctx) {
   const q = ctx.query.get('q') || '';
   const page = +(ctx.query.get('page') || 1);
   const inner = tab === 'users' ? await users(q, page) : tab === 'reports' ? await reports(ctx.query.get('status') || 'open') : tab === 'audit' ? await audit(q, page)
-    : tab === 'runners' ? await runners() : tab === 'settings' ? await settings() : await overview();
+    : tab === 'runners' ? await runners() : tab === 'sign-in' ? await signin() : tab === 'settings' ? await settings() : await overview();
   return {
     title: 'Site administration',
     html: html`<div class="wrap">
@@ -274,6 +326,49 @@ export default async function (ctx) {
         if (!(await confirmDialog({ title: `Remove ${b.dataset.name}?`, text: 'Its token stops working, and jobs it was running go back to the queue.', ok: 'Remove', danger: true }))) return;
         try { await send('DELETE', `/admin/runners/${b.dataset.runnerDel}`); } catch (x) { return toast(x.message, 'err'); }
         toast('Runner removed');
+        navigate(location.pathname, { replace: true, scroll: false });
+      });
+      const pf = $('#provider-form', el);
+      pf?.addEventListener('change', (e) => {
+        if (e.target.name !== 'kind') return;
+        $('#pv-name', el).placeholder = KIND[e.target.value];
+        $('#pv-base', el).placeholder = ADDRESS[e.target.value];
+      });
+      pf?.addEventListener('submit', action(pf.querySelector('button[type=submit]'), async () => {
+        const err = $('#pv-err', el);
+        err.hidden = true;
+        try { await send('POST', '/admin/oauth-providers', providerBody(pf)); }
+        catch (x) { err.textContent = x.message; err.hidden = false; return; }
+        toast('Provider added');
+        navigate(location.pathname, { replace: true, scroll: false });
+      }));
+      $('#providers', el)?.addEventListener('click', async (e) => {
+        const b = e.target.closest('[data-prov]');
+        if (!b) return;
+        const row = b.closest('[data-provider]'), id = row.dataset.provider, name = row.dataset.name;
+        try {
+          if (b.dataset.prov === 'toggle') await send('PATCH', `/admin/oauth-providers/${id}`, { enabled: !b.dataset.on });
+          else if (b.dataset.prov === 'delete') {
+            if (!(await confirmDialog({ title: `Remove ${name}?`, text: 'Accounts linked to it are unlinked. Anyone who signs in only through it would be locked out, so that is refused: turn it off instead.', ok: 'Remove', danger: true }))) return;
+            await send('DELETE', `/admin/oauth-providers/${id}`);
+          } else if (b.dataset.prov === 'edit') {
+            const p = (await get('/admin/oauth-providers', { fresh: true })).providers.find((x) => String(x.id) === id);
+            const saved = await modal({
+              title: `Edit ${name}`, wide: true,
+              body: html`<form class="stack" id="pv-edit" novalidate>${providerFields(p, 'pe')}<p class="field-err" id="pv-edit-err" role="alert" hidden></p></form>`,
+              foot: html`<button class="btn" data-close>Cancel</button><button class="btn primary" data-ok>Save</button>`,
+              onMount(m, close) {
+                const ok = m.querySelector('[data-ok]'), f = m.querySelector('#pv-edit'), er = m.querySelector('#pv-edit-err');
+                ok.addEventListener('click', action(ok, async () => {
+                  er.hidden = true;
+                  try { await send('PATCH', `/admin/oauth-providers/${id}`, providerBody(f)); close(true); }
+                  catch (x) { er.textContent = x.message; er.hidden = false; }
+                }));
+              },
+            });
+            if (!saved) return;
+          }
+        } catch (x) { return toast(x.message, 'err'); }
         navigate(location.pathname, { replace: true, scroll: false });
       });
       const form = $('#site-settings', el);
