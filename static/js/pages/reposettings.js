@@ -1,5 +1,5 @@
 // Repository settings: name, description, website, default branch, access, deploy tokens, CI secrets, webhooks, visibility, transfer, delete.
-import { html, get, send, toast, action, confirmDialog, modal, timeEl, avatar, $ } from '../lib.js';
+import { html, get, send, toast, action, confirmDialog, modal, timeEl, avatar, plural, state, $ } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader, ciIcon } from '../repohead.js';
 import { navigate } from '../main.js';
@@ -11,7 +11,7 @@ const ROLES = [['read', 'Read'], ['write', 'Write'], ['admin', 'Admin']];
 function askRecipient(full) {
   return modal({
     title: `Transfer ${full}`,
-    body: html`<div class="stack"><p class="muted">They'll find the offer in their settings. Nothing moves until they accept, and the offer ends after 7 days.</p>
+    body: html`<div class="stack"><p class="muted">They'll find the offer in their settings. Nothing moves until they accept, and the offer ends after ${plural(state.instance?.transfer_offer_days ?? 7, 'day')}.</p>
       <div class="field"><label for="tr-to">New owner's username</label><input id="tr-to" class="input" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus></div>
       <div class="field"><label for="tr-typed">Type <b>${full}</b> to confirm</label><input id="tr-typed" class="input" autocomplete="off"></div></div>`,
     foot: html`<button class="btn" data-close>Cancel</button><button class="btn danger" data-ok disabled>Offer it</button>`,
@@ -143,7 +143,7 @@ export default async function (ctx) {
           ? html`Offered to <b>${offer.to}</b>, who can accept or decline it until ${timeEl(offer.expires_at)}.`
           : 'Give this repository to another account. It moves once they accept, with its issues, stars and history, and its old address leads to the new one.'}</div></div>
         ${offer ? html`<button class="btn" id="s-untransfer">Cancel the offer</button>` : html`<button class="btn danger" id="s-transfer">${icon('users', 'sm')} Transfer</button>`}</div>` : ''}
-      <div class="list-row"><div class="grow"><b>Delete this repository</b><div class="muted small">Moves it, with its issues and pull requests, to Recently deleted in your settings for 7 days; after that it's gone for good.</div></div>
+      <div class="list-row"><div class="grow"><b>Delete this repository</b><div class="muted small">Moves it, with its issues and pull requests, to Recently deleted in your settings for ${plural(state.instance?.trash_days ?? 7, 'day')}; after that it's gone for good.</div></div>
         <button class="btn danger" id="s-del">${icon('trash', 'sm')} Delete repository</button></div>
     </div></div>
   </div>`;
@@ -282,7 +282,7 @@ export default async function (ctx) {
       }));
       const del = $('#s-del', el);
       del.addEventListener('click', action(del, async () => {
-        const ok = await confirmDialog({ title: `Delete ${full}?`, text: 'It moves to Recently deleted (Settings → Repositories), where you can restore it for 7 days. After that it and its issues and pull requests are gone for good.', ok: 'Delete this repository', danger: true, typed: full });
+        const ok = await confirmDialog({ title: `Delete ${full}?`, text: `It moves to Recently deleted (Settings → Repositories), where you can restore it for ${plural(state.instance?.trash_days ?? 7, 'day')}. After that it and its issues and pull requests are gone for good.`, ok: 'Delete this repository', danger: true, typed: full });
         if (!ok) return;
         await send('DELETE', api, { confirm: full });
         toast(`Deleted ${full}`);

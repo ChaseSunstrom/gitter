@@ -84,7 +84,7 @@ pub async fn backfill_sizes(st: &AppState) {
     let ids: Vec<i64> = st
         .db
         .call(|c| {
-            let mut s = c.prepare("SELECT id FROM repos WHERE size_bytes = 0")?;
+            let mut s = c.prepare("SELECT id FROM repos WHERE size_bytes = 0 AND deleted_at IS NULL")?;
             Ok(s.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
         })
         .await

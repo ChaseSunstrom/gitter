@@ -1388,6 +1388,17 @@ async fn lifecycle_settings_windows_transfer_flag_and_late_size_refresh() {
     for (who, want) in [(&alice, true), (&admin, true), (&carol, false), (&Client::default(), false)] {
         assert_eq!(app.req(who, "GET", "/api/repos/alice/p", None).await.1["can_transfer"], want);
     }
+    // An organization's repository: its owners see it, its admins don't.
+    let dave = app.signup("dave").await;
+    let erin = app.signup("erin").await;
+    app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await;
+    app.req(&alice, "PUT", "/api/orgs/acme/members/dave", Some(json!({ "role": "owner" }))).await;
+    app.req(&alice, "PUT", "/api/orgs/acme/members/erin", Some(json!({ "role": "admin" }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "o", "owner": "acme" }))).await;
+    for (who, want) in [(&dave, true), (&erin, false)] {
+        let (s, v) = app.req(who, "GET", "/api/repos/acme/o", None).await;
+        assert_eq!((s, &v["can_transfer"]), (StatusCode::OK, &json!(want)), "{v}");
+    }
     // The windows follow the settings.
     let (_, mut cur) = app.req(&admin, "GET", "/api/admin/settings", None).await;
     cur["trash_days"] = json!(2);

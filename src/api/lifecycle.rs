@@ -1,6 +1,6 @@
 //! What happens to repositories and accounts over their life: transfers to
 //! another account (an offer the recipient accepts), the trash (a deleted
-//! repository is kept for a week, then purged), the account data export and
+//! repository is kept for the retention window, then purged), the account data export and
 //! deleting your own account.
 
 use std::path::{Path as FsPath, PathBuf};
@@ -444,11 +444,12 @@ pub async fn restore(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp
             .await?;
         return Err(AppError::internal(format!("restoring repository {id}: {e}")));
     }
+    crate::hooks::refresh_size(&st, id).await;
     record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "repo_restored", detail: format!("{owner}/{name}"), ip: &ip.0 }).await;
     Ok(Json(json!({ "owner": owner, "name": name })))
 }
 
-/// Admins can empty a repository from the trash without waiting the week.
+/// Admins can empty a repository from the trash without waiting out the retention window.
 pub async fn purge_now(State(st): State<AppState>, Admin(me): Admin, _s: Sudo, ip: ClientIp, Path(id): Path<i64>) -> J<Value> {
     if !purge(&st, id, Some(&me), &ip.0).await? {
         return Err(AppError::not_found());
@@ -456,7 +457,7 @@ pub async fn purge_now(State(st): State<AppState>, Admin(me): Admin, _s: Sudo, i
     ok()
 }
 
-/// Hourly: purge repositories trashed over a week ago, and drop expired offers
+/// Hourly: purge repositories trashed past the retention window, and drop expired offers
 /// and exports. Returns how many repositories were purged.
 pub async fn sweep(st: &AppState) -> R<usize> {
     let (t, keep) = (now(), trash_secs(st));
@@ -500,7 +501,7 @@ pub async fn upkeep(st: AppState) {
     }
     loop {
         match sweep(&st).await {
-            Ok(n) if n > 0 => println!("trash: purged {n} repositories deleted over a week ago"),
+            Ok(n) if n > 0 => println!("trash: purged {n} repositories deleted past the retention window"),
             Ok(_) => {}
             Err(e) => eprintln!("trash sweep: {}", e.msg),
         }
@@ -587,12 +588,12 @@ pub async fn delete_me(State(st): State<AppState>, Sudo(u): Sudo, ip: ClientIp, 
 
 /// Start building your data export in the background (one at a time).
 pub async fn start_export(State(st): State<AppState>, Sudo(u): Sudo) -> J<Value> {
-    if let Err(wait) = st.limiter.check(&format!("export:{}", u.id), 10, 86400) {
-        return Err(AppError::slow_down("You've made a lot of exports today. Try again tomorrow.", wait));
-    }
     let uid = u.id;
     let used = st.db.call(move |c| Ok(c.query_row(&format!("SELECT {}", crate::repo::STORAGE_USED), [uid], |r| r.get::<_, i64>(0))?)).await?;
     check_room(super::admin::free_space(&st.cfg.data_dir).await, used.max(0) as u64)?;
+    if let Err(wait) = st.limiter.check(&format!("export:{}", u.id), 10, 86400) {
+        return Err(AppError::slow_down("You've made a lot of exports today. Try again tomorrow.", wait));
+    }
     let (id, old) = st
         .db
         .call(move |c| {

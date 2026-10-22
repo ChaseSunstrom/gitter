@@ -379,7 +379,7 @@ pub async fn remove(
     if !req.confirm.eq_ignore_ascii_case(&r.full_name()) {
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
-    // Into the trash for a week (restorable); the upkeep loop purges it after.
+    // Into the trash for the retention window (restorable); the upkeep loop purges it after.
     super::lifecycle::trash(&st, &r).await?;
     record(&st.db, Event { actor: Some(&u), subject: Some(r.owner_id), action: "repo_deleted", detail: r.full_name(), ip: &ip.0 }).await;
     ok()
