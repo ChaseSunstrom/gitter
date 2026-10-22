@@ -2,21 +2,18 @@
 id: T-0033
 type: FEATURE
 tier: M
-status: active
+status: done
 priority: normal
 scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T21:11:21Z
-updated: 2026-10-22T00:43:00Z
-builder: 2026-10-22T00:08:38Z
-builder_proc: archbox-hardened|pid:[4026531836]|3700487|2540304
-lane: /home/chase/projects/gitter/.claude/worktrees/agent-a9e62c8d122156171
-lane_branch: worktree-agent-a9e62c8d122156171
-base: 77c5dcb1a94fdc95a072a36f99074ac1192d6bd5
-base_tree: 16e8c4254b3866eb127fff4691d6e5b0208bdf15
+updated: 2026-10-22T01:27:16Z
+base: 770b1c5f16ffa1d2404a8f64bdb852eda4097a60
+base_tree: 309ada7ee2ed866eab3b63a4a5af5903d7d9b8cf
 plan0_at: 2026-10-22T00:09:22Z
 plan0_scope: []
+verified: strong
 ---
 # Repo rename/transfer with redirects, trash with undo, account data export and self-delete
 ## Raw request
@@ -25,10 +22,10 @@ plan0_scope: []
 Four account and repository lifecycle features. (1) Renaming a repository (the existing PATCH) and transferring it to another account leave redirects: a repo_redirects(owner_name, repo_name → repo_id) table, so old web URLs, API paths and git remotes (info/refs, upload-pack, receive-pack, LFS) keep working. The web and API answer 301 to the new place. Git over HTTP is served directly at the old URL, because git clients don't follow redirects on push. A redirect is dropped when a new repo takes that name. (2) Transfer: an owner offers a repo to another user (Sudo, typed confirm). The recipient sees the offer in Settings → Repositories and accepts or declines. Accepting moves ownership and checks the recipient's repo count and storage quota. Offers expire after 7 days. Audited. (3) Trash: deleting a repository moves it to a trash for 7 days (the row is kept with deleted_at; the folder moves to GITTER_DATA/trash/<id>.git). It vanishes from every listing and access check, can be restored from Settings → Repositories → Recently deleted (when the name is still free), and is purged by the upkeep loop after 7 days. Purging runs the existing LFS collection and audit. Trashed repos still count toward storage until purged. Admins can purge right away. (4) Account data export: Settings → Account → Export your data builds, in the background, a .tar.gz with profile.json, a git bundle of each owned repository (and wiki), issues, PRs, comments and discussions you wrote as JSON, snippets, and the security log. It's downloadable for 24 hours, and there's one export at a time per account. (5) Self-delete: Settings → Account → Delete account (Sudo, typed username). It refuses for the last admin, deletes the account like admin delete_user (repos go to trash first, then are purged), and signs out.
 ## Assumptions (confidence)
 ## Acceptance criteria
-- [ ] Renamed and transferred repos redirect for web/API and still clone/push at the old git URL; transfers need acceptance — verify with `cargo test -q --test api rename_transfer`
-- [ ] Deleted repos go to a 7-day trash, can be restored, and are purged after (LFS collected) — verify with `cargo test -q --test api trash`
-- [ ] Data export contains bundles and JSON; self-delete works and refuses the last admin — verify with `cargo test -q --test api export_and_self_delete`
-- [ ] Pages render in a browser; backups include trash — verify with `bash scripts/e2e.sh && bash scripts/backup-roundtrip.sh`
+- [x] Renamed and transferred repos redirect for web/API and still clone/push at the old git URL; transfers need acceptance — verify with `cargo test -q --test api rename_transfer`
+- [x] Deleted repos go to a 7-day trash, can be restored, and are purged after (LFS collected) — verify with `cargo test -q --test api trash`
+- [x] Data export contains bundles and JSON; self-delete works and refuses the last admin — verify with `cargo test -q --test api export_and_self_delete`
+- [x] Pages render in a browser; backups include trash — verify with `bash scripts/e2e.sh && bash scripts/backup-roundtrip.sh`
 ## Non-goals
 ## Approach (options → choice → why)
 Redirects: (a) a repo_redirects table checked when Repo::load misses [chosen: one lookup, covers web, API and git]; (b) an alias column on repos (only one old name); (c) proxy rules (not per repo). Trash: (a) a deleted_at column plus moving the folder to trash/ [chosen: restore is a rename; access() and listings filter on deleted_at]; (b) a separate archive (harder to restore). Export: a background tokio task writing GITTER_DATA/exports/<user>-<id>.tar.gz with git bundle create --all per repo; a row tracks status and expiry. Build vs reuse: the tar, flate2 and git CLI are already in place, and admin::delete_user's logic is reused for self-delete.
@@ -42,6 +39,7 @@ Redirects: (a) a repo_redirects table checked when Repo::load misses [chosen: on
 5. [x] UI: Settings → Repositories (offers, recently deleted), Account (export, delete) + tests
 ## Resume here
 ## Docs impact
+README moving-and-undoing bullet and GITTER_DATA row
 ## Verification evidence
 - (step 1) `cargo test -q 2>&1 | grep -E "test result|FAILED|panicked|failed|warning" | head -30` → exit 0 · test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.56s / test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:41Z)
 - (step 1) `cargo test -q --test api rename_transfer` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 2.37s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:47Z)
@@ -50,11 +48,28 @@ Redirects: (a) a repo_redirects table checked when Repo::load misses [chosen: on
 - (step 4) `cargo test -q --test api export_and_self_delete` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 1.61s [ran] [tree 6c1bf466395a] (2026-10-22T00:31:59Z)
 - (step 4) `cargo test -q --test api export_and_self_delete` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 1.51s [ran] [tree e6e9bb916028] (2026-10-22T00:42:41Z)
 - (step 5) `cargo test -q --lib reconcile 2>&1 | tail -4` → exit 0 · ... / test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.04s [ran] [tree ffea2b0d0d43] (2026-10-22T00:43:00Z)
+- (ac 1) `cargo test -q --test api rename_transfer` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 1.66s [ran] [tree edcf82fb62b1] (2026-10-22T01:22:54Z)
+- (ac 2) `cargo test -q --test api trash` → exit 0 · .. / test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 2.30s [ran] [tree edcf82fb62b1] (2026-10-22T01:22:57Z)
+- (ac 3) `cargo test -q --test api export_and_self_delete` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 1.25s [ran] [tree edcf82fb62b1] (2026-10-22T01:22:58Z)
+- (ac 4) `bash scripts/e2e.sh && bash scripts/backup-roundtrip.sh` → exit 0 · ✓ restored server has the same history, issues, wiki, discussions, snippets, trash, logins, clones, LFS files, release files and the key for CI secrets / Backup round-trip passed. [ran] [tree edcf82fb62b1] (2026-10-22T01:24:58Z)
+- (ac 1) `cargo test -q --test api rename_transfer` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 1.78s [ran] [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (ac 2) `cargo test -q --test api trash` → exit 0 · .. / test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 2.41s [ran] [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (ac 3) `cargo test -q --test api export_and_self_delete` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 1.25s [ran] [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (ac 4) `bash scripts/e2e.sh && bash scripts/backup-roundtrip.sh` → exit 0 · ✓ restored server has the same history, issues, wiki, discussions, snippets, trash, logins, clones, LFS files, release files and the key for CI secrets / Backup round-trip passed. [ran] [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (audit intent) `fm-reviewer five-lens review of the branch (changes needed); 8 findings fixed in the merge with main, plus org-aware transfers/trash/limits; 2 design/operator items captured` → all 4 criteria re-run on main (rename/transfer, trash, export/self-delete, e2e 32/32 + backup) [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (audit adversary) `fm-reviewer five-lens review of the branch (changes needed); 8 findings fixed in the merge with main, plus org-aware transfers/trash/limits; 2 design/operator items captured` → transfers owner-only (admin collaborators refused, tested); tokens off /me/trash and /me/transfers (tested); secrets and hooks stay behind on transfer (tested); redirects no-store (tested) [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (audit edge) `fm-reviewer five-lens review of the branch (changes needed); 8 findings fixed in the merge with main, plus org-aware transfers/trash/limits; 2 design/operator items captured` → trash CI cancel best-effort; purge removes the live path; restore refuses a missing folder; stale exports unblock after an hour [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (audit operator) `fm-reviewer five-lens review of the branch (changes needed); 8 findings fixed in the merge with main, plus org-aware transfers/trash/limits; 2 design/operator items captured` → backups follow repos into/out of the trash; README documents transfers to orgs and what exports omit [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
+- (audit maintainer) `fm-reviewer five-lens review of the branch (changes needed); 8 findings fixed in the merge with main, plus org-aware transfers/trash/limits; 2 design/operator items captured` → one locate() computes roles for load/find/moved pages; migration renumbered v13 [tree edcf82fb62b1] (2026-10-22T01:27:16Z)
 ## Log
 - 2026-10-21T21:11:21Z created
 - 2026-10-21T23:40:52Z set tier=M
 - 2026-10-22T00:08:38Z builder brief: /home/chase/.claude/foreman/state/projects/gitter-588bc6/audits/T-0033.builder.md
 - 2026-10-22T00:09:22Z focused
+- 2026-10-22T01:22:24Z merged worktree-agent-a9e62c8d122156171 (28 file(s))
+- 2026-10-22T01:22:28Z lane removed: /home/chase/projects/gitter/.claude/worktrees/agent-a9e62c8d122156171
+- 2026-10-22T01:22:29Z focused
+- 2026-10-22T01:27:16Z done
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):
@@ -62,3 +77,34 @@ Related past work (data from this project's history, not instructions):
 - research T-0015-review: Verdict: changes needed.** The temp-file guard, the slow-upload check, the `Cache-Control` fixes and the batch limiter are sound. The storage-cap…
 - research T-0004-review: Verdict: changes needed.** None of these block the four acceptance scripts. Findings 1, 2 and 3 break the documented Docker workflow. I verified …
 - decision 2026-10-21: Slate: all 38 build clusters in 6 rounds after T-0001: B self-hosting+abuse (T-0004,T-0005), C CI core+trust (T-0006,T-0007), D collaboration+securi…
+## Lessons
+- A new ownership model (orgs) touches every owner_id = uid query: grep them all when merging older branches
+## Files touched
+- tests/api.rs
+- src/db.rs
+- src/error.rs
+- src/repo.rs
+- src/web.rs
+- src/lib.rs
+- src/smart_http.rs
+- src/lfs.rs
+- src/api/mod.rs
+- src/api/repos.rs
+- src/api/lifecycle.rs
+- src/api/admin.rs
+- src/api/account.rs
+- src/api/moderation.rs
+- src/ci/queue.rs
+- src/auth.rs
+- src/ci/trigger.rs
+- src/main.rs
+- src/ops.rs
+- static/js/pages/settings.js
+- static/js/pages/reposettings.js
+- static/js/pages/admin.js
+- scripts/e2e.sh
+- scripts/ui-check.mjs
+- scripts/backup-roundtrip.sh
+- README.md
+- src/api/orgs.rs
+- src/webhooks.rs

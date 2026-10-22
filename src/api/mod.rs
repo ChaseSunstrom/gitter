@@ -9,6 +9,7 @@ pub mod lifecycle;
 pub mod moderation;
 pub mod releases;
 pub mod repos;
+pub mod reviews;
 pub mod security;
 pub mod snippets;
 pub mod webhooks;
@@ -160,6 +161,12 @@ pub fn router() -> Router<AppState> {
         )
         .route(&format!("{repo}/pulls"), post(issues::create_pull))
         .route(&format!("{repo}/pulls/{{n}}/diff"), get(issues::pull_diff))
+        .route(&format!("{repo}/pulls/{{n}}/reviews"), get(reviews::list).post(reviews::submit))
+        .route(&format!("{repo}/pulls/{{n}}/reviews/pending"), delete(reviews::discard))
+        .route(&format!("{repo}/pulls/{{n}}/comments"), post(reviews::comment))
+        .route(&format!("{repo}/pulls/{{n}}/comments/{{id}}"), patch(reviews::edit).delete(reviews::delete))
+        .route(&format!("{repo}/pulls/{{n}}/comments/{{id}}/resolve"), post(reviews::resolve))
+        .route(&format!("{repo}/pulls/{{n}}/comments/{{id}}/apply"), post(reviews::apply))
         .route(
             &format!("{repo}/pulls/{{n}}/merge"),
             post(issues::merge_pull),
@@ -283,11 +290,13 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
     if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
         return true;
     }
-    // Writes: only inside a repository (/repos/{owner}/{repo}/{thing}...), never forking it.
+    // Writes: only inside a repository (/repos/{owner}/{repo}/{thing}...), never forking it,
+    // and never granting access (deploy tokens, collaborators) or giving the repository away:
+    // a leaked token mustn't leave access behind once it's revoked.
     l.scope != crate::auth::Scope::Read
         && segs.len() >= 4
         && segs[0] == "repos"
-        && !matches!(segs[3], "fork" | "deploy-tokens" | "transfer")
+        && !matches!(segs[3], "fork" | "deploy-tokens" | "transfer" | "collaborators")
 }
 
 /// Per-address limits on all API requests, and per-account limits on changes

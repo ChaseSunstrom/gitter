@@ -189,6 +189,11 @@ api GET /repos/bob/hello
 [ "$(jq_ 'd["fork_of"]["name"]')" = hello ] || fail "fork"
 EXPECT=403 api PATCH /repos/alice/hello '{"description":"pwned"}'
 ok "second user: star, fork, can't edit others' repos"
+api POST /repos/alice/hello/pulls/2/comments '{"path":"src/lib.rs","side":"new","line":1,"body":"Looks good here","pending":true}'
+api POST /repos/alice/hello/pulls/2/reviews '{"event":"approve","body":"Ship it"}'
+api GET /repos/alice/hello/pulls/2/reviews
+[ "$(jq_ 'd["summary"]["approved"]')" = "['bob']" ] || fail "review: $BODY"
+ok "code review: a line comment in a review, submitted as an approval"
 JAR="$JAR_A"
 api POST /repos '{"name":"secret","private":true,"readme":true}'
 JAR="$TMP/jar2"

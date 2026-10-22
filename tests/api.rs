@@ -2802,6 +2802,10 @@ async fn collaborators_get_exactly_their_role() {
     let (_, acc) = app.req(&bob, "GET", "/api/repos/alice/p/collaborators", None).await;
     assert!(acc["access"].to_string().contains("can do everything"), "{acc}");
     assert_eq!(acc["collaborators"][0]["username"], "bob");
+    // No token, not even a full-access one, adds collaborators: a leaked token mustn't leave access behind.
+    let (_, t) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "full" }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "PUT", "/api/repos/alice/p/collaborators/root1", &t, Some(json!({ "role": "admin" }))).await, StatusCode::FORBIDDEN);
     // Removing them revokes access; bad roles and organizations are refused.
     assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "god" }))).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/p/collaborators/bob", None).await.0, StatusCode::OK);
@@ -2988,4 +2992,159 @@ async fn transfers_and_trash_follow_org_ownership() {
     app.req(&bob, "DELETE", "/api/repos/acme/proj", Some(json!({ "confirm": "acme/proj" }))).await;
     assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
     assert!(!app.state.cfg.data_dir.join(format!("trash/{id}.git")).exists());
+}
+
+// ---------------------------------------------------------------- code review
+
+/// Commit `content` to `path` on `branch` (or a new branch from it) through the web-edit API.
+async fn put_file(app: &App, c: &Client, branch: &str, new_branch: Option<&str>, path: &str, content: &str) -> String {
+    let mut body = json!({ "branch": branch, "message": format!("Write {path}"), "changes": [{ "path": path, "content": content }] });
+    if let Some(nb) = new_branch {
+        body["new_branch"] = json!(nb);
+    }
+    let (s, v) = app.req(c, "POST", "/api/repos/alice/r/contents", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    v["sha"].as_str().unwrap().to_string()
+}
+
+/// alice/r with a.txt on main and a pull request #1 from `feat` changing it.
+async fn review_fixture(app: &App, alice: &Client) {
+    app.req(alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    put_file(app, alice, "main", None, "a.txt", "one\ntwo\nthree\n").await;
+    put_file(app, alice, "main", Some("feat"), "a.txt", "one\nTWO\nthree\nfour\n").await;
+    let (s, v) = app.req(alice, "POST", "/api/repos/alice/r/pulls", Some(json!({ "title": "Shout", "head": "feat", "base": "main" }))).await;
+    assert_eq!((s, v["number"].as_i64()), (StatusCode::OK, Some(1)), "{v}");
+}
+
+fn threads(v: &Value) -> Vec<Value> {
+    v["threads"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn review_threads_states_and_outdated_comments() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    review_fixture(&app, &alice).await;
+    let pr = "/api/repos/alice/r/pulls/1";
+
+    // A single comment on a line is visible to everyone at once.
+    let (s, c1) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 2, "body": "Why shout?" }))).await;
+    assert_eq!(s, StatusCode::OK, "{c1}");
+    let c1 = c1["id"].as_i64().unwrap();
+    // Comments in a pending review are only for their author until it's submitted.
+    let (s, v) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "start_line": 3, "line": 4, "body": "A range", "pending": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(threads(&app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1).len(), 1);
+    let (_, mine) = app.req(&bob, "GET", &format!("{pr}/reviews"), None).await;
+    assert_eq!((threads(&mine).len(), mine["pending"]["comments"].as_i64()), (2, Some(1)), "{mine}");
+    let t = threads(&mine).into_iter().find(|t| t["line"] == 4).unwrap();
+    assert_eq!((t["start_line"].as_i64(), t["original"].as_str()), (Some(3), Some("three\nfour")), "{t}");
+    // Anchors must exist in the pull request's files.
+    for bad in [json!({ "path": "a.txt", "side": "new", "line": 99, "body": "x" }), json!({ "path": "nope.txt", "side": "new", "line": 1, "body": "x" }),
+        json!({ "path": "a.txt", "side": "up", "line": 1, "body": "x" }), json!({ "path": "a.txt", "side": "new", "line": 2, "start_line": 3, "body": "x" }),
+        json!({ "path": "a.txt", "side": "new", "line": 1, "body": "" })] {
+        assert_eq!(app.req(&bob, "POST", &format!("{pr}/comments"), Some(bad.clone())).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(app.req(&Client::default(), "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 1, "body": "x" }))).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "README.md", "side": "new", "line": 1, "body": "x" }))).await.0, StatusCode::BAD_REQUEST, "only files the PR changes");
+    // Nobody else can see, or reply to, a pending thread.
+    let hidden = threads(&mine).into_iter().find(|t| t["line"] == 4).unwrap()["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments"), Some(json!({ "in_reply_to": hidden, "body": "peek" }))).await.0, StatusCode::BAD_REQUEST);
+
+    // A pending review can be thrown away; the review then has nothing pending.
+    let (_, tmp) = app.req(&carol, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 1, "body": "draft", "pending": true }))).await;
+    assert!(tmp["id"].is_i64());
+    assert_eq!(app.req(&carol, "DELETE", &format!("{pr}/reviews/pending"), None).await.0, StatusCode::OK);
+    assert!(app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1["pending"].is_null());
+    // Reviews: the author can't approve their own; the latest decision per reviewer counts.
+    assert_eq!(app.req(&alice, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "comment" }))).await.0, StatusCode::OK, "the pending comment is enough");
+    assert_eq!(threads(&app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1).len(), 2, "submitted comments are public");
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "comment" }))).await.0, StatusCode::BAD_REQUEST, "an empty review");
+    let (s, v) = app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "request_changes", "body": "Please don't shout" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "request_changes" }))).await.0, StatusCode::BAD_REQUEST, "say what to change");
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    assert_eq!(all["summary"]["changes_requested"], json!(["bob"]), "{all}");
+    let (_, list) = app.req(&carol, "GET", "/api/repos/alice/r/issues?kind=pr&state=open", None).await;
+    assert_eq!(list["items"][0]["review_state"], "changes_requested", "{list}");
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::OK);
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    assert_eq!((all["summary"]["approved"].clone(), all["summary"]["changes_requested"].clone()), (json!(["bob"]), json!([])), "{all}");
+    let (_, issue) = app.req(&carol, "GET", pr.replace("/pulls/", "/issues/").as_str(), None).await;
+    assert_eq!(issue["issue"]["review_state"], "approved", "{issue}");
+
+    // Replies join the thread; the PR's author, the thread's author and writers resolve it.
+    assert_eq!(app.req(&alice, "POST", &format!("{pr}/comments"), Some(json!({ "in_reply_to": c1, "body": "For emphasis" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{c1}/resolve"), Some(json!({ "resolved": true }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "POST", &format!("{pr}/comments/{c1}/resolve"), Some(json!({ "resolved": true }))).await.0, StatusCode::OK);
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    let t1 = threads(&all).into_iter().find(|t| t["id"] == c1).unwrap();
+    assert_eq!((t1["comments"].as_array().unwrap().len(), t1["resolved_by"].as_str()), (2, Some("alice")), "{t1}");
+    // Edits are the author's; deleting a thread's first comment takes the thread.
+    assert_eq!(app.req(&carol, "PATCH", &format!("{pr}/comments/{c1}"), Some(json!({ "body": "pwned" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", &format!("{pr}/comments/{c1}"), Some(json!({ "body": "Why shout, though?" }))).await.0, StatusCode::OK);
+
+    // A push that changes a commented line makes that comment outdated; others stay put.
+    put_file(&app, &alice, "feat", None, "a.txt", "one\nTwo!\nthree\nfour\n").await;
+    let (_, all) = app.req(&carol, "GET", &format!("{pr}/reviews"), None).await;
+    let by_line = |l: i64| threads(&all).into_iter().find(|t| t["line"] == l).unwrap();
+    assert_eq!((by_line(2)["outdated"].as_bool(), by_line(4)["outdated"].as_bool()), (Some(true), Some(false)), "{all}");
+    assert_eq!(app.req(&bob, "DELETE", &format!("{pr}/comments/{c1}"), None).await.0, StatusCode::OK);
+    assert_eq!(threads(&app.req(&carol, "GET", &format!("{pr}/reviews"), None).await.1).len(), 1);
+}
+
+#[tokio::test]
+async fn review_suggestions_apply_as_commits() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    review_fixture(&app, &alice).await;
+    app.req(&alice, "PUT", "/api/repos/alice/r/collaborators/carol", Some(json!({ "role": "write" }))).await;
+    let pr = "/api/repos/alice/r/pulls/1";
+    let suggest = |line: i64, text: &str| json!({ "path": "a.txt", "side": "new", "line": line, "body": format!("Try:\n```suggestion\n{text}\n```") });
+    let (_, s1) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(suggest(2, "Two"))).await;
+    let s1 = s1["id"].as_i64().unwrap();
+    let (_, s2) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(suggest(3, "Three"))).await;
+    let s2 = s2["id"].as_i64().unwrap();
+    let (_, plain) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "a.txt", "side": "new", "line": 1, "body": "no suggestion" }))).await;
+
+    // What the applier saw: the comment's updated_at, so an edit since is refused.
+    let seen = |id: i64| {
+        let app = &app;
+        let carol = carol.clone();
+        async move {
+            let (_, all) = app.req(&carol, "GET", "/api/repos/alice/r/pulls/1/reviews", None).await;
+            let t = threads(&all).into_iter().find(|t| t["id"] == id).unwrap();
+            json!({ "updated_at": t["comments"][0]["updated_at"] })
+        }
+    };
+    // Only people who can push to the head branch apply suggestions.
+    assert_eq!(app.req(&bob, "POST", &format!("{pr}/comments/{s1}/apply"), Some(seen(s1).await)).await.0, StatusCode::FORBIDDEN);
+    let pid = plain["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{pid}/apply"), Some(seen(pid).await)).await.0, StatusCode::BAD_REQUEST, "nothing to apply");
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{s1}/apply"), Some(json!({ "updated_at": 1 }))).await.0, StatusCode::CONFLICT, "edited since it was read");
+    let (s, v) = app.req(&carol, "POST", &format!("{pr}/comments/{s1}/apply"), Some(seen(s1).await)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, text, _) = raw_get(&app, "/raw/alice/r/feat/a.txt").await;
+    assert_eq!(text, "one\nTwo\nthree\nfour\n");
+    let (_, all) = app.req(&bob, "GET", &format!("{pr}/reviews"), None).await;
+    let t = threads(&all).into_iter().find(|t| t["id"] == s1).unwrap();
+    assert_eq!(t["resolved_by"], "carol", "applying resolves the thread: {t}");
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{s1}/apply"), Some(seen(s1).await)).await.0, StatusCode::CONFLICT, "applied already");
+    // A suggestion whose lines changed since is refused rather than applied on top.
+    let s2_seen = seen(s2).await;
+    put_file(&app, &alice, "feat", None, "a.txt", "one\nTwo\n3\nfour\n").await;
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{s2}/apply"), Some(s2_seen)).await.0, StatusCode::CONFLICT);
+    // Only the suggested lines change: a CRLF file keeps its line endings.
+    put_file(&app, &alice, "feat", None, "w.txt", "x\r\ny\r\nz\r\n").await;
+    let (s, w) = app.req(&bob, "POST", &format!("{pr}/comments"), Some(json!({ "path": "w.txt", "side": "new", "line": 2, "body": "```suggestion\nY\n```" }))).await;
+    assert_eq!(s, StatusCode::OK, "{w}");
+    let wid = w["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{wid}/apply"), Some(seen(wid).await)).await.0, StatusCode::OK);
+    let (_, text, _) = raw_get(&app, "/raw/alice/r/feat/w.txt").await;
+    assert_eq!(text, "x\r\nY\r\nz\r\n");
 }
