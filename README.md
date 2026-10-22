@@ -149,6 +149,24 @@ Turning CI off stops new runs, re-runs and queued jobs.
 
 **Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts are deleted 30 days after their job, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
 
+**Run it locally.** `gitter ci run` runs `.gitter/ci.yml` on your machine with the same parser and step runner, no server needed. Jobs run one at a time in `needs` order, and a job whose needs failed is skipped. Each job gets a fresh copy of the work tree as it is now: tracked files and untracked ones that aren't ignored, without `.git`. Use `--here` to run in the folder itself, for example when steps need git history. `HOME` is a fresh folder, and no secrets are set. Triggers, `paths` and `runs-on` don't apply, and jobs with an `image` need docker. It exits 1 when a job fails.
+
+## Command-line client
+
+The same `gitter` binary is a client for any Gitter server, like `gh`:
+
+```sh
+gitter login https://git.example.com       # asks for an access token (or --token, or GITTER_TOKEN)
+gitter repo create notes --private && gitter repo clone alice/notes && cd notes
+gitter issue create --title "Crash on start" --body "…"
+git switch -c fix && git commit -am "Fix the crash"
+gitter pr create                           # pushes the branch first, then opens the pull request
+gitter pr list; gitter pr checkout 7; gitter pr merge 7 --method squash
+gitter ci status; gitter ci logs 12        # follows a running job; gitter ci rerun 12
+```
+
+`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name`. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter <command> --help` lists every command.
+
 ## Webhooks
 
 A repository's admins add webhooks under **Settings → Webhooks** (signed in on the web, with a recent password confirmation). Each event is a `POST` of JSON to the payload URL with these headers:

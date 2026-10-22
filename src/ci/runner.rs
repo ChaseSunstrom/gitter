@@ -451,7 +451,7 @@ async fn run_job(r: &Runner, l: Lease) {
     };
     let deadline = Instant::now() + Duration::from_secs(l.job.timeout_secs.max(1));
     let groups = Groups::default();
-    let (success, code) = steps(&b, &l, &ws, &home, &tx, &stop, deadline, &groups).await;
+    let (success, code) = steps(Some(b.source(&l)), &l, &ws, &home, &tx, &stop, deadline, &groups).await;
     kill_groups(&groups).await;
     if success && !l.job.artifacts.is_empty() && !halted(&stop) {
         pack_artifacts(&b, &l, &ws, &r.work, &tx).await;
@@ -473,47 +473,49 @@ async fn run_job(r: &Runner, l: Lease) {
     }
 }
 
-/// Check out the commit, then run the steps until one fails.
+/// Check out the commit from `source` (`Backend::source`; None: the workspace
+/// is ready), then run the steps until one fails.
 #[allow(clippy::too_many_arguments)]
-async fn steps(b: &Backend, l: &Lease, ws: &Path, home: &Path, tx: &mpsc::Sender<Msg>, stop: &AtomicBool, deadline: Instant, groups: &Groups) -> (bool, Option<i32>) {
-    let (src, config_key, config_value) = b.source(l);
-    note(tx, "90", &format!("Checking out {} at {}", l.repo, &l.sha[..l.sha.len().min(12)])).await;
-    let git = |args: &[&str]| {
-        let mut c = Command::new("git");
-        c.args(args).current_dir(ws).env_clear();
-        for k in ["PATH", "LANG"] {
-            if let Ok(v) = std::env::var(k) {
-                c.env(k, v);
-            }
-        }
-        c.env("HOME", home)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_LFS_SKIP_SMUDGE", "1")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", config_key)
-            .env("GIT_CONFIG_VALUE_0", &config_value);
-        c
-    };
-    for args in [
-        vec!["init", "-q"],
-        vec!["fetch", "-q", "--no-tags", "--depth=1", &src, &l.sha],
-        vec!["checkout", "-q", "--detach", "FETCH_HEAD"],
-    ] {
-        match run(git(&args), tx, stop, deadline, None, groups).await {
-            Ok(0) => {}
-            Ok(c) => {
-                note(tx, "31", &format!("git {} failed", args[0])).await;
-                for i in 0..l.job.steps.len() {
-                    let _ = tx.send(Msg::Step(i, "skipped")).await;
+async fn steps(source: Option<(String, &'static str, String)>, l: &Lease, ws: &Path, home: &Path, tx: &mpsc::Sender<Msg>, stop: &AtomicBool, deadline: Instant, groups: &Groups) -> (bool, Option<i32>) {
+    if let Some((src, config_key, config_value)) = source {
+        note(tx, "90", &format!("Checking out {} at {}", l.repo, &l.sha[..l.sha.len().min(12)])).await;
+        let git = |args: &[&str]| {
+            let mut c = Command::new("git");
+            c.args(args).current_dir(ws).env_clear();
+            for k in ["PATH", "LANG"] {
+                if let Ok(v) = std::env::var(k) {
+                    c.env(k, v);
                 }
-                return (false, Some(c));
             }
-            Err(Stopped::TimedOut) => {
-                note(tx, "31", "The job ran out of time while checking out.").await;
-                return (false, Some(-1));
+            c.env("HOME", home)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_LFS_SKIP_SMUDGE", "1")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", config_key)
+                .env("GIT_CONFIG_VALUE_0", &config_value);
+            c
+        };
+        for args in [
+            vec!["init", "-q"],
+            vec!["fetch", "-q", "--no-tags", "--depth=1", &src, &l.sha],
+            vec!["checkout", "-q", "--detach", "FETCH_HEAD"],
+        ] {
+            match run(git(&args), tx, stop, deadline, None, groups).await {
+                Ok(0) => {}
+                Ok(c) => {
+                    note(tx, "31", &format!("git {} failed", args[0])).await;
+                    for i in 0..l.job.steps.len() {
+                        let _ = tx.send(Msg::Step(i, "skipped")).await;
+                    }
+                    return (false, Some(c));
+                }
+                Err(Stopped::TimedOut) => {
+                    note(tx, "31", "The job ran out of time while checking out.").await;
+                    return (false, Some(-1));
+                }
+                Err(Stopped::Cancelled) => return (false, None),
             }
-            Err(Stopped::Cancelled) => return (false, None),
         }
     }
     let env = job_env(l, ws, home);
@@ -643,6 +645,31 @@ async fn pack_artifacts(b: &Backend, l: &Lease, ws: &Path, work: &Path, tx: &mps
         Err(e) => note(tx, "31", &format!("Couldn't pack the artifacts: {e}")).await,
     }
     let _ = tokio::fs::remove_file(&out).await;
+}
+
+/// `gitter ci run`: one job's steps in `ws` (already holding the files), with
+/// the output on stdout. Stops when `SHUTDOWN` is set. (success, exit code)
+pub async fn run_here(l: &Lease, ws: &Path, home: &Path) -> (bool, Option<i32>) {
+    let (tx, mut rx) = mpsc::channel::<Msg>(256);
+    let printer = tokio::spawn(async move {
+        use std::io::Write;
+        while let Some(m) = rx.recv().await {
+            let mut out = std::io::stdout().lock();
+            let _ = match m {
+                Msg::Out(d) => out.write_all(&d),
+                Msg::Note(t) => out.write_all(t.as_bytes()),
+                Msg::Step(..) => Ok(()),
+            };
+            let _ = out.flush();
+        }
+    });
+    let groups = Groups::default();
+    let deadline = Instant::now() + Duration::from_secs(l.job.timeout_secs.max(1));
+    let res = steps(None, l, ws, home, &tx, &AtomicBool::new(false), deadline, &groups).await;
+    kill_groups(&groups).await;
+    drop(tx);
+    let _ = printer.await;
+    res
 }
 
 /// Ask every running job to stop and wait (up to `limit`) until they have.
