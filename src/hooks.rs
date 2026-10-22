@@ -17,6 +17,8 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     record_pushers(st, repo.id, user.id, updates).await;
     crate::ci::trigger::on_push(st, repo, user.id, updates).await;
     crate::webhooks::push(st, repo, user.id, updates).await;
+    // A queued pull request's branch, or the branch it's tested against, may have moved.
+    crate::mergequeue::kick(st, repo.id);
 }
 
 /// Who moved each branch last (a scheduled run counts as theirs). A deleted

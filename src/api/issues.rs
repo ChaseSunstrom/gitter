@@ -510,19 +510,25 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
     status["can_ff"] = json!(mb.as_deref() == Some(b.as_str()));
     // What the branch rules still ask for, the checks on the head, and auto-merge.
     let gate = crate::protect::gate(st, r, iid, &base_b, &h).await?;
-    let auto: Option<(String, Option<String>)> = st
+    let (auto, queue): (Option<(String, Option<String>)>, Option<serde_json::Value>) = st
         .db
         .call(move |c| {
-            Ok(c.query_row("SELECT p.auto_merge, u.username FROM pulls p LEFT JOIN users u ON u.id = p.auto_merge_by WHERE p.issue_id = ?1 AND p.auto_merge IS NOT NULL", [iid], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?)
+            let auto = c
+                .query_row("SELECT p.auto_merge, u.username FROM pulls p LEFT JOIN users u ON u.id = p.auto_merge_by WHERE p.issue_id = ?1 AND p.auto_merge IS NOT NULL", [iid], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            Ok((auto, crate::mergequeue::position(c, iid)?))
         })
         .await?;
+    // A queue runs the checks on its own commit, so they don't hold the pull request back here.
+    let queued = gate.rule.as_ref().is_some_and(|x| x.merge_queue);
+    let blocked: Vec<&String> = gate.missing.iter().filter(|m| !queued || !gate.missing_checks.contains(m)).collect();
     status["checks"] = json!(gate.checks);
     status["checks_state"] = json!(crate::protect::combined(&gate.checks));
     status["rule"] = json!(gate.rule);
-    status["blocked"] = json!(gate.missing);
+    status["blocked"] = json!(blocked);
+    status["queue"] = json!(queue);
     status["can_bypass"] = json!(gate.can_bypass);
     status["auto_merge"] = json!(auto.map(|(m, by)| json!({ "method": m, "by": by })));
     Ok(status)
@@ -1014,6 +1020,13 @@ fn default_method() -> String {
     "merge".into()
 }
 
+impl MergeReq {
+    /// A merge made by the merge queue, of head `head` only.
+    pub(crate) fn queued(method: &str, head: &str) -> MergeReq {
+        MergeReq { method: method.into(), title: None, message: None, delete_branch: false, bypass_rules: false, expect_head: Some(head.into()), ip: String::new() }
+    }
+}
+
 pub async fn merge_pull(
     State(st): State<AppState>,
     Authed(u): Authed,
@@ -1033,6 +1046,29 @@ pub(crate) async fn merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i
 }
 
 async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq) -> R<serde_json::Value> {
+    let delete_branch = req.delete_branch;
+    let plan = prepare_merge(st, r, u, num, req, false).await?;
+    let sha = plan.new_sha.clone();
+    land_merge(st, r, u, plan, delete_branch).await?;
+    Ok(json!({ "sha": sha }))
+}
+
+/// A merge worked out but not landed: the commit the base branch would move to.
+pub(crate) struct MergePlan {
+    pub issue_id: i64,
+    pub num: i64,
+    pub title: String,
+    pub head_b: String,
+    pub base_b: String,
+    pub head: String,
+    pub base: String,
+    pub new_sha: String,
+}
+
+/// Check a merge may happen and make its commit (nothing moves yet). `queued`:
+/// for the merge queue, which checks the commit it makes rather than the head,
+/// so only the rule's other requirements (approvals) are looked at here.
+pub(crate) async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq, queued: bool) -> R<MergePlan> {
     let issue = load_issue(st, r, num, Some(u)).await?;
     if !issue.is_pr {
         return Err(AppError::not_found());
@@ -1058,11 +1094,22 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
         return Err(AppError::conflict("The source branch moved on"));
     }
     let gate = crate::protect::gate(st, r, issue.id, &base_b, &head).await?;
+    let missing: Vec<String> = gate.missing.iter().filter(|m| !queued || !gate.missing_checks.contains(m)).cloned().collect();
+    // Only an admin the rule isn't enforced on may skip the queue.
+    let skip_queue = gate.rule.as_ref().is_some_and(|x| x.merge_queue) && !queued;
+    if skip_queue && !(req.bypass_rules && gate.can_bypass) {
+        return Err(AppError::conflict(format!("{base_b} uses a merge queue: add this pull request to the queue")));
+    }
+    let gate = crate::protect::Gate { missing, ..gate };
     if !gate.missing.is_empty() && !(gate.can_bypass && req.bypass_rules) {
         return Err(AppError::conflict(format!("Merging is blocked: {}", gate.missing.join("; "))));
     }
-    if !gate.missing.is_empty() {
-        let detail = format!("{} merged {}#{num} past its branch rules ({})", u.username, r.full_name(), gate.missing.join("; "));
+    if !gate.missing.is_empty() || skip_queue {
+        let mut why = gate.missing.clone();
+        if skip_queue {
+            why.push("skipped the merge queue".into());
+        }
+        let detail = format!("{} merged {}#{num} past its branch rules ({})", u.username, r.full_name(), why.join("; "));
         crate::security::record(&st.db, crate::security::Event { actor: Some(u), subject: Some(u.id), action: "branch_rule_bypass", detail, ip: &req.ip }).await;
     }
     let (an, ae) = u.signature();
@@ -1121,10 +1168,17 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
         }
         _ => return Err(AppError::bad("Unknown merge method")),
     };
+    Ok(MergePlan { issue_id: issue.id, num, title: issue.title, head_b, base_b, head, base, new_sha })
+}
+
+/// Move the base branch to the plan's commit (only if it's still where the plan
+/// found it) and record the pull request as merged by `u`.
+pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: MergePlan, delete_branch: bool) -> R<()> {
+    let MergePlan { issue_id, num, title, head_b, base_b, head, base, new_sha } = plan;
     // Move the branch and record the merge in a task of its own, so a client
     // that disconnects halfway can't leave the branch moved and the PR open.
     let (st2, path, full) = (st.clone(), r.path.clone(), r.full_name());
-    let (iid, uid) = (issue.id, u.id);
+    let (iid, uid) = (issue_id, u.id);
     let (hs, bs, ms) = (head.clone(), base.clone(), new_sha.clone());
     let base_ref = format!("refs/heads/{base_b}");
     tokio::spawn(async move {
@@ -1161,30 +1215,21 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
     .await
     .map_err(AppError::internal)??;
     touch(&st.db, r.id, true).await?;
-    record_event(
-        &st.db,
-        u.id,
-        Some(r.id),
-        "merge",
-        &issue.title,
-        &num.to_string(),
-        1,
-    )
-    .await?;
+    record_event(&st.db, u.id, Some(r.id), "merge", &title, &num.to_string(), 1).await?;
     let upd = RefUpdate {
         refname: format!("refs/heads/{base_b}"),
         old: Some(base),
         new: Some(new_sha.clone()),
     };
     crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
-    notify(st, r.id, Thread::Issue(issue.id), u.id, "").await;
+    notify(st, r.id, Thread::Issue(issue_id), u.id, "").await;
     crate::hooks::on_push(st, r, u, &[upd]).await;
-    if req.delete_branch && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
+    if delete_branch && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
         let _ = st
             .git
             .delete_ref(&r.path, &format!("refs/heads/{head_b}"))
             .await;
         crate::hooks::forget_branches(st, r.id, vec![head_b.clone()]).await;
     }
-    Ok(json!({ "sha": new_sha }))
+    Ok(())
 }

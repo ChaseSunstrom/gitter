@@ -500,7 +500,12 @@ pub struct ReadAllReq {
 
 pub async fn read_all(State(st): State<AppState>, Authed(u): Authed, Json(req): Json<ReadAllReq>) -> J<Value> {
     person(&u)?;
-    let (ro, rn) = split_repo(req.repo.as_deref().filter(|s| !s.is_empty()));
+    let named = req.repo.as_deref().filter(|s| !s.is_empty());
+    let (ro, rn) = split_repo(named);
+    // A repository named wrong must not mean "all of them".
+    if named.is_some() && ro.is_none() {
+        return Err(AppError::bad("repo is owner/name"));
+    }
     let uid = u.id;
     st.db
         .call(move |c| {

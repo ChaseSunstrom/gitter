@@ -101,7 +101,11 @@ async fn participants_mentions_assignees_and_watchers_get_one_notification_per_t
     comment(&app, &carol, "alice/p", n, "Looking").await;
     assert_eq!(inbox(&app, &dave, "").await[0]["reason"], "subscribed");
 
-    // Ignoring a repository silences it, mentions included.
+    // Ignoring a repository silences it, mentions included. (A repository named wrong marks nothing.)
+    let before = count(&app, &dave).await;
+    assert!(before > 0);
+    assert_eq!(app.req(&dave, "POST", "/api/notifications/read", Some(json!({ "repo": "nope" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(count(&app, &dave).await, before);
     ok(&app, &dave, "POST", "/api/notifications/read", Some(json!({ "repo": "alice/p" }))).await;
     ok(&app, &dave, "PUT", "/api/repos/alice/p/subscription", Some(json!({ "level": "ignoring" }))).await;
     assert_eq!(ok(&app, &dave, "GET", "/api/repos/alice/p/subscription", None).await["level"], "ignoring");

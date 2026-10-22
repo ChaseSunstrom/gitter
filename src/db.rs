@@ -777,7 +777,27 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX osv_affected_pkg ON osv_affected(ecosystem, name);
     CREATE INDEX osv_affected_vuln ON osv_affected(vuln_id);
     "#,
-    // v24: notifications, one row per thread per person (`thread` is "issue:<id>",
+    // v24: the merge queue. An entry is tested on a commit made on top of the base
+    // (kept at refs/gitter-queue/<id>); it lands only if that exact commit passes.
+    r#"
+    ALTER TABLE branch_rules ADD COLUMN merge_queue INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE merge_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        issue_id INTEGER NOT NULL UNIQUE REFERENCES issues(id) ON DELETE CASCADE,
+        base TEXT NOT NULL,
+        method TEXT NOT NULL,
+        added_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        head_sha TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'queued',
+        test_sha TEXT,
+        tested_base TEXT,
+        started_at INTEGER,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX merge_queue_repo ON merge_queue(repo_id, base, id);
+    "#,
+    // v25: notifications, one row per thread per person (`thread` is "issue:<id>",
     // "discussion:<id>" or "run:<id>"; the id columns make rows go with their thread, so a
     // reused id never inherits them). thread_subscriptions are explicit choices
     // (subscribed 0 = unsubscribed); repo_watches levels are 'watching' or 'ignoring'
@@ -799,6 +819,8 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE(user_id, thread)
     );
     CREATE INDEX notifications_inbox ON notifications(user_id, done, unread, updated_at);
+    -- The inbox sorts read and unread together.
+    CREATE INDEX notifications_recent ON notifications(user_id, done, updated_at);
     -- For the cascades: without them every deleted repo, issue, discussion, run or account scans the table.
     CREATE INDEX notifications_repo ON notifications(repo_id);
     CREATE INDEX notifications_issue ON notifications(issue_id);

@@ -26,11 +26,12 @@ function askRecipient(full) {
 }
 
 const ruleText = (r) => [
-  r.require_pr ? 'pull requests only' : 'direct pushes allowed',
+  r.require_pr || r.merge_queue ? 'pull requests only' : 'direct pushes allowed',
   r.approvals ? `${r.approvals} approval${r.approvals > 1 ? 's' : ''}` : '',
   r.checks.length ? `checks: ${r.checks.join(', ')}` : '',
   r.allow_force_push ? 'force-pushes allowed' : 'no force-pushes',
   r.allow_deletion ? 'can be deleted' : "can't be deleted",
+  r.merge_queue ? 'merge queue' : '',
   r.enforce_admins ? 'admins too' : '',
 ].filter(Boolean).join(' · ');
 
@@ -39,6 +40,7 @@ const ruleFields = (r = {}) => html`<div class="field"><label>Branch pattern</la
   <div class="row wrap-ok" style="gap:12px;align-items:flex-start">
     <div class="field" style="width:180px"><label>Approvals needed</label><input class="input" type="number" min="0" max="10" name="approvals" value="${r.approvals || 0}"><span class="hint">From people with write access.</span></div>
     <div class="field grow"><label>Checks that must pass</label><input class="input mono" name="checks" value="${(r.checks || []).join(', ')}" placeholder="test, lint" spellcheck="false"><span class="hint">CI job names or commit status contexts, comma-separated.</span></div></div>
+  <label class="check small"><input type="checkbox" name="merge_queue" ${r.merge_queue ? 'checked' : ''}> Merge through a queue (one at a time, each tested on top of the branch first)</label>
   <label class="check small"><input type="checkbox" name="allow_force_push" ${r.allow_force_push ? 'checked' : ''}> Allow force-pushes</label>
   <label class="check small"><input type="checkbox" name="allow_deletion" ${r.allow_deletion ? 'checked' : ''}> Allow deleting the branch</label>
   <label class="check small"><input type="checkbox" name="enforce_admins" ${r.enforce_admins ? 'checked' : ''}> Apply to admins too (otherwise they can bypass)</label>`;
@@ -47,6 +49,7 @@ const readRule = (f) => ({
   pattern: f.pattern.value.trim(), require_pr: f.require_pr.checked, approvals: +f.approvals.value || 0,
   checks: f.checks.value.split(',').map((s) => s.trim()).filter(Boolean),
   allow_force_push: f.allow_force_push.checked, allow_deletion: f.allow_deletion.checked, enforce_admins: f.enforce_admins.checked,
+  merge_queue: f.merge_queue.checked,
 });
 
 export default async function (ctx) {
