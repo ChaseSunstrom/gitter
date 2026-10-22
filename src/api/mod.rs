@@ -10,6 +10,7 @@ pub mod releases;
 pub mod repos;
 pub mod security;
 pub mod snippets;
+pub mod webhooks;
 pub mod wiki;
 
 use std::net::SocketAddr;
@@ -156,6 +157,14 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/status"), get(ci::statuses))
         .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
         .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
+        .route(&format!("{repo}/hooks"), get(webhooks::list).post(webhooks::create))
+        .route(
+            &format!("{repo}/hooks/{{id}}"),
+            get(webhooks::show).patch(webhooks::update).delete(webhooks::remove),
+        )
+        .route(&format!("{repo}/hooks/{{id}}/ping"), post(webhooks::ping))
+        .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}"), get(webhooks::delivery))
+        .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}/redeliver"), post(webhooks::redeliver))
         .route(&format!("{repo}/releases"), get(releases::list).post(releases::create))
         .route(&format!("{repo}/releases/latest"), get(releases::latest))
         .route(
@@ -258,11 +267,15 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
     if ACCOUNT_ROUTES.iter().any(|p| path == *p || path.starts_with(&format!("{p}/"))) {
         return false;
     }
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // Webhooks are the repository's configuration, and their URLs can hold credentials.
+    if segs.len() >= 4 && segs[0] == "repos" && segs[3] == "hooks" {
+        return false;
+    }
     if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
         return true;
     }
     // Writes: only inside a repository (/repos/{owner}/{repo}/{thing}...), never forking it.
-    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
     l.scope != crate::auth::Scope::Read
         && segs.len() >= 4
         && segs[0] == "repos"

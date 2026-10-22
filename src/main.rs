@@ -186,6 +186,7 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
     }
     tokio::spawn(gitter::ci::upkeep(st.clone()));
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));
+    tokio::spawn(gitter::webhooks::run(st.clone()));
     let st2 = st.clone();
     tokio::spawn(async move {
         st2.git.sweep().await;

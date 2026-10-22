@@ -30,6 +30,7 @@ const ROUTES = [
   ['/:owner/:repo/pull/:n/:tab', 'issue', { kind: 'pr' }],
   ['/:owner/:repo/ci', 'ci'], ['/:owner/:repo/ci/:n', 'ci'],
   ['/:owner/:repo/labels', 'labels'], ['/:owner/:repo/settings', 'reposettings'],
+  ['/:owner/:repo/settings/hooks/new', 'webhook', { create: true }], ['/:owner/:repo/settings/hooks/:id', 'webhook'],
   ['/:owner/:repo/insights', 'insights'], ['/:owner/:repo/search', 'search'],
   ['/:owner/:repo/wiki', 'wiki', { view: 'page' }], ['/:owner/:repo/wiki/_new', 'wiki', { view: 'edit', create: true }],
   ['/:owner/:repo/wiki/:page', 'wiki', { view: 'page' }], ['/:owner/:repo/wiki/:page/edit', 'wiki', { view: 'edit' }],

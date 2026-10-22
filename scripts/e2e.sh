@@ -16,7 +16,7 @@ ok() { pass=$((pass + 1)); echo "✓ $*"; }
 cargo build -q
 GITTER_DATA="$TMP/data" GITTER_ADDR="127.0.0.1:$PORT" GITTER_URL="$BASE" ./target/debug/gitter >"$LOG" 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; rm -rf "$TMP"' EXIT
+trap 'kill $PID ${HOOK_PID:-} 2>/dev/null; rm -rf "$TMP"' EXIT
 for _ in $(seq 50); do curl -sf "$BASE/robots.txt" >/dev/null && break; sleep 0.1; done
 SETUP=$(grep -o 'setup=[A-Za-z0-9_-]*' "$LOG" | head -1 | cut -d= -f2)
 [ -n "$SETUP" ] || fail "first boot should print a setup link"
@@ -293,6 +293,46 @@ curl -sf -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/log" | grep -q 'hel
 curl -sf -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/artifacts" -o "$TMP/art.tgz" && tar -tzf "$TMP/art.tgz" | grep -q 'src/main.rs' || fail "CI artifacts"
 curl -sf -N -m 5 -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/log/stream" | grep -q 'event: status' || fail "CI log stream"
 ok "CI: a push runs jobs in order on the built-in runner, with log, live stream and artifacts"
+
+# --- webhooks: a local receiver gets a signed ping and an issue event (private addresses need the admin's say-so)
+HOOK_LOG="$TMP/hook.log"
+python3 -c '
+import http.server, json, sys
+log = open(sys.argv[1], "a")
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        log.write(json.dumps({"headers": {k.lower(): v for k, v in self.headers.items()}, "body": body.decode()}) + "\n"); log.flush()
+        self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[2], "w").write(str(s.server_port))
+s.serve_forever()
+' "$HOOK_LOG" "$TMP/hook.port" &
+HOOK_PID=$!
+for _ in $(seq 50); do [ -s "$TMP/hook.port" ] && break; sleep 0.1; done
+HOOK_URL="http://127.0.0.1:$(cat "$TMP/hook.port")/hook"
+api POST /repos/alice/hello/hooks "{\"url\":\"$HOOK_URL\",\"secret\":\"e2e-secret\",\"events\":[\"issues\"],\"allow_private\":true}"
+HOOK_ID=$(jq_ 'd["id"]')
+api POST /repos/alice/hello/issues '{"title":"Hooked","body":"Sent to a webhook"}'
+for _ in $(seq 100); do [ "$(grep -c . "$HOOK_LOG" 2>/dev/null)" -ge 2 ] && break; sleep 0.1; done
+python3 - "$HOOK_LOG" <<'PY' || fail "webhook deliveries: $(cat "$HOOK_LOG")"
+import hashlib, hmac, json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert sorted(r["headers"]["x-gitter-event"] for r in rows) == ["issues", "ping"], rows
+for r in rows:
+    want = "sha256=" + hmac.new(b"e2e-secret", r["body"].encode(), hashlib.sha256).hexdigest()
+    assert r["headers"]["x-gitter-signature-256"] == want, r["headers"]
+issue = next(json.loads(r["body"]) for r in rows if r["headers"]["x-gitter-event"] == "issues")
+assert issue["action"] == "opened" and issue["issue"]["title"] == "Hooked", issue
+PY
+for _ in $(seq 50); do
+  api GET "/repos/alice/hello/hooks/$HOOK_ID"
+  [ "$(jq_ '[x["status"] for x in d["deliveries"]]')" = "['ok', 'ok']" ] && break
+  sleep 0.1
+done
+[ "$(jq_ '[x["status"] for x in d["deliveries"]]')" = "['ok', 'ok']" ] || fail "webhook delivery log: $BODY"
+ok "webhooks: a local receiver gets a signed ping and issue event, and the delivery log shows both"
 
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")

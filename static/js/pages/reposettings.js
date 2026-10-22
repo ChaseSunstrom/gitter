@@ -1,8 +1,9 @@
-// Repository settings: name, description, website, default branch, visibility, delete.
+// Repository settings: name, description, website, default branch, access, deploy tokens, CI secrets, webhooks, visibility, delete.
 import { html, get, send, toast, action, confirmDialog, timeEl, avatar, $ } from '../lib.js';
 import { icon } from '../icons.js';
-import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
+import { loadRepo, repoUrl, repoPage, mountRepoHeader, ciIcon } from '../repohead.js';
 import { navigate } from '../main.js';
+import { eventsLabel, deliveryState } from './webhook.js';
 
 const ROLES = [['read', 'Read'], ['write', 'Write'], ['admin', 'Admin']];
 
@@ -11,10 +12,11 @@ export default async function (ctx) {
   if (!meta.can_admin) throw Object.assign(new Error('Only admins of this repository can change its settings'), { status: 403 });
   const api = repoUrl(meta.owner, meta.name);
   const full = `${meta.owner}/${meta.name}`;
-  const [access, deploy, secrets] = await Promise.all([
+  const [access, deploy, secrets, hooks] = await Promise.all([
     get(`${api}/collaborators`, { fresh: true }),
     get(`${api}/deploy-tokens`, { fresh: true }).then((d) => d.tokens),
     get(`${api}/ci/secrets`, { fresh: true }).then((d) => d.secrets),
+    get(`${api}/hooks`, { fresh: true }).then((d) => d.hooks),
   ]);
   const body = html`<div class="mid stack" style="max-width:820px">
     <form class="box" id="general"><div class="box-head"><b>General</b></div><div class="box-body settings-sec">
@@ -66,6 +68,15 @@ export default async function (ctx) {
           <div class="small muted">Updated ${timeEl(s.updated_at)}</div></div>
         <button class="btn sm danger" data-sec-del="${s.name}">Delete</button></div>`)}</div>` : ''}
     </div></div>
+
+    <div class="box" id="hooks"><div class="box-head"><b>Webhooks</b><span class="grow"></span><a class="btn sm" href="/${full}/settings/hooks/new">${icon('plus', 'sm')} Add webhook</a></div>
+      <div class="box-body"><p class="muted small">Gitter sends a signed POST to each URL when something happens here: pushes, issues, comments, pull requests and finished CI runs.</p></div>
+      ${hooks.length ? html`<div class="list">${hooks.map((h) => {
+        const [ic, words] = h.last ? deliveryState(h.last) : [ciIcon('pending'), 'Nothing sent yet'];
+        return html`<a class="list-row" href="/${full}/settings/hooks/${h.id}">${ic}<div class="grow"><b class="mono">${h.url}</b>
+          <div class="small muted">${eventsLabel(h.events)}${h.active ? '' : ' · Turned off'} · ${h.last?.at ? html`Last delivery ${timeEl(h.last.at)}: ` : ''}${words}</div></div>${icon('chev-right', 'sm muted')}</a>`;
+      })}</div>` : ''}
+    </div>
 
     <div class="box danger-zone"><div class="box-head"><b class="c-red">Danger zone</b></div><div class="list">
       <div class="list-row"><div class="grow"><b>Change visibility</b><div class="muted small">This repository is <b>${meta.private ? 'private' : 'public'}</b>. ${meta.private ? 'Making it public lets anyone see and clone it.' : 'Making it private hides it from everyone without access.'}</div></div>

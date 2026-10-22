@@ -249,6 +249,10 @@ pub async fn update_user(
                     "UPDATE users SET is_admin = ?1 WHERE id = ?2",
                     rusqlite::params![a as i64, id],
                 )?;
+                // Only admins may point hooks at private addresses: a former admin's own repos lose that.
+                if !a {
+                    tx.execute("UPDATE webhooks SET allow_private = 0 WHERE repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)", [id])?;
+                }
             }
             if let Some(s) = p.suspended {
                 tx.execute(

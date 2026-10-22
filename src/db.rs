@@ -394,6 +394,50 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE(release_id, name)
     );
     "#,
+    // v12: webhooks
+    r#"
+    CREATE TABLE webhooks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        url TEXT NOT NULL,
+        -- Sealed with GITTER_DATA/secret.key.
+        secret BLOB NOT NULL,
+        -- Comma-separated event names, or '*' for all.
+        events TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        -- Set by a site admin only: may reach loopback and private addresses.
+        allow_private INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX webhooks_repo ON webhooks(repo_id);
+    -- The queue and the delivery log in one: next_at is when to try next (NULL once delivered or given up).
+    CREATE TABLE webhook_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hook_id INTEGER NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+        guid TEXT NOT NULL,
+        event TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        redelivery INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_at INTEGER,
+        request_headers TEXT NOT NULL DEFAULT '{}',
+        response_code INTEGER,
+        response_body TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        duration_ms INTEGER,
+        created_at INTEGER NOT NULL,
+        tried_at INTEGER
+    );
+    CREATE INDEX webhook_deliveries_due ON webhook_deliveries(next_at) WHERE next_at IS NOT NULL;
+    CREATE INDEX webhook_deliveries_hook ON webhook_deliveries(hook_id, id);
+    -- A finished run whose finished_at differs from hooked_at hasn't been announced yet
+    -- (a re-run finishes again with a new time).
+    ALTER TABLE ci_runs ADD COLUMN hooked_at INTEGER;
+    UPDATE ci_runs SET hooked_at = finished_at;
+    CREATE INDEX ci_runs_unhooked ON ci_runs(id) WHERE finished_at IS NOT hooked_at;
+    "#,
 ];
 
 impl Db {
