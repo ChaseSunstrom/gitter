@@ -270,6 +270,11 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Path((o, n)):
     if !st.git.refs(&r.path).await?.iter().any(|x| x.kind == "tag" && x.name == tag) {
         let (name, sha) = check_target(&st, &r, &req.target).await?;
         if req.draft {
+            // Its tag waits for publishing, but a ref in the way (`v3` for `v3/rc`) shows now.
+            let refname = format!("refs/tags/{tag}");
+            if let Some(x) = st.git.ref_in_way(&r.path, &refname).await? {
+                return Err(crate::git::in_way(&refname, &x));
+            }
             target = name;
         } else {
             made = Some(make_tag(&st, &r, &u, &tag, &sha, &title).await?);
@@ -300,7 +305,7 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Path((o, n)):
         }
     };
     if let Some(oid) = made {
-        announce_tag(&st, &r, &u, &tag2, oid).await;
+        announce_tag(&st, &r, &u, &tag2, oid);
     }
     Ok(Json(json!({ "id": id })))
 }
@@ -335,10 +340,12 @@ pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, t
     }
 }
 
-/// A tag made on the web runs the push hooks (CI, webhooks, mirrors) once its release is saved.
-async fn announce_tag(st: &AppState, r: &Repo, u: &User, tag: &str, oid: String) {
+/// A tag made on the web runs the push hooks (CI, webhooks, mirrors) once its release is saved,
+/// in a task of its own so a client that disconnects now can't stop them.
+fn announce_tag(st: &AppState, r: &Repo, u: &User, tag: &str, oid: String) {
     let upd = crate::smart_http::RefUpdate { refname: format!("refs/tags/{tag}"), old: None, new: Some(oid) };
-    crate::hooks::on_push(st, r, u, &[upd]).await;
+    let (st, r, u) = (st.clone(), r.clone(), u.clone());
+    tokio::spawn(async move { crate::hooks::on_push(&st, &r, &u, &[upd]).await });
 }
 
 #[derive(Deserialize)]
@@ -398,7 +405,7 @@ pub async fn update(
         return Err(e);
     }
     if let Some(oid) = made {
-        announce_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), oid).await;
+        announce_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), oid);
     }
     ok()
 }

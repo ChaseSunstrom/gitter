@@ -614,13 +614,16 @@ impl Git {
         .await;
         let _ = tokio::fs::remove_file(&tmp).await;
         let sha = res?;
-        self.update_ref(
-            repo,
-            &format!("refs/heads/{}", c.branch),
-            &sha,
-            c.expect_old,
-        )
-        .await?;
+        let refname = format!("refs/heads/{}", c.branch);
+        match c.expect_old {
+            Some(_) => self.update_ref(repo, &refname, &sha, c.expect_old).await?,
+            // A new branch: a ref in the way (`v3` for `v3/rc`) is named.
+            None => {
+                if let Some(x) = self.create_ref(repo, &refname, &sha).await? {
+                    return Err(in_way(&refname, &x));
+                }
+            }
+        }
         Ok(sha)
     }
 
@@ -678,9 +681,12 @@ impl Git {
         if o.code == 0 {
             return Ok(None);
         }
+        let err = String::from_utf8_lossy(&o.stderr);
         match self.ref_in_way(repo, refname).await? {
             Some(x) => Ok(Some(x)),
-            None => Err(AppError::internal(format!("update-ref {refname}: {}", String::from_utf8_lossy(&o.stderr).trim()))),
+            // Another git holds the ref's lock (or left it behind).
+            None if err.contains(".lock'") || err.contains("cannot lock ref") => Err(AppError::conflict("That ref is busy; try again")),
+            None => Err(AppError::internal(format!("update-ref {refname}: {}", err.trim()))),
         }
     }
 

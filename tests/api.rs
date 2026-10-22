@@ -2643,15 +2643,44 @@ async fn ref_clash_names_the_ref_in_the_way_as_a_409() {
     let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/contents", Some(change)).await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     assert!(err(&v).contains("refs/heads/v3 "), "{v}");
+    let change = json!({ "branch": "main", "new_branch": "x/y", "message": "Fix", "changes": [{ "path": "f.txt", "content": "f" }] });
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/contents", Some(change)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(err(&v).contains("refs/heads/x/y already exists"), "{v}");
+    // A branch locked by another git (a stale or live `.lock`) is busy, not a server error.
+    let lock = app.state.git.repo_path(1).join("refs/heads/busy.lock");
+    std::fs::write(&lock, "").unwrap();
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("busy"))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(err(&v).contains("busy"), "{v}");
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("busy"))).await.0, StatusCode::OK);
     // Tags: a branch `v3` doesn't stop a tag `v3/rc`; a tag `t1` stops `t1/rc`, and `t2/rc` stops `t2`.
     assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": "v3/rc" }))).await.0, StatusCode::OK);
     assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": "t1" }))).await.0, StatusCode::OK);
     assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": "t2/rc" }))).await.0, StatusCode::OK);
-    for (tag, blocker) in [("t1/rc", "refs/tags/t1"), ("t2", "refs/tags/t2/rc")] {
-        let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": tag }))).await;
-        assert_eq!(s, StatusCode::CONFLICT, "{tag}: {v}");
+    // A draft's tag waits for publishing, but a clash shows now.
+    for (tag, blocker, draft) in [("t1/rc", "refs/tags/t1", false), ("t2", "refs/tags/t2/rc", false), ("t1/rc", "refs/tags/t1", true)] {
+        let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": tag, "draft": draft }))).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{tag} draft {draft}: {v}");
         assert!(err(&v).contains(&format!("{blocker} ")), "{tag}: {v}");
     }
+}
+
+/// The push webhook payloads delivered so far, once at least `n` have gone out (or after 5 s).
+async fn push_payloads(app: &App, rx: &Receiver, n: usize) -> Vec<Value> {
+    let get = || -> Vec<Value> {
+        let seen = rx.seen.lock().unwrap();
+        seen.iter().filter(|(h, _)| h["x-gitter-event"] == "push").map(|(_, b)| serde_json::from_str::<Value>(b).unwrap()).collect()
+    };
+    for _ in 0..100 {
+        gitter::webhooks::tick(&app.state).await;
+        if get().len() >= n {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    get()
 }
 
 #[tokio::test]
@@ -2694,8 +2723,7 @@ async fn ref_clash_merge_branch_deletion_and_web_tags_run_the_push_hooks() {
     // A tag made on the web (a release) is announced like a pushed one.
     let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/releases", Some(json!({ "tag": "v1" }))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    gitter::webhooks::tick(&app.state).await;
-    let got = pushes();
+    let got = push_payloads(&app, &rx, 3).await;
     assert_eq!(got.len(), 3, "{got:?}");
     let tag = got.iter().find(|p| p["ref"] == "refs/tags/v1").unwrap_or_else(|| panic!("no tag push: {got:?}"));
     assert_eq!((tag["created"].as_bool(), tag["before"].is_null()), (Some(true), true), "{tag}");
@@ -2705,8 +2733,40 @@ async fn ref_clash_merge_branch_deletion_and_web_tags_run_the_push_hooks() {
     assert_eq!(pushes().len(), 3, "a draft makes no tag yet");
     let (s, v) = app.req(&admin, "PATCH", &format!("/api/repos/root1/r/releases/{}", d["id"]), Some(json!({ "draft": false }))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    gitter::webhooks::tick(&app.state).await;
-    assert!(pushes().iter().any(|p| p["ref"] == "refs/tags/v2" && p["created"] == true), "{:?}", pushes());
+    let got = push_payloads(&app, &rx, 4).await;
+    assert!(got.iter().any(|p| p["ref"] == "refs/tags/v2" && p["created"] == true), "{got:?}");
+}
+
+#[tokio::test]
+async fn ref_clash_merge_keeps_a_head_branch_that_moved_meanwhile() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let change = json!({ "branch": "main", "new_branch": "fix", "message": "Fix", "changes": [{ "path": "fix.txt", "content": "fixed" }] });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(change)).await.0, StatusCode::OK);
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Fix", "head": "fix", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let n = v["number"].as_i64().unwrap();
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["push"], "allow_private": true }); // pragma: allowlist secret
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await.0, StatusCode::OK);
+
+    // The merge is worked out, then the branch moves on before it lands (called directly: the API does both at once).
+    let u = gitter::auth::user_by_id(&app.state.db, 1).await.unwrap().unwrap();
+    let r = gitter::repo::Repo::writable(&app.state, Some(&u), "root1", "r").await.unwrap();
+    let req = serde_json::from_value(json!({ "method": "merge", "delete_branch": true })).unwrap();
+    let plan = gitter::api::issues::prepare_merge(&app.state, &r, &u, n, req, false).await.unwrap();
+    let more = json!({ "branch": "fix", "message": "More", "changes": [{ "path": "more.txt", "content": "more" }] });
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(more)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let moved = v["sha"].as_str().unwrap().to_string();
+    gitter::api::issues::land_merge(&app.state, &r, &u, plan, true).await.unwrap();
+
+    // The new commit isn't lost with the branch, and no deletion is announced.
+    assert_eq!(insights_git(&app.state.git.repo_path(1), &["rev-parse", "refs/heads/fix"]).trim(), moved);
+    let got = push_payloads(&app, &rx, 2).await;
+    assert_eq!(got.len(), 2, "the push to fix and the merge into main: {got:?}");
+    assert!(got.iter().all(|p| p["deleted"] == false), "{got:?}");
 }
 
 #[tokio::test]
