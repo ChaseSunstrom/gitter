@@ -142,6 +142,8 @@ async fn git_push_with_a_secret_is_refused_until_allowed_once() {
     let (ok, err) = push(h, w);
     assert!(ok, "allowed once: {err}");
     assert_ne!(main(&app), before);
+    let (_, sec) = app.req(&alice, "GET", "/api/repos/alice/r/security", None).await;
+    assert_eq!(sec["blocked"], json!([]), "what went through isn't listed as refused");
 
     // Once: the same secret added again is refused again; in another file it's another finding.
     commit_file(h, w, "conf/aws.env", &format!("# keys\nAWS_ACCESS_KEY_ID={0}\nAGAIN={0}\n", aws()));

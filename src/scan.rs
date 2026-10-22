@@ -315,8 +315,12 @@ impl Scanner {
 
     fn found(&mut self, kind: &str, line: usize, masked: String, secret: &[u8]) {
         let fingerprint = fingerprint(kind, &self.path, secret);
-        if !self.seen.insert(fingerprint.clone()) {
+        if self.seen.contains(&fingerprint) {
             return;
+        }
+        // Repeats are only told apart up to a bound (a file of a million tokens).
+        if self.seen.len() < 100 * MAX_FINDINGS {
+            self.seen.insert(fingerprint.clone());
         }
         if self.findings.len() >= MAX_FINDINGS {
             self.more += 1;
@@ -653,7 +657,7 @@ pub fn refusal(blocked: &[Finding], more: usize, url: &str) -> String {
     );
     for f in blocked {
         let at = if f.commit.len() >= 7 { format!("  (commit {})", &f.commit[..7]) } else { String::new() };
-        s += &format!("  {}:{}  {}  {}{at}\n", clean(&f.path), f.line, f.kind, f.masked);
+        s += &format!("  {}:{}  {}  {}{at}\n", clean(&f.path), f.line, f.kind, clean(&f.masked));
     }
     if more > 0 {
         s += &format!("  …and {more} more\n");
@@ -873,6 +877,16 @@ mod tests {
         );
         let (_, cut) = scan_diff(d.as_bytes(), 10);
         assert!(cut);
+    }
+
+    #[test]
+    #[ignore]
+    fn tmp_self_scan() {
+        let out = std::process::Command::new("git").args(["diff", "-U0", "--no-color", crate::git::EMPTY_TREE, "HEAD"]).output().unwrap().stdout;
+        let (s, _) = scan_diff(&out[..], u64::MAX);
+        for f in &s.findings {
+            eprintln!("FOUND {}:{} {} {}", f.path, f.line, f.kind, f.masked);
+        }
     }
 
     #[test]

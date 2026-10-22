@@ -74,6 +74,9 @@ const pages = [
   ['/alice/hello/labels', ['bug']],
   ['/alice/hello/issues/new', []],
   ['/alice/hello/insights', ['Alice', 'Traffic', 'Referring sites', 'example.org', 'Popular pages']],
+  // e2e.sh's push-protection section leaves a refused push, a scan, an OSV advisory and a Cargo.lock here.
+  ['/alice/vault/security', ['Security', 'Push protection refused', 'ci.sh:1', 'Gitter access token', 'Allow it once', 'Secret scanning', 'deploy.env:1',
+    'Vulnerabilities', 'GHSA-e2e-0001', 'fixed in', 'Dependencies', 'smallvec', 'SPDX', 'CycloneDX', 'Vulnerability database']],
   ['/alice/hello/commits?graph=1', ['Commits', 'on every branch', 'Add lib']],
   ['/alice/hello/history/main/README.md', ['History for', 'More docs', 'View file']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
@@ -516,6 +519,32 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   } catch (e) { errors.push(String(e)); }
   if (errors.length || !badge || !logged) { failed++; console.log('✗ agent token', { num, badge, logged, errors }); }
   else console.log('  ok agent token made in settings; its issue has an Agent badge and the security log names it');
+  await page.close();
+}
+
+// Push protection in the browser: a new file with a key opens the refusal dialog; allowing it once commits.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error' && !/status of 422/.test(m.text())) errors.push(m.text()); });
+  let text = '', landed = false;
+  try {
+    await page.goto(BASE + '/alice/vault/new/main', { waitUntil: 'networkidle' });
+    await page.fill('#ed-path', 'web.env');
+    await page.fill('#ed-text', 'KEY=AKIA' + 'Z7XQ2LMW4NRT6YB8' + '\n');
+    await page.click('#cm-go');
+    await page.waitForSelector('.modal [data-ok]', { timeout: 5000 });
+    text = await page.locator('.modal').innerText();
+    await page.click('.modal [data-ok]');
+    for (let i = 0; i < 50 && !landed; i++) {
+      await page.waitForTimeout(100);
+      landed = (await ctx.request.get(BASE + '/api/repos/alice/vault/blob?rev=main&path=web.env')).ok();
+    }
+  } catch (e) { errors.push(String(e)); }
+  const missing = ['This looks like a secret', 'web.env:1', 'AWS access key ID', 'AKIA…B8', 'Allow once'].filter((s) => !text.includes(s));
+  if (errors.length || missing.length || !landed) { failed++; console.log('✗ push protection dialog', { missing, landed, errors }); }
+  else console.log('  ok a web commit with a secret is refused in a dialog, then goes through once allowed');
   await page.close();
 }
 

@@ -31,12 +31,15 @@ pub async fn overview(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n)
         .call(move |c| {
             let mut blocked = Vec::new();
             if let Some(uid) = uid {
-                // The latest refusal of each finding this week, and whether it's allowed now.
+                // The latest refusal of each finding this week, and whether it's allowed now;
+                // not ones that went through after their last refusal.
                 let mut s = c.prepare(
-                    "SELECT b.fingerprint, b.kind, b.path, b.line, b.masked, b.commit_sha, max(b.created_at),
+                    "SELECT b.fingerprint, b.kind, b.path, b.line, b.masked, b.commit_sha, max(b.created_at) AS at,
                             EXISTS (SELECT 1 FROM secret_bypasses p WHERE p.repo_id = b.repo_id AND p.user_id = b.user_id AND p.fingerprint = b.fingerprint AND p.used_at IS NULL AND p.expires_at > ?3)
                      FROM secret_blocks b WHERE b.repo_id = ?1 AND b.user_id = ?2 AND b.created_at > ?3 - 7 * 86400
-                     GROUP BY b.fingerprint ORDER BY max(b.created_at) DESC LIMIT 100",
+                     GROUP BY b.fingerprint
+                     HAVING NOT EXISTS (SELECT 1 FROM secret_bypasses p WHERE p.repo_id = ?1 AND p.user_id = ?2 AND p.fingerprint = b.fingerprint AND p.used_at >= at)
+                     ORDER BY at DESC LIMIT 100",
                 )?;
                 blocked = s
                     .query_map(rusqlite::params![id, uid, now()], |r| {

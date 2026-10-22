@@ -35,6 +35,7 @@ const TABS = [
   ['commits', 'history', 'Commits', '/commits'],
   ['branches', 'branch', 'Branches', '/branches'],
   ['insights', 'chart', 'Insights', '/insights'],
+  ['security', 'shield', 'Security', '/security'],
   ['settings', 'settings', 'Settings', '/settings'],
 ];
 
