@@ -5,6 +5,7 @@ use rusqlite::types::Value;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::notifications::{Thread, notify};
 use super::{J, like, ok};
 use crate::auth::{Authed, User, Viewer};
 use crate::db::now;
@@ -291,7 +292,7 @@ pub async fn create(
     }
     let (rid, uid, can_label) = (r.id, u.id, r.can_write);
     let agent = u.agent().map(|a| a.name.clone());
-    let title = req.title.clone();
+    let (title, body) = (req.title.clone(), req.body.clone());
     // Looked up among the templates there are, so the name never reaches git.
     let template_labels = match &req.template {
         Some(f) => super::milestones::load_templates(&st, &r)
@@ -304,7 +305,7 @@ pub async fn create(
             .unwrap_or_default(),
         None => vec![],
     };
-    let num = st
+    let (id, num) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -321,7 +322,7 @@ pub async fn create(
                 )?;
             }
             tx.commit()?;
-            Ok(num)
+            Ok((id, num))
         })
         .await?;
     record_event(
@@ -335,6 +336,7 @@ pub async fn create(
     )
     .await?;
     crate::webhooks::issue(&st, r.id, u.id, num, false, "opened").await;
+    notify(&st, r.id, Thread::Issue(id), u.id, &body).await;
     Ok(Json(json!({ "number": num })))
 }
 
@@ -508,19 +510,25 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
     status["can_ff"] = json!(mb.as_deref() == Some(b.as_str()));
     // What the branch rules still ask for, the checks on the head, and auto-merge.
     let gate = crate::protect::gate(st, r, iid, &base_b, &h).await?;
-    let auto: Option<(String, Option<String>)> = st
+    let (auto, queue): (Option<(String, Option<String>)>, Option<serde_json::Value>) = st
         .db
         .call(move |c| {
-            Ok(c.query_row("SELECT p.auto_merge, u.username FROM pulls p LEFT JOIN users u ON u.id = p.auto_merge_by WHERE p.issue_id = ?1 AND p.auto_merge IS NOT NULL", [iid], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?)
+            let auto = c
+                .query_row("SELECT p.auto_merge, u.username FROM pulls p LEFT JOIN users u ON u.id = p.auto_merge_by WHERE p.issue_id = ?1 AND p.auto_merge IS NOT NULL", [iid], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            Ok((auto, crate::mergequeue::position(c, iid)?))
         })
         .await?;
+    // A queue runs the checks on its own commit, so they don't hold the pull request back here.
+    let queued = gate.rule.as_ref().is_some_and(|x| x.merge_queue);
+    let blocked: Vec<&String> = gate.missing.iter().filter(|m| !queued || !gate.missing_checks.contains(m)).collect();
     status["checks"] = json!(gate.checks);
     status["checks_state"] = json!(crate::protect::combined(&gate.checks));
     status["rule"] = json!(gate.rule);
-    status["blocked"] = json!(gate.missing);
+    status["blocked"] = json!(blocked);
+    status["queue"] = json!(queue);
     status["can_bypass"] = json!(gate.can_bypass);
     status["auto_merge"] = json!(auto.map(|(m, by)| json!({ "method": m, "by": by })));
     Ok(status)
@@ -578,8 +586,10 @@ pub async fn update(
     };
     let (iid, rid, uid) = (issue.id, r.id, u.id);
     let edited = req.title.is_some() || req.body.is_some() || req.labels.is_some() || req.milestone.is_some() || assignees.is_some();
-    st.db
+    let added = st
+        .db
         .call(move |c| {
+            let mut added = vec![];
             let tx = c.transaction()?;
             let t = now();
             if let Some(title) = req.title {
@@ -613,6 +623,7 @@ pub async fn update(
                 tx.execute("UPDATE issues SET milestone_id = ?1 WHERE id = ?2", rusqlite::params![id, iid])?;
             }
             if let Some(names) = assignees {
+                let before: Vec<i64> = tx.prepare("SELECT user_id FROM issue_assignees WHERE issue_id = ?1")?.query_map([iid], |r| r.get(0))?.collect::<Result<_, _>>()?;
                 tx.execute("DELETE FROM issue_assignees WHERE issue_id = ?1", [iid])?;
                 let sql = format!(
                     "SELECT u.id FROM users u JOIN repos r ON r.id = ?2 WHERE u.username = ?1 AND {}",
@@ -623,18 +634,23 @@ pub async fn update(
                     let shown: String = name.chars().take(39).collect();
                     let who = who.ok_or_else(|| AppError::bad(format!("{shown} can't be assigned: only people with write access can")))?;
                     tx.execute("INSERT INTO issue_assignees(issue_id, user_id) VALUES (?1, ?2)", [iid, who])?;
+                    if !before.contains(&who) {
+                        added.push(who);
+                    }
                 }
             }
             tx.execute("UPDATE issues SET updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid])?;
             tx.commit()?;
-            Ok(())
+            Ok(added)
         })
         .await?;
+    super::notifications::tell(&st, r.id, Thread::Issue(issue.id), Some(u.id), added, "assign").await;
     if edited {
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, "edited").await;
     }
     if let Some(s) = new_state {
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
+        notify(&st, r.id, Thread::Issue(issue.id), u.id, "").await;
     }
     ok()
 }
@@ -673,7 +689,7 @@ pub async fn comment(
     if body.is_empty() && new_state.is_none() {
         return Err(AppError::bad("Write a comment"));
     }
-    let (iid, uid) = (issue.id, u.id);
+    let (iid, uid, text) = (issue.id, u.id, body.clone());
     let agent = u.agent().map(|a| a.name.clone());
     let id = st
         .db
@@ -718,6 +734,7 @@ pub async fn comment(
     if let Some(s) = new_state {
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
     }
+    notify(&st, r.id, Thread::Issue(iid), u.id, &text).await;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -917,9 +934,9 @@ pub async fn create_pull(
     }
     let (rid, uid) = (r.id, u.id);
     let agent = u.agent().map(|a| a.name.clone());
-    let title = req.title.clone();
+    let (title, body) = (req.title.clone(), req.body.clone());
     let (head_branch, base_branch) = (req.head.clone(), req.base.clone());
-    let num = st
+    let (id, num) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -936,7 +953,7 @@ pub async fn create_pull(
             let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, true, agent.as_deref())?;
             tx.execute("INSERT INTO pulls(issue_id, head_branch, base_branch) VALUES (?1, ?2, ?3)", rusqlite::params![id, req.head, req.base])?;
             tx.commit()?;
-            Ok(num)
+            Ok((id, num))
         })
         .await?;
     record_event(
@@ -950,6 +967,7 @@ pub async fn create_pull(
     )
     .await?;
     crate::webhooks::issue(&st, r.id, u.id, num, true, "opened").await;
+    notify(&st, r.id, Thread::Issue(id), u.id, &body).await;
     if let Err(e) = crate::ci::trigger::on_pull_opened(&st, &r, u.id, num, &head_branch, &base_branch).await {
         eprintln!("ci: {}#{num}: {}", r.full_name(), e.msg);
     }
@@ -1002,6 +1020,13 @@ fn default_method() -> String {
     "merge".into()
 }
 
+impl MergeReq {
+    /// A merge made by the merge queue, of head `head` only.
+    pub(crate) fn queued(method: &str, head: &str) -> MergeReq {
+        MergeReq { method: method.into(), title: None, message: None, delete_branch: false, bypass_rules: false, expect_head: Some(head.into()), ip: String::new() }
+    }
+}
+
 pub async fn merge_pull(
     State(st): State<AppState>,
     Authed(u): Authed,
@@ -1021,6 +1046,29 @@ pub(crate) async fn merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i
 }
 
 async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq) -> R<serde_json::Value> {
+    let delete_branch = req.delete_branch;
+    let plan = prepare_merge(st, r, u, num, req, false).await?;
+    let sha = plan.new_sha.clone();
+    land_merge(st, r, u, plan, delete_branch).await?;
+    Ok(json!({ "sha": sha }))
+}
+
+/// A merge worked out but not landed: the commit the base branch would move to.
+pub(crate) struct MergePlan {
+    pub issue_id: i64,
+    pub num: i64,
+    pub title: String,
+    pub head_b: String,
+    pub base_b: String,
+    pub head: String,
+    pub base: String,
+    pub new_sha: String,
+}
+
+/// Check a merge may happen and make its commit (nothing moves yet). `queued`:
+/// for the merge queue, which checks the commit it makes rather than the head,
+/// so only the rule's other requirements (approvals) are looked at here.
+pub(crate) async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq, queued: bool) -> R<MergePlan> {
     crate::mirrors::refuse_writes(r)?;
     let issue = load_issue(st, r, num, Some(u)).await?;
     if !issue.is_pr {
@@ -1047,11 +1095,22 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
         return Err(AppError::conflict("The source branch moved on"));
     }
     let gate = crate::protect::gate(st, r, issue.id, &base_b, &head).await?;
+    let missing: Vec<String> = gate.missing.iter().filter(|m| !queued || !gate.missing_checks.contains(m)).cloned().collect();
+    // Only an admin the rule isn't enforced on may skip the queue.
+    let skip_queue = gate.rule.as_ref().is_some_and(|x| x.merge_queue) && !queued;
+    if skip_queue && !(req.bypass_rules && gate.can_bypass) {
+        return Err(AppError::conflict(format!("{base_b} uses a merge queue: add this pull request to the queue")));
+    }
+    let gate = crate::protect::Gate { missing, ..gate };
     if !gate.missing.is_empty() && !(gate.can_bypass && req.bypass_rules) {
         return Err(AppError::conflict(format!("Merging is blocked: {}", gate.missing.join("; "))));
     }
-    if !gate.missing.is_empty() {
-        let detail = format!("{} merged {}#{num} past its branch rules ({})", u.username, r.full_name(), gate.missing.join("; "));
+    if !gate.missing.is_empty() || skip_queue {
+        let mut why = gate.missing.clone();
+        if skip_queue {
+            why.push("skipped the merge queue".into());
+        }
+        let detail = format!("{} merged {}#{num} past its branch rules ({})", u.username, r.full_name(), why.join("; "));
         crate::security::record(&st.db, crate::security::Event { actor: Some(u), subject: Some(u.id), action: "branch_rule_bypass", detail, ip: &req.ip }).await;
     }
     let (an, ae) = u.signature();
@@ -1110,10 +1169,17 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
         }
         _ => return Err(AppError::bad("Unknown merge method")),
     };
+    Ok(MergePlan { issue_id: issue.id, num, title: issue.title, head_b, base_b, head, base, new_sha })
+}
+
+/// Move the base branch to the plan's commit (only if it's still where the plan
+/// found it) and record the pull request as merged by `u`.
+pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: MergePlan, delete_branch: bool) -> R<()> {
+    let MergePlan { issue_id, num, title, head_b, base_b, head, base, new_sha } = plan;
     // Move the branch and record the merge in a task of its own, so a client
     // that disconnects halfway can't leave the branch moved and the PR open.
     let (st2, path, full) = (st.clone(), r.path.clone(), r.full_name());
-    let (iid, uid) = (issue.id, u.id);
+    let (iid, uid) = (issue_id, u.id);
     let (hs, bs, ms) = (head.clone(), base.clone(), new_sha.clone());
     let base_ref = format!("refs/heads/{base_b}");
     tokio::spawn(async move {
@@ -1150,24 +1216,16 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
     .await
     .map_err(AppError::internal)??;
     touch(&st.db, r.id, true).await?;
-    record_event(
-        &st.db,
-        u.id,
-        Some(r.id),
-        "merge",
-        &issue.title,
-        &num.to_string(),
-        1,
-    )
-    .await?;
+    record_event(&st.db, u.id, Some(r.id), "merge", &title, &num.to_string(), 1).await?;
     let upd = RefUpdate {
         refname: format!("refs/heads/{base_b}"),
         old: Some(base),
         new: Some(new_sha.clone()),
     };
     crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
+    notify(st, r.id, Thread::Issue(issue_id), u.id, "").await;
     crate::hooks::on_push(st, r, u, &[upd]).await;
-    if req.delete_branch && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
+    if delete_branch && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
         let _ = st
             .git
             .delete_ref(&r.path, &format!("refs/heads/{head_b}"))
@@ -1175,5 +1233,5 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
         crate::hooks::forget_branches(st, r.id, vec![head_b.clone()]).await;
         crate::mirrors::changed(st, r.id).await;
     }
-    Ok(json!({ "sha": new_sha }))
+    Ok(())
 }

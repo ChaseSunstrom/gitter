@@ -176,6 +176,26 @@ async fn pull_mirror_follows_its_remote_and_refuses_changes_here() {
     refused(s, &v, "suggestion");
     let (s, v) = app.req(&root, "POST", "/api/repos/root1/mir/releases", Some(json!({ "tag": "v9" }))).await;
     refused(s, &v, "new tag");
+    let (s, v) = app.req(&root, "PATCH", "/api/repos/root1/mir", Some(json!({ "default_branch": "feat" }))).await;
+    refused(s, &v, "default branch");
+    // LFS uploads too (git-lfs talks to the server directly).
+    let (_, t0) = app.req(&root, "POST", "/api/me/tokens", Some(json!({ "name": "lfs" }))).await;
+    let rt_early = t0["token"].as_str().unwrap().to_string();
+    let lfs =json!({ "operation": "upload", "transfers": ["basic"], "objects": [{ "oid": "a".repeat(64), "size": 1 }] });
+    let basic = format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("root1:{rt_early}")));
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/root1/mir.git/info/lfs/objects/batch")
+        .header("host", "test.local")
+        .header("content-type", "application/vnd.git-lfs+json")
+        .header("authorization", basic)
+        .body(axum::body::Body::from(lfs.to_string()))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "LFS upload");
+    // Others don't see where a private remote is; its admins do.
+    let (_, meta) = app.req(&alice, "GET", "/api/repos/root1/mir", None).await;
+    assert_eq!(meta["mirror"]["url"], "a private server", "{meta}");
     let (_, t) = app.req(&root, "POST", "/api/me/tokens", Some(json!({ "name": "cli" }))).await;
     let rt = t["token"].as_str().unwrap();
     let (work, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

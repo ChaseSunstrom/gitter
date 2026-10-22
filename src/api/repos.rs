@@ -218,7 +218,7 @@ pub async fn show(
     let parent = parent
         .filter(|p| !p.2)
         .map(|p| json!({ "owner": p.0, "name": p.1 }));
-    let mirror = if r.mirror { crate::mirrors::badge(&st, r.id).await? } else { serde_json::Value::Null };
+    let mirror = if r.mirror { crate::mirrors::badge(&st, r.id, r.can_admin).await? } else { serde_json::Value::Null };
     Ok(Json(json!({
         "owner": r.owner, "name": r.name, "description": r.description, "website": r.website,
         "private": r.private, "default_branch": r.default_branch, "created_at": r.created_at,
@@ -270,6 +270,10 @@ pub async fn update(
         && !(w.starts_with("https://") || w.starts_with("http://"))
     {
         return Err(AppError::bad("Website must start with https:// or http://"));
+    }
+    if req.default_branch.is_some() {
+        // A pull mirror's default branch follows its remote.
+        crate::mirrors::refuse_writes(&r)?;
     }
     if let Some(b) = &req.default_branch
         && (!validate::ref_name(b)

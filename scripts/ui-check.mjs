@@ -765,6 +765,84 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Notifications: a @mention shows in alice's inbox and on the bell; marking all read
+// clears the badge; the issue page offers unsubscribe and the repo header the watch levels.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('pageerror', (e) => errors.push(String(e)));
+  let listed = false, badge = '', cleared = false, sub = '', watch = '';
+  try {
+    // A fresh account (bob has two-factor sign-in on by now).
+    const bob = await browser.newContext();
+    const lr = await bob.request.post(BASE + '/api/auth/signup', { headers: { Origin: BASE }, data: { username: 'nina', email: 'nina@example.com', password: 'nina horse battery' } });
+    if (!lr.ok()) throw new Error(`nina signup: ${lr.status()}`);
+    const ir = await bob.request.post(BASE + '/api/repos/alice/hello/issues', { headers: { Origin: BASE }, data: { title: 'Ping for the inbox', body: 'Hey @alice, a look?' } });
+    if (!ir.ok()) throw new Error(`issue: ${ir.status()}`);
+    const num = (await ir.json()).number;
+    await bob.close();
+    await page.goto(BASE + '/notifications?filter=mentions', { waitUntil: 'networkidle' });
+    listed = (await page.locator('#page').innerText()).includes('Ping for the inbox');
+    badge = await page.locator('#notif-badge').innerText();
+    await page.goto(BASE + '/notifications', { waitUntil: 'networkidle' });
+    await page.click('#read-all');
+    await page.waitForSelector('#notif-badge', { state: 'hidden', timeout: 5000 });
+    cleared = true;
+    await page.goto(`${BASE}/alice/hello/issues/${num}`, { waitUntil: 'networkidle' });
+    await page.waitForSelector('#sub-btn:not([disabled])', { timeout: 5000 });
+    sub = await page.locator('#sub-btn').innerText();
+    await page.click('#watch-btn');
+    await page.waitForSelector('.watch-opt[aria-checked="true"]', { timeout: 5000 });
+    watch = await page.locator('.watch-opt[aria-checked="true"]').innerText();
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !listed || !/^\d+\+?$/.test(badge.trim()) || !cleared || !sub.includes('Unsubscribe') || !watch.includes('All activity')) {
+    failed++; console.log('✗ notifications', { listed, badge, cleared, sub, watch, errors });
+  } else console.log('  ok mention in the inbox and on the bell; mark all read clears the badge; subscribe and watch controls');
+  await page.close();
+}
+
+// Merge queue: the rule's option in settings, the queue button and state on the pull request, the queue on the list.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const seen = {};
+  try {
+    await page.goto(BASE + '/alice/hello/settings', { waitUntil: 'networkidle' });
+    await page.click('#rules summary');
+    await page.fill('#rule-form input[name=pattern]', 'main');
+    await page.fill('#rule-form input[name=checks]', 'release-check');
+    await page.check('#rule-form input[name=merge_queue]');
+    await page.click('#rule-form button[type=submit]');
+    await page.waitForSelector('#rules [data-rule-edit]', { timeout: 5000 });
+    seen.option = (await page.locator('#rules').innerText()).includes('merge queue');
+    const num = await page.evaluate(async () => {
+      const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json());
+      await post('/api/repos/alice/hello/contents', { branch: 'main', new_branch: 'ui-queue', message: 'Queue check', changes: [{ path: 'queue.txt', content: 'x\n' }] });
+      return (await post('/api/repos/alice/hello/pulls', { title: 'Goes through the queue', head: 'ui-queue', base: 'main' })).number;
+    });
+    await page.goto(`${BASE}/alice/hello/pull/${num}`, { waitUntil: 'networkidle' });
+    seen.button = (await page.locator('#merge-form [type=submit]').innerText()).includes('Add to merge queue');
+    await page.click('#merge-form [type=submit]');
+    await page.waitForSelector('#queue-off', { timeout: 5000 });
+    seen.state = (await page.locator('.merge-auto').innerText()).includes('merge queue');
+    await page.goto(BASE + '/alice/hello/pulls', { waitUntil: 'networkidle' });
+    seen.list = (await page.locator('#merge-queue').innerText()).includes('Goes through the queue');
+    await page.goto(`${BASE}/alice/hello/pull/${num}`, { waitUntil: 'networkidle' });
+    await page.click('#queue-off');
+    await page.waitForSelector('#merge-form', { timeout: 5000 });
+    seen.removed = true;
+    await page.goto(BASE + '/alice/hello/settings', { waitUntil: 'networkidle' });
+    await page.click('#rules [data-rule-del]');
+    await page.click('.modal [data-ok]');
+    await page.waitForSelector('#rules [data-rule-del]', { state: 'detached', timeout: 5000 });
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !(seen.option && seen.button && seen.state && seen.list && seen.removed)) { failed++; console.log('✗ merge queue', { seen, errors }); }
+  else console.log('  ok merge queue option in settings; pull request queued and removed from its page; queue shown on the list');
+  await page.close();
+}
+
 // Mirrors: e2e.sh's synced pull mirror shows its badge and settings; a push mirror added there
 // to a remote that isn't there fails in the server's loop and shows on the admin overview.
 {

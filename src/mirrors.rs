@@ -112,7 +112,7 @@ fn auth_header(remote: &Remote) -> Option<String> {
 fn clean(err: &str, remote: &Remote) -> String {
     let mut e = err.replace('\r', "\n");
     for s in [remote.password.clone(), basic(remote)] {
-        if s.len() >= 4 {
+        if !s.is_empty() {
             e = e.replace(&s, "•••");
         }
     }
@@ -122,14 +122,59 @@ fn clean(err: &str, remote: &Remote) -> String {
     if e.is_empty() { "git failed without saying why".into() } else { e }
 }
 
-/// Run a prepared git command to its end, within TIMEOUT.
-async fn exec(st: &AppState, mut cmd: tokio::process::Command) -> Result<(), String> {
+/// Run a prepared git command to its end, within TIMEOUT. `cap`: a fetch into
+/// `repo` is stopped once the packs it's writing pass this many bytes.
+async fn exec(st: &AppState, mut cmd: tokio::process::Command, cap: Option<(&Path, u64)>) -> Result<(), String> {
     let _permit = st.git.permit_stream().await.map_err(|e| e.msg)?;
-    let out = tokio::time::timeout(TIMEOUT, cmd.output())
-        .await
-        .map_err(|_| format!("Stopped after {} minutes", TIMEOUT.as_secs() / 60))?
-        .map_err(|e| e.to_string())?;
-    if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).into_owned()) }
+    // Its own process group, so stopping it stops the helpers it started too.
+    cmd.process_group(0).stdout(std::process::Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut stderr = child.stderr.take().ok_or("no stderr")?;
+    let errs = tokio::spawn(async move {
+        let mut v = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut v).await;
+        v
+    });
+    let packs = cap.map(|(repo, max)| (repo.join("objects/pack"), max));
+    let start = packs.as_ref().map_or(0, |(d, _)| pack_bytes(d));
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let stop = loop {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.map_err(|e| e.to_string())?;
+                let err = errs.await.unwrap_or_default();
+                return if status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&err).into_owned()) };
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                if tokio::time::Instant::now() > deadline {
+                    break format!("Stopped after {} minutes", TIMEOUT.as_secs() / 60);
+                }
+                if let Some((d, max)) = &packs && pack_bytes(d).saturating_sub(start) > *max {
+                    break "Stopped: the remote sent more than the storage left on this account".to_string();
+                }
+            }
+        }
+    };
+    if let Some(pid) = child.id() {
+        let _ = tokio::process::Command::new("kill").args(["-KILL", &format!("-{pid}")]).status().await;
+    }
+    let _ = child.kill().await;
+    // What a stopped fetch leaves behind.
+    if let Some((d, _)) = &packs
+        && let Ok(rd) = std::fs::read_dir(d)
+    {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("tmp_") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    Err(stop)
+}
+
+/// Bytes in a repository's pack folder (where a fetch writes what it receives).
+fn pack_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------- the queue
@@ -229,14 +274,16 @@ async fn load_repo(st: &AppState, id: i64) -> Result<Repo, String> {
 /// Fetch the remote's branches and tags over ours (those gone there go here too).
 async fn pull(st: &AppState, repo_id: i64, remote: &Remote) -> Result<(), String> {
     let repo = load_repo(st, repo_id).await?;
-    // ponytail: checked before the fetch, so one fetch can overshoot the quota; git has no fetch-size cap to pass.
-    if crate::repo::storage_left(st, repo.owner_id).await.map_err(|e| e.msg)? == Some(0) {
+    // git has no fetch-size limit to pass, so exec watches what the fetch writes.
+    let left = crate::repo::storage_left(st, repo.owner_id).await.map_err(|e| e.msg)?;
+    if left == Some(0) {
         return Err("This account is out of storage, so nothing more is fetched".into());
     }
     let before = crate::smart_http::ref_map(st, &repo).await.map_err(|e| e.msg)?;
     let mut cmd = git(st, &repo.path, remote).await?;
-    cmd.args(["fetch", "--quiet", "--prune", "--force", "--no-write-fetch-head", "--no-auto-gc", &remote.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
-    exec(st, cmd).await?;
+    // Objects from elsewhere are checked like pushed ones.
+    cmd.args(["-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--prune", "--force", "--no-write-fetch-head", "--no-auto-gc", &remote.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+    exec(st, cmd, left.map(|l| (repo.path.as_path(), l))).await?;
     let after = crate::smart_http::ref_map(st, &repo).await.map_err(|e| e.msg)?;
     if after == before {
         return Ok(());
@@ -258,7 +305,7 @@ async fn push(st: &AppState, repo_id: i64, remote: &Remote) -> Result<(), String
     let path = st.git.repo_path(repo_id);
     let mut cmd = git(st, &path, remote).await?;
     cmd.args(["push", "--quiet", "--force", "--prune", &remote.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
-    exec(st, cmd).await
+    exec(st, cmd, None).await
 }
 
 /// Repository `repo_id` changed: its push mirrors are due (unless one is
@@ -321,12 +368,22 @@ pub async fn run(st: AppState) {
 
 // ---------------------------------------------------------------- shown elsewhere
 
-/// A pull mirror's remote and last sync, for the badge on its pages.
-pub async fn badge(st: &AppState, repo_id: i64) -> R<Value> {
+/// A pull mirror's remote and last sync, for the badge on its pages. Only the
+/// repository's admins (`full`) see the whole URL; others see it without a query
+/// string (tokens hide there), and nothing of a private address.
+pub async fn badge(st: &AppState, repo_id: i64, full: bool) -> R<Value> {
     st.db
         .call(move |c| {
-            Ok(c.query_row("SELECT url, last_ok_at FROM mirrors WHERE repo_id = ?1 AND direction = 'pull'", [repo_id], |r| {
-                Ok(json!({ "url": r.get::<_, String>(0)?, "last_ok_at": r.get::<_, Option<i64>>(1)? }))
+            Ok(c.query_row("SELECT url, last_ok_at, allow_private FROM mirrors WHERE repo_id = ?1 AND direction = 'pull'", [repo_id], |r| {
+                let (url, private): (String, bool) = (r.get(0)?, r.get(2)?);
+                let shown = if full {
+                    url
+                } else if private {
+                    "a private server".to_string()
+                } else {
+                    url.split(['?', '#']).next().unwrap_or_default().to_string()
+                };
+                Ok(json!({ "url": shown, "last_ok_at": r.get::<_, Option<i64>>(1)? }))
             })
             .optional()?
             .unwrap_or(Value::Null))
@@ -370,5 +427,33 @@ mod tests {
         assert!(!e.contains("hunter2") && !e.contains(&basic(&r)), "{e}");
         assert_eq!(clean(&"x".repeat(5000), &r).len(), KEEP_ERROR);
         assert!(auth_header(&Remote { username: String::new(), password: String::new(), ..r }).is_none());
+        let short = Remote { url: "https://example.com/x.git".into(), username: "me".into(), password: "pw1".into(), allow_private: false };
+        assert!(!clean("remote: wrong pw1", &short).contains("pw1"), "short passwords are blanked too");
+    }
+
+    #[tokio::test]
+    async fn a_fetch_past_the_storage_left_is_stopped_and_its_leftovers_removed() {
+        let dir = std::env::temp_dir().join(format!("gitter-cap-{}", std::process::id()));
+        let pack = dir.join("objects/pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        let cfg = crate::Config {
+            data_dir: dir.clone(),
+            addr: String::new(),
+            url: "http://localhost".into(),
+            secure_cookies: false,
+            trust_proxy: false,
+            signup: crate::SignupMode::Open,
+            max_push_bytes: 1,
+            max_repos_per_user: 1,
+        };
+        let st = AppState::new(cfg, crate::db::Db::memory().unwrap());
+        // Stands in for a fetch that keeps receiving.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(format!("head -c 3000000 /dev/zero > {}/tmp_pack_x; exec tail -f /dev/null", pack.display())).stderr(std::process::Stdio::piped());
+        let t = std::time::Instant::now();
+        let e = exec(&st, cmd, Some((dir.as_path(), 1_000_000))).await.unwrap_err();
+        assert!(e.contains("more than the storage left") && t.elapsed() < Duration::from_secs(15), "{e}");
+        assert_eq!(pack_bytes(&pack), 0, "the partial pack is gone");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

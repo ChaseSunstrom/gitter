@@ -137,6 +137,8 @@ async fn open(st: &AppState, headers: &HeaderMap, ip: &str, owner: &str, name: &
 }
 
 fn need_write(repo: &Repo, anonymous: bool) -> R<()> {
+    // A pull mirror changes only when it syncs.
+    crate::mirrors::refuse_writes(repo)?;
     match (repo.can_write, anonymous) {
         (true, _) => Ok(()),
         (false, true) => Err(AppError::unauthorized()),

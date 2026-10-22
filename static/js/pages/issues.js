@@ -47,10 +47,11 @@ export async function prefetch(ctx) {
 export default async function (ctx) {
   const { owner, repo, kind } = ctx.params;
   const pr = kind === 'pr';
-  const [meta, data, labels] = await Promise.all([
+  const [meta, data, labels, queue] = await Promise.all([
     loadRepo(owner, repo),
     get(listUrl(ctx)),
     get(`${repoUrl(owner, repo)}/labels`).catch(() => ({ labels: [] })),
+    pr ? get(`${repoUrl(owner, repo)}/merge-queue`).catch(() => ({ entries: [] })) : { entries: [] },
   ]);
   const f = query(ctx);
   const base = `/${owner}/${repo}`;
@@ -107,6 +108,15 @@ export default async function (ctx) {
       ${f.author ? html`<a class="pill" href="${link({ author: '' })}">author: ${f.author} ${icon('x', 'sm')}</a>` : ''}
       ${f.milestone ? html`<a class="pill" href="${link({ milestone: '' })}">milestone: ${f.milestone} ${icon('x', 'sm')}</a>` : ''}
       ${f.assignee ? html`<a class="pill" href="${link({ assignee: '' })}">assignee: ${f.assignee} ${icon('x', 'sm')}</a>` : ''}
+    </div>` : ''}
+    ${queue.entries.length ? html`<div class="box" id="merge-queue">
+      <div class="box-head"><b>${icon('clock', 'sm')} Merge queue</b><span class="muted small">Merged one at a time, each tested on top of its target branch first.</span></div>
+      <div class="list">${queue.entries.map((q) => html`<div class="list-row small">
+        <span class="counter">${q.position}</span>
+        <a class="grow ellipsis" href="${base}/pull/${q.number}">#${q.number} ${q.title}</a>
+        <span class="muted hide-sm">into ${q.base} · added by ${q.added_by}</span>
+        ${q.state === 'testing' ? html`<span class="pill small">${icon('play', 'sm')} Testing</span>` : html`<span class="pill small muted">Waiting</span>`}
+      </div>`)}</div>
     </div>` : ''}
     <div class="box">
       <div class="box-head">
