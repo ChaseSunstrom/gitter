@@ -236,6 +236,7 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         gitter::hooks::backfill_sizes(&st2).await;
         loop {
             gitter::lfs::sweep(&st2).await;
+            gitter::api::releases::sweep(&st2).await;
             gitter::registry::sweep(&st2).await;
             if let Err(e) = gitter::api::notifications::sweep(&st2).await {
                 eprintln!("notifications sweep: {}", e.msg);

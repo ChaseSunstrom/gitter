@@ -72,11 +72,10 @@ async fn add_shas(st: &AppState, r: &Repo, list: &mut [Value]) -> R<()> {
     Ok(())
 }
 
-/// Release `id` of `r` with its files, if the viewer may see it.
-async fn load(st: &AppState, r: &Repo, id: i64) -> R<Value> {
+/// Release `id` of `r` with its files, if the viewer may see it: database only, no tag commit.
+async fn find(st: &AppState, r: &Repo, id: i64) -> R<Value> {
     let (rid, writer) = (r.id, r.can_write);
-    let mut rel = st
-        .db
+    st.db
         .call(move |c| {
             let rel = c
                 .query_row(&format!("SELECT {COLS} WHERE rl.id = ?1 AND rl.repo_id = ?2 AND (?3 OR rl.draft = 0)"), params![id, rid, writer], row)
@@ -84,7 +83,12 @@ async fn load(st: &AppState, r: &Repo, id: i64) -> R<Value> {
             Ok(rel.map(|x| with_assets(c, x)).transpose()?)
         })
         .await?
-        .ok_or_else(AppError::not_found)?;
+        .ok_or_else(AppError::not_found)
+}
+
+/// `find`, with the tag's commit.
+async fn load(st: &AppState, r: &Repo, id: i64) -> R<Value> {
+    let mut rel = find(st, r, id).await?;
     add_shas(st, r, std::slice::from_mut(&mut rel)).await?;
     Ok(rel)
 }
@@ -112,10 +116,72 @@ pub fn ids_of(c: &rusqlite::Connection, owner: bool, id: i64) -> rusqlite::Resul
     q.query_map([id], |r| r.get(0))?.collect()
 }
 
-/// Remove the files of these deleted releases.
+/// Remove the files of these deleted releases (repositories and accounts; a deleted release or file waits for `sweep`).
 pub async fn remove_files(st: &AppState, ids: Vec<i64>) {
     for id in ids {
-        let _ = tokio::fs::remove_dir_all(dir(st, id)).await;
+        let p = dir(st, id);
+        if let Err(e) = tokio::fs::remove_dir_all(&p).await.or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) {
+            eprintln!("warning: couldn't remove {}: {e}", p.display());
+        }
+    }
+}
+
+/// Release folders with no release row, and files with no asset row, under `data`/releases.
+pub fn orphans(c: &rusqlite::Connection, data: &std::path::Path) -> rusqlite::Result<Vec<PathBuf>> {
+    let ids = |p: PathBuf| std::fs::read_dir(p).into_iter().flatten().flatten().filter_map(|e| Some((e.file_name().to_str()?.parse::<i64>().ok()?, e.path())));
+    let (mut has, mut owns) = (c.prepare("SELECT 1 FROM releases WHERE id = ?1")?, c.prepare("SELECT 1 FROM release_assets WHERE id = ?1 AND release_id = ?2")?);
+    let mut out = Vec::new();
+    for (rid, folder) in ids(data.join("releases")) {
+        if !has.exists([rid])? {
+            out.push(folder);
+            continue;
+        }
+        for (aid, file) in ids(folder) {
+            if !owns.exists([aid, rid])? {
+                out.push(file);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Hourly, from boot: remove what deleted releases and files left behind. Deleting
+/// only drops the row, so a backup that listed the row still finds its file.
+/// Runs on the database connection, so no upload is between its rename and its row.
+pub async fn sweep(st: &AppState) {
+    let data = st.cfg.data_dir.clone();
+    // A running backup has listed rows whose files it hasn't copied yet: wait for the next hour.
+    let backing_up = std::fs::read_dir(&data).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".backup-tmp-"));
+    if backing_up {
+        return;
+    }
+    let found = st.db.call(move |c| Ok(orphans(c, &data)?)).await;
+    // Removed outside the database call: ids are AUTOINCREMENT, so an orphan can never become valid again.
+    match found {
+        Ok(list) => {
+            for p in list {
+                let gone = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                if let Err(e) = gone {
+                    eprintln!("warning: couldn't remove {}: {e}", p.display());
+                }
+            }
+        }
+        Err(e) => eprintln!("releases sweep: {}", e.msg),
+    }
+}
+
+/// Delete the tag `tag` (made by `make_tag` as `oid`) after its release failed to save, unless a release
+/// other than `own` (0 for a new one) holds that tag now: the winner of a race may rely on it.
+async fn take_back_tag(st: &AppState, r: &Repo, tag: &str, oid: &str, own: i64) {
+    let (rid, t) = (r.id, tag.to_string());
+    let held = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT 1 FROM releases WHERE repo_id = ?1 AND tag = ?2 AND id != ?3", params![rid, t, own], |_| Ok(())).optional()?.is_some()))
+        .await
+        .unwrap_or(true);
+    if !held {
+        let _ = st.git.run(&r.path, &["update-ref", "-d", &format!("refs/tags/{tag}"), oid], None, &[]).await;
+        crate::mirrors::changed(st, r.id).await;
     }
 }
 
@@ -200,16 +266,17 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Path((o, n)):
         return Err(AppError::conflict("There's already a release for that tag"));
     }
     // A draft's new tag waits until it's published (readers would see it in the tag list); its target must exist now.
-    let mut target = String::new();
+    let (mut target, mut made) = (String::new(), None);
     if !st.git.refs(&r.path).await?.iter().any(|x| x.kind == "tag" && x.name == tag) {
         let (name, sha) = check_target(&st, &r, &req.target).await?;
         if req.draft {
             target = name;
         } else {
-            make_tag(&st, &r, &u, &tag, &sha, &title).await?;
+            made = Some(make_tag(&st, &r, &u, &tag, &sha, &title).await?);
         }
     }
     let (uid, draft, pre, notes) = (u.id, req.draft, req.prerelease, req.notes);
+    let tag2 = tag.clone();
     let id = st
         .db
         .call(move |c| {
@@ -221,7 +288,17 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Path((o, n)):
             .map_err(taken("There's already a release for that tag"))?;
             Ok(c.last_insert_rowid())
         })
-        .await?;
+        .await;
+    let id = match id {
+        Ok(id) => id,
+        Err(e) => {
+            // The insert failed: take back the tag made for it (unless a release that won a race holds it).
+            if let Some(oid) = made {
+                take_back_tag(&st, &r, &tag2, &oid, 0).await;
+            }
+            return Err(e);
+        }
+    };
     Ok(Json(json!({ "id": id })))
 }
 
@@ -237,8 +314,8 @@ async fn check_target(st: &AppState, r: &Repo, raw: &str) -> R<(String, String)>
     Ok((target, sha))
 }
 
-/// Point `refs/tags/<tag>` at a new annotated tag of commit `sha`, unless the tag appears meanwhile.
-pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title: &str) -> R<()> {
+/// Point `refs/tags/<tag>` at a new annotated tag of commit `sha`, unless the tag appears meanwhile. Returns the tag object.
+pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title: &str) -> R<String> {
     crate::mirrors::refuse_writes(r)?;
     let (name, email) = u.signature();
     // mktag checks the object strictly: no angle brackets or line breaks in the name, no NULs.
@@ -258,7 +335,7 @@ pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, t
         });
     }
     crate::mirrors::changed(st, r.id).await;
-    Ok(())
+    Ok(oid)
 }
 
 #[derive(Deserialize)]
@@ -276,7 +353,7 @@ pub async fn update(
     Json(req): Json<UpdateReq>,
 ) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
-    let cur = load(&st, &r, id).await?;
+    let mut cur = find(&st, &r, id).await?;
     let text = |v: Option<String>, k: &str| v.unwrap_or_else(|| cur[k].as_str().unwrap_or("").to_string());
     let title = text(req.title, "title").trim().to_string();
     let title = if title.is_empty() { text(None, "tag") } else { title };
@@ -285,6 +362,10 @@ pub async fn update(
     let draft = req.draft.unwrap_or(cur["draft"] == true);
     let pre = req.prerelease.unwrap_or(cur["prerelease"] == true);
     // Publishing a draft makes its new tag now (unless someone pushed that tag meanwhile).
+    if cur["draft"] == true && !draft {
+        add_shas(&st, &r, std::slice::from_mut(&mut cur)).await?;
+    }
+    let mut made = None;
     if cur["draft"] == true && !draft && cur["sha"].is_null() {
         // A draft of an existing tag keeps no target: if that tag was deleted, don't guess one.
         let target = cur["target"].as_str().unwrap_or("");
@@ -292,9 +373,10 @@ pub async fn update(
             return Err(AppError::conflict("This release's tag no longer exists. Push it again, or delete this draft and make a new one."));
         }
         let (_, sha) = check_target(&st, &r, target).await?;
-        make_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), &sha, &title).await?;
+        made = Some(make_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), &sha, &title).await?);
     }
-    st.db
+    let saved = st
+        .db
         .call(move |c| {
             // A draft isn't published; publishing it (again) dates it now.
             c.execute(
@@ -305,16 +387,22 @@ pub async fn update(
             )?;
             Ok(())
         })
-        .await?;
+        .await;
+    if let Err(e) = saved {
+        if let Some(oid) = made {
+            take_back_tag(&st, &r, cur["tag"].as_str().unwrap_or(""), &oid, id).await;
+        }
+        return Err(e);
+    }
     ok()
 }
 
 /// Delete a release and its files. Its tag stays.
 pub async fn delete(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp, Path((o, n, id)): Path<(String, String, i64)>) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
-    let rel = load(&st, &r, id).await?;
+    let rel = find(&st, &r, id).await?;
+    // The files wait for the hourly sweep, so a backup that saw the rows still finds them.
     st.db.call(move |c| Ok(c.execute("DELETE FROM releases WHERE id = ?1", [id])?)).await?;
-    remove_files(&st, vec![id]).await;
     let detail = format!("{} {}", r.full_name(), rel["tag"].as_str().unwrap_or(""));
     record(&st.db, Event { actor: Some(&u), subject: Some(r.owner_id), action: "release_deleted", detail, ip: &ip.0 }).await;
     ok()
@@ -367,7 +455,7 @@ pub async fn upload(
 ) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
     let full = || AppError::bad(format!("A release holds at most {MAX_ASSETS} files"));
-    if load(&st, &r, id).await?["assets"].as_array().map_or(0, |a| a.len()) as i64 >= MAX_ASSETS {
+    if find(&st, &r, id).await?["assets"].as_array().map_or(0, |a| a.len()) as i64 >= MAX_ASSETS {
         return Err(full());
     }
     let name = asset_name(&q.name).ok_or_else(|| AppError::bad("Give the file a name"))?;
@@ -459,12 +547,12 @@ pub async fn download(
 
 pub async fn delete_asset(State(st): State<AppState>, Authed(u): Authed, Path((o, n, id, aid)): Path<(String, String, i64, i64)>) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
-    load(&st, &r, id).await?;
+    find(&st, &r, id).await?;
     let gone = st.db.call(move |c| Ok(c.execute("DELETE FROM release_assets WHERE id = ?1 AND release_id = ?2", [aid, id])?)).await?;
     if gone == 0 {
         return Err(AppError::not_found());
     }
-    let _ = tokio::fs::remove_file(dir(&st, id).join(aid.to_string())).await;
+    // The file waits for the hourly sweep (see `sweep`).
     ok()
 }
 
