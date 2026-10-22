@@ -31,6 +31,8 @@ pub struct MirrorReq {
     password: Option<String>,
     interval_minutes: Option<i64>,
     allow_private: Option<bool>,
+    /// A pull mirror that removes itself after its first successful sync (a one-time import); set when adding only.
+    once: Option<bool>,
 }
 
 fn check_url(url: &str) -> R<String> {
@@ -76,7 +78,7 @@ fn detail(url: &str, r: &Repo, direction: &str) -> String {
 }
 
 const COLS: &str = "id, direction, url, username, secret IS NOT NULL, allow_private, interval_secs, next_at, running_until, failures,
-    last_ok_at, last_tried_at, last_error, created_at";
+    last_ok_at, last_tried_at, last_error, created_at, once";
 
 fn mirror_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let running: Option<i64> = r.get(8)?;
@@ -85,7 +87,7 @@ fn mirror_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "has_password": r.get::<_, bool>(4)?, "allow_private": r.get::<_, bool>(5)?, "interval_minutes": r.get::<_, i64>(6)? / 60,
         "next_at": r.get::<_, Option<i64>>(7)?, "running": running.is_some_and(|t| t > now()), "failures": r.get::<_, i64>(9)?,
         "last_ok_at": r.get::<_, Option<i64>>(10)?, "last_tried_at": r.get::<_, Option<i64>>(11)?, "last_error": r.get::<_, String>(12)?,
-        "created_at": r.get::<_, i64>(13)?,
+        "created_at": r.get::<_, i64>(13)?, "once": r.get::<_, bool>(14)?,
     }))
 }
 
@@ -133,6 +135,10 @@ pub async fn create(
         return Err(admin_only());
     }
     let pull = direction == "pull";
+    let once = req.once.unwrap_or(false);
+    if once && !pull {
+        return Err(AppError::bad("Only a pull mirror can be a one-time import"));
+    }
     if pull && !st.git.refs(&r.path).await?.is_empty() {
         return Err(AppError::conflict("Only an empty repository can become a pull mirror: syncing replaces all its branches and tags. Make a new repository for it."));
     }
@@ -150,8 +156,8 @@ pub async fn create(
             }
             let t = now();
             tx.execute(
-                "INSERT INTO mirrors(repo_id, direction, url, username, secret, allow_private, interval_secs, next_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-                params![rid, dir2, url2, username, secret, private, interval, t],
+                "INSERT INTO mirrors(repo_id, direction, url, username, secret, allow_private, interval_secs, next_at, created_at, once) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+                params![rid, dir2, url2, username, secret, private, interval, t, once],
             )?;
             let id = tx.last_insert_rowid();
             tx.commit()?;

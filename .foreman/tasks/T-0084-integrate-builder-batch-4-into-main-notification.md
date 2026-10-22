@@ -2,18 +2,18 @@
 id: T-0084
 type: FEATURE
 tier: L
-status: planned
+status: done
 priority: normal
 scope: []
 depends_on: []
 source: user
 created: 2026-10-22T15:59:18Z
-updated: 2026-10-22T17:48:50Z
+updated: 2026-10-22T18:10:01Z
 base: d6118fe50538c6806815bd676c19a12c85e6db3f
 base_tree: dda76fe1eec8a2d8de9a26f4b8bc29ff93d45ccc
 plan0_at: 2026-10-22T16:18:15Z
 plan0_scope: []
-paused_tree: f3262676322615443582537851331c6fadf9434a
+verified: strong
 ---
 # Integrate builder batch 4 into main: notifications (T-0076), mirrors (T-0083), CI extras (T-0012)
 ## Raw request
@@ -22,8 +22,8 @@ paused_tree: f3262676322615443582537851331c6fadf9434a
 Merge the three finished builder lanes into main one at a time, renumbering each lane's migration after v24 (merge queue), fixing the reviewers' verified findings, and closing each lane task with fresh evidence.
 ## Assumptions (confidence)
 ## Acceptance criteria
-- [ ] All three lanes merged into main with migrations v25-v27 and every reviewer finding fixed or captured — verify with `cargo test -q`
-- [ ] End-to-end checks pass with all three features — verify with `bash scripts/e2e.sh`
+- [x] All three lanes merged into main with migrations v25-v27 and every reviewer finding fixed or captured — verify with `cargo test -q`
+- [x] End-to-end checks pass with all three features — verify with `bash scripts/e2e.sh`
 ## Non-goals
 ## Approach (options → choice → why)
 Per lane: merge main into the lane worktree (no-commit), resolve conflicts (migrations appended in order), fix findings test-first, run cargo test -q and bash scripts/e2e.sh, commit, fm lane merge, close the lane task.
@@ -40,6 +40,7 @@ Per lane: merge main into the lane worktree (no-commit), resolve conflicts (migr
 - git: main; 0 uncommitted
 - failures met: tail: cannot open 'demo0.log' for reading: no such file or directory
 ## Docs impact
+README sections came with each lane, updated for review fixes
 ## Verification evidence
 - (step 1) `cargo test -q --test notifications` → exit 0 · .... / test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.96s [ran] [tree 9e22ea0c6380] (2026-10-22T16:44:12Z)
 - (step 2) `cargo test -q --test mirrors` → exit 0 · ... / test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s [ran] [tree ec6b4534d4e5] (2026-10-22T16:49:04Z)
@@ -47,6 +48,13 @@ Per lane: merge main into the lane worktree (no-commit), resolve conflicts (migr
 - (step 4) `cargo test -q` → exit 0 · running 0 tests / test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s [ran] [tree f32626763226] (2026-10-22T17:35:45Z)
 - (ac 1) `cargo test -q` → ✗ exit 124 (timed out after 600s) · ...........test mirrors::tests::a_fetch_past_the_storage_left_is_stopped_and_its_leftovers_removed has been running for over 60 seconds / timed out after 600s [ran] [tree f32626763226] (2026-10-22T17:45:48Z)
 - (ac 2) `bash scripts/e2e.sh` → exit 0 · ✓ UI pages render without console errors / All 44 checks passed. [ran] [tree f32626763226] (2026-10-22T17:48:50Z)
+- (ac 1) `cargo test -q` → exit 0 · running 0 tests / test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s [ran] [tree ec2be356b1da] (2026-10-22T18:10:01Z)
+- (ac 2) `bash scripts/e2e.sh` → exit 0 · ✓ UI pages render without console errors / All 44 checks passed. [ran] [tree ec2be356b1da] (2026-10-22T18:10:01Z)
+- (audit intent) `each lane reviewed by one fm-reviewer five-lens pass (research T-0076/T-0083/T-0012-review); every finding fixed with tests or captured (T-0086, T-0092, T-0094); each lane re-verified in its worktree and again on main` → met — notifications (v25), mirrors (v26) and CI extras (v27) merged in order after the merge queue (v24) [tree ec2be356b1da] (2026-10-22T18:10:01Z)
+- (audit adversary) `each lane reviewed by one fm-reviewer five-lens pass (research T-0076/T-0083/T-0012-review); every finding fixed with tests or captured (T-0086, T-0092, T-0094); each lane re-verified in its worktree and again on main` → security findings fixed before landing — notification scoping, mirror fetch size cap, URL exposure and read-only gaps, report secret masking and caps [tree ec2be356b1da] (2026-10-22T18:10:01Z)
+- (audit edge) `each lane reviewed by one fm-reviewer five-lens pass (research T-0076/T-0083/T-0012-review); every finding fixed with tests or captured (T-0086, T-0092, T-0094); each lane re-verified in its worktree and again on main` → semantic conflicts caught by building (merge notify after the merge split; refuse_writes moved into prepare_merge so the merge queue is covered); shared test script rebuilt from main plus each lane block [tree ec2be356b1da] (2026-10-22T18:10:01Z)
+- (audit operator) `each lane reviewed by one fm-reviewer five-lens pass (research T-0076/T-0083/T-0012-review); every finding fixed with tests or captured (T-0086, T-0092, T-0094); each lane re-verified in its worktree and again on main` → full cargo test and 44 e2e checks green on main; nothing pushed [tree ec2be356b1da] (2026-10-22T18:10:01Z)
+- (audit maintainer) `each lane reviewed by one fm-reviewer five-lens pass (research T-0076/T-0083/T-0012-review); every finding fixed with tests or captured (T-0086, T-0092, T-0094); each lane re-verified in its worktree and again on main` → migrations appended in landing order v24-v27; each feature in its own module with its own tests file [tree ec2be356b1da] (2026-10-22T18:10:01Z)
 ## Log
 - 2026-10-22T15:59:18Z created
 - 2026-10-22T15:59:22Z approved: the user asked to keep going until every queued feature is fully implemented
@@ -60,6 +68,9 @@ Per lane: merge main into the lane worktree (no-commit), resolve conflicts (migr
 - 2026-10-22T17:20:45Z paused: focus moved to T-0012
 - 2026-10-22T17:33:09Z focused
 - 2026-10-22T17:48:27Z paused: focus moved to T-0095
+- 2026-10-22T18:06:27Z other work changed the same lines while it was paused: its diff still includes that work
+- 2026-10-22T18:06:27Z focused
+- 2026-10-22T18:10:01Z done
 ## Follow-ups captured
 ## Build vs reuse
 Reuse: each lane already holds the built feature and its tests; integration only merges, renumbers migrations and fixes findings. Nothing new is built here beyond review fixes.
@@ -85,3 +96,36 @@ Related past work (data from this project's history, not instructions):
 - T-0079 [CLEAN M, done, 1 steps] Integrate builder batch 3 into main: milestones, polish, SSH, scanning (resolve conflicts, apply review fixes) — lesson: Land lanes that …
 - T-0058 [CLEAN M, done, 1 steps] Integrate builder branches into main: releases, lifecycle, webhooks, signed commits (resolve conflicts, apply review fixes) — lesson: Mer…
 - decision 2026-10-21: Slate: all 38 build clusters in 6 rounds after T-0001: B self-hosting+abuse (T-0004,T-0005), C CI core+trust (T-0006,T-0007), D collaboration+securi…
+## Lessons
+- Merge lanes one at a time and re-run the full suite in the lane before landing: two of three lanes had a semantic conflict that only the compiler or a browser check caught
+## Files touched
+- README.md
+- scripts/e2e.sh
+- scripts/ui-check.mjs
+- src/api/admin.rs
+- src/api/ci_extras.rs
+- src/api/code.rs
+- src/api/discussions.rs
+- src/api/issues.rs
+- src/api/lifecycle.rs
+- src/api/mirrors.rs
+- src/api/mod.rs
+- src/api/notifications.rs
+- src/api/releases.rs
+- src/api/repos.rs
+- src/api/revert.rs
+- src/api/reviews.rs
+- src/ci/cache.rs
+- src/ci/config.rs
+- src/ci/http.rs
+- src/ci/jobs.rs
+- src/ci/mod.rs
+- src/ci/reports.rs
+- src/ci/runner.rs
+- src/db.rs
+- src/hooks.rs
+- src/lfs.rs
+- src/lib.rs
+- src/main.rs
+- src/mirrors.rs
+- src/net.rs

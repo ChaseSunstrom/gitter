@@ -321,3 +321,29 @@ async fn push_mirror_pushes_after_changes_and_retries() {
     assert_eq!(rev(&app, dst, "refs/heads/main"), rev(&app, src, "refs/heads/main"));
     assert!(!mirrors(&app, &root, "root1/src").await.to_string().contains(&token));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_one_time_import_syncs_once_then_is_an_ordinary_repository() {
+    let Setup { app, root, alice, url, token } = setup().await;
+    let up = repo_id(&app, &alice, "alice/up").await;
+    assert_eq!(app.req(&root, "POST", "/api/repos", Some(json!({ "name": "copy" }))).await.0, StatusCode::OK);
+    let copy = repo_id(&app, &root, "root1/copy").await;
+    let remote = format!("{url}/alice/up.git");
+    let add = json!({ "direction": "pull", "url": remote, "username": "alice", "password": token, "allow_private": true, "once": true });
+    let (s, v) = app.req(&root, "POST", "/api/repos/root1/copy/mirrors", Some(add)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // Until it lands, it's read-only and says it's importing.
+    let (_, meta) = app.req(&root, "GET", "/api/repos/root1/copy", None).await;
+    assert_eq!(meta["mirror"]["once"], true, "{meta}");
+    assert_eq!(commit(&app, &root, "root1/copy", "early.txt").await, StatusCode::FORBIDDEN);
+    // The first sync brings everything over, then the mirror is gone.
+    assert_eq!(tick(&app).await, 1);
+    assert_eq!(rev(&app, copy, "refs/heads/main"), rev(&app, up, "refs/heads/main"));
+    assert_eq!(mirrors(&app, &root, "root1/copy").await["mirrors"], json!([]));
+    let (_, meta) = app.req(&root, "GET", "/api/repos/root1/copy", None).await;
+    assert!(meta["mirror"].is_null(), "{meta}");
+    assert_eq!(commit(&app, &root, "root1/copy", "mine.txt").await, StatusCode::OK, "an ordinary repository now");
+    // Push mirrors can't be one-time.
+    let (s, _) = app.req(&root, "POST", "/api/repos/root1/copy/mirrors", Some(json!({ "direction": "push", "url": remote, "allow_private": true, "once": true }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}

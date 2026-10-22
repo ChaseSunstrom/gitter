@@ -1,11 +1,11 @@
 // Repository code views: file tree (with README), single file, and blame.
-import { html, raw, state, get, copy, timeEl, avatar, bytes, plural, short, encPath, enc, esc, num, $, popover, closePop, safeUrl, langOf, send, toast, confirmDialog, action, sigBadge } from '../lib.js';
+import { html, raw, state, get, invalidate, copy, timeEl, avatar, bytes, plural, short, encPath, enc, esc, num, $, popover, closePop, safeUrl, langOf, send, toast, confirmDialog, action, sigBadge } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, splitRev, repoPage, mountRepoHeader, refPicker, mountRefPicker, crumbs } from '../repohead.js';
 import { codeBlock, highlightInto, mountLineSelection } from '../codeview.js';
 import { scan, warning, revealHidden } from '../unicode.js';
 import { renderMarkdown, preloadLangs } from '../md.js';
-import { navigate } from '../main.js';
+import { navigate, refresh } from '../main.js';
 
 function target(ctx, meta) {
   const { rev, path } = splitRev(meta, ctx.params.rest || '');
@@ -60,8 +60,10 @@ function emptyRepo(meta) {
   const url = meta.clone_url;
   const base = `/${meta.owner}/${meta.name}`;
   if (meta.mirror) {
-    return html`<div class="box empty-setup fade"><div class="box-body stack"><h2 style="font-size:18px">Waiting for the first sync</h2>
-      <p class="muted">This repository mirrors <span class="mono">${meta.mirror.url}</span>. Its branches and tags show up here once they're fetched.${meta.can_admin ? html` See how it's going in <a href="${base}/settings/mirrors">Settings → Mirrors</a>.` : ''}</p></div></div>`;
+    const m = meta.mirror;
+    return html`<div class="box empty-setup fade"><div class="box-body stack"><h2 style="font-size:18px" class="row">${m.error ? icon('x', 'c-red') : html`<span class="spinner"></span>`} ${m.once ? 'Copying' : 'Waiting for the first sync'}</h2>
+      <p class="muted">${m.once ? html`This repository is being copied from <span class="mono">${m.url}</span>; when that's done it's an ordinary repository you can change.` : html`This repository mirrors <span class="mono">${m.url}</span>.`} Its branches and tags show up here once they're fetched; this page updates by itself.${meta.can_admin ? html` See how it's going in <a href="${base}/settings/mirrors">Settings → Mirrors</a>.` : ''}</p>
+      ${m.error ? html`<pre class="setup-cmd small c-red">${m.error}</pre><p class="muted small">It tries again on its own; fix the URL or password in Settings → Mirrors, then press Sync now.</p>` : ''}</div></div>`;
   }
   return html`<div class="box empty-setup fade">
     <div class="box-body stack">
@@ -123,7 +125,22 @@ async function treeView(meta, rev, path, rootTree) {
     return {
       title: `${meta.owner}/${meta.name}`,
       html: repoPage(meta, 'code', emptyRepo(meta)),
-      mount: (el) => mountRepoHeader(el, meta),
+      mount: (el) => {
+        mountRepoHeader(el, meta);
+        // A first sync is on its way: look again until it lands.
+        if (meta.mirror) {
+          const again = () => setTimeout(async () => {
+            if (!el.isConnected) return;
+            const now = await get(repoUrl(meta.owner, meta.name), { fresh: true }).catch(() => null);
+            if (now && (!now.empty || now.mirror?.error !== meta.mirror.error)) {
+              // What was cached while it was empty (its file list) is stale now.
+              invalidate(repoUrl(meta.owner, meta.name));
+              refresh();
+            } else again();
+          }, 3000);
+          again();
+        }
+      },
     };
   }
   const [data, langs] = await Promise.all([

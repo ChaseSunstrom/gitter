@@ -915,6 +915,33 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// New repository → a copy of another repository: created empty, filled by its first sync,
+// then (Keep it in sync off) an ordinary repository.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const seen = {};
+  try {
+    await page.goto(BASE + '/new', { waitUntil: 'networkidle' });
+    await page.check('input[name=start][value=copy]');
+    await page.fill('#copy-url', BASE + '/alice/hello.git');
+    seen.named = (await page.inputValue('#repo-name')) === 'hello';
+    await page.fill('#repo-name', 'hello-copy');
+    await page.dispatchEvent('#repo-name', 'input');
+    await page.uncheck('input[name=copy_sync]');
+    await page.check('input[name=copy_private]');
+    await page.click('#create-btn');
+    await page.waitForURL(BASE + '/alice/hello-copy', { timeout: 10000 });
+    seen.copying = (await page.locator('.mirror-badge').innerText()).includes('copying from');
+    await page.waitForSelector('.files-box', { timeout: 60000 });
+    seen.ordinary = (await page.locator('.mirror-badge').count()) === 0 && (await page.locator('#add-file').count()) === 1;
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !(seen.named && seen.copying && seen.ordinary)) { failed++; console.log('✗ copy a repository', { seen, errors }); }
+  else console.log('  ok New repository copies a URL: named from it, fills in by itself, then an ordinary repository');
+  await page.close();
+}
+
 // Layout: long commit messages and a wide README stay inside the main column at
 // desktop widths, and every repository tab is on screen or in the More menu.
 {

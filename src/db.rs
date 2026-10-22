@@ -925,6 +925,10 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo_id, name)
     );
     "#,
+    // v28: one-time imports: a pull mirror that removes itself after its first successful sync.
+    r#"
+    ALTER TABLE mirrors ADD COLUMN once INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Db {

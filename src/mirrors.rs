@@ -230,11 +230,15 @@ fn claim(c: &mut Connection, limit: usize) -> rusqlite::Result<Vec<Job>> {
 fn finish(c: &Connection, j: &Job, result: Result<(), String>) -> rusqlite::Result<()> {
     let t = now();
     match result {
-        Ok(()) => c.execute(
-            "UPDATE mirrors SET running_until = NULL, failures = 0, last_ok_at = ?2, last_error = '',
-             next_at = CASE direction WHEN 'pull' THEN coalesce(next_at, ?2 + interval_secs) ELSE next_at END WHERE id = ?1",
-            params![j.id, t],
-        )?,
+        Ok(()) => {
+            c.execute(
+                "UPDATE mirrors SET running_until = NULL, failures = 0, last_ok_at = ?2, last_error = '',
+                 next_at = CASE direction WHEN 'pull' THEN coalesce(next_at, ?2 + interval_secs) ELSE next_at END WHERE id = ?1",
+                params![j.id, t],
+            )?;
+            // A one-time import is done: the repository is an ordinary one from here on (its password goes too).
+            c.execute("DELETE FROM mirrors WHERE id = ?1 AND once = 1", [j.id])?
+        }
         Err(e) => {
             let wait = backoff(if j.pull { 600 } else { 60 }, j.failures + 1);
             c.execute(
@@ -374,8 +378,8 @@ pub async fn run(st: AppState) {
 pub async fn badge(st: &AppState, repo_id: i64, full: bool) -> R<Value> {
     st.db
         .call(move |c| {
-            Ok(c.query_row("SELECT url, last_ok_at, allow_private FROM mirrors WHERE repo_id = ?1 AND direction = 'pull'", [repo_id], |r| {
-                let (url, private): (String, bool) = (r.get(0)?, r.get(2)?);
+            Ok(c.query_row("SELECT url, last_ok_at, allow_private, once, last_error FROM mirrors WHERE repo_id = ?1 AND direction = 'pull'", [repo_id], |r| {
+                let (url, private, once, error): (String, bool, bool, String) = (r.get(0)?, r.get(2)?, r.get(3)?, r.get(4)?);
                 let shown = if full {
                     url
                 } else if private {
@@ -383,7 +387,9 @@ pub async fn badge(st: &AppState, repo_id: i64, full: bool) -> R<Value> {
                 } else {
                     url.split(['?', '#']).next().unwrap_or_default().to_string()
                 };
-                Ok(json!({ "url": shown, "last_ok_at": r.get::<_, Option<i64>>(1)? }))
+                // Why the last sync failed, for those who can fix it.
+                let error = if full { error } else { String::new() };
+                Ok(json!({ "url": shown, "last_ok_at": r.get::<_, Option<i64>>(1)?, "once": once, "error": error }))
             })
             .optional()?
             .unwrap_or(Value::Null))

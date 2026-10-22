@@ -17,7 +17,7 @@ function row(m, canPrivate) {
   const [ic, words] = mirrorState(m);
   const pull = m.direction === 'pull';
   return html`<div class="list-row mirror-row" data-mid="${m.id}">${ic}<div class="grow" style="min-width:0">
-      <div class="row wrap-ok"><span class="pill">${icon(pull ? 'download' : 'upload', 'sm')} ${pull ? 'Pulls from' : 'Pushes to'}</span><b class="mono ellipsis">${m.url}</b></div>
+      <div class="row wrap-ok"><span class="pill">${icon(pull ? 'download' : 'upload', 'sm')} ${m.once ? 'Copies once from' : pull ? 'Pulls from' : 'Pushes to'}</span><b class="mono ellipsis">${m.url}</b></div>
       <div class="small muted">${words}${pull ? ` · every ${interval(m.interval_minutes)}` : ' · after every change'}${m.username ? ` · as ${m.username}` : ''}${m.allow_private ? ' · private addresses allowed' : ''}</div>
       ${m.last_error ? html`<pre class="setup-cmd small c-red mirror-error">${m.last_error}</pre>` : ''}
       <details class="mirror-edit"><summary class="btn sm">Edit</summary>${form(m, canPrivate)}</details></div>

@@ -207,6 +207,9 @@ button.sig-badge { cursor: pointer; }
 /* ---------- loading ---------- */
 .skel { background: linear-gradient(90deg, var(--hover) 0%, var(--surface-2) 40%, var(--hover) 80%); background-size: 300% 100%; animation: shimmer 1.4s infinite linear; border-radius: 6px; }
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -200% 0; } }
+.spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 .skel.line { height: 12px; margin: 10px 0; }
 .spin { width: 16px; height: 16px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: rot .7s linear infinite; display: inline-block; }
 @keyframes rot { to { transform: rotate(360deg); } }
