@@ -1468,14 +1468,14 @@ pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, p
     };
     crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
     notify(st, r.id, Thread::Issue(issue_id), u.id, "").await;
-    crate::hooks::on_push(st, r, u, &[upd]).await;
+    let mut upds = vec![upd];
     if delete_branch && !from_fork && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
-        let _ = st
-            .git
-            .delete_ref(&r.path, &format!("refs/heads/{head_b}"))
-            .await;
-        crate::hooks::forget_branches(st, r.id, vec![head_b.clone()]).await;
-        crate::mirrors::changed(st, r.id).await;
+        // Only the commit merged: a push to the branch meanwhile keeps it. Deleted like a push deletes it (webhook, pusher forgotten).
+        let head_ref = format!("refs/heads/{head_b}");
+        if st.git.ok(&r.path, &["update-ref", "-d", &head_ref, &head]).await.is_ok() {
+            upds.push(RefUpdate { refname: head_ref, old: Some(head), new: None });
+        }
     }
+    crate::hooks::on_push(st, r, u, &upds).await;
     Ok(())
 }

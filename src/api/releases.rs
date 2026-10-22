@@ -299,6 +299,9 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Path((o, n)):
             return Err(e);
         }
     };
+    if let Some(oid) = made {
+        announce_tag(&st, &r, &u, &tag2, oid).await;
+    }
     Ok(Json(json!({ "id": id })))
 }
 
@@ -314,7 +317,7 @@ async fn check_target(st: &AppState, r: &Repo, raw: &str) -> R<(String, String)>
     Ok((target, sha))
 }
 
-/// Point `refs/tags/<tag>` at a new annotated tag of commit `sha`, unless the tag appears meanwhile. Returns the tag object.
+/// Point `refs/tags/<tag>` at a new annotated tag of commit `sha`, unless the tag appears meanwhile. Returns the tag object; `announce_tag` it once kept.
 pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title: &str) -> R<String> {
     crate::mirrors::refuse_writes(r)?;
     let (name, email) = u.signature();
@@ -324,18 +327,18 @@ pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, t
     let obj = format!("object {sha}\ntype commit\ntag {tag}\ntagger {name} <{email}> {} +0000\n\n{}\n", now(), title.replace('\0', ""));
     let oid = st.git.ok_env(&r.path, &["mktag"], Some(obj.as_bytes()), &[]).await?;
     let refname = format!("refs/tags/{tag}");
-    let o = st.git.run(&r.path, &["update-ref", &refname, &oid, crate::git::EMPTY_OID], None, &[]).await?;
-    if o.code != 0 {
-        // Only a tag that's there now was made meanwhile; anything else (`v1` in the way of `v1/rc`, a stale lock) is an error of its own.
-        let there = st.git.run(&r.path, &["show-ref", "--verify", "--quiet", &refname], None, &[]).await?.code == 0;
-        return Err(if there {
-            AppError::conflict("That tag was just created by someone else. Try again.")
-        } else {
-            AppError::internal(format!("{}: update-ref {refname}: {}", r.full_name(), String::from_utf8_lossy(&o.stderr).trim()))
-        });
+    // Only the tag itself was made meanwhile; `v1` in the way of `v1/rc` is named.
+    match st.git.create_ref(&r.path, &refname, &oid).await? {
+        Some(x) if x == refname => Err(AppError::conflict("That tag was just created by someone else. Try again.")),
+        Some(x) => Err(crate::git::in_way(&refname, &x)),
+        None => Ok(oid),
     }
-    crate::mirrors::changed(st, r.id).await;
-    Ok(oid)
+}
+
+/// A tag made on the web runs the push hooks (CI, webhooks, mirrors) once its release is saved.
+async fn announce_tag(st: &AppState, r: &Repo, u: &User, tag: &str, oid: String) {
+    let upd = crate::smart_http::RefUpdate { refname: format!("refs/tags/{tag}"), old: None, new: Some(oid) };
+    crate::hooks::on_push(st, r, u, &[upd]).await;
 }
 
 #[derive(Deserialize)]
@@ -393,6 +396,9 @@ pub async fn update(
             take_back_tag(&st, &r, cur["tag"].as_str().unwrap_or(""), &oid, id).await;
         }
         return Err(e);
+    }
+    if let Some(oid) = made {
+        announce_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), oid).await;
     }
     ok()
 }

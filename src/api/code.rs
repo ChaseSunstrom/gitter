@@ -1038,13 +1038,9 @@ pub async fn write_contents(
             if !validate::ref_name(nb) {
                 return Err(AppError::bad("That isn't a valid branch name"));
             }
-            if st
-                .git
-                .resolve(&r.path, &format!("refs/heads/{nb}"))
-                .await?
-                .is_some()
-            {
-                return Err(AppError::conflict("A branch with that name already exists"));
+            let refname = format!("refs/heads/{nb}");
+            if let Some(x) = st.git.ref_in_way(&r.path, &refname).await? {
+                return Err(crate::git::in_way(&refname, &x));
             }
             nb.clone()
         }

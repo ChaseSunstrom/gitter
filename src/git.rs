@@ -671,6 +671,32 @@ impl Git {
         Ok(())
     }
 
+    /// Make `refname` at `new` if it isn't there. `Ok(Some(x))`: the ref `x`
+    /// is in the way (see `ref_in_way`); other failures are internal errors.
+    pub async fn create_ref(&self, repo: &Path, refname: &str, new: &str) -> R<Option<String>> {
+        let o = self.run(repo, &["update-ref", refname, new, EMPTY_OID], None, &[]).await?;
+        if o.code == 0 {
+            return Ok(None);
+        }
+        match self.ref_in_way(repo, refname).await? {
+            Some(x) => Ok(Some(x)),
+            None => Err(AppError::internal(format!("update-ref {refname}: {}", String::from_utf8_lossy(&o.stderr).trim()))),
+        }
+    }
+
+    /// The existing ref that stops `refname` (`refs/heads/v3/rc`) being made: itself,
+    /// one it would sit under (`refs/heads/v3`) or one under it (`refs/heads/v3/rc/1`).
+    pub async fn ref_in_way(&self, repo: &Path, refname: &str) -> R<Option<String>> {
+        // `refs` and `refs/heads` are folders; each longer prefix may be a ref.
+        let ups: Vec<&str> = refname.match_indices('/').skip(2).map(|(i, _)| &refname[..i]).collect();
+        let mut args = vec!["for-each-ref", "--format=%(refname)", refname];
+        args.extend(&ups);
+        // ponytail: an up-folder with refs past 8 MB may hide the one in the way (the caller's error stands); list per prefix if that bites.
+        let out = self.run_records(repo, &args, 8 << 20, b'\n').await?;
+        let under = format!("{refname}/");
+        Ok(String::from_utf8_lossy(&out).lines().find(|x| *x == refname || x.starts_with(&under) || ups.contains(x)).map(str::to_string))
+    }
+
     pub async fn delete_ref(&self, repo: &Path, refname: &str) -> R<()> {
         self.ok(repo, &["update-ref", "-d", refname]).await?;
         Ok(())
@@ -842,6 +868,15 @@ pub struct Ref {
     pub date: i64,
     pub subject: String,
     pub author: String,
+}
+
+/// The 409 for `refname` blocked by the existing ref `x` (from `ref_in_way`).
+pub fn in_way(refname: &str, x: &str) -> AppError {
+    AppError::conflict(if x == refname {
+        format!("{x} already exists")
+    } else {
+        format!("Can't make {refname}: {x} is in the way (a name can't be both a ref and a folder of refs)")
+    })
 }
 
 pub fn parse_refs(s: &str) -> Vec<Ref> {
