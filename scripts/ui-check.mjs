@@ -877,5 +877,43 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// CI extras (seeded by e2e's alice/reports): test results, coverage and flaky marks on the run,
+// failures under the changed lines of the pull request, and Set up CI opening a pull request.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  let run = '', list = '', ann = '', report = '', setup = '';
+  try {
+    await page.goto(BASE + '/alice/reports/ci/1', { waitUntil: 'networkidle' });
+    run = await page.locator('.ci-tests').innerText();
+    await page.goto(BASE + '/alice/reports/ci', { waitUntil: 'networkidle' });
+    list = await page.locator('.ci-flaky-box').innerText();
+    await page.goto(BASE + '/alice/reports/pull/1/files', { waitUntil: 'networkidle' });
+    await page.waitForSelector('tr.ci-ann', { timeout: 5000 });
+    ann = await page.locator('tr.ci-ann').first().innerText();
+    report = await page.locator('#pr-ci-report').innerText();
+    await page.evaluate(() => fetch('/api/repos', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'ci-setup', readme: true }) }));
+    await page.goto(BASE + '/alice/ci-setup/ci', { waitUntil: 'networkidle' });
+    await page.click('#ci-setup');
+    // Docker: its run (on runners labelled docker) pulls no image, unlike the language templates.
+    await page.click('.ci-template:has-text("Docker")');
+    await page.waitForFunction(() => document.querySelector('#tpl-preview')?.textContent.includes('docker build'), null, { timeout: 5000 });
+    await page.click('#tpl-go');
+    await page.waitForURL(/\/alice\/ci-setup\/pull\/\d+$/, { timeout: 10000 });
+    await page.waitForLoadState('networkidle');
+    setup = await page.locator('.issue-page').innerText();
+  } catch (e) { errors.push(String(e)); }
+  const okRun = /2 tests/.test(run) && run.includes('flaky') && run.includes('75% coverage') && run.includes('adds');
+  const okList = list.includes('Flaky tests') && list.includes('math::adds');
+  const okAnn = ann.includes('math::adds') && ann.includes('expected 4, got 5');
+  const okReport = report.includes('1 failed') && report.includes('75% coverage');
+  const okSetup = setup.includes('Set up CI') && setup.includes('docker template');
+  if (errors.length || !okRun || !okList || !okAnn || !okReport || !okSetup) { failed++; console.log('✗ CI extras', { run, list, ann, report, setup, errors }); }
+  else console.log('  ok CI run shows tests, coverage and flaky marks; PR files show failures; Set up CI opens a pull request');
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{post, put};
+use axum::routing::{get, post, put};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -36,6 +36,8 @@ pub fn router() -> Router<AppState> {
         // Only the artifact upload streams big bodies; everything else keeps axum's 2 MB cap,
         // which applies before the token is checked.
         .route("/ci-runner/jobs/{id}/artifacts", put(artifacts).layer(DefaultBodyLimit::disable()))
+        .route("/ci-runner/jobs/{id}/reports", put(reports).layer(DefaultBodyLimit::disable()))
+        .route("/ci-runner/jobs/{id}/cache", get(cache_get).put(cache_put).layer(DefaultBodyLimit::disable()))
         .route("/ci-runner/jobs/{id}/finish", post(finish))
 }
 
@@ -123,28 +125,72 @@ async fn step(State(st): State<AppState>, h: HeaderMap, Path((id, index, status)
     Ok(StatusCode::OK)
 }
 
-async fn artifacts(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>, body: Body) -> R<StatusCode> {
-    job(&st, &h, id).await?;
+/// Stream an upload of job `id` into a temporary file (at most `cap` bytes),
+/// hand it to `keep`, then remove whatever `keep` left behind.
+async fn receive<F: Future<Output = R<()>>>(st: &AppState, id: i64, body: Body, cap: u64, too_big: &str, keep: impl FnOnce(std::path::PathBuf) -> F) -> R<StatusCode> {
     let dir = st.cfg.data_dir.join("ci/tmp");
     tokio::fs::create_dir_all(&dir).await?;
-    let tmp = dir.join(format!("{id}.{}", crate::db::now()));
+    let tmp = dir.join(format!("{id}.{}.{:08x}", crate::db::now(), rand::random::<u32>()));
     let res = async {
         let mut f = tokio::fs::File::create(&tmp).await?;
         let (mut stream, mut n) = (body.into_data_stream(), 0u64);
         while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next()).await.map_err(|_| AppError::bad("The upload stalled"))? {
             let chunk = chunk.map_err(|_| AppError::bad("The upload was interrupted"))?;
             n += chunk.len() as u64;
-            if n > jobs::ARTIFACT_CAP {
-                return Err(AppError::bad("Artifacts are limited to 1 GB per job"));
+            if n > cap {
+                return Err(AppError::bad(too_big));
             }
             f.write_all(&chunk).await?;
         }
         f.sync_all().await?;
-        jobs::store_artifact(&st, id, &tmp).await
+        keep(tmp.clone()).await
     }
     .await;
     let _ = tokio::fs::remove_file(&tmp).await;
     res.map(|_| StatusCode::OK)
+}
+
+async fn artifacts(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>, body: Body) -> R<StatusCode> {
+    job(&st, &h, id).await?;
+    let s = st.clone();
+    receive(&st, id, body, jobs::ARTIFACT_CAP, "Artifacts are limited to 1 GB per job", |f| async move { jobs::store_artifact(&s, id, &f).await }).await
+}
+
+async fn reports(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>, body: Body) -> R<StatusCode> {
+    job(&st, &h, id).await?;
+    let s = st.clone();
+    receive(&st, id, body, super::reports::UPLOAD_CAP, "Reports are limited to 32 MB per job", |f| async move { super::reports::store(&s, id, &f).await }).await
+}
+
+#[derive(Deserialize)]
+struct CacheQ {
+    key: String,
+    /// Comma-separated key prefixes to fall back on.
+    #[serde(default)]
+    restore: String,
+}
+
+/// The archive to restore (its key in `x-cache-key`), or 204.
+async fn cache_get(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>, Query(q): Query<CacheQ>) -> R<Response> {
+    job(&st, &h, id).await?;
+    let restore = q.restore.split(',').filter(|s| !s.is_empty()).take(10).map(String::from).collect();
+    let Some((key, path)) = super::cache::find(&st, id, q.key, restore).await? else { return Ok(StatusCode::NO_CONTENT.into_response()) };
+    let Ok(f) = tokio::fs::File::open(&path).await else { return Ok(StatusCode::NO_CONTENT.into_response()) };
+    let len = f.metadata().await?.len();
+    let mut resp = Response::new(Body::from_stream(tokio_util::io::ReaderStream::new(f)));
+    let hd = resp.headers_mut();
+    hd.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/gzip"));
+    hd.insert(header::CONTENT_LENGTH, header::HeaderValue::from(len));
+    if let Ok(v) = header::HeaderValue::from_str(&key) {
+        hd.insert("x-cache-key", v);
+    }
+    Ok(resp)
+}
+
+async fn cache_put(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>, Query(q): Query<CacheQ>, body: Body) -> R<StatusCode> {
+    job(&st, &h, id).await?;
+    let s = st.clone();
+    receive(&st, id, body, super::cache::ENTRY_CAP, "A cache is limited to 1 GB", |f| async move { super::cache::store(&s, id, q.key, &f).await.map(|_| ()) }).await
 }
 
 #[derive(Deserialize)]

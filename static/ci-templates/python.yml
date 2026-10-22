@@ -1,0 +1,17 @@
+# Python: install the requirements and run pytest. Test results (JUnit XML)
+# show on the run page and failures on pull requests' changed files.
+jobs:
+  test:
+    image: python:3.12
+    cache:
+      key: pip-{{ hash requirements*.txt }}
+      restore-keys: [pip-]
+      paths: [.pip]
+    reports: [reports/junit.xml]
+    steps:
+      - name: Install
+        run: |
+          if [ -f requirements.txt ]; then pip install --cache-dir .pip -r requirements.txt; fi
+          pip install --cache-dir .pip pytest
+      - name: Test
+        run: python -m pytest --junitxml=reports/junit.xml

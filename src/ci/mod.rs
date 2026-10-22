@@ -1,9 +1,11 @@
 //! Built-in CI: pipeline config, the job queue, and the runner.
 
+pub mod cache;
 pub mod config;
 pub mod http;
 pub mod jobs;
 pub mod queue;
+pub mod reports;
 pub mod runner;
 pub mod trigger;
 
@@ -28,6 +30,9 @@ pub async fn upkeep(st: AppState) {
                 Ok(n) if n > 0 => println!("ci: removed {n} old log or artifact file(s)"),
                 Ok(_) => {}
                 Err(e) => eprintln!("ci sweep: {}", e.msg),
+            }
+            if let Err(e) = cache::sweep(&st).await {
+                eprintln!("ci cache sweep: {}", e.msg);
             }
         }
         if now / 60 != minute {

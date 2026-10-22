@@ -169,6 +169,25 @@ Turning CI off stops new runs, re-runs and queued jobs.
 
 **Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts are deleted 30 days after their job, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
 
+**Caches.** A job can keep folders between runs:
+
+```yaml
+jobs:
+  test:
+    cache:
+      key: cargo-{{ hash Cargo.lock }}   # also {{ os }}, {{ arch }}, ${{ matrix.x }}
+      restore-keys: [cargo-]             # fall back on the newest key with this prefix
+      paths: [.cargo, target]            # folders or files in the workspace
+    reports: ["target/junit/*.xml"]      # JUnit XML
+    coverage: [coverage/cobertura.xml]   # Cobertura XML or LCOV
+```
+
+Before the steps, the runner restores the newest cache with that key (`hash` is the SHA-256 of the files the patterns match, as in `artifacts`), else the newest whose key starts with a `restore-keys` prefix: first from the run's branch, then from the default branch. After a successful job it saves the paths under the key, unless it restored that exact key. Caches stay inside the workspace (point tools at it, e.g. `CARGO_HOME=$GITTER_WORKSPACE/.cargo`), go through the runner API like artifacts, and live under `GITTER_DATA/ci/cache`: at most 1 GB each and 2 GB per repository, the least recently used going first, and deleted after 7 days unused. A run only restores caches written by runs at least as trusted as itself (a site admin's, then anyone's with write access, then an agent's), so the default branch never restores a branch's cache and an admin's run never restores one an agent's run wrote. The other way round is allowed: a less trusted run (an agent's) may restore a cache a more trusted run saved, so keep credentials out of cached folders. `restore-keys` get matrix values like `key`.
+
+**Test results and coverage.** After the steps, pass or fail, the runner sends the files that `reports` and `coverage` match. The run page lists the tests, the failed ones with their message and `file:line`, and the coverage percentage; a pull request shows the same summary, and failures that name a changed line appear under that line in **Files changed**. A test that failed and then passed on the same commit (re-run the failed jobs) is marked flaky, and the repository's flaky tests are listed on the CI tab. Reports are capped at 32 MB and 50,000 test cases per job and read without DTDs or entity expansion; secret values in them are replaced by `***` as in logs, and a report that can't be read is named in the job's log. The CI tab remembers up to 1,000 flaky tests per repository.
+
+**Set up CI.** On a repository without runs, **Set up CI** on the CI tab offers starter pipelines (Rust, Node.js, Python, Go, Docker), commits the chosen one as `.gitter/ci.yml` on a new branch and opens a pull request, whose run shows whether it fits.
+
 **Run it locally.** `gitter ci run` runs `.gitter/ci.yml` on your machine with the same parser and step runner, no server needed. Jobs run one at a time in `needs` order, and a job whose needs failed is skipped. Each job gets a fresh copy of the work tree as it is now: tracked files and untracked ones that aren't ignored, without `.git`. Use `--here` to run in the folder itself, for example when steps need git history. `HOME` is a fresh folder, and no secrets are set. Triggers, `paths` and `runs-on` don't apply, and jobs with an `image` need docker. It exits 1 when a job fails.
 
 ## Command-line client

@@ -388,6 +388,73 @@ curl -sf -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/artifacts" -o "$TMP
 curl -sf -N -m 5 -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/log/stream" | grep -q 'event: status' || fail "CI log stream"
 ok "CI: a push runs jobs in order on the built-in runner, with log, live stream and artifacts"
 
+# --- CI extras: test reports, coverage, flaky tests, caches, annotations (left for the UI check)
+ci_wait() { # alice/$1 has $2 runs, all finished
+  for _ in $(seq 300); do
+    api GET "/repos/alice/$1/ci/runs"
+    [ "$(jq_ "len(d['runs']) >= $2 and all(r['status'] in ('success', 'failure', 'cancelled', 'skipped') for r in d['runs'])")" = True ] && return
+    sleep 0.2
+  done
+  fail "CI runs of $1 didn't finish: $BODY"
+}
+api POST /repos '{"name":"reports","readme":true}'
+RP="$TMP/reports"
+git clone -q "$BASE/alice/reports.git" "$RP" || fail "clone reports"
+(
+  cd "$RP" && git config user.name Alice && git config user.email alice@example.com
+  mkdir -p src .gitter
+  printf 'pub fn add(a: i32, b: i32) -> i32 {\n    // adds\n    a + b\n}\n' >src/lib.rs
+  echo 1 >lock.txt
+  printf 'SF:src/lib.rs\nLF:4\nLH:3\nend_of_record\n' >lcov.info
+  printf '<testsuites><testsuite name="math"><testcase classname="math" name="adds" file="src/lib.rs" line="3"><failure message="expected 4, got 5">assertion failed</failure></testcase><testcase classname="math" name="subtracts"/></testsuite></testsuites>\n' >fail.xml
+  printf '<testsuites><testsuite name="math"><testcase classname="math" name="adds"/><testcase classname="math" name="subtracts"/></testsuite></testsuites>\n' >pass.xml
+  # Fails the first time (a flaky test), and always on a branch with ALWAYS_FAIL.
+  cat >.gitter/ci.yml <<YML
+jobs:
+  test:
+    reports: ["out/*.xml"]
+    coverage: [lcov.info]
+    cache:
+      key: deps-{{ hash lock.txt }}
+      paths: [deps]
+    env:
+      MARK: $TMP/flaky-mark
+    steps:
+      - run: mkdir -p out deps && echo cached > deps/x
+      - run: if [ -e ALWAYS_FAIL ] || [ ! -e "\$MARK" ]; then touch "\$MARK"; cp fail.xml out/junit.xml; exit 1; fi; cp pass.xml out/junit.xml
+YML
+  git add -A && git commit -qm "Tests" && git push -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/reports.git" main  # pragma: allowlist secret
+) || fail "push the reports pipeline"
+ci_wait reports 1
+api GET /repos/alice/reports/ci/runs/1/tests
+[ "$(jq_ 'd["jobs"][0]["failed"], d["coverage"], d["results"][0]["file"], d["results"][0]["line"]')" = "1 75.0 src/lib.rs 3" ] || fail "JUnit results and coverage: $BODY"
+api POST /repos/alice/reports/ci/runs/1/rerun '{}'
+ci_wait reports 1
+api GET /repos/alice/reports/ci/flaky
+[ "$(jq_ 'd["tests"][0]["name"]')" = "math::adds" ] || fail "a test that failed, then passed on the same commit is flaky: $BODY"
+api GET /repos/alice/reports/ci/runs/1
+JOB=$(jq_ 'd["jobs"][0]["id"]')
+curl -sf -b "$JAR" "$BASE/api/repos/alice/reports/ci/jobs/$JOB/log" | grep -q 'as the cache deps-' || fail "the cache was saved after the passing attempt"
+(
+  cd "$RP" && git checkout -qb broken && touch ALWAYS_FAIL && sed -i 's/a + b/a + b + 1/' src/lib.rs \
+    && git add -A && git commit -qm "Break add" && git push -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/reports.git" broken  # pragma: allowlist secret
+) || fail "push the broken branch"
+api POST /repos/alice/reports/pulls '{"title":"Break add","head":"broken","base":"main"}'
+ci_wait reports 3
+api GET /repos/alice/reports/ci/runs
+LAST=$(jq_ 'd["runs"][0]["number"]')
+SHA=$(jq_ 'd["runs"][0]["sha"]')
+api GET "/repos/alice/reports/ci/runs/$LAST"
+curl -sf -b "$JAR" "$BASE/api/repos/alice/reports/ci/jobs/$(jq_ 'd["jobs"][0]["id"]')/log" | grep -q 'from the cache deps-' || fail "a branch restores the default branch's cache"
+# (Opening a pull request right after a push can start a second run of it: wait for the newest.)
+for _ in $(seq 50); do
+  api GET "/repos/alice/reports/ci/report?sha=$SHA"
+  [ "$(jq_ 'len(d["annotations"])')" != 0 ] && break
+  sleep 0.2
+done
+[ "$(jq_ 'd["annotations"][0]["path"] + ":" + str(d["annotations"][0]["line"])')" = "src/lib.rs:3" ] || fail "failures as annotations for the pull request: $BODY"
+ok "CI extras: JUnit results with file:line, coverage, flaky tests, caches with default-branch fallback, PR annotations"
+
 # --- rename and transfer with redirects, trash with restore, data export, self-delete
 moved() { curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE$1"; }
 api POST /repos '{"name":"old-name","readme":true}'

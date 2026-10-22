@@ -2,6 +2,7 @@ pub mod account;
 pub mod admin;
 pub mod checks;
 pub mod ci;
+pub mod ci_extras;
 pub mod orgs;
 pub mod code;
 pub mod discussions;
@@ -212,6 +213,9 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/jobs/{{id}}/log/stream"), get(ci::log_stream))
         .route(&format!("{repo}/ci/jobs/{{id}}/artifacts"), get(ci::artifacts))
         .route(&format!("{repo}/ci/status"), get(ci::statuses))
+        .route(&format!("{repo}/ci/runs/{{n}}/tests"), get(ci_extras::run_tests))
+        .route(&format!("{repo}/ci/report"), get(ci_extras::report))
+        .route(&format!("{repo}/ci/flaky"), get(ci_extras::flaky))
         .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
         .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
         .route(&format!("{repo}/hooks"), get(webhooks::list).post(webhooks::create))
