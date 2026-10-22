@@ -182,6 +182,8 @@ async fn setup_git_lets_plain_git_clone_and_push() {
     let home = tmp.path().to_path_buf();
     let (code, _, err) = gitter(&home, &home, &["auth", "setup-git"]);
     assert!(code != 0 && err.contains("login"), "nothing to set up before a login: {err}");
+    // gh's helper for another server isn't gitter's.
+    git(&home, &home, &["config", "--global", "credential.https://github.com.helper", "!'/home/J Smith/bin/gh' auth git-credential"]);
     let (_, _, err) = gitter(&home, &home, &["login", &url, "--token", &tok]);
     assert!(!err.contains("setup-git"), "no hint before setup-git was ever run: {err}");
     ok(&home, &home, &["repo", "create", "secret", "--private", "--readme"]);
@@ -392,6 +394,124 @@ fn a_flag_a_command_does_not_take_is_refused_with_its_usage() {
     // A mistyped --token=… names the flag, not the value after it.
     let (code, _, err) = gitter(home, home, &["login", "http://127.0.0.1:1", "--tokens=SECRETVALUE"]); // pragma: allowlist secret
     assert!(code != 0 && err.contains("--tokens") && !err.contains("SECRETVALUE"), "{err}");
+}
+
+#[test]
+fn logout_removes_the_token_and_only_gitters_git_helper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let (a, b) = ("http://127.0.0.1:1", "http://127.0.0.1:2/sub");
+    let cfg = home.join(".config/gitter/config.json");
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    let hosts = json!({ "default": a, "hosts": {
+        a: { "user": "alice", "token": "gtr_tokena" }, // pragma: allowlist secret
+        b: { "user": "alice", "token": "gtr_tokenb" }, // pragma: allowlist secret
+    }});
+    std::fs::write(&cfg, hosts.to_string()).unwrap();
+    let (code, _, err) = gitter(home, home, &["logout"]);
+    assert!(code != 0 && err.contains(a) && err.contains(b), "two logins: which one must be said: {err}");
+    let (code, _, err) = gitter(home, home, &["logout", a, "--json"]);
+    assert!(code != 0 && err.contains("doesn't take") && err.contains("gitter logout"), "{err}");
+
+    ok(home, home, &["auth", "setup-git"]);
+    let helpers = |server: &str| -> Vec<String> {
+        let out = cmd("git", home, home).args(["config", "--global", "--get-all", &format!("credential.{server}.helper")]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect()
+    };
+    // The user's own helpers: after gitter's on its key (one looks like gh's), and on another server.
+    let key = format!("credential.{a}.helper");
+    git(home, home, &["config", "--global", "--add", &key, "!/usr/bin/gh auth git-credential"]);
+    git(home, home, &["config", "--global", "--add", &key, "cache"]);
+    git(home, home, &["config", "--global", "credential.https://github.com.helper", "store"]);
+
+    let out = ok(home, home, &["logout", &format!("{a}/")]);
+    assert!(out.contains(a), "{out}");
+    let saved = json_of(&std::fs::read_to_string(&cfg).unwrap());
+    assert!(saved["hosts"].get(a).is_none() && saved["hosts"][b]["token"] == "gtr_tokenb", "{saved}");
+    assert_eq!(saved["default"], b, "the default moves to a login that's left");
+    assert_eq!(helpers(a), ["!/usr/bin/gh auth git-credential", "cache"], "gitter's reset and helper gone, the user's kept");
+    assert_eq!(helpers(b).len(), 2, "the other server's helper stays");
+    assert_eq!(helpers("https://github.com"), ["store"]);
+    let (code, _, err) = gitter(home, home, &["logout", a]);
+    assert!(code != 0 && err.contains("not logged in"), "a second logout: {err}");
+
+    // One login left: no argument needed, and its key goes entirely.
+    ok(home, home, &["logout"]);
+    let saved = json_of(&std::fs::read_to_string(&cfg).unwrap());
+    assert!(saved["hosts"].as_object().unwrap().is_empty() && saved["default"] == "", "{saved}");
+    assert!(helpers(b).is_empty(), "{:?}", helpers(b));
+    assert_eq!(helpers("https://github.com"), ["store"]);
+    let (code, _, err) = gitter(home, home, &["logout"]);
+    assert!(code != 0 && err.contains("not logged in"), "{err}");
+}
+
+#[test]
+fn logout_tells_gitters_helpers_from_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let servers = ["http://127.0.0.1:1", "http://127.0.0.1:2", "http://127.0.0.1:3", "http://127.0.0.1:4"];
+    let cfg = home.join(".config/gitter/config.json");
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    let hosts: serde_json::Map<String, Value> = servers.iter().map(|s| (s.to_string(), json!({ "user": "alice", "token": "gtr_t" }))).collect(); // pragma: allowlist secret
+    std::fs::write(&cfg, json!({ "default": servers[0], "hosts": hosts }).to_string()).unwrap();
+    let key = |s: &str| format!("credential.{s}.helper");
+    let set = |s: &str, vals: &[&str]| {
+        for v in vals {
+            git(home, home, &["config", "--global", "--add", &key(s), v]);
+        }
+    };
+    let helpers = |s: &str| -> Vec<String> {
+        let out = cmd("git", home, home).args(["config", "--global", "--get-all", &key(s)]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect()
+    };
+    let ours = |s: &str| format!("!'{}' auth git-credential '{s}'", env!("CARGO_BIN_EXE_gitter"));
+    let gh = "!'/home/J Smith/bin/gh' auth git-credential";
+    // The old form (no server), from a gitter elsewhere; and gh's, quoted the same way.
+    set(servers[0], &["", "!'/opt/x/gitter' auth git-credential", gh]);
+    // The user's own helper before gitter's reset and helper.
+    set(servers[1], &["mine", "", &ours(servers[1])]);
+    // Only the helper, no reset.
+    set(servers[2], &[&ours(servers[2])]);
+    for s in &servers[..3] {
+        ok(home, home, &["logout", s]);
+    }
+    assert_eq!(helpers(servers[0]), [gh], "the old form goes, gh's stays");
+    assert_eq!(helpers(servers[1]), ["mine"]);
+    assert!(helpers(servers[2]).is_empty(), "{:?}", helpers(servers[2]));
+
+    // git's config can't be read: a warning, not a claim that its helper is gone.
+    std::fs::write(home.join(".gitconfig"), "[credential\n").unwrap();
+    let (code, out, err) = gitter(home, home, &["logout", servers[3]]);
+    assert!(code == 0 && out.contains("Logged out") && !out.contains("git no longer"), "{out}");
+    assert!(err.contains("can't read git's config"), "{err}");
+}
+
+#[test]
+fn help_after_a_command_prints_only_its_usage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    for (args, want, not) in [
+        (&["repo", "list", "--help"][..], "gitter repo list", "gitter issue"),
+        (&["help", "pr", "merge"][..], "gitter pr merge N", "gitter repo"),
+        (&["issue", "view", "3", "-h"][..], "gitter issue view|close N", "gitter issue list"),
+        (&["ci", "run", "--help"][..], "copy of the work tree", "gitter ci status"),
+        (&["login", "--help"][..], "gitter login URL", "gitter repo"),
+        (&["logout", "--help"][..], "gitter logout [SERVER]", "gitter login"),
+        (&["repo", "--help"][..], "gitter repo clone", "gitter issue"),
+        (&["help", "auth"][..], "gitter auth setup-git", "gitter repo"),
+        (&["runner", "--help"][..], "gitter runner --url URL", "gitter serve"),
+    ] {
+        let (code, out, err) = gitter(home, home, args);
+        assert!(code == 0 && out.contains(want) && !out.contains(not), "{args:?}: {out}\n{err}");
+    }
+    // Alone, or for no command the client knows: the server's whole list, which names logout too.
+    for args in [&["help"][..], &["--help"][..], &["help", "bogus"][..]] {
+        let (code, out, _) = gitter(home, home, args);
+        assert!(code == 0 && out.contains("Settings come from environment variables") && out.contains("gitter logout"), "{args:?}: {out}");
+    }
+    // A command word alone: the client's whole list (only it explains how the repository is found).
+    let (code, out, _) = gitter(home, home, &["repo"]);
+    assert!(code == 0 && out.contains("The repository is the one whose git remote"), "{out}");
 }
 
 /// Wait for the newest run to finish.

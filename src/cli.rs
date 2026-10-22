@@ -18,6 +18,8 @@ use crate::validate;
 const USAGE: &str = "gitter — command-line client
 
   gitter login URL [--token T]       save the server and an access token (or set GITTER_TOKEN; asks when neither)
+  gitter logout [SERVER]             forget a server's token and its git credential helper (SERVER: when
+                                     you're logged in to more than one)
   gitter auth setup-git              let plain git clone/pull/push use your logins (a git credential helper)
   gitter auth git-credential get     what git runs for that (store and erase do nothing)
   gitter repo create NAME [--description D] [--private] [--readme] [--owner ORG]
@@ -41,14 +43,16 @@ const USAGE: &str = "gitter — command-line client
                                      jobs); exits 1 if a job fails
 
 The repository is the one whose git remote points at a server you logged in to,
-or -R OWNER/NAME (or -R URL/OWNER/NAME). --json prints the server's answer as JSON.";
+or -R OWNER/NAME (or -R URL/OWNER/NAME). --json prints the server's answer as JSON.
+`gitter COMMAND --help` (or `gitter help COMMAND`) prints just that command's usage.";
 
 const BOOL_FLAGS: &[&str] = &["--json", "--private", "--readme", "--delete-branch", "--all", "--here", "--help"];
 const VALUE_FLAGS: &[&str] = &["-R", "--repo", "--token", "--title", "--body", "--state", "--base", "--head", "--method", "--description", "--owner", "--job"];
 
-/// Each command and the flags it takes (--help: all of them). `login`'s second word is the URL.
+/// Each command and the flags it takes (--help: all of them). One-word commands have "" as their second word.
 const COMMANDS: &[(&str, &str, &[&str])] = &[
     ("login", "", &["--token"]),
+    ("logout", "", &[]),
     ("auth", "setup-git", &[]),
     ("auth", "git-credential", &[]),
     ("repo", "create", &["--description", "--private", "--readme", "--owner", "--json"]),
@@ -71,7 +75,12 @@ const COMMANDS: &[(&str, &str, &[&str])] = &[
     ("ci", "run", &["--here"]),
 ];
 
-/// The USAGE lines of `gitter cmd sub` (with their continuation lines).
+/// One-word commands: their second word is an argument.
+fn one_word(cmd: &str) -> bool {
+    COMMANDS.iter().any(|(c, s, _)| *c == cmd && s.is_empty())
+}
+
+/// The USAGE lines of `gitter cmd sub` (with their continuation lines); an empty `sub`: all of `cmd`'s.
 fn usage_of(cmd: &str, sub: &str) -> String {
     let mut out = vec![];
     let mut on = false;
@@ -79,7 +88,7 @@ fn usage_of(cmd: &str, sub: &str) -> String {
         let t = l.trim_start();
         if let Some(rest) = t.strip_prefix("gitter ") {
             let w: Vec<&str> = rest.split_whitespace().collect();
-            on = w.first() == Some(&cmd) && (cmd == "login" || w.get(1).is_some_and(|s| s.split('|').any(|x| x == sub)));
+            on = w.first() == Some(&cmd) && (sub.is_empty() || w.get(1).is_some_and(|s| s.split('|').any(|x| x == sub)));
         } else if t.is_empty() || l.len() - t.len() <= 2 {
             on = false;
         }
@@ -452,11 +461,21 @@ fn print_json(v: &Value) -> Result<()> {
 
 pub fn main(raw: &[String]) -> Result<()> {
     let a = Args::parse(raw)?;
-    if a.has("--help") || (a.pos.len() < 2 && a.pos(0) != Some("login")) {
+    // `gitter CMD [SUB] --help` or `gitter help CMD [SUB]`: that command's lines, else all of CMD's, else everything.
+    let help = a.pos(0) == Some("help");
+    if help || a.has("--help") {
+        let w = &a.pos[usize::from(help)..];
+        let (c, s) = (w.first().map_or("", String::as_str), w.get(1).map_or("", String::as_str));
+        let u = [usage_of(c, s), usage_of(c, "")].into_iter().find(|u| !c.is_empty() && !u.is_empty());
+        println!("{}", u.unwrap_or_else(|| USAGE.to_string()));
+        return Ok(());
+    }
+    if a.pos.len() < 2 && !a.pos(0).is_some_and(one_word) {
         println!("{USAGE}");
         return Ok(());
     }
-    let (c0, c1) = (a.pos(0).unwrap_or(""), if a.pos(0) == Some("login") { "" } else { a.pos(1).unwrap_or("") });
+    let c0 = a.pos(0).unwrap_or("");
+    let c1 = if one_word(c0) { "" } else { a.pos(1).unwrap_or("") };
     let Some((_, _, takes)) = COMMANDS.iter().find(|(c, s, _)| *c == c0 && *s == c1) else {
         bail!("unknown command `gitter {c0} {c1}`\n\n{USAGE}");
     };
@@ -471,6 +490,7 @@ pub fn main(raw: &[String]) -> Result<()> {
     let sub = cx.a.pos(1).unwrap_or("");
     match (cx.a.pos(0).unwrap_or(""), sub) {
         ("login", _) => login(cx),
+        ("logout", _) => logout(cx),
         ("auth", "setup-git") => setup_git(&cx),
         ("auth", "git-credential") => git_credential(&cx),
         ("repo", "create") => repo_create(&cx),
@@ -516,9 +536,13 @@ fn login(mut cx: Ctx) -> Result<()> {
     cx.cfg.default = url.clone();
     save(&cx.cfg)?;
     // setup-git was run for other servers, not this one.
+    // A hint only: an unreadable git config gives none.
     let ours: Vec<String> = global_config(&["--get-regexp", r"^credential\..*\.helper$"])
+        .unwrap_or_default()
         .iter()
-        .filter_map(|e| e.split_once('\n').filter(|(_, v)| v.contains("auth git-credential")).map(|(k, _)| k.to_string()))
+        .filter_map(|e| e.split_once('\n'))
+        .filter(|(k, v)| k.strip_prefix("credential.").and_then(|k| k.strip_suffix(".helper")).is_some_and(|s| gitters_helper(v, s)))
+        .map(|(k, _)| k.to_string())
         .collect();
     if !ours.is_empty() && !ours.contains(&format!("credential.{url}.helper")) {
         eprintln!("To let plain git use this login too, run `gitter auth setup-git` again.");
@@ -526,13 +550,23 @@ fn login(mut cx: Ctx) -> Result<()> {
     Ok(())
 }
 
-/// `git config --global --null ARGS…`: its entries (empty when there are none or git fails).
-fn global_config(args: &[&str]) -> Vec<String> {
+/// Whether `v` is a credential helper setup-git wrote for `server`: `!'EXE' auth git-credential 'SERVER'`, or
+/// the older form without SERVER when EXE is named gitter (gh's helper, quoted, looks the same otherwise).
+fn gitters_helper(v: &str, server: &str) -> bool {
+    let Some(rest) = v.strip_prefix("!'") else { return false };
+    rest.ends_with(&format!("' auth git-credential {}", quote(server)))
+        || rest.strip_suffix("' auth git-credential").is_some_and(|exe| exe == "gitter" || exe.ends_with("/gitter"))
+}
+
+/// `git config --global --null ARGS…`: its entries (empty when there are none; an error when git fails).
+fn global_config(args: &[&str]) -> Result<Vec<String>> {
     let mut a = vec!["config", "--global", "--null"];
     a.extend(args);
-    match git_cmd(&a, None).stdin(Stdio::null()).stderr(Stdio::null()).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).split_terminator('\0').map(String::from).collect(),
-        _ => vec![],
+    let o = git_cmd(&a, None).stdin(Stdio::null()).output().context("can't run git")?;
+    match o.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&o.stdout).split_terminator('\0').map(String::from).collect()),
+        Some(1) => Ok(vec![]), // no such key
+        _ => bail!("{}", clean(String::from_utf8_lossy(&o.stderr).trim(), false)),
     }
 }
 
@@ -621,10 +655,10 @@ fn setup_git(cx: &Ctx) -> Result<()> {
     let exe = std::env::current_exe().context("can't find the gitter program")?;
     let exe = exe.to_str().ok_or_else(|| anyhow!("gitter's path isn't UTF-8: {}", exe.display()))?;
     // git runs a `!` helper through the shell. Each server's entry names it, so it answers only with that login.
-    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    // The empty value first drops helpers from other settings (like gh), and a rerun leaves the same two.
     let mut failed = vec![];
     for host in cx.cfg.hosts.keys() {
-        match set_helper(&format!("credential.{host}.helper"), &format!("!{} auth git-credential {}", quote(exe), quote(host))) {
+        match set_all(&format!("credential.{host}.helper"), &["", &format!("!{} auth git-credential {}", quote(exe), quote(host))]) {
             Ok(()) => println!("git now uses your gitter login for {host}"),
             Err(e) => {
                 eprintln!("can't set git's credential helper for {host}: {e:#}");
@@ -638,17 +672,68 @@ fn setup_git(cx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Makes `key` exactly ["", helper]: the empty value first drops helpers from other settings (like gh), and a
-/// rerun leaves the same two. If the second step fails, the old values are put back, never just the reset.
-fn set_helper(key: &str, helper: &str) -> Result<()> {
-    let old = global_config(&["--get-all", key]);
-    git(&["config", "--global", "--replace-all", key, ""], None)?;
-    if let Err(e) = git(&["config", "--global", "--add", key, helper], None) {
+/// `s` as one shell word.
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Makes `key` exactly `vals` in the global git config (none: unset). If a step fails, the old values are put
+/// back, never a part of the new ones (just a reset would leave git with no helper). Unreadable: nothing written.
+fn set_all(key: &str, vals: &[&str]) -> Result<()> {
+    let old = global_config(&["--get-all", key])?;
+    let set = || -> Result<()> {
+        let Some((first, rest)) = vals.split_first() else {
+            return git(&["config", "--global", "--unset-all", key], None).map(drop);
+        };
+        git(&["config", "--global", "--replace-all", key, first], None)?;
+        rest.iter().try_for_each(|v| git(&["config", "--global", "--add", key, v], None).map(drop))
+    };
+    if let Err(e) = set() {
         let _ = git(&["config", "--global", "--unset-all", key], None);
         for v in &old {
             let _ = git(&["config", "--global", "--add", key, v], None);
         }
         return Err(e);
+    }
+    Ok(())
+}
+
+/// `gitter logout [SERVER]`: forgets SERVER's token (no SERVER: the only login) and takes out what setup-git
+/// wrote for it, its helper and the empty reset just before it. The user's other helpers stay.
+fn logout(mut cx: Ctx) -> Result<()> {
+    let server = match cx.a.pos(1) {
+        Some(s) => s.trim().trim_end_matches('/').to_string(),
+        None => match cx.cfg.hosts.keys().collect::<Vec<_>>()[..] {
+            [] => bail!("not logged in to any server"),
+            [one] => one.clone(),
+            ref many => bail!("logged in to {}: say which, like `gitter logout {}`", clean(&many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "), false), clean(many[0], false)),
+        },
+    };
+    let shown = clean(&server, false);
+    let had = cx.cfg.hosts.remove(&server).is_some();
+    if had {
+        if cx.cfg.default == server {
+            cx.cfg.default = cx.cfg.hosts.keys().next().cloned().unwrap_or_default();
+        }
+        save(&cx.cfg)?;
+        println!("Logged out of {shown}");
+    }
+    let key = format!("credential.{server}.helper");
+    let old = match global_config(&["--get-all", &key]) {
+        Ok(v) => v,
+        Err(e) if had => {
+            eprintln!("Warning: can't read git's config, so a credential helper for {shown} may be left there: {e:#}");
+            return Ok(());
+        }
+        Err(e) => return Err(e.context(format!("not logged in to {shown}, and can't read git's config"))),
+    };
+    let ours = |v: &str| gitters_helper(v, &server);
+    let keep: Vec<&str> = old.iter().enumerate().filter(|(i, v)| !(ours(v) || (v.is_empty() && old.get(i + 1).is_some_and(|n| ours(n))))).map(|(_, v)| v.as_str()).collect();
+    if keep.len() < old.len() {
+        set_all(&key, &keep).with_context(|| format!("can't remove git's credential helper for {shown}"))?;
+        println!("git no longer uses a gitter login for {shown}");
+    } else if !had {
+        bail!("not logged in to {shown}");
     }
     Ok(())
 }
