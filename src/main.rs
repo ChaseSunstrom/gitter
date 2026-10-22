@@ -60,6 +60,7 @@ usage:
 
 client (like gh; `gitter <command> --help` for each):
   gitter login URL [--token T]  save a server and an access token (or GITTER_TOKEN) to ~/.config/gitter/config.json
+  gitter logout [SERVER]        forget a server's token (and its git credential helper)
   gitter auth setup-git         let plain git push/pull use that login (a git credential helper)
   gitter repo create|clone|list|view
   gitter issue list|create|view|close|comment
@@ -76,7 +77,9 @@ fn main() -> anyhow::Result<()> {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("serve");
-    if matches!(cmd, "login" | "auth" | "repo" | "issue" | "pr" | "ci") {
+    let client = |c: &str| matches!(c, "login" | "logout" | "auth" | "repo" | "issue" | "pr" | "ci");
+    // `gitter help repo`: the client's own help for it.
+    if client(cmd) || (cmd == "help" && args.get(1).is_some_and(|c| client(c))) {
         return gitter::cli::main(&args);
     }
     let cfg = config();

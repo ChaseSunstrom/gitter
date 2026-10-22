@@ -394,6 +394,79 @@ fn a_flag_a_command_does_not_take_is_refused_with_its_usage() {
     assert!(code != 0 && err.contains("--tokens") && !err.contains("SECRETVALUE"), "{err}");
 }
 
+#[test]
+fn logout_removes_the_token_and_only_gitters_git_helper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let (a, b) = ("http://127.0.0.1:1", "http://127.0.0.1:2/sub");
+    let cfg = home.join(".config/gitter/config.json");
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    let hosts = json!({ "default": a, "hosts": {
+        a: { "user": "alice", "token": "gtr_tokena" }, // pragma: allowlist secret
+        b: { "user": "alice", "token": "gtr_tokenb" }, // pragma: allowlist secret
+    }});
+    std::fs::write(&cfg, hosts.to_string()).unwrap();
+    let (code, _, err) = gitter(home, home, &["logout"]);
+    assert!(code != 0 && err.contains(a) && err.contains(b), "two logins: which one must be said: {err}");
+    let (code, _, err) = gitter(home, home, &["logout", a, "--json"]);
+    assert!(code != 0 && err.contains("doesn't take") && err.contains("gitter logout"), "{err}");
+
+    ok(home, home, &["auth", "setup-git"]);
+    let helpers = |server: &str| -> Vec<String> {
+        let out = cmd("git", home, home).args(["config", "--global", "--get-all", &format!("credential.{server}.helper")]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect()
+    };
+    // The user's own helpers: after gitter's on its key (one looks like gh's), and on another server.
+    let key = format!("credential.{a}.helper");
+    git(home, home, &["config", "--global", "--add", &key, "!/usr/bin/gh auth git-credential"]);
+    git(home, home, &["config", "--global", "--add", &key, "cache"]);
+    git(home, home, &["config", "--global", "credential.https://github.com.helper", "store"]);
+
+    let out = ok(home, home, &["logout", &format!("{a}/")]);
+    assert!(out.contains(a), "{out}");
+    let saved = json_of(&std::fs::read_to_string(&cfg).unwrap());
+    assert!(saved["hosts"].get(a).is_none() && saved["hosts"][b]["token"] == "gtr_tokenb", "{saved}");
+    assert_eq!(saved["default"], b, "the default moves to a login that's left");
+    assert_eq!(helpers(a), ["!/usr/bin/gh auth git-credential", "cache"], "gitter's reset and helper gone, the user's kept");
+    assert_eq!(helpers(b).len(), 2, "the other server's helper stays");
+    assert_eq!(helpers("https://github.com"), ["store"]);
+    let (code, _, err) = gitter(home, home, &["logout", a]);
+    assert!(code != 0 && err.contains("not logged in"), "a second logout: {err}");
+
+    // One login left: no argument needed, and its key goes entirely.
+    ok(home, home, &["logout"]);
+    let saved = json_of(&std::fs::read_to_string(&cfg).unwrap());
+    assert!(saved["hosts"].as_object().unwrap().is_empty() && saved["default"] == "", "{saved}");
+    assert!(helpers(b).is_empty(), "{:?}", helpers(b));
+    assert_eq!(helpers("https://github.com"), ["store"]);
+    let (code, _, err) = gitter(home, home, &["logout"]);
+    assert!(code != 0 && err.contains("not logged in"), "{err}");
+}
+
+#[test]
+fn help_after_a_command_prints_only_its_usage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    for (args, want, not) in [
+        (&["repo", "list", "--help"][..], "gitter repo list", "gitter issue"),
+        (&["help", "pr", "merge"][..], "gitter pr merge N", "gitter repo"),
+        (&["issue", "view", "3", "-h"][..], "gitter issue view|close N", "gitter issue list"),
+        (&["ci", "run", "--help"][..], "copy of the work tree", "gitter ci status"),
+        (&["login", "--help"][..], "gitter login URL", "gitter repo"),
+        (&["logout", "--help"][..], "gitter logout [SERVER]", "gitter login"),
+        (&["repo", "--help"][..], "gitter repo clone", "gitter issue"),
+        (&["help", "auth"][..], "gitter auth setup-git", "gitter repo"),
+    ] {
+        let (code, out, err) = gitter(home, home, args);
+        assert!(code == 0 && out.contains(want) && !out.contains(not), "{args:?}: {out}\n{err}");
+    }
+    // Alone, or for no command it knows: the whole list.
+    for args in [&["help"][..], &["--help"][..], &["help", "bogus"][..]] {
+        let (code, out, _) = gitter(home, home, args);
+        assert!(code == 0 && out.contains("gitter logout"), "{args:?}: {out}");
+    }
+}
+
 /// Wait for the newest run to finish.
 async fn settle(app: &App) {
     for _ in 0..300 {
