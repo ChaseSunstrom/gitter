@@ -112,7 +112,7 @@ export default async function (ctx) {
     </div></div>
 
     <div class="box" id="secrets"><div class="box-head"><b>CI secrets</b></div><div class="box-body stack">
-      <p class="muted small">CI jobs get these as environment variables, and their values are masked in logs. They're encrypted on the server and can't be read back, only replaced.</p>
+      <p class="muted small">CI jobs get these as environment variables, and their values are masked in logs. They're encrypted on the server and can't be read back, only replaced. Secrets for one environment only (like production), and which branches may deploy there, are set on the <a href="/${full}/deployments">Deployments</a> page.</p>
       <form id="sec-form" class="row wrap-ok">
         <input class="input mono" name="name" placeholder="NAME" pattern="[A-Za-z_][A-Za-z0-9_]*" title="Letters, digits and _ (saved in capitals)" maxlength="64" required style="max-width:220px" aria-label="Secret name" autocomplete="off" spellcheck="false">
         <input class="input mono" name="value" type="password" placeholder="Value" required autocomplete="new-password" aria-label="Secret value" style="max-width:320px">

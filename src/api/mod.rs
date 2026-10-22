@@ -24,6 +24,8 @@ pub mod mcp;
 pub mod notifications;
 pub mod oauth;
 pub mod revert;
+pub mod deploy;
+pub mod preview;
 
 use std::net::SocketAddr;
 
@@ -231,6 +233,12 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/flaky"), get(ci_extras::flaky))
         .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
         .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
+        .route(&format!("{repo}/environments"), get(deploy::environments).put(deploy::put_environment))
+        .route(&format!("{repo}/environments/{{id}}"), delete(deploy::delete_environment))
+        .route(&format!("{repo}/environments/{{id}}/secrets"), get(deploy::env_secrets))
+        .route(&format!("{repo}/environments/{{id}}/secrets/{{name}}"), put(deploy::set_env_secret).delete(deploy::delete_env_secret))
+        .route(&format!("{repo}/deployments"), get(deploy::list).post(deploy::create))
+        .route(&format!("{repo}/deployments/{{id}}"), patch(deploy::update))
         .route(&format!("{repo}/hooks"), get(webhooks::list).post(webhooks::create))
         .route(
             &format!("{repo}/hooks/{{id}}"),

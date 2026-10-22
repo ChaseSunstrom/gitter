@@ -22,6 +22,7 @@ const RESERVED: &[&str] = &[
     "org",
     "orgs",
     "packages",
+    "preview",
     "raw",
     "robots.txt",
     "runners",
@@ -35,6 +36,12 @@ const RESERVED: &[&str] = &[
     // The container registry's API.
     "v2",
 ];
+
+/// A link shown on a page (an environment's or deployment's URL): http(s) only, so it can never
+/// be a script, at most 2000 characters, with no spaces or control characters.
+pub fn web_link(s: &str) -> bool {
+    (s.starts_with("https://") || s.starts_with("http://")) && s.len() <= 2000 && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
 
 /// User and repository names: start alphanumeric, then alphanumerics, `-`, `_`, `.`.
 pub fn name(s: &str, max: usize) -> bool {

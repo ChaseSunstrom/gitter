@@ -1014,6 +1014,47 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE pulls ADD COLUMN maintainer_can_modify INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX pulls_head_repo ON pulls(head_repo_id, head_branch);
     "#,
+    // v32: deployments. An environment (production, preview/pr-7) can keep other branches
+    // out (`branches`: patterns, '' = any) and has secrets of its own; a deployment is one
+    // ref deployed there, by someone or by a CI job, with a status; `preview` is the token
+    // of the folder Gitter serves for it.
+    r#"
+    CREATE TABLE environments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL COLLATE NOCASE,
+        url TEXT NOT NULL DEFAULT '',
+        branches TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        UNIQUE(repo_id, name)
+    );
+    CREATE TABLE environment_secrets (
+        environment_id INTEGER NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        value BLOB NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(environment_id, name)
+    );
+    CREATE TABLE deployments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        environment_id INTEGER NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+        ref TEXT NOT NULL,
+        sha TEXT NOT NULL,
+        creator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        job_id INTEGER REFERENCES ci_jobs(id) ON DELETE SET NULL,
+        pr_number INTEGER,
+        status TEXT NOT NULL DEFAULT 'queued',
+        url TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        preview TEXT UNIQUE,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX deployments_environment ON deployments(environment_id, id);
+    CREATE INDEX deployments_job ON deployments(job_id);
+    CREATE INDEX deployments_pull ON deployments(repo_id, pr_number);
+    "#,
 ];
 
 impl Db {

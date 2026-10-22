@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T02:26:50Z
-updated: 2026-10-22T22:09:19Z
+updated: 2026-10-22T22:09:20Z
 base: 826af23e438a44d0c2084f736ba5e0fe7a940ca3
 base_tree: 196aa9606fb1cd1ee98d60f1f688d00032f7b0aa
 plan0_at: 2026-10-22T22:00:31Z
@@ -53,6 +53,7 @@ README (ci run --here, -R with pr create, plain-http warning) and the CLI help l
 - 2026-10-22T22:04:54Z re-based: what other work changed while it was paused isn't its own change
 - 2026-10-22T22:04:54Z focused
 - 2026-10-22T22:09:19Z done
+- 2026-10-22T22:09:20Z committed a6c62e6 (5 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

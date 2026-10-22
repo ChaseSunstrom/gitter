@@ -643,6 +643,7 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
             })
             .await?;
         issue.state = "merged".into();
+        crate::api::deploy::pull_closed(st, r.id, issue.number).await;
         status["merged_sha"] = json!(h);
         return Ok(status);
     }
@@ -798,6 +799,8 @@ pub async fn update(
     if let Some(s) = new_state {
         if s == "open" {
             refresh_fork_head(&st, &r, &issue).await;
+        } else if issue.is_pr {
+            crate::api::deploy::pull_closed(&st, r.id, num).await;
         }
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
         notify(&st, r.id, Thread::Issue(issue.id), u.id, "").await;
@@ -884,6 +887,8 @@ pub async fn comment(
     if let Some(s) = new_state {
         if s == "open" {
             refresh_fork_head(&st, &r, &issue).await;
+        } else if issue.is_pr {
+            crate::api::deploy::pull_closed(&st, r.id, num).await;
         }
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
     }
@@ -1466,6 +1471,7 @@ pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, p
         old: Some(base),
         new: Some(new_sha.clone()),
     };
+    crate::api::deploy::pull_closed(st, r.id, num).await;
     crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
     notify(st, r.id, Thread::Issue(issue_id), u.id, "").await;
     let mut upds = vec![upd];
