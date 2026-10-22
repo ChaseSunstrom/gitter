@@ -70,6 +70,7 @@ README: Pull requests from forks bullet (opening, syncing, maintainer edits and 
 - 2026-10-22T21:41:36Z review follow-ups fixed: pending/compare refs always removed (per-request compare ref), base checked before fetching, fork head taken from the copied ref, PR row removed if its head ref fails, reopen refetches the fork head, maintainer pushes skip the fork's CI, refs/pull left out of push diffs, README wording; tests + 4 mutations killed; check_refs unit test
 - 2026-10-22T21:53:07Z re-review fixes: private fork needs push to open a PR from it; fork fetches run through mirrors::exec within the base owner's storage and refresh its size; fetch+use+cleanup in spawned tasks so dropped requests can't leak refs; tests + 2 mutations killed
 - 2026-10-22T21:59:57Z done
+- 2026-10-22T21:59:57Z committed 6a95d94 (31 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses the existing PR machinery unchanged by giving each PR a head ref (refs/heads/<b> or refs/pull/<n>/head), git fetch from the fork's path on this server (no network), hooks::on_push for re-syncing, protect.rs's pre-receive hook for the one-branch limit. No new crate.

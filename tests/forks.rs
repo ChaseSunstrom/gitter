@@ -218,6 +218,34 @@ async fn only_forks_in_the_same_family_that_the_opener_can_read() {
     assert!(s == StatusCode::BAD_REQUEST && c.to_string().contains("out of storage"), "{s} {c}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_gone_private_stops_reaching_pull_requests_whose_author_cannot_push_there() {
+    let World { app, alice, bob } = world().await;
+    let carol = {
+        let (_, _, c) = app.call(&Client::default(), "POST", "/api/auth/login", Some(json!({ "login": "carol", "password": "correct horse" })), Some(common::ORIGIN)).await;
+        Client(c)
+    };
+    // carol, who can only read bob's public fork, opens a pull request from it.
+    let (s, v) = app.req(&carol, "POST", "/api/repos/alice/hello/pulls", Some(open("feature", "bob/hello", json!({})))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let n = v["number"].as_i64().unwrap();
+    let tip = pull_ref(&app, "alice/hello", n).await;
+    // bob makes his fork private (carol can still read it): what he pushes there stays there.
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/bob/hello", Some(json!({ "private": true }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "PUT", "/api/repos/bob/hello/collaborators/carol", Some(json!({ "role": "read" }))).await.0, StatusCode::OK);
+    commit(&app, &bob, "bob/hello", "feature", "f.txt", "private now\n").await;
+    assert_eq!(pull_ref(&app, "alice/hello", n).await, tip);
+    // Nor does reopening the pull request copy it.
+    let ip = format!("/api/repos/alice/hello/issues/{n}");
+    assert_eq!(app.req(&alice, "PATCH", &ip, Some(json!({ "state": "closed" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "PATCH", &ip, Some(json!({ "state": "open" }))).await.0, StatusCode::OK);
+    assert_eq!(pull_ref(&app, "alice/hello", n).await, tip);
+    // Once carol can push to the fork, it follows again.
+    assert_eq!(app.req(&bob, "PUT", "/api/repos/bob/hello/collaborators/carol", Some(json!({ "role": "write" }))).await.0, StatusCode::OK);
+    commit(&app, &bob, "bob/hello", "feature", "f.txt", "shared\n").await;
+    assert_eq!(pull_ref(&app, "alice/hello", n).await, Some(head(&app, &bob, "bob/hello", "feature").await));
+}
+
 fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new("git")
         .current_dir(dir)

@@ -129,9 +129,32 @@ pub async fn fetch_branch(st: &AppState, base_id: i64, fork: &std::path::Path, b
     st.git.resolve(&base, dest).await
 }
 
+/// Whether pull request `issue_id`'s fork may still be copied in, by the rule for opening one: a
+/// public fork always, a private one only while the pull request's author can push to it.
+async fn may_copy(st: &AppState, issue_id: i64) -> bool {
+    let row = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT h.is_private, hu.username, h.name, i.author_id FROM pulls p JOIN issues i ON i.id = p.issue_id
+                 JOIN repos h ON h.id = p.head_repo_id JOIN users hu ON hu.id = h.owner_id WHERE p.issue_id = ?1",
+                [issue_id],
+                |r| Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)),
+            )
+            .optional()?)
+        })
+        .await;
+    let Ok(Some((private, owner, name, author))) = row else { return false };
+    if !private {
+        return true;
+    }
+    let Ok(Some(author)) = crate::auth::user_by_id(&st.db, author).await else { return false };
+    Repo::readable(st, Some(&author), &owner, &name).await.is_ok_and(|f| f.can_write)
+}
+
 /// A reopened pull request from a fork catches up with its branch (it stops following while closed).
 async fn refresh_fork_head(st: &AppState, r: &Repo, issue: &IssueRow) {
-    if !issue.from_fork {
+    if !issue.from_fork || !may_copy(st, issue.id).await {
         return;
     }
     let iid = issue.id;
@@ -159,18 +182,21 @@ pub async fn sync_fork_pulls(st: &AppState, repo: &Repo, updates: &[crate::smart
         return;
     }
     let rid = repo.id;
-    let prs: Vec<(i64, i64, String)> = st
+    let prs: Vec<(i64, i64, String, i64)> = st
         .db
         .call(move |c| {
             let mut q = c.prepare(
-                "SELECT i.repo_id, i.number, p.head_branch FROM pulls p JOIN issues i ON i.id = p.issue_id
+                "SELECT i.repo_id, i.number, p.head_branch, i.id FROM pulls p JOIN issues i ON i.id = p.issue_id
                  WHERE p.from_fork = 1 AND p.head_repo_id = ?1 AND i.state = 'open'",
             )?;
-            Ok(q.query_map([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?)
+            Ok(q.query_map([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?)
         })
         .await
         .unwrap_or_default();
-    for (base_id, number, branch) in prs.into_iter().filter(|p| branches.contains(&p.2)) {
+    for (base_id, number, branch, iid) in prs.into_iter().filter(|p| branches.contains(&p.2)) {
+        if !may_copy(st, iid).await {
+            continue;
+        }
         if let Err(e) = fetch_branch(st, base_id, &repo.path, &branch, &format!("refs/pull/{number}/head")).await {
             eprintln!("forks: pull {number} of repository {base_id}: {}", e.msg);
         }
