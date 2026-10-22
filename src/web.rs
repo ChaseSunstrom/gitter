@@ -45,10 +45,16 @@ fn index_html() -> Vec<u8> {
 }
 
 pub async fn index(State(st): State<AppState>, req: Request) -> Response {
+    let path = req.uri().path().to_string();
     if let Some(to) = moved_page(&st, req).await {
         return redirect(StatusCode::MOVED_PERMANENTLY, &to);
     }
-    let mut r = Response::new(Body::from(index_html()));
+    let mut page = index_html();
+    if let Some(head) = unfurl(&st, &path).await {
+        let s = String::from_utf8_lossy(&page).replacen("</head>", &format!("{head}</head>"), 1);
+        page = s.into_bytes();
+    }
+    let mut r = Response::new(Body::from(page));
     r.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
@@ -56,6 +62,49 @@ pub async fn index(State(st): State<AppState>, req: Request) -> Response {
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     r
+}
+
+/// Link previews (Open Graph tags) for public repositories and their issues
+/// and pull requests, so a pasted link unfurls in chat apps. Nothing for pages
+/// a signed-out visitor couldn't see.
+async fn unfurl(st: &AppState, path: &str) -> Option<String> {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let (o, n) = (*segs.first()?, *segs.get(1)?);
+    if !crate::validate::username(o) || !crate::validate::repo_name(n) || segs.len() > 4 {
+        return None;
+    }
+    let repo = crate::repo::Repo::find(st, None, o, n).await.ok().filter(|r| r.can_read)?;
+    let full = repo.full_name();
+    let (title, desc) = match (segs.get(2).copied(), segs.get(3).and_then(|x| x.parse::<i64>().ok())) {
+        (None, _) => (full.clone(), repo.description.clone()),
+        (Some("issues" | "pull"), Some(num)) => {
+            let id = repo.id;
+            let (t, body, is_pr): (String, String, bool) = st
+                .db
+                .call(move |c| {
+                    use rusqlite::OptionalExtension;
+                    Ok(c.query_row("SELECT title, body, is_pr FROM issues WHERE repo_id = ?1 AND number = ?2 AND hidden = 0", rusqlite::params![id, num], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .optional()?)
+                })
+                .await
+                .ok()??;
+            (format!("{t} · {} #{num} · {full}", if is_pr { "Pull request" } else { "Issue" }), body)
+        }
+        _ => return None,
+    };
+    let desc: String = desc.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+    let site = st.settings.get().instance_name;
+    let e = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    Some(format!(
+        "<meta property=\"og:site_name\" content=\"{}\"><meta property=\"og:type\" content=\"website\"><meta property=\"og:title\" content=\"{}\"><meta property=\"og:description\" content=\"{}\"><meta property=\"og:url\" content=\"{}{}\"><meta name=\"twitter:card\" content=\"summary\">",
+        e(&site),
+        e(&title),
+        e(&desc),
+        e(&st.cfg.url),
+        e(path),
+    ))
 }
 
 /// A page of a renamed or transferred repository (`/owner/repo/...`): where it

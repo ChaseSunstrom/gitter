@@ -82,6 +82,11 @@ a.branch-name:hover { text-decoration: underline; }
 .tl-merge { margin-left: 50px; }
 .merge-box { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 14px 16px; display: grid; gap: 12px; }
 .merge-box.ready { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
+.merge-checks { display: grid; gap: 6px; padding: 10px 0 0; border-top: 1px solid var(--line); }
+.merge-check { gap: 8px; align-items: center; min-width: 0; }
+.merge-blocked { border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--line)); border-radius: var(--r); padding: 10px 12px; background: color-mix(in srgb, var(--amber) 8%, var(--surface)); }
+.merge-blocked ul { margin: 6px 0 0 18px; padding: 0; }
+.merge-auto { gap: 8px; align-items: center; flex-wrap: wrap; }
 .merge-box.merged-box { display: flex; align-items: center; gap: 12px; border-color: color-mix(in srgb, var(--purple) 45%, var(--line)); background: color-mix(in srgb, var(--purple-soft) 55%, var(--surface)); }
 .merge-status { align-items: flex-start; gap: 12px; }
 .merge-icon { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--hover); color: var(--muted); }

@@ -67,6 +67,10 @@ client (like gh; `gitter <command> --help` for each):
 Settings come from environment variables; see the README.";
 
 fn main() -> anyhow::Result<()> {
+    // Git runs this binary as a repository's pre-receive hook (a link named so).
+    if std::env::args_os().next().is_some_and(|a| std::path::Path::new(&a).file_name().is_some_and(|f| f == "pre-receive")) {
+        std::process::exit(gitter::protect::pre_receive());
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("serve");
     if matches!(cmd, "login" | "repo" | "issue" | "pr" | "ci") {

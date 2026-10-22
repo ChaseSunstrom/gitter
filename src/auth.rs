@@ -136,6 +136,11 @@ impl User {
 
 pub const USER_COLS: &str = "id, username, display_name, email, is_admin";
 
+/// An account that isn't suspended, by id (signed in with no token limits).
+pub async fn user_by_id(db: &Db, id: i64) -> R<Option<User>> {
+    db.call(move |c| Ok(c.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1 AND suspended = 0"), [id], User::from_row).optional()?)).await
+}
+
 pub async fn hash_password(pw: String) -> R<String> {
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut rand::rngs::OsRng);

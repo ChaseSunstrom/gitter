@@ -106,11 +106,13 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
                 Ok(p) => queue::create_run(c, &run, &p.jobs, &skip)?.1,
                 Err(e) => queue::create_failed_run(c, &run, &e)?,
             };
+            // An agent's run also waits for a person to approve it (they read what it will run).
             c.execute(
                 "UPDATE ci_runs SET agent = COALESCE(?1, (SELECT agent FROM agent_branches WHERE repo_id = ?2 AND branch = ?4))
                  WHERE repo_id = ?2 AND number = ?3",
                 rusqlite::params![agent, repo_id, n, branch],
             )?;
+            c.execute("UPDATE ci_runs SET approval = 'needed' WHERE repo_id = ?1 AND number = ?2 AND agent IS NOT NULL AND status = 'queued'", rusqlite::params![repo_id, n])?;
             Ok(n)
         })
         .await?;
@@ -254,7 +256,13 @@ async fn scheduled(st: &AppState, repo: &Repo) -> R<()> {
     let refname = format!("refs/heads/{}", repo.default_branch);
     let Some(sha) = st.git.resolve(&repo.path, &refname).await? else { return Ok(()) };
     if let Some(p) = pipeline_at(st, &repo.path, &sha).await? {
-        let s = Start { event: "schedule", refname, sha, pr_number: None, actor_id: None, files: None };
+        // A scheduled run is on behalf of whoever last moved the branch.
+        let (id, b) = (repo.id, repo.default_branch.clone());
+        let actor_id: Option<i64> = st
+            .db
+            .call(move |c| Ok(c.query_row("SELECT user_id FROM branch_pushers WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![id, b], |r| r.get(0)).optional()?))
+            .await?;
+        let s = Start { event: "schedule", refname, sha, pr_number: None, actor_id, files: None };
         start(st, repo, p, s).await?;
     }
     Ok(())

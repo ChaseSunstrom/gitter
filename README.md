@@ -134,13 +134,26 @@ jobs:
 - `needs` waits for other jobs and skips when one of them fails. `runs-on: [gpu]` sends a job to runners with those labels. The default `timeout` is 30 minutes.
 - The YAML is a documented subset: block maps and lists, `|` and `>` text, quotes, and `[a, b]` / `{a: b}`. Anchors and tags give a clear error.
 
-**Runners.** The server runs up to 2 jobs at once itself, for repositories owned by admins only. A job there runs as the server's own user and can read its data folder, so treat pushing to an admin's repository as server access. To add machines, make a token in **Site administration → CI runners**, then run on the machine. It needs git, and docker for jobs with an `image`:
+**Runners.** The server runs up to 2 jobs at once itself, only for repositories owned by admins and only for runs a site admin started: their push or merge, their press of Run, or a schedule on a branch they last pushed. A collaborator's push to an admin's repository waits for a separate runner. A job on the built-in runner without an `image` runs as the server's own user and can read its data folder. To add machines, make a token in **Site administration → CI runners**, then run on the machine. It needs git, and docker for jobs with an `image`:
 
 ```sh
 GITTER_RUNNER_TOKEN=grn_… gitter runner --url https://git.example.com --labels gpu --jobs 4
 ```
 
+**Sandbox.** A job with an `image` runs in a container that gets only its workspace mounted (never the docker socket), no new privileges, a few capabilities dropped (raw sockets, device nodes, chroot), at most 4096 processes, and the site's CPU and memory limits (2 CPUs and 4 GB unless the admin changes them; 0 is no limit). `network: false` on a job, or turning the network off site-wide, gives the container no network. Jobs without an `image` run as plain processes on the runner, so register runners on machines you're happy to have run your repositories' code.
+
+**Approval.** A run started by an agent's changes (see AI agents) waits until someone with write access reads the changes and presses **Approve and run**. It then goes to a separate runner, without secrets.
+
 Jobs are leased with a heartbeat. A job whose runner dies goes back to the queue, and a runner that lost its lease can't report over the new attempt. Stopping a runner (Ctrl-C or SIGTERM) kills its running steps, and their jobs go back to the queue.
+
+**Branch rules, checks and auto-merge.** In a repository's **Settings → Branch rules**, admins protect the branches matching a pattern (`main`, `release/*`; `*` stays within one part of the name, `**` spans parts). A rule can:
+
+- require pull requests: no direct pushes or web edits;
+- require approving reviews from people with write access, any of whom can also block by requesting changes;
+- require checks to pass on the pull request's head: CI job names, or contexts of commit statuses that other systems post with `POST /api/repos/OWNER/REPO/statuses/SHA` (`{"state": "success", "context": "deploy", "target_url": "https://…"}`; states are pending, success, failure and error);
+- allow or refuse force-pushes and deleting the branch (refused unless allowed).
+
+Rules apply to git pushes (through a pre-receive hook, before anything moves), web edits, branch deletion and merges. Repository admins may bypass them unless the rule says it applies to admins too, and a bypassed merge has to be asked for. **Merge when ready** on a pull request merges it by itself, with the method chosen, once its checks pass and its reviews are in. A CI badge for a README: `![CI](https://git.example.com/api/repos/OWNER/REPO/ci/badge.svg)` (add `?branch=NAME` for another branch). Links to public repositories, issues and pull requests unfurl in chat apps.
 
 **Who can run CI** is set in Site administration:
 
@@ -214,7 +227,7 @@ Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_
 
 - It reaches only the repositories you picked (not even other public ones) and only the tools you ticked.
 - It can't change settings, collaborators or webhooks, see CI secrets, tokens or your account, or merge pull requests. `commit_files` starts a new branch (`new_branch`) or adds to one an agent started, never the default branch or a person's branch; then `open_pull_request`. Agents hold at most 100 branches per repository (deleting one frees its place).
-- Any CI run of an agent's branch, whoever pushed, gets no CI secrets, since the agent wrote the workflow and reads the log, and the built-in runner (the server itself) never takes it: it waits for a runner you registered. Once a person merges the work, it runs like anyone's.
+- Any CI run of an agent's branch, whoever pushed, waits for your approval, gets no CI secrets (the agent wrote the workflow and reads the log), and never runs on the built-in runner (the server itself): once approved it goes to a runner you registered. Once a person merges the work, it runs like anyone's.
 - The token works only at `/mcp`: not for git, the REST API or the web.
 - It has its own rate limit (120 calls a minute) and its changes count apart from yours.
 - Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".

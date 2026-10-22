@@ -3690,7 +3690,15 @@ async fn mcp_agent_ci_runs_get_no_secrets_and_never_the_builtin_runner() {
     assert_eq!(app.req(&root, "POST", "/api/repos/root1/r/contents", Some(human)).await.0, StatusCode::OK);
     let lease = gitter::ci::jobs::claim(&app.state, builtin, vec![], true).await.unwrap().expect("a person's run");
     assert_eq!((lease.run_number, lease.secrets.len()), (3, 1), "a person's own branch runs with secrets");
-    // Another runner may take agent runs, without secrets.
+    // Another runner may take agent runs once a person approves them, and without secrets.
+    assert!(gitter::ci::jobs::claim(&app.state, own, vec![], false).await.unwrap().is_none(), "agent runs wait for approval");
+    let (_, run) = app.req(&root, "GET", "/api/repos/root1/r/ci/runs/1", None).await;
+    assert_eq!((run["approval"].as_str(), run["agent"].as_str()), (Some("needed"), Some("helper")), "{run}");
+    for n in [1, 2] {
+        assert_eq!(app.req(&root, "POST", &format!("/api/repos/root1/r/ci/runs/{n}/approve"), None).await.0, StatusCode::OK);
+    }
+    assert_eq!(app.req(&root, "POST", "/api/repos/root1/r/ci/runs/1/approve", None).await.0, StatusCode::CONFLICT, "once");
+    assert!(gitter::ci::jobs::claim(&app.state, builtin, vec![], true).await.unwrap().is_none(), "approved, still never the server itself");
     for n in [1, 2] {
         let lease = gitter::ci::jobs::claim(&app.state, own, vec![], false).await.unwrap().expect("agent run");
         assert_eq!((lease.run_number, lease.secrets.len()), (n, 0));
@@ -4109,4 +4117,173 @@ async fn review_suggestions_apply_as_commits() {
     assert_eq!(app.req(&carol, "POST", &format!("{pr}/comments/{wid}/apply"), Some(seen(wid).await)).await.0, StatusCode::OK);
     let (_, text, _) = raw_get(&app, "/raw/alice/r/feat/w.txt").await;
     assert_eq!(text, "x\r\nY\r\nz\r\n");
+}
+
+// ---------- branch rules, commit statuses, auto-merge, badges (T-0007)
+
+/// A test server on a real port, for the git client.
+async fn protection_serve(app: &App) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = app.router.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+    });
+    url
+}
+
+/// Run git in `dir` off the async thread: (succeeded, stderr).
+async fn protection_git(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let (dir, args): (std::path::PathBuf, Vec<String>) = (dir.to_path_buf(), args.iter().map(|s| s.to_string()).collect());
+    tokio::task::spawn_blocking(move || {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=b", "-c", "user.email=b@x", "-c", "init.defaultBranch=main"])
+            .args(&args)
+            .current_dir(&dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned())
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn protection_rules_guard_pushes_web_commits_and_deletion() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "readme": true }))).await;
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    let rule = |p: &str, extra: Value| {
+        let mut r = json!({ "pattern": p });
+        r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        r
+    };
+    assert_eq!(app.req(&bob, "POST", "/api/repos/alice/p/branch-rules", Some(rule("main", json!({})))).await.0, StatusCode::FORBIDDEN, "admins make rules");
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/p/branch-rules", Some(rule("main", json!({})))).await.0, StatusCode::OK);
+    let (s, _) = app.req(&alice, "POST", "/api/repos/alice/p/branch-rules", Some(rule("release/*", json!({ "require_pr": false })))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/p/branch-rules", Some(rule("bad pattern", json!({})))).await.0, StatusCode::BAD_REQUEST);
+
+    // The web: a writer's commit to main goes through a pull request; the owner (an admin) passes.
+    let edit = |branch: &str| json!({ "branch": branch, "message": "m", "changes": [{ "path": "x.txt", "content": "x\n" }] });
+    let (s, e) = app.req(&bob, "POST", "/api/repos/alice/p/contents", Some(edit("main"))).await;
+    assert!(s == StatusCode::FORBIDDEN && e["error"].as_str().unwrap().contains("pull request"), "{e}");
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/p/contents", Some(edit("main"))).await.0, StatusCode::OK);
+
+    // Git: the pre-receive hook applies the same rules.
+    let url = protection_serve(&app).await;
+    let work = tempfile::tempdir().unwrap();
+    let remote = url.replace("http://", "http://bob:correct%20horse@") + "/alice/p.git"; // pragma: allowlist secret
+    let w = work.path();
+    assert!(protection_git(w, &["clone", "-q", &remote, "c"]).await.0);
+    let c = w.join("c");
+    std::fs::write(c.join("y.txt"), "y\n").unwrap();
+    protection_git(&c, &["add", "y.txt"]).await;
+    assert!(protection_git(&c, &["commit", "-qm", "add y"]).await.0);
+    let (ok, err) = protection_git(&c, &["push", "-q", "origin", "HEAD:main"]).await;
+    assert!(!ok && err.contains("main is protected: changes go through a pull request"), "{err}");
+    assert!(protection_git(&c, &["push", "-q", "origin", "HEAD:refs/heads/release/1"]).await.0, "a new branch is fine");
+    protection_git(&c, &["commit", "-q", "--amend", "-m", "rewritten"]).await;
+    let (ok, err) = protection_git(&c, &["push", "-q", "-f", "origin", "HEAD:refs/heads/release/1"]).await;
+    assert!(!ok && err.contains("force-pushes aren't allowed"), "{err}");
+    let (ok, err) = protection_git(&c, &["push", "-q", "origin", ":refs/heads/release/1"]).await;
+    assert!(!ok && err.contains("can't be deleted"), "{err}");
+    let (s, e) = app.req(&bob, "DELETE", "/api/repos/alice/p/branches?name=release/1", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{e}");
+    protection_git(&c, &["reset", "-q", "--hard", "origin/release/1"]).await;
+    protection_git(&c, &["commit", "-q", "--allow-empty", "-m", "more"]).await;
+    assert!(protection_git(&c, &["push", "-q", "origin", "HEAD:refs/heads/release/1"]).await.0, "fast-forwards are fine");
+    // Unprotected branches take anything.
+    assert!(protection_git(&c, &["push", "-q", "-f", "origin", "HEAD~1:refs/heads/topic"]).await.0);
+    assert!(protection_git(&c, &["push", "-q", "-f", "origin", "HEAD:refs/heads/topic"]).await.0);
+    // Rules enforced on admins bind the owner too.
+    let (_, list) = app.req(&alice, "GET", "/api/repos/alice/p/branch-rules", None).await;
+    let main = list["rules"].as_array().unwrap().iter().find(|r| r["pattern"] == "main").unwrap()["id"].as_i64().unwrap();
+    assert_eq!(app.req(&alice, "PUT", &format!("/api/repos/alice/p/branch-rules/{main}"), Some(rule("main", json!({ "enforce_admins": true })))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/p/contents", Some(edit("main"))).await.0, StatusCode::FORBIDDEN);
+    let (_, log) = app.req(&alice, "GET", "/api/me/audit", None).await;
+    assert!(log.to_string().contains("changed the rule for main"), "rule changes are audited: {log}");
+}
+
+#[tokio::test]
+async fn protection_merges_wait_for_checks_and_approvals_and_auto_merge() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "readme": true }))).await;
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    let r = json!({ "pattern": "main", "approvals": 1, "checks": ["build"] });
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/p/branch-rules", Some(r)).await.0, StatusCode::OK);
+    let pr = |name: &'static str| {
+        let (app, bob) = (&app, bob.clone());
+        async move {
+            let c = json!({ "branch": "main", "new_branch": name, "message": name, "changes": [{ "path": format!("{name}.txt"), "content": "x\n" }] });
+            let (_, v) = app.req(&bob, "POST", "/api/repos/alice/p/contents", Some(c)).await;
+            let sha = v["sha"].as_str().unwrap().to_string();
+            let (_, p) = app.req(&bob, "POST", "/api/repos/alice/p/pulls", Some(json!({ "title": name, "head": name, "base": "main" }))).await;
+            (p["number"].as_i64().unwrap(), sha)
+        }
+    };
+    let (one, sha) = pr("one").await;
+    let merge = |n: i64| format!("/api/repos/alice/p/pulls/{n}/merge");
+    let (s, e) = app.req(&bob, "POST", &merge(one), Some(json!({}))).await;
+    let msg = e["error"].as_str().unwrap_or_default().to_string();
+    assert!(s == StatusCode::CONFLICT && msg.contains("build hasn't run") && msg.contains("0 of 1 approving"), "{e}");
+    let (_, issue) = app.req(&bob, "GET", &format!("/api/repos/alice/p/issues/{one}"), None).await;
+    assert_eq!(issue["pull"]["blocked"].as_array().unwrap().len(), 2, "{issue}");
+    // A status from outside counts as a check; a reader's approval doesn't count.
+    let status = |state: &str| json!({ "state": state, "context": "build", "target_url": "https://ci.example/1" });
+    assert_eq!(app.req(&carol, "POST", &format!("/api/repos/alice/p/statuses/{sha}"), Some(status("success"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "POST", &format!("/api/repos/alice/p/statuses/{sha}"), Some(status("success"))).await.0, StatusCode::OK);
+    let (_, ch) = app.req(&carol, "GET", &format!("/api/repos/alice/p/checks/{sha}"), None).await;
+    assert_eq!((ch["state"].as_str(), ch["checks"][0]["name"].as_str()), (Some("success"), Some("build")), "{ch}");
+    assert_eq!(app.req(&carol, "POST", &format!("/api/repos/alice/p/pulls/{one}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::OK);
+    let (s, e) = app.req(&bob, "POST", &merge(one), Some(json!({}))).await;
+    assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("0 of 1"), "readers' approvals don't count: {e}");
+    // The owner may merge past rules not enforced on admins, but must say so.
+    assert_eq!(app.req(&bob, "POST", &merge(one), Some(json!({ "bypass_rules": true }))).await.0, StatusCode::CONFLICT);
+    assert_eq!(app.req(&alice, "POST", &merge(one), Some(json!({ "bypass_rules": true }))).await.0, StatusCode::OK);
+
+    // Auto-merge: armed by a writer, it merges once the last requirement is met.
+    let (two, sha2) = pr("two").await;
+    assert_eq!(app.req(&carol, "PUT", &format!("/api/repos/alice/p/pulls/{two}/auto-merge"), Some(json!({ "method": "squash" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PUT", &format!("/api/repos/alice/p/pulls/{two}/auto-merge"), Some(json!({ "method": "squash" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "POST", &format!("/api/repos/alice/p/statuses/{sha2}"), Some(status("pending"))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", &format!("/api/repos/alice/p/pulls/{two}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::OK);
+    let state = || async {
+        let (_, i) = app.req(&bob, "GET", &format!("/api/repos/alice/p/issues/{two}"), None).await;
+        (i["issue"]["state"].as_str().unwrap_or_default().to_string(), i)
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (s, i) = state().await;
+    assert_eq!(s, "open", "build is still pending");
+    assert_eq!(i["pull"]["auto_merge"]["method"], "squash", "{i}");
+    assert_eq!(app.req(&bob, "POST", &format!("/api/repos/alice/p/statuses/{sha2}"), Some(status("success"))).await.0, StatusCode::OK);
+    let mut merged = false;
+    for _ in 0..50 {
+        if state().await.0 == "merged" {
+            merged = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(merged, "auto-merged once build passed");
+
+    // Badges: unknown without runs, and for repositories the viewer can't see.
+    let (s, svg, _) = raw_get(&app, "/api/repos/alice/p/ci/badge.svg").await;
+    assert!(s == StatusCode::OK && svg.contains("ci: unknown"), "{svg}");
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "secret", "private": true }))).await;
+    let (_, svg, _) = raw_get(&app, "/api/repos/alice/secret/ci/badge.svg").await;
+    assert!(svg.contains("ci: unknown"), "{svg}");
+    // Link previews for public pages only.
+    let (_, page, _) = raw_get(&app, &format!("/alice/p/pull/{two}")).await;
+    assert!(page.contains(r#"<meta property="og:title" content="two · Pull request #2 · alice/p">"#), "{page}");
+    let (_, page, _) = raw_get(&app, "/alice/secret").await;
+    assert!(!page.contains("og:title"), "nothing about private repositories");
 }

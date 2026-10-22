@@ -633,6 +633,48 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo_id, name, version, file)
     );
     "#,
+    // v19: CI trust and branch rules. A run started by an agent's changes waits for a
+    // person's approval (approval 'needed', then 'approved'). branch_pushers: who last
+    // moved each branch (a scheduled run counts as theirs). Commit statuses come from
+    // outside systems. Branch rules guard the branches matching a pattern.
+    r#"
+    ALTER TABLE ci_runs ADD COLUMN approval TEXT;
+    ALTER TABLE ci_runs ADD COLUMN approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+    CREATE TABLE branch_pushers (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        branch TEXT NOT NULL,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, branch)
+    );
+    CREATE TABLE commit_statuses (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        sha TEXT NOT NULL,
+        context TEXT NOT NULL,
+        state TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        target_url TEXT NOT NULL DEFAULT '',
+        creator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, sha, context)
+    );
+    CREATE TABLE branch_rules (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        pattern TEXT NOT NULL,
+        require_pr INTEGER NOT NULL DEFAULT 1,
+        approvals INTEGER NOT NULL DEFAULT 0,
+        checks TEXT NOT NULL DEFAULT '[]',
+        allow_force_push INTEGER NOT NULL DEFAULT 0,
+        allow_deletion INTEGER NOT NULL DEFAULT 0,
+        enforce_admins INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        UNIQUE (repo_id, pattern)
+    );
+    ALTER TABLE pulls ADD COLUMN auto_merge TEXT;
+    ALTER TABLE pulls ADD COLUMN auto_merge_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+    "#,
 ];
 
 impl Db {

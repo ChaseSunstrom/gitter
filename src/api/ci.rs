@@ -25,7 +25,7 @@ use crate::repo::Repo;
 use crate::security::{Event, record};
 use crate::validate;
 
-const RUN_COLS: &str = "r.id, r.number, r.event, r.ref, r.sha, r.pr_number, r.title, r.status, r.error, r.created_at, r.started_at, r.finished_at, u.username";
+const RUN_COLS: &str = "r.id, r.number, r.event, r.ref, r.sha, r.pr_number, r.title, r.status, r.error, r.created_at, r.started_at, r.finished_at, u.username, r.agent, r.approval";
 
 fn run_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     Ok(json!({
@@ -33,6 +33,7 @@ fn run_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "sha": r.get::<_, String>(4)?, "pr_number": r.get::<_, Option<i64>>(5)?, "title": r.get::<_, String>(6)?,
         "status": r.get::<_, String>(7)?, "error": r.get::<_, String>(8)?, "created_at": r.get::<_, i64>(9)?,
         "started_at": r.get::<_, Option<i64>>(10)?, "finished_at": r.get::<_, Option<i64>>(11)?, "actor": r.get::<_, Option<String>>(12)?,
+        "agent": r.get::<_, Option<String>>(13)?, "approval": r.get::<_, Option<String>>(14)?,
     }))
 }
 
@@ -160,6 +161,23 @@ pub async fn cancel(State(st): State<AppState>, Authed(u): Authed, Path((o, n, n
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
     let id = run_id(&st, &r, number).await?;
     st.db.call(move |c| Ok(queue::cancel(c, id)?)).await?;
+    ok()
+}
+
+/// Let a run that waits for approval (one an agent's changes started) go to
+/// the runners. It still gets no secrets and never runs on the server itself.
+pub async fn approve(State(st): State<AppState>, Authed(u): Authed, Path((o, n, number)): Path<(String, String, i64)>) -> J<Value> {
+    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let id = run_id(&st, &r, number).await?;
+    let uid = u.id;
+    let changed = st
+        .db
+        .call(move |c| Ok(c.execute("UPDATE ci_runs SET approval = 'approved', approved_by = ?2 WHERE id = ?1 AND approval = 'needed'", rusqlite::params![id, uid])?))
+        .await?;
+    if changed == 0 {
+        return Err(AppError::conflict("This run isn't waiting for approval"));
+    }
+    st.ci_wake.notify_waiters();
     ok()
 }
 

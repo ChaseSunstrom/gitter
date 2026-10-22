@@ -1,7 +1,7 @@
 // One commit: message, authorship, parents and the full diff.
-import { html, state, get, avatar, timeEl, short, fullDate, sigBadge } from '../lib.js';
+import { html, state, get, avatar, timeEl, short, fullDate, sigBadge, safeUrl } from '../lib.js';
 import { icon } from '../icons.js';
-import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
+import { loadRepo, repoUrl, repoPage, mountRepoHeader, ciIcon } from '../repohead.js';
 import { diffView, mountDiff } from '../diffview.js';
 
 const url = (ctx) => `${repoUrl(ctx.params.owner, ctx.params.repo)}/commit/${encodeURIComponent(ctx.params.sha)}`;
@@ -11,6 +11,8 @@ export function prefetch(ctx) { get(url(ctx)); }
 export default async function (ctx) {
   const { owner, repo } = ctx.params;
   const [meta, d] = await Promise.all([loadRepo(owner, repo), get(url(ctx))]);
+  // Statuses posted from outside (CI here shows in the badge above).
+  const outside = await get(`${repoUrl(owner, repo)}/checks/${d.commit.sha}`).then((x) => x.checks.filter((k) => k.kind === 'status')).catch(() => []);
   const c = d.commit;
   state.sha = c.sha;
   const base = `/${owner}/${repo}`;
@@ -38,6 +40,9 @@ export default async function (ctx) {
         <button class="btn ghost sm icon" data-copy="${c.sha}" data-copy-label="Commit SHA copied" aria-label="Copy SHA">${icon('copy', 'sm')}</button>
       </div>
     </div>
+    ${outside.length ? html`<div class="box"><div class="box-head"><b>Statuses</b></div><div class="list">${outside.map((k) => html`<div class="list-row small">
+      ${ciIcon({ success: 'success', failure: 'failure' }[k.state] || 'running')}<b class="mono">${k.name}</b><span class="muted grow ellipsis">${k.description}</span>
+      ${k.url ? html`<a href="${safeUrl(k.url)}" rel="noopener">Details</a>` : ''}</div>`)}</div></div>` : ''}
     ${c.parents.length > 1 ? html`<p class="small muted">${icon('merged', 'sm')} Merge commit — showing changes against the first parent.</p>` : ''}
     ${diffView(d.diff, { owner, repo, sha: c.sha, key: `${owner}/${repo}@${c.sha}` })}
   </div>`;

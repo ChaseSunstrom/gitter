@@ -442,6 +442,23 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
         }
     }
     status["can_ff"] = json!(mb.as_deref() == Some(b.as_str()));
+    // What the branch rules still ask for, the checks on the head, and auto-merge.
+    let gate = crate::protect::gate(st, r, iid, &base_b, &h).await?;
+    let auto: Option<(String, Option<String>)> = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row("SELECT p.auto_merge, u.username FROM pulls p LEFT JOIN users u ON u.id = p.auto_merge_by WHERE p.issue_id = ?1 AND p.auto_merge IS NOT NULL", [iid], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+        })
+        .await?;
+    status["checks"] = json!(gate.checks);
+    status["checks_state"] = json!(crate::protect::combined(&gate.checks));
+    status["rule"] = json!(gate.rule);
+    status["blocked"] = json!(gate.missing);
+    status["can_bypass"] = json!(gate.can_bypass);
+    status["auto_merge"] = json!(auto.map(|(m, by)| json!({ "method": m, "by": by })));
     Ok(status)
 }
 
@@ -870,6 +887,9 @@ pub struct MergeReq {
     message: Option<String>,
     #[serde(default)]
     delete_branch: bool,
+    /// A repository admin merging past branch rules not enforced on admins.
+    #[serde(default)]
+    bypass_rules: bool,
 }
 
 fn default_method() -> String {
@@ -883,7 +903,17 @@ pub async fn merge_pull(
     Json(req): Json<MergeReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
-    let issue = load_issue(&st, &r, num, Some(&u)).await?;
+    merge_with(&st, &r, &u, num, req).await.map(Json)
+}
+
+/// Auto-merge: as `u`, with the method they chose, never past the branch rules.
+pub(crate) async fn merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, method: &str) -> R<serde_json::Value> {
+    let req = MergeReq { method: method.into(), title: None, message: None, delete_branch: false, bypass_rules: false };
+    merge_with(st, r, u, num, req).await
+}
+
+async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq) -> R<serde_json::Value> {
+    let issue = load_issue(st, r, num, Some(u)).await?;
     if !issue.is_pr {
         return Err(AppError::not_found());
     }
@@ -904,6 +934,10 @@ pub async fn merge_pull(
         .resolve(&r.path, &format!("refs/heads/{base_b}"))
         .await?
         .ok_or_else(|| AppError::conflict("The target branch is gone"))?;
+    let gate = crate::protect::gate(st, r, issue.id, &base_b, &head).await?;
+    if !gate.missing.is_empty() && !(gate.can_bypass && req.bypass_rules) {
+        return Err(AppError::conflict(format!("Merging is blocked: {}", gate.missing.join("; "))));
+    }
     let (an, ae) = u.signature();
     let title = req
         .title
@@ -1015,13 +1049,14 @@ pub async fn merge_pull(
         old: Some(base),
         new: Some(new_sha.clone()),
     };
-    crate::webhooks::issue(&st, r.id, u.id, num, true, "merged").await;
-    crate::hooks::on_push(&st, &r, &u, &[upd]).await;
-    if req.delete_branch && head_b != r.default_branch {
+    crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
+    crate::hooks::on_push(st, r, u, &[upd]).await;
+    if req.delete_branch && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
         let _ = st
             .git
             .delete_ref(&r.path, &format!("refs/heads/{head_b}"))
             .await;
+        crate::hooks::forget_branches(st, r.id, vec![head_b.clone()]).await;
     }
-    Ok(Json(json!({ "sha": new_sha })))
+    Ok(json!({ "sha": new_sha }))
 }

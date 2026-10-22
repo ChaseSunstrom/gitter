@@ -1,5 +1,6 @@
 pub mod account;
 pub mod admin;
+pub mod checks;
 pub mod ci;
 pub mod orgs;
 pub mod code;
@@ -183,6 +184,13 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/runs/{{n}}"), get(ci::run))
         .route(&format!("{repo}/ci/runs/{{n}}/cancel"), post(ci::cancel))
         .route(&format!("{repo}/ci/runs/{{n}}/rerun"), post(ci::rerun))
+        .route(&format!("{repo}/ci/runs/{{n}}/approve"), post(ci::approve))
+        .route(&format!("{repo}/ci/badge.svg"), get(checks::badge))
+        .route(&format!("{repo}/branch-rules"), get(checks::rules).post(checks::create_rule))
+        .route(&format!("{repo}/branch-rules/{{id}}"), put(checks::update_rule).delete(checks::delete_rule))
+        .route(&format!("{repo}/statuses/{{sha}}"), post(checks::post_status))
+        .route(&format!("{repo}/checks/{{sha}}"), get(checks::checks))
+        .route(&format!("{repo}/pulls/{{n}}/auto-merge"), put(checks::set_auto_merge).delete(checks::clear_auto_merge))
         .route(&format!("{repo}/ci/jobs/{{id}}/log"), get(ci::log))
         .route(&format!("{repo}/ci/jobs/{{id}}/log/stream"), get(ci::log_stream))
         .route(&format!("{repo}/ci/jobs/{{id}}/artifacts"), get(ci::artifacts))
