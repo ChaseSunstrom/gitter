@@ -2989,3 +2989,331 @@ async fn transfers_and_trash_follow_org_ownership() {
     assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
     assert!(!app.state.cfg.data_dir.join(format!("trash/{id}.git")).exists());
 }
+
+// ---------- container registry and packages ----------
+
+fn digest(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", hex::encode(Sha256::digest(b)))
+}
+
+/// A registry request with extra headers; the body's JSON error code, if any, comes back too.
+async fn reg(app: &App, method: &str, path: &str, auth: Option<&str>, headers: &[(&str, &str)], body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut b = Request::builder().method(method).uri(path).header("host", "test.local");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let resp = app.router.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+    let (s, h) = (resp.status(), resp.headers().clone());
+    (s, h, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+}
+
+fn oci_code(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body).ok().and_then(|v| v["errors"][0]["code"].as_str().map(String::from)).unwrap_or_default()
+}
+
+const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+
+fn image_manifest(config: &[u8], layers: &[&[u8]]) -> Vec<u8> {
+    json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": digest(config), "size": config.len() },
+        "layers": layers.iter().map(|l| json!({ "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": digest(l), "size": l.len() })).collect::<Vec<_>>(),
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Upload a blob in one request (POST with ?digest=).
+async fn push_blob(app: &App, image: &str, auth: &str, data: &[u8]) -> StatusCode {
+    reg(app, "POST", &format!("/v2/{image}/blobs/uploads/?digest={}", digest(data)), Some(auth), &[], data.to_vec()).await.0
+}
+
+#[tokio::test]
+async fn registry_pushes_and_pulls_images_with_chunked_and_monolithic_uploads() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "app", "private": true }))).await;
+    let pw = basic("alice", "correct horse");
+
+    // The ping: a Basic challenge for anonymous callers and bad passwords, 200 when signed in.
+    let (s, h, _) = reg(&app, "GET", "/v2/", None, &[], vec![]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert!(h["www-authenticate"].to_str().unwrap().starts_with("Basic "), "{h:?}");
+    assert_eq!(h["docker-distribution-api-version"], "registry/2.0");
+    assert_eq!(reg(&app, "GET", "/v2/", Some(&basic("alice", "wrong")), &[], vec![]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(reg(&app, "GET", "/v2/", Some(&pw), &[], vec![]).await.0, StatusCode::OK);
+
+    // Monolithic upload: the digest is checked and a wrong one stores nothing.
+    let config = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers"}}"#.to_vec();
+    let cd = digest(&config);
+    let (s, _, b) = reg(&app, "POST", &format!("/v2/alice/app/blobs/uploads/?digest={}", digest(b"other")), Some(&pw), &[], config.clone()).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "DIGEST_INVALID"));
+    assert_eq!(reg(&app, "HEAD", &format!("/v2/alice/app/blobs/{cd}"), Some(&pw), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+    let (s, h, _) = reg(&app, "POST", &format!("/v2/alice/app/blobs/uploads/?digest={cd}"), Some(&pw), &[], config.clone()).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(h["location"], format!("/v2/alice/app/blobs/{cd}").as_str());
+    assert_eq!(h["docker-content-digest"], cd.as_str());
+    let (s, h, _) = reg(&app, "HEAD", &format!("/v2/alice/app/blobs/{cd}"), Some(&pw), &[], vec![]).await;
+    assert_eq!((s, h["content-length"].to_str().unwrap()), (StatusCode::OK, config.len().to_string().as_str()));
+    assert_eq!(reg(&app, "GET", "/v2/alice/app/blobs/sha256:..%2F..%2Fetc", Some(&pw), &[], vec![]).await.0, StatusCode::BAD_REQUEST);
+
+    // Chunked upload: POST, PATCHes in order (an out-of-order range is refused), PUT with the digest.
+    let layer: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let ld = digest(&layer);
+    let (s, h, _) = reg(&app, "POST", "/v2/alice/app/blobs/uploads/", Some(&pw), &[], vec![]).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let loc = h["location"].to_str().unwrap().to_string();
+    assert!(loc.starts_with("/v2/alice/app/blobs/uploads/"), "{loc}");
+    let (s, h, _) = reg(&app, "PATCH", &loc, Some(&pw), &[("content-range", "0-99999")], layer[..100_000].to_vec()).await;
+    assert_eq!((s, h["range"].to_str().unwrap()), (StatusCode::ACCEPTED, "0-99999"));
+    let (s, _, _) = reg(&app, "PATCH", &loc, Some(&pw), &[("content-range", "5-10")], vec![0; 6]).await;
+    assert_eq!(s, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(reg(&app, "PATCH", &loc, Some(&basic("bob", "correct horse")), &[], vec![1]).await.0, StatusCode::NOT_FOUND, "someone else's upload");
+    let (s, h, _) = reg(&app, "PATCH", &loc, Some(&pw), &[], layer[100_000..200_000].to_vec()).await;
+    assert_eq!((s, h["range"].to_str().unwrap()), (StatusCode::ACCEPTED, "0-199999"));
+    let (s, h, _) = reg(&app, "GET", &loc, Some(&pw), &[], vec![]).await;
+    assert_eq!((s, h["range"].to_str().unwrap()), (StatusCode::NO_CONTENT, "0-199999"));
+    let (s, h, _) = reg(&app, "PUT", &format!("{loc}?digest={ld}"), Some(&pw), &[], layer[200_000..].to_vec()).await;
+    assert_eq!((s, h["docker-content-digest"].to_str().unwrap()), (StatusCode::CREATED, ld.as_str()));
+    assert_eq!(reg(&app, "PATCH", &loc, Some(&pw), &[], vec![1]).await.0, StatusCode::NOT_FOUND, "a finished upload is gone");
+    let (s, h, got) = reg(&app, "GET", &format!("/v2/alice/app/blobs/{ld}"), Some(&pw), &[], vec![]).await;
+    assert_eq!((s, got == layer, h["docker-content-digest"].to_str().unwrap()), (StatusCode::OK, true, ld.as_str()));
+    // A chunked upload whose bytes don't match the digest is refused.
+    let (_, h, _) = reg(&app, "POST", "/v2/alice/app/blobs/uploads/", Some(&pw), &[], vec![]).await;
+    let bad = h["location"].to_str().unwrap().to_string();
+    let (s, _, b) = reg(&app, "PUT", &format!("{bad}?digest={ld}"), Some(&pw), &[], b"not the layer".to_vec()).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "DIGEST_INVALID"));
+
+    // Manifests: every blob they name must be in the repository; then by tag and by digest.
+    let missing = image_manifest(&config, &[b"never uploaded"]);
+    let ct = [("content-type", OCI_MANIFEST)];
+    let (s, _, b) = reg(&app, "PUT", "/v2/alice/app/manifests/v1", Some(&pw), &ct, missing).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "MANIFEST_BLOB_UNKNOWN"));
+    let (s, _, b) = reg(&app, "PUT", "/v2/alice/app/manifests/v1", Some(&pw), &ct, b"{not json".to_vec()).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "MANIFEST_INVALID"));
+    let manifest = image_manifest(&config, &[&layer]);
+    let md = digest(&manifest);
+    let (s, _, b) = reg(&app, "PUT", &format!("/v2/alice/app/manifests/{}", digest(b"x")), Some(&pw), &ct, manifest.clone()).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "DIGEST_INVALID"), "a digest reference must match the body");
+    let (s, h, _) = reg(&app, "PUT", "/v2/alice/app/manifests/v1", Some(&pw), &ct, manifest.clone()).await;
+    assert_eq!((s, h["docker-content-digest"].to_str().unwrap()), (StatusCode::CREATED, md.as_str()));
+    for r in ["v1", md.as_str()] {
+        let (s, h, got) = reg(&app, "GET", &format!("/v2/alice/app/manifests/{r}"), Some(&pw), &[], vec![]).await;
+        assert_eq!((s, got == manifest), (StatusCode::OK, true), "{r}");
+        assert_eq!((h["content-type"].to_str().unwrap(), h["docker-content-digest"].to_str().unwrap()), (OCI_MANIFEST, md.as_str()));
+    }
+    let (s, h, got) = reg(&app, "HEAD", "/v2/alice/app/manifests/v1", Some(&pw), &[], vec![]).await;
+    assert_eq!((s, h["content-length"].to_str().unwrap(), got.len()), (StatusCode::OK, manifest.len().to_string().as_str(), 0));
+    let (s, _, b) = reg(&app, "GET", "/v2/alice/app/manifests/nope", Some(&pw), &[], vec![]).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN"));
+    // More tags, and a named image under the same repository (its blobs are the repository's).
+    assert_eq!(reg(&app, "PUT", "/v2/alice/app/manifests/latest", Some(&pw), &ct, manifest.clone()).await.0, StatusCode::CREATED);
+    assert_eq!(reg(&app, "PUT", "/v2/alice/app/web/manifests/2.0", Some(&pw), &ct, manifest.clone()).await.0, StatusCode::CREATED);
+    let (s, _, b) = reg(&app, "GET", "/v2/alice/app/tags/list", Some(&pw), &[], vec![]).await;
+    assert_eq!((s, serde_json::from_slice::<Value>(&b).unwrap()), (StatusCode::OK, json!({ "name": "alice/app", "tags": ["latest", "v1"] })));
+    let (_, h, b) = reg(&app, "GET", "/v2/alice/app/tags/list?n=1", Some(&pw), &[], vec![]).await;
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["tags"], json!(["latest"]));
+    assert!(h["link"].to_str().unwrap().contains("last=latest"), "{h:?}");
+    let (_, _, b) = reg(&app, "GET", "/v2/alice/app/web/tags/list", Some(&pw), &[], vec![]).await;
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap(), json!({ "name": "alice/app/web", "tags": ["2.0"] }));
+    // An index naming a manifest the image doesn't have is refused; one naming v1's is kept.
+    let index = |m: &str| json!({ "schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{ "mediaType": OCI_MANIFEST, "digest": m, "size": manifest.len(), "platform": { "architecture": "amd64", "os": "linux" } }] }).to_string().into_bytes();
+    let ict = [("content-type", "application/vnd.oci.image.index.v1+json")];
+    assert_eq!(oci_code(&reg(&app, "PUT", "/v2/alice/app/manifests/multi", Some(&pw), &ict, index(&digest(b"x"))).await.2), "MANIFEST_UNKNOWN");
+    assert_eq!(reg(&app, "PUT", "/v2/alice/app/manifests/multi", Some(&pw), &ict, index(&md)).await.0, StatusCode::CREATED);
+
+    // Deleting a tag keeps the manifest; deleting the manifest drops its tags.
+    assert_eq!(reg(&app, "DELETE", "/v2/alice/app/manifests/latest", Some(&pw), &[], vec![]).await.0, StatusCode::ACCEPTED);
+    assert_eq!(reg(&app, "GET", "/v2/alice/app/manifests/latest", Some(&pw), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(reg(&app, "GET", &format!("/v2/alice/app/manifests/{md}"), Some(&pw), &[], vec![]).await.0, StatusCode::OK);
+    assert_eq!(reg(&app, "DELETE", &format!("/v2/alice/app/web/manifests/{md}"), Some(&pw), &[], vec![]).await.0, StatusCode::ACCEPTED);
+    let (_, _, b) = reg(&app, "GET", "/v2/alice/app/web/tags/list", Some(&pw), &[], vec![]).await;
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["tags"], json!([]));
+    assert_eq!(reg(&app, "GET", "/v2/alice/app/manifests/v1", Some(&pw), &[], vec![]).await.0, StatusCode::OK, "other images keep theirs");
+}
+
+#[tokio::test]
+async fn registry_access_follows_the_repository() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "app", "private": true }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "pub" }))).await;
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "mine" }))).await;
+    let pw = basic("alice", "correct horse");
+    let bob_pw = basic("bob", "correct horse");
+    let token = |body: Value| {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", "/api/me/tokens", Some(body)).await.1["token"].as_str().unwrap().to_string() }
+    };
+    let read = basic("alice", &token(json!({ "name": "ro", "scope": "read" })).await);
+    let (_, d) = app.req(&alice, "POST", "/api/repos/alice/app/deploy-tokens", Some(json!({ "name": "deploy", "write": true }))).await;
+    let deploy = basic("x-access-token", d["token"].as_str().unwrap());
+
+    let layer = b"layer bytes".repeat(100);
+    let config = b"{}".to_vec();
+    assert_eq!(push_blob(&app, "alice/app", &pw, &layer).await, StatusCode::CREATED);
+    assert_eq!(push_blob(&app, "alice/app", &deploy, &config).await, StatusCode::CREATED, "a deploy token pushes to its repository");
+    let manifest = image_manifest(&config, &[&layer]);
+    let ct = [("content-type", OCI_MANIFEST)];
+    assert_eq!(reg(&app, "PUT", "/v2/alice/app/manifests/v1", Some(&deploy), &ct, manifest.clone()).await.0, StatusCode::CREATED);
+
+    // A private image: a challenge for anonymous callers, "unknown" for outsiders, pulls for readers.
+    let (s, h, b) = reg(&app, "GET", "/v2/alice/app/manifests/v1", None, &[], vec![]).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"));
+    assert!(h.get("www-authenticate").is_some());
+    let (s, _, b) = reg(&app, "GET", "/v2/alice/app/manifests/v1", Some(&bob_pw), &[], vec![]).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::NOT_FOUND, "NAME_UNKNOWN"));
+    assert_eq!(reg(&app, "GET", &format!("/v2/alice/app/blobs/{}", digest(&layer)), Some(&bob_pw), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(reg(&app, "GET", "/v2/alice/app/manifests/v1", Some(&read), &[], vec![]).await.0, StatusCode::OK);
+    let (s, _, b) = reg(&app, "POST", "/v2/alice/app/blobs/uploads/", Some(&read), &[], vec![]).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::FORBIDDEN, "DENIED"), "a read-only token can't push");
+    assert_eq!(reg(&app, "POST", "/v2/alice/pub/blobs/uploads/", Some(&deploy), &[], vec![]).await.0, StatusCode::FORBIDDEN, "a deploy token is for one repository");
+    assert_eq!(reg(&app, "GET", "/v2/alice/missing/tags/list", Some(&pw), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+    let (s, _, b) = reg(&app, "GET", "/v2/alice/app/Bad_Name/tags/list", Some(&pw), &[], vec![]).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "NAME_INVALID"));
+
+    // Cross-repository mount: from a repository you can read, otherwise a normal upload starts.
+    let mount = format!("/v2/alice/pub/blobs/uploads/?mount={}&from=alice/app", digest(&layer));
+    let (s, h, _) = reg(&app, "POST", &mount, Some(&pw), &[], vec![]).await;
+    assert_eq!((s, h["location"].to_str().unwrap()), (StatusCode::CREATED, format!("/v2/alice/pub/blobs/{}", digest(&layer)).as_str()));
+    let steal = format!("/v2/bob/mine/blobs/uploads/?mount={}&from=alice/app", digest(&layer));
+    assert_eq!(reg(&app, "POST", &steal, Some(&bob_pw), &[], vec![]).await.0, StatusCode::ACCEPTED, "bob can't read alice/app");
+    assert_eq!(reg(&app, "HEAD", &format!("/v2/bob/mine/blobs/{}", digest(&layer)), Some(&bob_pw), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+    // A public image: anyone pulls, nobody anonymous pushes.
+    assert_eq!(push_blob(&app, "alice/pub", &pw, &config).await, StatusCode::CREATED);
+    assert_eq!(reg(&app, "PUT", "/v2/alice/pub/manifests/latest", Some(&pw), &ct, manifest.clone()).await.0, StatusCode::CREATED);
+    let (s, _, got) = reg(&app, "GET", "/v2/alice/pub/manifests/latest", None, &[], vec![]).await;
+    assert_eq!((s, got == manifest), (StatusCode::OK, true));
+    assert_eq!(reg(&app, "GET", "/v2/alice/pub/manifests/latest", Some(&basic("alice", "wrong")), &[], vec![]).await.0, StatusCode::UNAUTHORIZED, "bad credentials aren't anonymous");
+    assert_eq!(reg(&app, "POST", "/v2/alice/pub/blobs/uploads/", None, &[], vec![]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(reg(&app, "PUT", "/v2/alice/pub/manifests/x", Some(&bob_pw), &ct, manifest.clone()).await.0, StatusCode::FORBIDDEN);
+
+    // The Packages tab's listing, and the same rules there.
+    let (s, p) = app.req(&alice, "GET", "/api/repos/alice/app/packages", None).await;
+    assert_eq!(s, StatusCode::OK, "{p}");
+    assert_eq!(p["images"][0]["name"], "alice/app", "{p}");
+    assert_eq!(p["images"][0]["tags"][0]["tag"], "v1");
+    assert_eq!(p["images"][0]["tags"][0]["size"], manifest.len() + layer.len() + config.len());
+    assert_eq!(p["images"][0]["pull"], "test.local/alice/app:v1");
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/app/packages", None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn registry_storage_is_counted_once_and_freed_with_the_repository() {
+    let app = App::new();
+    app.signup("root").await; // the first account is a site admin, with no quota
+    let alice = app.signup("alice").await;
+    for n in ["a", "b"] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n }))).await;
+    }
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 0", [])?)).await.unwrap();
+    let pw = basic("alice", "correct horse");
+    let layer = vec![9u8; 400 * 1024];
+    let config = b"{\"os\":\"linux\"}".to_vec();
+    let manifest = image_manifest(&config, &[&layer]);
+    let ct = [("content-type", OCI_MANIFEST)];
+    for repo in ["alice/a", "alice/b"] {
+        assert_eq!(push_blob(&app, repo, &pw, &layer).await, StatusCode::CREATED);
+        assert_eq!(push_blob(&app, repo, &pw, &config).await, StatusCode::CREATED);
+        assert_eq!(reg(&app, "PUT", &format!("/v2/{repo}/manifests/v1"), Some(&pw), &ct, manifest.clone()).await.0, StatusCode::CREATED);
+    }
+    let used = || async { app.req(&alice, "GET", "/api/me", None).await.1["storage"]["used"].as_u64().unwrap() };
+    assert_eq!(used().await as usize, layer.len() + config.len() + manifest.len(), "shared blobs count once");
+
+    // Uploads stop at the quota, monolithic and chunked alike, and leave nothing behind.
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    let big = vec![3u8; 700 * 1024];
+    let (st, _, b) = reg(&app, "POST", &format!("/v2/alice/a/blobs/uploads/?digest={}", digest(&big)), Some(&pw), &[], big.clone()).await;
+    assert_eq!((st, oci_code(&b).as_str()), (StatusCode::PAYLOAD_TOO_LARGE, "DENIED"));
+    let (_, h, _) = reg(&app, "POST", "/v2/alice/a/blobs/uploads/", Some(&pw), &[], vec![]).await;
+    let loc = h["location"].to_str().unwrap().to_string();
+    assert_eq!(reg(&app, "PATCH", &loc, Some(&pw), &[], big[..400 * 1024].to_vec()).await.0, StatusCode::ACCEPTED);
+    assert_eq!(reg(&app, "PATCH", &loc, Some(&pw), &[], big[400 * 1024..].to_vec()).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(used().await as usize, layer.len() + config.len() + manifest.len());
+    let data = app.state.cfg.data_dir.clone();
+    let blob = data.join(format!("registry/sha256/{}/{}", &digest(&layer)[7..9], &digest(&layer)[7..]));
+    assert!(blob.is_file(), "{}", blob.display());
+
+    // A trashed repository's images are gone from the registry; purging it frees the
+    // blobs no other repository holds, and the last one's purge frees the rest.
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/a", Some(json!({ "confirm": "alice/a" }))).await.0, StatusCode::OK);
+    assert_eq!(reg(&app, "GET", "/v2/alice/a/manifests/v1", Some(&pw), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(reg(&app, "HEAD", &format!("/v2/alice/a/blobs/{}", digest(&layer)), Some(&pw), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+    purge_trash(&app).await;
+    assert!(blob.is_file(), "alice/b still holds it");
+    assert_eq!(reg(&app, "GET", "/v2/alice/b/manifests/v1", Some(&pw), &[], vec![]).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/b", Some(json!({ "confirm": "alice/b" }))).await.0, StatusCode::OK);
+    purge_trash(&app).await;
+    assert!(!blob.exists(), "no repository holds it any more");
+    assert_eq!(used().await, 0);
+}
+
+#[tokio::test]
+async fn registry_sweep_drops_unreferenced_blobs_and_stale_uploads() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "a" }))).await;
+    let pw = basic("alice", "correct horse");
+    let (kept, loose) = (b"kept layer".to_vec(), b"loose blob".to_vec());
+    let config = b"{}".to_vec();
+    for b in [&kept, &loose, &config] {
+        assert_eq!(push_blob(&app, "alice/a", &pw, b).await, StatusCode::CREATED);
+    }
+    assert_eq!(reg(&app, "PUT", "/v2/alice/a/manifests/v1", Some(&pw), &[("content-type", OCI_MANIFEST)], image_manifest(&config, &[&kept])).await.0, StatusCode::CREATED);
+    let (_, h, _) = reg(&app, "POST", "/v2/alice/a/blobs/uploads/", Some(&pw), &[], vec![]).await;
+    let upload = h["location"].to_str().unwrap().to_string();
+    // A day later: the blob no manifest names and the abandoned upload are swept; the rest stay.
+    app.state.db.call(|c| Ok(c.execute_batch("UPDATE registry_blobs SET created_at = created_at - 90000; UPDATE registry_uploads SET created_at = created_at - 90000")?)).await.unwrap();
+    let tmp = app.state.cfg.data_dir.join("registry/tmp").join(upload.rsplit('/').next().unwrap());
+    let f = std::fs::File::options().write(true).open(&tmp).unwrap();
+    f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)).unwrap();
+    gitter::registry::sweep(&app.state).await;
+    assert!(!tmp.exists(), "the abandoned upload's bytes are gone");
+    let head = |d: String| {
+        let (app, pw) = (&app, pw.clone());
+        async move { reg(app, "HEAD", &format!("/v2/alice/a/blobs/{d}"), Some(&pw), &[], vec![]).await.0 }
+    };
+    assert_eq!(head(digest(&loose)).await, StatusCode::NOT_FOUND);
+    assert_eq!(head(digest(&kept)).await, StatusCode::OK);
+    assert_eq!(head(digest(&config)).await, StatusCode::OK);
+    assert_eq!(reg(&app, "PATCH", &upload, Some(&pw), &[], vec![1]).await.0, StatusCode::NOT_FOUND);
+    let d = digest(&loose);
+    assert!(!app.state.cfg.data_dir.join(format!("registry/sha256/{}/{}", &d[7..9], &d[7..])).exists());
+}
+
+#[tokio::test]
+async fn registry_generic_packages_upload_and_download_files() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "tool", "private": true }))).await;
+    let t = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "ci" }))).await.1["token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {t}");
+    let file = b"#!/bin/sh\necho hi\n".to_vec();
+    let url = "/api/repos/alice/tool/packages/generic/cli/1.0.0/install.sh";
+    let (s, _, b) = reg(&app, "PUT", url, Some(&bearer), &[], file.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let up: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!((up["size"].as_u64(), up["sha256"].as_str()), (Some(file.len() as u64), Some(&digest(&file)[7..])));
+    let (s, _, got) = reg(&app, "GET", url, Some(&bearer), &[], vec![]).await;
+    assert_eq!((s, got == file), (StatusCode::OK, true));
+    assert_eq!(app.call(&bob, "GET", url, None, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(reg(&app, "PUT", "/api/repos/alice/tool/packages/generic/cli/1.0.0/..", Some(&bearer), &[], file.clone()).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(reg(&app, "PUT", "/api/repos/alice/tool/packages/generic/c%20li/1/x", Some(&bearer), &[], file.clone()).await.0, StatusCode::BAD_REQUEST);
+    let (_, p) = app.req(&alice, "GET", "/api/repos/alice/tool/packages", None).await;
+    assert_eq!(p["packages"][0]["name"], "cli", "{p}");
+    assert_eq!(p["packages"][0]["version"], "1.0.0");
+    assert_eq!(p["packages"][0]["files"][0]["file"], "install.sh");
+    assert_eq!(reg(&app, "DELETE", url, Some(&bearer), &[], vec![]).await.0, StatusCode::OK);
+    assert_eq!(reg(&app, "GET", url, Some(&bearer), &[], vec![]).await.0, StatusCode::NOT_FOUND);
+}

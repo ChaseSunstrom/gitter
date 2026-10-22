@@ -381,11 +381,19 @@ pub async fn spool(dir: &Path, limit: u64, too_big: &str, body: Body) -> Result<
     let mut rnd = [0u8; 8];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
     let tmp = Tmp(dir.join(hex::encode(rnd)));
-    // Bytes received since `window` began; checked, then restarted, about every minute.
-    let (mut window, mut recent) = (std::time::Instant::now(), 0u64);
     tokio::fs::create_dir_all(dir).await.map_err(internal)?;
     let mut f = tokio::fs::File::create(&tmp.0).await.map_err(internal)?;
-    let (mut hash, mut n) = (Sha256::new(), 0u64);
+    let mut hash = Sha256::new();
+    let n = pipe(&mut f, limit, too_big, body, &mut hash).await?;
+    Ok((tmp, n, hex::encode(hash.finalize())))
+}
+
+/// Stream `body` onto the end of `f` (synced) while hashing it, refusing it past
+/// `limit` bytes, when it stalls, or when it's too slow. Returns the bytes written.
+pub async fn pipe(f: &mut tokio::fs::File, limit: u64, too_big: &str, body: Body, hash: &mut Sha256) -> Result<u64, (StatusCode, String)> {
+    // Bytes received since `window` began; checked, then restarted, about every minute.
+    let (mut window, mut recent) = (std::time::Instant::now(), 0u64);
+    let mut n = 0u64;
     let mut stream = body.into_data_stream();
     loop {
         let chunk = match tokio::time::timeout(STALL, stream.next()).await {
@@ -409,7 +417,7 @@ pub async fn spool(dir: &Path, limit: u64, too_big: &str, body: Body) -> Result<
         f.write_all(&chunk).await.map_err(internal)?;
     }
     f.sync_all().await.map_err(internal)?;
-    Ok((tmp, n, hex::encode(hash.finalize())))
+    Ok(n)
 }
 
 /// Remove the files of these objects that no repository holds any more.

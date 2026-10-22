@@ -50,8 +50,8 @@ const STORES: &[Store] = &[
     Store { dir: "snippets", table: "snippets", what: "snippets", required: true, trashed: None },
 ];
 
-/// Folders of plain files the database lists one by one: Git LFS objects and release files.
-const DATA_DIRS: [&str; 2] = ["lfs", "releases"];
+/// Folders of plain files the database lists one by one: Git LFS objects, release files and registry blobs.
+const DATA_DIRS: [&str; 3] = ["lfs", "releases", "registry"];
 
 /// Folder names (`<id>.git`) the database knows for a store. A table that
 /// doesn't exist yet (a database from before it was added) knows none, and
@@ -112,6 +112,24 @@ fn release_files(db: &Connection) -> Result<Vec<(String, String)>> {
     Ok(files.collect::<Result<_, _>>()?)
 }
 
+/// Container registry blobs the database refers to, as (`registry/sha256/ab/<hex>`, hex);
+/// none before the table exists.
+fn registry_files(db: &Connection) -> Result<Vec<(String, String)>> {
+    let table = db
+        .query_row("SELECT 1 FROM sqlite_master WHERE name = 'registry_blobs'", [], |_| Ok(()))
+        .optional()?;
+    if table.is_none() {
+        return Ok(vec![]);
+    }
+    let mut s = db.prepare("SELECT DISTINCT digest FROM registry_blobs ORDER BY digest")?;
+    let digests = s.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(digests
+        .into_iter()
+        .filter(|d| crate::registry::valid_digest(d))
+        .map(|d| (crate::registry::blob_path(Path::new(""), &d).to_string_lossy().into_owned(), d[7..].to_string()))
+        .collect())
+}
+
 fn sha256_file(p: &Path) -> Result<String> {
     let mut h = sha2::Sha256::new();
     std::io::copy(&mut std::fs::File::open(p)?, &mut h)?;
@@ -138,7 +156,7 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
     };
     // The snapshot holds password and session hashes: keep it next to the data, owner-only.
     let tmp = tempdir_in(&cfg.data_dir)?;
-    let res = (|| -> Result<(usize, i64, usize, usize)> {
+    let res = (|| -> Result<(usize, i64, usize, usize, usize)> {
         let snap = tmp.join("gitter.db");
         let conn = Connection::open(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
@@ -148,6 +166,7 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
         let stores: Vec<Vec<String>> = STORES.iter().map(|s| folders(&snap_conn, s)).collect::<Result<_>>()?;
         let oids = lfs_oids(&snap_conn)?;
         let assets = release_files(&snap_conn)?;
+        let blobs = registry_files(&snap_conn)?;
         drop(snap_conn);
         let users: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
         drop(conn);
@@ -155,7 +174,7 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
         let manifest = serde_json::json!({
             "format": FORMAT, "gitter": env!("CARGO_PKG_VERSION"), "created_at": crate::db::now(),
             "repos": count("repos"), "trash": count("trash"), "snippets": count("snippets"), "users": users, "lfs_objects": oids.len(),
-            "release_files": assets.len(),
+            "release_files": assets.len(), "registry_blobs": blobs.len(),
         });
         std::fs::write(tmp.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
@@ -215,19 +234,29 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
             // Tolerates the file vanishing between the check and the copy.
             append_tree(&mut tar, &src, name)?;
         }
+        // Like LFS files: a blob is in place before its row commits, and never rewritten.
+        tar.append_dir("registry", &cfg.data_dir)?;
+        for (name, _) in &blobs {
+            let src = cfg.data_dir.join(name);
+            if !src.is_file() {
+                eprintln!("warning: registry blob {name} is missing (deleted during the backup?)");
+                continue;
+            }
+            append_tree(&mut tar, &src, name)?;
+        }
         tar.into_inner()?.finish()?.flush()?;
-        Ok((stores[0].len(), users, oids.len(), assets.len()))
+        Ok((stores[0].len(), users, oids.len(), assets.len(), blobs.len()))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     if res.is_err() && !to_stdout {
         let _ = std::fs::remove_file(&out);
     }
-    let (repos, users, lfs, files) = res?;
+    let (repos, users, lfs, files, blobs) = res?;
     let size = if to_stdout { String::new() } else {
         format!(" ({:.1} MB)", std::fs::metadata(&out)?.len() as f64 / 1e6)
     };
     eprintln!(
-        "Backed up {users} accounts, {repos} repositories, {lfs} Git LFS files and {files} release files to {}{size}.",
+        "Backed up {users} accounts, {repos} repositories, {lfs} Git LFS files, {files} release files and {blobs} registry blobs to {}{size}.",
         if to_stdout { "stdout".into() } else { out.display().to_string() },
     );
     Ok(())
@@ -297,6 +326,8 @@ fn inspect_archive(archive: &Path) -> Result<serde_json::Value> {
             || name.starts_with("lfs/")
             || name == "releases"
             || name.starts_with("releases/")
+            || name == "registry"
+            || name.starts_with("registry/")
             || STORES.iter().any(|s| name == s.dir || name.starts_with(&format!("{}/", s.dir)));
         // Only plain relative paths, no `..`, no absolute paths, no links that could point outside.
         let safe = path
@@ -589,10 +620,12 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
             report(damaged == 0, format!("{damaged} Git LFS files don't match their hash"));
         }
     }
-    let assets = release_files(&conn)?;
-    if !assets.is_empty() {
+    for (files, what) in [(release_files(&conn)?, "release files"), (registry_files(&conn)?, "registry blobs")] {
+        if files.is_empty() {
+            continue;
+        }
         let (mut missing, mut damaged) = (0, 0);
-        for (name, sha) in &assets {
+        for (name, sha) in &files {
             let p = data.join(name);
             if !p.is_file() {
                 missing += 1;
@@ -600,9 +633,9 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
                 damaged += 1;
             }
         }
-        report(missing == 0, format!("{} of {} release files on disk", assets.len() - missing, assets.len()));
+        report(missing == 0, format!("{} of {} {what} on disk", files.len() - missing, files.len()));
         if fsck {
-            report(damaged == 0, format!("{damaged} release files don't match their hash"));
+            report(damaged == 0, format!("{damaged} {what} don't match their hash"));
         }
     }
     Ok(problems)
@@ -960,6 +993,47 @@ mod tests {
         assert!(verify(&cfg_for(&data), &bad).is_err(), "a damaged release file fails verify");
         std::fs::remove_file(&file).unwrap();
         assert_eq!(check(&cfg_for(&data), false).unwrap(), 1, "a missing release file is a problem");
+    }
+
+    #[test]
+    fn backups_carry_registry_blobs_and_verify_checks_them() {
+        use sha2::Digest;
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(data.join("repos")).unwrap();
+        crate::db::Db::open(&data.join("gitter.db")).unwrap();
+        run(git(&["init", "-q", "--bare", &data.join("repos/1.git").to_string_lossy()]), "git init").unwrap();
+        let body = b"an image layer".to_vec();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
+        Connection::open(data.join("gitter.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO users(id, username, pass_hash, created_at) VALUES (1, 'a', 'x', 0);
+                 INSERT INTO repos(id, owner_id, name, created_at, updated_at) VALUES (1, 1, 'r', 0, 0);
+                 INSERT INTO registry_blobs(repo_id, digest, size, created_at) VALUES (1, '{digest}', {}, 0);",
+                body.len()
+            ))
+            .unwrap();
+        let file = crate::registry::blob_path(&data, &digest);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, &body).unwrap();
+        std::fs::create_dir_all(data.join("registry/tmp")).unwrap();
+        std::fs::write(data.join("registry/tmp/half-upload"), b"x").unwrap();
+
+        let good = root.path().join("good.tar.gz");
+        backup(&cfg_for(&data), &good).unwrap();
+        verify(&cfg_for(&data), &good).unwrap();
+        let fresh = root.path().join("fresh");
+        restore(&cfg_for(&fresh), &good, false).unwrap();
+        assert_eq!(std::fs::read(crate::registry::blob_path(&fresh, &digest)).unwrap(), body);
+        assert!(!fresh.join("registry/tmp").exists(), "unfinished uploads aren't backed up");
+
+        std::fs::write(&file, b"bit rot").unwrap();
+        let bad = root.path().join("bad.tar.gz");
+        backup(&cfg_for(&data), &bad).unwrap();
+        assert!(verify(&cfg_for(&data), &bad).is_err(), "a damaged blob fails verify");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(check(&cfg_for(&data), false).unwrap(), 1, "a missing blob is a problem");
     }
 
     #[test]

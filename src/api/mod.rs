@@ -196,6 +196,14 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/releases/{{id}}/assets/{{asset}}"),
             get(releases::download).delete(releases::delete_asset),
         )
+        .route(&format!("{repo}/packages"), get(crate::registry::list))
+        .route(
+            &format!("{repo}/packages/generic/{{pkg}}/{{version}}/{{file}}"),
+            get(crate::registry::generic_get)
+                .put(crate::registry::generic_put)
+                .delete(crate::registry::generic_delete)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .route(&format!("{repo}/wiki"), get(wiki::pages).post(wiki::create))
         .route(
             &format!("{repo}/wiki/{{page}}"),

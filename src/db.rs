@@ -493,6 +493,64 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX signing_keys_fingerprint ON signing_keys(fingerprint);
     CREATE INDEX signing_keys_user ON signing_keys(user_id);
     "#,
+    // v15: the container registry and generic packages. Blob files live once by content in
+    // GITTER_DATA/registry/sha256/ab/<hex>; registry_blobs records which repositories hold
+    // each (like lfs_objects). A manifest's own bytes are a blob too.
+    r#"
+    CREATE TABLE registry_blobs (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        digest TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, digest)
+    );
+    CREATE INDEX registry_blobs_digest ON registry_blobs(digest);
+    -- name is the image's path under the repository ('' for owner/repo itself);
+    -- size is the manifest plus the blobs or manifests it names.
+    CREATE TABLE registry_manifests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(repo_id, name, digest)
+    );
+    -- What each manifest names (layers, config, child manifests), so the sweep keeps them.
+    CREATE TABLE registry_refs (
+        manifest_id INTEGER NOT NULL REFERENCES registry_manifests(id) ON DELETE CASCADE,
+        digest TEXT NOT NULL,
+        PRIMARY KEY (manifest_id, digest)
+    );
+    CREATE TABLE registry_tags (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        tag TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, name, tag)
+    );
+    -- Uploads in progress: the bytes so far are GITTER_DATA/registry/tmp/<id>.
+    CREATE TABLE registry_uploads (
+        id TEXT PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        size INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX registry_uploads_user ON registry_uploads(user_id);
+    CREATE TABLE packages (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        file TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, name, version, file)
+    );
+    "#,
 ];
 
 impl Db {
