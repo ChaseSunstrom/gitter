@@ -180,6 +180,7 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
     }
     tokio::spawn(gitter::ci::upkeep(st.clone()));
+    tokio::spawn(gitter::api::lifecycle::upkeep(st.clone()));
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));
     let st2 = st.clone();
     tokio::spawn(async move {

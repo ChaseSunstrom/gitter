@@ -1,17 +1,36 @@
-// Repository settings: name, description, website, default branch, visibility, delete.
-import { html, get, send, toast, action, confirmDialog, timeEl, $ } from '../lib.js';
+// Repository settings: name, description, website, default branch, visibility, transfer, delete.
+import { html, get, send, toast, action, confirmDialog, modal, timeEl, $ } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
 import { navigate } from '../main.js';
+
+/** Ask who should get the repository, with its name typed to confirm. Resolves to their username, or null. */
+function askRecipient(full) {
+  return modal({
+    title: `Transfer ${full}`,
+    body: html`<div class="stack"><p class="muted">They'll find the offer in their settings. Nothing moves until they accept, and the offer ends after 7 days.</p>
+      <div class="field"><label for="tr-to">New owner's username</label><input id="tr-to" class="input" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus></div>
+      <div class="field"><label for="tr-typed">Type <b>${full}</b> to confirm</label><input id="tr-typed" class="input" autocomplete="off"></div></div>`,
+    foot: html`<button class="btn" data-close>Cancel</button><button class="btn danger" data-ok disabled>Offer it</button>`,
+    onMount(el, close) {
+      const ok = el.querySelector('[data-ok]'), to = el.querySelector('#tr-to'), typed = el.querySelector('#tr-typed');
+      const check = () => { ok.disabled = !to.value.trim() || typed.value.trim().toLowerCase() !== full.toLowerCase(); };
+      to.addEventListener('input', check);
+      typed.addEventListener('input', check);
+      ok.addEventListener('click', () => close(to.value.trim()));
+    },
+  });
+}
 
 export default async function (ctx) {
   const meta = await loadRepo(ctx.params.owner, ctx.params.repo);
   if (!meta.can_write) throw Object.assign(new Error('Only people who can write to this repository can change its settings'), { status: 403 });
   const api = repoUrl(meta.owner, meta.name);
   const full = `${meta.owner}/${meta.name}`;
-  const [deploy, secrets] = await Promise.all([
+  const [deploy, secrets, offer] = await Promise.all([
     get(`${api}/deploy-tokens`, { fresh: true }).then((d) => d.tokens),
     get(`${api}/ci/secrets`, { fresh: true }).then((d) => d.secrets),
+    get(`${api}/transfer`, { fresh: true }).then((d) => d.offer),
   ]);
   const body = html`<div class="mid stack" style="max-width:820px">
     <form class="box" id="general"><div class="box-head"><b>General</b></div><div class="box-body settings-sec">
@@ -54,7 +73,11 @@ export default async function (ctx) {
     <div class="box danger-zone"><div class="box-head"><b class="c-red">Danger zone</b></div><div class="list">
       <div class="list-row"><div class="grow"><b>Change visibility</b><div class="muted small">This repository is <b>${meta.private ? 'private' : 'public'}</b>. ${meta.private ? 'Making it public lets anyone see and clone it.' : 'Making it private hides it from everyone but you.'}</div></div>
         <button class="btn danger" id="s-vis">${icon(meta.private ? 'globe' : 'lock', 'sm')} Make ${meta.private ? 'public' : 'private'}</button></div>
-      <div class="list-row"><div class="grow"><b>Delete this repository</b><div class="muted small">Deletes the code, issues and pull requests. This can't be undone.</div></div>
+      <div class="list-row" id="transfer"><div class="grow"><b>Transfer ownership</b><div class="muted small">${offer
+          ? html`Offered to <b>${offer.to}</b>, who can accept or decline it until ${timeEl(offer.expires_at)}.`
+          : 'Give this repository to another account. It moves once they accept, with its issues, stars and history, and its old address leads to the new one.'}</div></div>
+        ${offer ? html`<button class="btn" id="s-untransfer">Cancel the offer</button>` : html`<button class="btn danger" id="s-transfer">${icon('users', 'sm')} Transfer</button>`}</div>
+      <div class="list-row"><div class="grow"><b>Delete this repository</b><div class="muted small">Moves it, with its issues and pull requests, to Recently deleted in your settings for 7 days; after that it's gone for good.</div></div>
         <button class="btn danger" id="s-del">${icon('trash', 'sm')} Delete repository</button></div>
     </div></div>
   </div>`;
@@ -124,9 +147,23 @@ export default async function (ctx) {
         toast(`Deleted ${name}`);
         navigate(location.pathname, { replace: true, scroll: false });
       });
+      const tr = $('#s-transfer', el);
+      tr?.addEventListener('click', action(tr, async () => {
+        const to = await askRecipient(full);
+        if (!to) return;
+        await send('POST', `${api}/transfer`, { to, confirm: full });
+        toast(`Offered ${full} to ${to}`);
+        navigate(location.pathname, { replace: true, scroll: false });
+      }));
+      const untr = $('#s-untransfer', el);
+      untr?.addEventListener('click', action(untr, async () => {
+        await send('DELETE', `${api}/transfer`);
+        toast('Offer cancelled');
+        navigate(location.pathname, { replace: true, scroll: false });
+      }));
       const del = $('#s-del', el);
       del.addEventListener('click', action(del, async () => {
-        const ok = await confirmDialog({ title: `Delete ${full}?`, text: 'This permanently deletes the repository, its issues and its pull requests.', ok: 'Delete this repository', danger: true, typed: full });
+        const ok = await confirmDialog({ title: `Delete ${full}?`, text: 'It moves to Recently deleted (Settings → Repositories), where you can restore it for 7 days. After that it and its issues and pull requests are gone for good.', ok: 'Delete this repository', danger: true, typed: full });
         if (!ok) return;
         await send('DELETE', api, { confirm: full });
         toast(`Deleted ${full}`);

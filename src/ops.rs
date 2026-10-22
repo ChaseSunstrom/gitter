@@ -39,16 +39,20 @@ struct Store {
     what: &'static str,
     /// Every row has a folder (wikis are only made on the first edit).
     required: bool,
+    /// Only the rows in (true) or out of (false) the trash; None for all of them.
+    trashed: Option<bool>,
 }
 
 const STORES: &[Store] = &[
-    Store { dir: "repos", table: "repos", what: "repositories", required: true },
-    Store { dir: "wikis", table: "repos", what: "wikis", required: false },
-    Store { dir: "snippets", table: "snippets", what: "snippets", required: true },
+    Store { dir: "repos", table: "repos", what: "repositories", required: true, trashed: Some(false) },
+    Store { dir: "trash", table: "repos", what: "deleted repositories", required: true, trashed: Some(true) },
+    Store { dir: "wikis", table: "repos", what: "wikis", required: false, trashed: None },
+    Store { dir: "snippets", table: "snippets", what: "snippets", required: true, trashed: None },
 ];
 
 /// Folder names (`<id>.git`) the database knows for a store. A table that
-/// doesn't exist yet (a database from before it was added) knows none.
+/// doesn't exist yet (a database from before it was added) knows none, and
+/// nothing is in the trash before the trash existed.
 fn folders(db: &Connection, s: &Store) -> Result<Vec<String>> {
     let exists = db
         .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [s.table], |_| Ok(()))
@@ -56,7 +60,17 @@ fn folders(db: &Connection, s: &Store) -> Result<Vec<String>> {
     if exists.is_none() {
         return Ok(vec![]);
     }
-    let mut q = db.prepare(&format!("SELECT CAST(id AS TEXT) FROM {} ORDER BY id", s.table))?;
+    let has_trash = db
+        .query_row("SELECT 1 FROM pragma_table_info(?1) WHERE name = 'deleted_at'", [s.table], |_| Ok(()))
+        .optional()?
+        .is_some();
+    let cond = match (s.trashed, has_trash) {
+        (Some(true), false) => return Ok(vec![]),
+        (Some(true), true) => "deleted_at IS NOT NULL",
+        (Some(false), true) => "deleted_at IS NULL",
+        _ => "1 = 1",
+    };
+    let mut q = db.prepare(&format!("SELECT CAST(id AS TEXT) FROM {} WHERE {cond} ORDER BY id", s.table))?;
     let ids = q.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<String>, _>>()?;
     // Ids are numbers or hex; anything else (a hand-edited row) must never become a path.
     Ok(ids
@@ -119,9 +133,10 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
         drop(snap_conn);
         let users: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
         drop(conn);
+        let count = |dir: &str| STORES.iter().zip(&stores).find(|(s, _)| s.dir == dir).map_or(0, |(_, n)| n.len());
         let manifest = serde_json::json!({
             "format": FORMAT, "gitter": env!("CARGO_PKG_VERSION"), "created_at": crate::db::now(),
-            "repos": stores[0].len(), "snippets": stores[2].len(), "users": users, "lfs_objects": oids.len(),
+            "repos": count("repos"), "trash": count("trash"), "snippets": count("snippets"), "users": users, "lfs_objects": oids.len(),
         });
         std::fs::write(tmp.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
@@ -538,6 +553,19 @@ pub fn reconcile(cfg: &Config) -> Result<()> {
         return Ok(());
     }
     let conn = Connection::open(&db_path)?;
+    // A crash between moving a folder into or out of the trash and recording it
+    // leaves the folder on the other side: put it back where the database says.
+    for s in STORES.iter().filter(|s| s.trashed.is_some()) {
+        let Some(other) = STORES.iter().find(|o| o.table == s.table && o.trashed.is_some() && o.trashed != s.trashed) else { continue };
+        for name in folders(&conn, s)? {
+            let (want, stray) = (cfg.data_dir.join(s.dir).join(&name), cfg.data_dir.join(other.dir).join(&name));
+            if !want.is_dir() && stray.is_dir() {
+                std::fs::create_dir_all(cfg.data_dir.join(s.dir))?;
+                std::fs::rename(&stray, &want)?;
+                eprintln!("moved {}/{name} back to {}/", other.dir, s.dir);
+            }
+        }
+    }
     for s in STORES {
         let names = folders(&conn, s)?;
         let root = cfg.data_dir.join(s.dir);
@@ -638,6 +666,28 @@ mod tests {
         let mut moved: Vec<String> = std::fs::read_dir(d.join("orphans")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         moved.sort();
         assert!(moved[0].starts_with("snippets-cd.git.") && moved[1].starts_with("wikis-8.git."), "{moved:?}");
+    }
+
+    #[test]
+    fn reconcile_puts_half_moved_trash_folders_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        crate::db::Db::open(&d.join("gitter.db")).unwrap();
+        Connection::open(d.join("gitter.db"))
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO users(id, username, pass_hash, created_at) VALUES (1, 'a', 'x', 0);
+                 INSERT INTO repos(id, owner_id, name, created_at, updated_at) VALUES (1, 1, 'live', 0, 0);
+                 INSERT INTO repos(id, owner_id, name, deleted_name, deleted_at, created_at, updated_at) VALUES (2, 1, '~2', 'gone', 5, 0, 0);",
+            )
+            .unwrap();
+        // A crash left the live repo's folder in the trash and the trashed one's still in repos/.
+        for p in ["trash/1.git", "repos/2.git"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        reconcile(&cfg_for(d)).unwrap();
+        assert!(d.join("repos/1.git").is_dir() && d.join("trash/2.git").is_dir());
+        assert!(!d.join("orphans").exists(), "nothing known is moved aside");
     }
 
     #[cfg(unix)]

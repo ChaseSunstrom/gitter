@@ -58,8 +58,7 @@ async fn insert_repo(
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
-            let count: i64 = tx.query_row("SELECT count(*) FROM repos WHERE owner_id = ?1", [oid], |r| r.get(0))?;
-            if count >= max && !admin {
+            if !admin && super::lifecycle::live_repos(&tx, oid)? >= max {
                 return Err(AppError::bad(format!("You've reached the limit of {max} repositories")));
             }
             let exists = tx.query_row("SELECT 1 FROM repos WHERE owner_id = ?1 AND name = ?2", rusqlite::params![oid, n], |_| Ok(())).optional()?;
@@ -72,6 +71,7 @@ async fn insert_repo(
                 rusqlite::params![oid, n, d, private as i64, forked_from, t],
             )?;
             let id = tx.last_insert_rowid();
+            crate::repo::claim_name(&tx, oid, &n)?;
             for (name, color) in DEFAULT_LABELS {
                 tx.execute("INSERT INTO labels(repo_id, name, color) VALUES (?1, ?2, ?3)", rusqlite::params![id, name, color])?;
             }
@@ -173,14 +173,14 @@ pub async fn show(
             let q = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [rid], |r| r.get(0)) };
             let stars = q("SELECT count(*) FROM stars WHERE repo_id = ?1")?;
             let starred = c.query_row("SELECT count(*) FROM stars WHERE repo_id = ?1 AND user_id = ?2", [rid, vid], |r| r.get::<_, i64>(0))? > 0;
-            let forks = q("SELECT count(*) FROM repos WHERE forked_from = ?1")?;
+            let forks = q("SELECT count(*) FROM repos WHERE forked_from = ?1 AND deleted_at IS NULL")?;
             let issues = q("SELECT count(*) FROM issues WHERE repo_id = ?1 AND is_pr = 0 AND state = 'open'")?;
             let pulls = q("SELECT count(*) FROM issues WHERE repo_id = ?1 AND is_pr = 1 AND state = 'open'")?;
             let language: String = c.query_row("SELECT language FROM repos WHERE id = ?1", [rid], |r| r.get(0))?;
             let parent: Option<(String, String, bool)> = match fork_of {
                 Some(pid) => c
                     .query_row(
-                        "SELECT u.username, p.name, p.is_private OR p.hidden FROM repos p JOIN users u ON u.id = p.owner_id WHERE p.id = ?1",
+                        "SELECT u.username, p.name, p.is_private OR p.hidden OR p.deleted_at IS NOT NULL FROM repos p JOIN users u ON u.id = p.owner_id WHERE p.id = ?1",
                         [pid],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
                     )
@@ -255,11 +255,11 @@ pub async fn update(
         return Err(AppError::bad("That branch doesn't exist"));
     }
     let new_head = req.default_branch.clone();
-    let (id, oid) = (r.id, r.owner_id);
+    let (id, oid, old_name) = (r.id, r.owner_id, r.name.clone());
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
-            if let Some(n) = req.name {
+            if let Some(n) = req.name.as_deref().map(str::trim) {
                 let clash = tx
                     .query_row(
                         "SELECT 1 FROM repos WHERE owner_id = ?1 AND name = ?2 AND id != ?3",
@@ -274,8 +274,11 @@ pub async fn update(
                 }
                 tx.execute(
                     "UPDATE repos SET name = ?1 WHERE id = ?2",
-                    rusqlite::params![n.trim(), id],
+                    rusqlite::params![n, id],
                 )?;
+                // The old name keeps working (web and API redirect, git is served there).
+                crate::repo::add_redirect(&tx, oid, &old_name, id)?;
+                crate::repo::claim_name(&tx, oid, n)?;
             }
             if let Some(d) = req.description {
                 tx.execute(
@@ -336,20 +339,8 @@ pub async fn remove(
     if !req.confirm.eq_ignore_ascii_case(&r.full_name()) {
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
-    let id = r.id;
-    let lfs = st
-        .db
-        .call(move |c| {
-            let oids = crate::lfs::held_by(c, false, id)?;
-            c.execute("DELETE FROM repos WHERE id = ?1", [id])?;
-            Ok(oids)
-        })
-        .await?;
-    crate::lfs::collect(&st, lfs).await;
-    if let Err(e) = tokio::fs::remove_dir_all(&r.path).await {
-        eprintln!("removing {}: {e}", r.path.display());
-    }
-    let _ = tokio::fs::remove_dir_all(super::wiki::path(&st, id)).await;
+    // Into the trash for a week (restorable); the upkeep loop purges it after.
+    super::lifecycle::trash(&st, &r).await?;
     record(&st.db, Event { actor: Some(&u), subject: Some(r.owner_id), action: "repo_deleted", detail: r.full_name(), ip: &ip.0 }).await;
     ok()
 }

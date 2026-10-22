@@ -13,6 +13,17 @@ pub struct AppError {
     pub code: Option<&'static str>,
     /// Seconds until a rate limit lifts (sent as Retry-After).
     pub retry_after: Option<i64>,
+    /// The repository asked for was renamed or transferred (see `Moved`).
+    pub moved: Option<Box<Moved>>,
+}
+
+/// A repository's old and new `(owner, name)`. Rides on a 404 as a response
+/// extension; `web::follow_moved` turns it into a redirect when the request
+/// path names the old place, and otherwise it stays a plain 404.
+#[derive(Clone, Debug)]
+pub struct Moved {
+    pub from: (String, String),
+    pub to: (String, String),
 }
 
 pub type R<T> = Result<T, AppError>;
@@ -24,7 +35,16 @@ impl AppError {
             msg: msg.into(),
             code: None,
             retry_after: None,
+            moved: None,
         }
+    }
+    pub fn moved(from: (&str, &str), to: (&str, &str)) -> Self {
+        let mut e = Self::not_found();
+        e.moved = Some(Box::new(Moved {
+            from: (from.0.to_string(), from.1.to_string()),
+            to: (to.0.to_string(), to.1.to_string()),
+        }));
+        e
     }
     /// 429 with a Retry-After header.
     pub fn slow_down(msg: impl Into<String>, retry_after: i64) -> Self {
@@ -75,6 +95,9 @@ impl IntoResponse for AppError {
             && let Ok(v) = axum::http::HeaderValue::from_str(&s.to_string())
         {
             r.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+        if let Some(m) = self.moved {
+            r.extensions_mut().insert(*m);
         }
         r
     }

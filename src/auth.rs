@@ -281,7 +281,7 @@ async fn job_user(db: &Db, raw: &str) -> R<Option<User>> {
         Ok(c.query_row(
             "SELECT u.id, u.username, u.display_name, u.email, u.is_admin, r.repo_id FROM ci_jobs j
              JOIN ci_runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id JOIN users u ON u.id = p.owner_id
-             WHERE j.token_hash = ?1 AND j.status = 'running' AND u.suspended = 0",
+             WHERE j.token_hash = ?1 AND j.status = 'running' AND u.suspended = 0 AND p.deleted_at IS NULL",
             [hash],
             |r| {
                 let mut u = User::from_row(r)?;

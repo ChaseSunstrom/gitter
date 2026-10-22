@@ -252,6 +252,51 @@ curl -sf -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/artifacts" -o "$TMP
 curl -sf -N -m 5 -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/log/stream" | grep -q 'event: status' || fail "CI log stream"
 ok "CI: a push runs jobs in order on the built-in runner, with log, live stream and artifacts"
 
+# --- rename and transfer with redirects, trash with restore, data export, self-delete
+moved() { curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE$1"; }
+api POST /repos '{"name":"old-name","readme":true}'
+git clone -q "$BASE/alice/old-name.git" "$TMP/moved" || fail "clone before the rename"
+api PATCH /repos/alice/old-name '{"name":"new-name"}'
+[ "$(moved /api/repos/alice/old-name/issues)" = "301 $BASE/api/repos/alice/new-name/issues" ] || fail "a renamed repo's API path should 301"
+[ "$(moved /alice/old-name)" = "301 $BASE/alice/new-name" ] || fail "a renamed repo's page should 301"
+(cd "$TMP/moved" && git config user.name Alice && git config user.email alice@example.com && echo moved >>README.md && git commit -qam "After the rename" \
+  && git push -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/old-name.git" main) || fail "push to the old URL after a rename"  # pragma: allowlist secret
+git clone -q "$BASE/alice/old-name.git" "$TMP/moved2" && grep -q moved "$TMP/moved2/README.md" || fail "clone from the old URL after a rename"
+ok "a renamed repo redirects (web, API) and still clones and pushes at its old URL"
+JAR="$TMP/jar2"
+api POST /repos '{"name":"gift","readme":true}'
+api POST /repos/bob/gift/transfer '{"to":"alice","confirm":"bob/gift"}'
+api POST /repos '{"name":"present"}'
+api POST /repos/bob/present/transfer '{"to":"alice","confirm":"bob/present"}'
+JAR="$JAR_A"
+EXPECT=404 api GET /repos/alice/gift
+api GET /me/transfers
+GIFT=$(jq_ '[t["id"] for t in d["incoming"] if t["repo"]=="bob/gift"][0]')
+api POST "/me/transfers/$GIFT/accept"
+api GET /repos/alice/gift
+[ "$(jq_ 'd["is_owner"]')" = True ] || fail "accepted transfer"
+[ "$(moved /api/repos/bob/gift)" = "301 $BASE/api/repos/alice/gift" ] || fail "a transferred repo should 301"
+ok "a transfer waits for the recipient, then moves the repo and redirects"
+api POST /repos '{"name":"scratch","readme":true}'
+api DELETE /repos/alice/scratch '{"confirm":"alice/scratch"}'
+EXPECT=404 api GET /repos/alice/scratch
+api POST /repos '{"name":"undo","readme":true}'
+api DELETE /repos/alice/undo '{"confirm":"alice/undo"}'
+api GET /me/trash
+UNDO=$(jq_ '[r["id"] for r in d["repos"] if r["name"]=="undo"][0]')
+api POST "/me/trash/$UNDO/restore"
+git clone -q "$BASE/alice/undo.git" "$TMP/undo" && [ -f "$TMP/undo/README.md" ] || fail "a restored repo clones"
+ok "deleted repos go to the trash and can be restored"
+api POST /me/export
+for _ in $(seq 100); do api GET /me/export; [ "$(jq_ 'd["export"]["status"]')" = running ] || break; sleep 0.1; done
+[ "$(jq_ 'd["export"]["status"]')" = ready ] || fail "export: $BODY"
+mkdir "$TMP/export"
+curl -sf -b "$JAR" "$BASE/api/me/export/download" | tar -xz -C "$TMP/export" || fail "export download"
+grep -q 'Crash on start' "$TMP/export/issues.json" || fail "export has the issues you wrote"
+git clone -q -b main "$TMP/export/repositories/hello.bundle" "$TMP/from-bundle" && [ -f "$TMP/from-bundle/src/main.rs" ] || fail "clone from the exported bundle"
+EXPECT=400 api DELETE /me '{"confirm":"bob"}'
+ok "data export (JSON and git bundles); self-delete needs the typed username"
+
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")
 [ "$code" = 200 ] && grep -q '<html' "$TMP/index.html" || fail "SPA route"

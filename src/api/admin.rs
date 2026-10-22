@@ -113,8 +113,8 @@ pub async fn overview(State(st): State<AppState>, _a: Admin) -> J<serde_json::Va
             Ok(json!({
                 "users": n("SELECT count(*) FROM users")?,
                 "suspended": n("SELECT count(*) FROM users WHERE suspended = 1")?,
-                "repos": n("SELECT count(*) FROM repos")?,
-                "private_repos": n("SELECT count(*) FROM repos WHERE is_private = 1")?,
+                "repos": n("SELECT count(*) FROM repos WHERE deleted_at IS NULL")?,
+                "private_repos": n("SELECT count(*) FROM repos WHERE is_private = 1 AND deleted_at IS NULL")?,
                 "open_issues": n("SELECT count(*) FROM issues WHERE is_pr = 0 AND state = 'open'")?,
                 "open_pulls": n("SELECT count(*) FROM issues WHERE is_pr = 1 AND state = 'open'")?,
                 "events_today": c.query_row("SELECT count(*) FROM events WHERE created_at > ?1", [day], |r| r.get::<_, i64>(0))?,
@@ -173,7 +173,7 @@ pub async fn users(
             let per = 50;
             let mut s = c.prepare(&format!(
                 "SELECT u.username, u.display_name, u.email, u.is_admin, u.suspended, u.created_at,
-                    (SELECT count(*) FROM repos r WHERE r.owner_id = u.id),
+                    (SELECT count(*) FROM repos r WHERE r.owner_id = u.id AND r.deleted_at IS NULL),
                     (SELECT max(e.created_at) FROM events e WHERE e.user_id = u.id),
                     u.totp_secret IS NOT NULL
                  FROM users u WHERE {cond} ORDER BY u.id DESC LIMIT {} OFFSET {}",
@@ -284,43 +284,13 @@ pub async fn delete_user(
     if !d.confirm.eq_ignore_ascii_case(&name) {
         return Err(AppError::bad(format!("Type {name} to confirm")));
     }
-    let (repo_ids, snippet_ids, lfs): (Vec<i64>, Vec<String>, Vec<String>) = st
-        .db
-        .call(move |c| {
-            let tx = c.transaction()?;
-            let id: i64 =
-                tx.query_row("SELECT id FROM users WHERE username = ?1", [&name], |r| {
-                    r.get(0)
-                })?;
-            ensure_another_admin(&tx, id)?;
-            let ids: Vec<i64> = {
-                let mut s = tx.prepare("SELECT id FROM repos WHERE owner_id = ?1")?;
-                s.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?
-            };
-            let snippets = super::snippets::ids_of(&tx, id)?;
-            let lfs = crate::lfs::held_by(&tx, true, id)?;
-            tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
-            crate::security::forget_user(&tx, id)?;
-            let e = Event { actor: Some(&me), subject: None, action: "user_deleted", detail: format!("{name} and {} repositories", ids.len()), ip: &ip.0 };
-            crate::security::append(&tx, &e)?;
-            tx.commit()?;
-            Ok((ids, snippets, lfs))
-        })
-        .await?;
-    crate::lfs::collect(&st, lfs).await;
-    for id in repo_ids {
-        let _ = tokio::fs::remove_dir_all(st.git.repo_path(id)).await;
-        let _ = tokio::fs::remove_dir_all(super::wiki::path(&st, id)).await;
-    }
-    for id in snippet_ids {
-        let _ = tokio::fs::remove_dir_all(super::snippets::path(&st, &id)).await;
-    }
+    super::lifecycle::delete_account(&st, &me, name, &ip.0).await?;
     ok()
 }
 
 /// Refuse a change that would leave the instance without an active admin.
 /// Runs inside the change's transaction, so two admins can't demote each other at once.
-fn ensure_another_admin(tx: &rusqlite::Transaction, losing: i64) -> R<()> {
+pub(super) fn ensure_another_admin(tx: &rusqlite::Transaction, losing: i64) -> R<()> {
     let others: i64 = tx.query_row(
         "SELECT count(*) FROM users WHERE is_admin = 1 AND suspended = 0 AND id != ?1",
         [losing],

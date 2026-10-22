@@ -33,6 +33,10 @@ AUTH=(-u 'alice:correct horse')  # pragma: allowlist secret
 curl -sf "${AUTH[@]}" -H 'Content-Type: application/vnd.git-lfs+json' -X POST "$B/alice/keep.git/info/lfs/objects/batch" \
   --data "{\"operation\":\"upload\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}" | grep -q '"upload"' || fail "LFS batch upload"
 curl -sf "${AUTH[@]}" -X PUT --data-binary @"$TMP/asset.bin" "$B/alice/keep.git/info/lfs/objects/$OID" >/dev/null || fail "LFS upload"
+# A deleted repository waits in the trash; the backup carries it so it can still be restored.
+c -X POST "$B/api/repos" --data '{"name":"gone","readme":true}' >/dev/null
+c -X DELETE "$B/api/repos/alice/gone" --data '{"confirm":"alice/gone"}' >/dev/null || fail "delete into the trash"
+GONE=$(c "$B/api/me/trash" | python3 -c 'import json,sys; print(json.load(sys.stdin)["repos"][0]["id"])')
 
 GITTER_DATA=$TMP/a $BIN backup "$TMP/backup.tar.gz" || fail "backup"
 [ -s "$TMP/backup.tar.gz" ] || fail "backup file is empty"
@@ -69,5 +73,9 @@ curl -sf "$B2/raw/snippets/$SNIP/latest/a.txt" | grep -q "snippet survives" || f
 git clone -q "$B2/alice/keep.git" "$TMP/clone" && [ -f "$TMP/clone/README.md" ] || fail "clone from restored server"
 curl -sf -H "Origin: $B2" -H 'Content-Type: application/json' -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct horse"}' >/dev/null || fail "login after restore"  # pragma: allowlist secret
 curl -sf "${AUTH[@]}" "$B2/alice/keep.git/info/lfs/objects/$OID" | cmp -s - "$TMP/asset.bin" || fail "LFS file missing or different after restore"
-echo "✓ restored server has the same history, issues, wiki, discussions, snippets, logins, clones, LFS files and the key for CI secrets"
+c2() { curl -sf -b "$TMP/jar2" -c "$TMP/jar2" -H "Origin: $B2" -H 'Content-Type: application/json' "$@"; }
+c2 -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct horse"}' >/dev/null || fail "login after restore"  # pragma: allowlist secret
+c2 -X POST "$B2/api/me/trash/$GONE/restore" >/dev/null || fail "restore from the trash after a backup restore"
+git clone -q "$B2/alice/gone.git" "$TMP/gone" && [ -f "$TMP/gone/README.md" ] || fail "a trashed repository's files must survive the backup"
+echo "✓ restored server has the same history, issues, wiki, discussions, snippets, trash, logins, clones, LFS files and the key for CI secrets"
 echo "Backup round-trip passed."

@@ -1,5 +1,5 @@
 //! Loading repositories and deciding who may read or write them. Every API
-//! route and the git HTTP endpoints go through `Repo::load`.
+//! route goes through `Repo::load`, and the git HTTP endpoints through `Repo::find`.
 
 use std::path::PathBuf;
 
@@ -60,28 +60,81 @@ pub fn row_to_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
     })
 }
 
+/// The live repository at `owner/name`, or (true) the one that was renamed or
+/// transferred away from there. Trashed repositories are never found.
+pub fn lookup(c: &rusqlite::Connection, owner: &str, name: &str) -> rusqlite::Result<Option<(Repo, bool)>> {
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    if !crate::validate::name(owner, 39) || !crate::validate::name(name, 100) {
+        return Ok(None);
+    }
+    let here = c
+        .query_row(&format!("{REPO_SELECT} WHERE u.username = ?1 AND r.name = ?2 AND r.deleted_at IS NULL"), [owner, name], row_to_repo)
+        .optional()?;
+    if let Some(r) = here {
+        return Ok(Some((r, false)));
+    }
+    let moved = c
+        .query_row(
+            &format!(
+                "{REPO_SELECT} WHERE r.deleted_at IS NULL AND r.id = (SELECT d.repo_id FROM repo_redirects d
+                 JOIN users du ON du.id = d.owner_id WHERE du.username = ?1 AND d.name = ?2)"
+            ),
+            [owner, name],
+            row_to_repo,
+        )
+        .optional()?;
+    Ok(moved.map(|r| (r, true)))
+}
+
+/// A live repository now uses `name`: drop any redirect from there, so the
+/// name never points elsewhere again (even after this repository goes).
+pub fn claim_name(c: &rusqlite::Connection, owner_id: i64, name: &str) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM repo_redirects WHERE owner_id = ?1 AND name = ?2", rusqlite::params![owner_id, name])?;
+    Ok(())
+}
+
+/// Remember that `owner_id/name` now means repository `repo_id` (a rename or a transfer away).
+pub fn add_redirect(c: &rusqlite::Connection, owner_id: i64, name: &str, repo_id: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO repo_redirects(owner_id, name, repo_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![owner_id, name, repo_id, now()],
+    )?;
+    // Bounded, so renaming in a loop can't grow the table without end.
+    c.execute(
+        "DELETE FROM repo_redirects WHERE repo_id = ?1 AND rowid NOT IN
+         (SELECT rowid FROM repo_redirects WHERE repo_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 20)",
+        [repo_id],
+    )?;
+    Ok(())
+}
+
 impl Repo {
     /// Look up `owner/name` and work out the viewer's access. Use `readable`
-    /// or `writable` in handlers; they turn "no access" into an error.
+    /// or `writable` in handlers; they turn "no access" into an error. A
+    /// repository that moved is `AppError::moved` (the web and API redirect),
+    /// but only for viewers who may see where it went.
     pub async fn load(st: &AppState, viewer: Option<&User>, owner: &str, name: &str) -> R<Repo> {
-        let name = name.strip_suffix(".git").unwrap_or(name);
-        if !crate::validate::name(owner, 39) || !crate::validate::name(name, 100) {
+        let (repo, moved) = Self::locate(st, owner, name).await?.ok_or_else(AppError::not_found)?;
+        let repo = Self::with_access(st, repo, viewer);
+        if !moved {
+            return Ok(repo);
+        }
+        if !repo.can_read {
             return Err(AppError::not_found());
         }
-        let (o, n) = (owner.to_string(), name.to_string());
-        let repo = st
-            .db
-            .call(move |c| {
-                Ok(c.query_row(
-                    &format!("{REPO_SELECT} WHERE u.username = ?1 AND r.name = ?2"),
-                    [&o, &n],
-                    row_to_repo,
-                )
-                .optional()?)
-            })
-            .await?
-            .ok_or_else(AppError::not_found)?;
+        Err(AppError::moved((owner, name.strip_suffix(".git").unwrap_or(name)), (&repo.owner, &repo.name)))
+    }
+
+    /// Like `load`, but a moved repository is served at its old name: git and
+    /// Git LFS clients don't follow redirects when pushing.
+    pub async fn find(st: &AppState, viewer: Option<&User>, owner: &str, name: &str) -> R<Repo> {
+        let (repo, _) = Self::locate(st, owner, name).await?.ok_or_else(AppError::not_found)?;
         Ok(Self::with_access(st, repo, viewer))
+    }
+
+    async fn locate(st: &AppState, owner: &str, name: &str) -> R<Option<(Repo, bool)>> {
+        let (o, n) = (owner.to_string(), name.to_string());
+        st.db.call(move |c| Ok(lookup(c, &o, &n)?)).await
     }
 
     pub fn with_access(st: &AppState, mut repo: Repo, viewer: Option<&User>) -> Repo {

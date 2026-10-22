@@ -179,6 +179,12 @@ fn describe(c: &rusqlite::Connection, kind: &str, id: i64) -> rusqlite::Result<s
     })
 }
 
+/// SQL condition: report `rp` isn't about a repository in the trash (or something in one).
+/// Those wait out of the queue: they're purged with it, or come back if it's restored.
+const NOT_TRASHED: &str = "NOT EXISTS (SELECT 1 FROM repos x WHERE x.deleted_at IS NOT NULL AND x.id IN (rp.repo_id,
+    (SELECT repo_id FROM issues WHERE id = rp.issue_id),
+    (SELECT i.repo_id FROM comments cm JOIN issues i ON i.id = cm.issue_id WHERE cm.id = rp.comment_id)))";
+
 pub async fn queue(State(st): State<AppState>, _a: Admin, Query(q): Query<QueueQ>) -> J<serde_json::Value> {
     let open = q.status.as_deref() != Some("resolved");
     let out = st
@@ -187,7 +193,7 @@ pub async fn queue(State(st): State<AppState>, _a: Admin, Query(q): Query<QueueQ
             let mut s = c.prepare(&format!(
                 "SELECT rp.id, rp.kind, COALESCE(rp.comment_id, rp.issue_id, rp.repo_id, rp.user_id), rp.reason, rp.details, rp.created_at, u.username, rp.resolution, ru.username, rp.resolved_at
                  FROM reports rp LEFT JOIN users u ON u.id = rp.reporter_id LEFT JOIN users ru ON ru.id = rp.resolved_by
-                 WHERE rp.status {} ORDER BY rp.id DESC LIMIT 200",
+                 WHERE rp.status {} AND {NOT_TRASHED} ORDER BY rp.id DESC LIMIT 200",
                 if open { "= 'open'" } else { "= 'resolved'" }
             ))?;
             let rows: Vec<(i64, String, i64, String, String, i64, Option<String>, String, Option<String>, Option<i64>)> = s
@@ -201,7 +207,7 @@ pub async fn queue(State(st): State<AppState>, _a: Admin, Query(q): Query<QueueQ
                     "target": describe(c, &kind, target)?,
                 }));
             }
-            let open_count: i64 = c.query_row("SELECT count(*) FROM reports WHERE status = 'open'", [], |r| r.get(0))?;
+            let open_count: i64 = c.query_row(&format!("SELECT count(*) FROM reports rp WHERE rp.status = 'open' AND {NOT_TRASHED}"), [], |r| r.get(0))?;
             Ok(json!({ "reports": out, "open": open_count }))
         })
         .await?;

@@ -15,7 +15,7 @@ function stat(label, value, sub = '') {
 }
 
 async function overview() {
-  const o = await get('/admin/overview', { fresh: true });
+  const [o, trash] = await Promise.all([get('/admin/overview', { fresh: true }), get('/admin/trash', { fresh: true })]);
   const used = o.repo_bytes + o.db_bytes;
   const total = o.free_bytes != null ? used + o.free_bytes : null;
   const pct = total ? Math.min(100, (used / total) * 100) : 0;
@@ -37,6 +37,10 @@ async function overview() {
       </div></div>
     <div class="box"><div class="box-head"><b>Newest accounts</b><span class="grow"></span><a class="btn sm" href="/admin/users">All accounts</a></div>
       <div class="list">${o.recent_users.map((u) => html`<a class="list-row" href="/${u.username}">${avatar(u.username, 22)}<b>${u.username}</b><span class="grow"></span><span class="muted small">joined ${timeEl(u.created_at)}</span></a>`)}</div></div>
+    ${trash.repos.length ? html`<div class="box" id="trash"><div class="box-head"><b>Recently deleted repositories</b><span class="grow"></span><span class="muted small">Each is deleted for good 7 days after it was deleted</span></div>
+      <div class="list">${trash.repos.map((r) => html`<div class="list-row">${icon('trash', 'muted')}<span class="grow"><b>${r.owner}/${r.name}</b>
+        <span class="muted small"> · deleted ${timeEl(r.deleted_at)} · gone for good ${timeEl(r.purge_at)}</span></span>
+        <button class="btn sm danger" data-purge="${r.id}" data-name="${r.owner}/${r.name}">Delete now</button></div>`)}</div></div>` : ''}
   </div>`;
 }
 
@@ -198,6 +202,12 @@ export default async function (ctx) {
             suspend: ['Suspend this account?', 'They are signed out everywhere and can’t sign in, push or use tokens until restored.', 'Suspend'], unhide: ['Show this again?', 'Everyone who could see it before can see it again.', 'Unhide'] }[act];
           if (!(await confirmDialog({ title: words[0], text: words[1], ok: words[2], danger: act === 'hide' || act === 'suspend' }))) return;
           await action(rb, async () => { await send('POST', `/admin/reports/${row.dataset.report}/resolve`, { action: act }); toast('Done'); refresh(); })();
+          return;
+        }
+        const pb = e.target.closest('[data-purge]');
+        if (pb) {
+          if (!(await confirmDialog({ title: `Delete ${pb.dataset.name} now?`, text: 'Its owner can no longer restore it. Its code, issues and pull requests are gone for good.', ok: 'Delete now', danger: true }))) return;
+          await action(pb, async () => { await send('DELETE', `/admin/trash/${pb.dataset.purge}`); toast(`Deleted ${pb.dataset.name}`); refresh(); })();
           return;
         }
         const del = e.target.closest('[data-inv-del]');

@@ -6,6 +6,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 - **Collaboration:** issues, labels, pull requests with server-side merge (merge commit, squash or fast-forward), comments in markdown, stars and forks.
 - **Wikis, discussions, snippets:** every repository has a markdown wiki with page history (its own git repository, private when the repo is) and a discussions forum with General, Q&A, Ideas and Announcements categories, marked answers and upvotes. Snippets share a few files, public or secret (only the link finds it), with every edit kept as a revision.
 - **Editing:** edit, create, rename, delete and upload files in the browser, committing straight to a branch or to a new branch for a pull request.
+- **Moving and undoing:** renaming a repository or transferring it to another account (they accept the offer in Settings → Repositories) keeps the old address working: pages and the API redirect, and git clones and pushes at the old URL as before. A deleted repository waits 7 days in Settings → Repositories → Recently deleted, where you can restore it, then it's removed for good (it counts toward your storage until then; admins can remove it sooner). Settings → Account exports your data (profile, a git bundle of each repository and wiki, your snippets, what you wrote as JSON, your security log) and deletes your account.
 - **Speed:** pages prefetch on hover, the UI has no framework, and diffs render lazily, so even huge commits stay smooth.
 - **Command palette:** press `Ctrl K` or `/` to jump to any repository, file, branch or action. Press `?` for every shortcut.
 - **Account security:** optional two-factor sign-in (any authenticator app, with recovery codes), a list of where you're signed in with one-click sign-out, a password re-check before dangerous actions (deleting a repo, making a private repo public, creating tokens), and a tamper-evident security log for you and for admins (`gitter doctor` verifies it). Code views mark hidden Unicode ("Trojan Source" bidi tricks, zero-width characters) and look-alike letters from other alphabets, with a warning above the file or diff.
@@ -148,7 +149,7 @@ Everything is optional. The defaults are tuned for a single small server, and th
 |---|---|---|
 | `GITTER_URL` | `http://localhost:3000` | Public address, used in clone URLs. `https://` also turns on secure cookies. |
 | `GITTER_ADDR` | `0.0.0.0:3000` | Address to listen on. |
-| `GITTER_DATA` | `./data` | Where the database and the bare git repositories live (`repos/`, `wikis/`, `snippets/`, plus Git LFS files in `lfs/`). Back this folder up, or use `gitter backup`, which includes all of them. |
+| `GITTER_DATA` | `./data` | Where the database and the bare git repositories live (`repos/`, `wikis/`, `snippets/`, deleted repositories in `trash/`, plus Git LFS files in `lfs/`; data exports wait a day in `exports/`). Back this folder up, or use `gitter backup`, which includes all of them but the exports. |
 | `GITTER_SIGNUP` | `open` | `invite` needs an invite link from an admin; `closed` stops new sign-ups. The first (admin) account is always created through the setup link. |
 | `GITTER_MAX_PUSH_MB` | `500` | Largest single push. |
 | `GITTER_MAX_REPOS` | `200` | Repositories per user (admins are exempt). |
