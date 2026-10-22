@@ -139,10 +139,10 @@ export default async function (ctx) {
     <div class="box danger-zone"><div class="box-head"><b class="c-red">Danger zone</b></div><div class="list">
       <div class="list-row"><div class="grow"><b>Change visibility</b><div class="muted small">This repository is <b>${meta.private ? 'private' : 'public'}</b>. ${meta.private ? 'Making it public lets anyone see and clone it.' : 'Making it private hides it from everyone without access.'}</div></div>
         <button class="btn danger" id="s-vis">${icon(meta.private ? 'globe' : 'lock', 'sm')} Make ${meta.private ? 'public' : 'private'}</button></div>
-      <div class="list-row" id="transfer"><div class="grow"><b>Transfer ownership</b><div class="muted small">${offer
+      ${meta.can_transfer ? html`<div class="list-row" id="transfer"><div class="grow"><b>Transfer ownership</b><div class="muted small">${offer
           ? html`Offered to <b>${offer.to}</b>, who can accept or decline it until ${timeEl(offer.expires_at)}.`
           : 'Give this repository to another account. It moves once they accept, with its issues, stars and history, and its old address leads to the new one.'}</div></div>
-        ${offer ? html`<button class="btn" id="s-untransfer">Cancel the offer</button>` : html`<button class="btn danger" id="s-transfer">${icon('users', 'sm')} Transfer</button>`}</div>
+        ${offer ? html`<button class="btn" id="s-untransfer">Cancel the offer</button>` : html`<button class="btn danger" id="s-transfer">${icon('users', 'sm')} Transfer</button>`}</div>` : ''}
       <div class="list-row"><div class="grow"><b>Delete this repository</b><div class="muted small">Moves it, with its issues and pull requests, to Recently deleted in your settings for 7 days; after that it's gone for good.</div></div>
         <button class="btn danger" id="s-del">${icon('trash', 'sm')} Delete repository</button></div>
     </div></div>

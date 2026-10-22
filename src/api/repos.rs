@@ -220,6 +220,14 @@ pub async fn show(
         .filter(|p| !p.2)
         .map(|p| json!({ "owner": p.0, "name": p.1 }));
     let mirror = if r.mirror { crate::mirrors::badge(&st, r.id, r.can_admin).await? } else { serde_json::Value::Null };
+    // Who may give it away: the owner, an owner of the owning organization, or a site admin.
+    let can_transfer = match v.as_ref().filter(|_| r.can_admin) {
+        Some(u) => {
+            let (u, oid) = (u.clone(), r.owner_id);
+            st.db.call(move |c| Ok(super::lifecycle::owns(c, &u, oid)?)).await?
+        }
+        None => false,
+    };
     Ok(Json(json!({
         "owner": r.owner, "name": r.name, "description": r.description, "website": r.website,
         "private": r.private, "default_branch": r.default_branch, "created_at": r.created_at,
@@ -227,7 +235,7 @@ pub async fn show(
         "empty": branches.is_empty(), "branches": branches, "tags": tags,
         "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
         "releases": releases, "latest_release": latest_release,
-        "fork_of": parent, "mirror": mirror, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
+        "fork_of": parent, "mirror": mirror, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "can_transfer": can_transfer, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
         "ssh_url": st.ssh_url.get().map(|b| format!("{b}{}/{}.git", r.owner, r.name)),
     })))

@@ -64,7 +64,7 @@ pub async fn refresh_size(st: &AppState, repo_id: i64) {
     let Ok(size) = tokio::task::spawn_blocking(move || crate::api::admin::dir_size(&path)).await else { return };
     let _ = st
         .db
-        .call(move |c| Ok(c.execute("UPDATE repos SET size_bytes = ?1 WHERE id = ?2", rusqlite::params![size as i64, repo_id])?))
+        .call(move |c| Ok(c.execute("UPDATE repos SET size_bytes = ?1 WHERE id = ?2 AND deleted_at IS NULL", rusqlite::params![size as i64, repo_id])?))
         .await;
 }
 

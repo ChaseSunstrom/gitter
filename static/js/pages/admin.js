@@ -173,6 +173,8 @@ async function settings() {
     <div class="row wrap-ok" style="gap:16px;align-items:flex-start">
       <div class="field" style="width:160px"><label for="s-cpus">CPUs per job</label><input id="s-cpus" class="input" type="number" min="0" max="256" value="${s.ci_cpus}"><span class="hint">0: no limit.</span></div>
       <div class="field" style="width:180px"><label for="s-mem">Memory per job (MB)</label><input id="s-mem" class="input" type="number" min="0" max="1048576" value="${s.ci_memory_mb}"><span class="hint">0: no limit.</span></div>
+      <div class="field" style="width:220px"><label for="s-trash">Deleted repositories kept (days)</label><input id="s-trash" class="input" type="number" min="1" max="365" value="${s.trash_days}"><span class="hint">How long they can be restored.</span></div>
+      <div class="field" style="width:220px"><label for="s-offer">Transfer offers last (days)</label><input id="s-offer" class="input" type="number" min="1" max="365" value="${s.transfer_offer_days}"></div>
       <label class="check" style="margin-top:26px"><input type="checkbox" id="s-net" ${s.ci_network ? 'checked' : ''}> Jobs may use the network</label>
     </div>
     <p class="hint">Limits apply to jobs that run in a container (they name an <code>image</code>). Containers never get the host's docker socket or new privileges.</p>
@@ -290,6 +292,8 @@ export default async function (ctx) {
           ci_cpus: +$('#s-cpus', el).value,
           ci_memory_mb: +$('#s-mem', el).value,
           ci_network: $('#s-net', el).checked,
+          trash_days: +$('#s-trash', el).value,
+          transfer_offer_days: +$('#s-offer', el).value,
           announcement: $('#s-ann', el).value.trim(),
         };
         const saved = await send('PUT', '/admin/settings', body);
