@@ -1,6 +1,7 @@
 //! Built-in CI: pipeline config, the job queue, and the runner.
 
 pub mod cache;
+pub mod compat;
 pub mod config;
 pub mod http;
 pub mod jobs;

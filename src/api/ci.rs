@@ -71,7 +71,7 @@ pub async fn runs(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n)): P
 /// Whether the default branch's pipeline allows the Run button.
 async fn can_start_manually(st: &AppState, r: &Repo) -> bool {
     let Ok(Some(sha)) = st.git.resolve(&r.path, &format!("refs/heads/{}", r.default_branch)).await else { return false };
-    matches!(trigger::pipeline_at(st, &r.path, &sha).await, Ok(Some(Ok(p))) if p.triggers.manual)
+    matches!(trigger::pipeline_at(st, &r.path, &sha, &r.default_branch).await, Ok(Some(Ok(p))) if p.triggers.manual)
 }
 
 async fn load_run(st: &AppState, r: &Repo, number: i64) -> R<Value> {
@@ -137,12 +137,15 @@ pub async fn start(State(st): State<AppState>, Authed(u): Authed, Path((o, n)): 
     }
     let refname = format!("refs/heads/{branch}");
     let sha = st.git.resolve(&r.path, &refname).await?.ok_or_else(|| AppError::bad("No such branch"))?;
-    let pipeline = trigger::pipeline_at(&st, &r.path, &sha).await?.ok_or_else(|| AppError::bad("This branch has no .gitter/ci.yml or .gitter/ci.sh"))?;
+    let pipeline = trigger::pipeline_at(&st, &r.path, &sha, &r.default_branch)
+        .await?
+        .ok_or_else(|| AppError::bad("This branch has no .gitter/ci.yml, .gitter/ci.sh, GitHub workflows or .gitlab-ci.yml"))?;
     if let Ok(p) = &pipeline
         && !p.triggers.manual
     {
-        return Err(AppError::bad("This pipeline doesn't allow manual runs (add `manual` under `on:`)"));
+        return Err(AppError::bad("This pipeline doesn't allow manual runs (add `manual` under `on:`, or workflow_dispatch to a GitHub workflow)"));
     }
+    let pipeline = trigger::pick(pipeline, "manual", &branch, &None).ok_or_else(|| AppError::bad("No job here runs manually"))?;
     let s = trigger::Start { event: "manual", refname, sha, pr_number: None, actor_id: Some(u.id), files: None };
     let number = trigger::start(&st, &r, pipeline, s).await?;
     Ok(Json(json!({ "number": number })))

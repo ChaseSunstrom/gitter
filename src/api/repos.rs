@@ -13,6 +13,7 @@ use crate::db::now;
 use crate::error::{AppError, R};
 use crate::git::Change;
 use crate::repo::{Repo, record_event, touch};
+use crate::smart_http::RefUpdate;
 use crate::{AppState, validate};
 
 pub const DEFAULT_LABELS: &[(&str, &str)] = &[
@@ -576,6 +577,7 @@ pub async fn create_branch(
     Json(req): Json<BranchReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    let u = v.ok_or_else(AppError::unauthorized)?;
     crate::mirrors::refuse_writes(&r)?;
     if !validate::ref_name(&req.name) {
         return Err(AppError::bad("That isn't a valid branch name"));
@@ -588,12 +590,14 @@ pub async fn create_branch(
         .resolve(&r.path, &req.from)
         .await?
         .ok_or_else(|| AppError::bad("Unknown starting point"))?;
+    let refname = format!("refs/heads/{}", req.name);
     st.git
-        .update_ref(&r.path, &format!("refs/heads/{}", req.name), &sha, None)
+        .update_ref(&r.path, &refname, &sha, None)
         .await
         .map_err(|_| AppError::conflict("A branch with that name already exists"))?;
     touch(&st.db, r.id, false).await?;
-    crate::mirrors::changed(&st, r.id).await;
+    let upd = RefUpdate { refname, old: None, new: Some(sha.clone()) };
+    crate::hooks::on_push(&st, &r, &u, &[upd]).await;
     Ok(Json(json!({ "name": req.name, "sha": sha })))
 }
 
@@ -609,6 +613,7 @@ pub async fn delete_branch(
     Query(q): Query<NameQ>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    let u = v.ok_or_else(AppError::unauthorized)?;
     crate::mirrors::refuse_writes(&r)?;
     if !validate::ref_name(&q.name) {
         return Err(AppError::bad("That isn't a valid branch name"));
@@ -617,12 +622,14 @@ pub async fn delete_branch(
         return Err(AppError::bad("You can't delete the default branch"));
     }
     crate::protect::direct(&st, &r, &q.name, true).await?;
-    st.git
-        .delete_ref(&r.path, &format!("refs/heads/{}", q.name))
-        .await?;
-    crate::hooks::forget_branches(&st, r.id, vec![q.name.clone()]).await;
+    let refname = format!("refs/heads/{}", q.name);
+    // Already gone: nothing to delete or announce.
+    let Some(old) = st.git.resolve(&r.path, &refname).await? else { return ok() };
+    // Only the commit looked at, so the deletion webhook names what was deleted.
+    st.git.ok(&r.path, &["update-ref", "-d", &refname, &old]).await?;
     touch(&st.db, r.id, false).await?;
-    crate::mirrors::changed(&st, r.id).await;
+    let upd = RefUpdate { refname, old: Some(old), new: None };
+    crate::hooks::on_push(&st, &r, &u, &[upd]).await;
     ok()
 }
 

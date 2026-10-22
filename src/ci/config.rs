@@ -2,8 +2,8 @@
 //!
 //! The YAML is a documented subset: block mappings and lists, `- ` items,
 //! `|` and `>` block text, quoted or plain scalars, `[a, b]` and `{a: b}`
-//! flow collections, and `#` comments. Anchors, tags and multi-document
-//! files are not supported (and give a clear error).
+//! flow collections, `#` comments, and `&anchor`, `*alias` and `<<:` merge
+//! keys. Tags and multi-document files are not supported (and give a clear error).
 
 use std::collections::BTreeMap;
 
@@ -42,8 +42,9 @@ pub fn parse_yaml(src: &str) -> Result<Value, String> {
         if body == "---" && lines.iter().all(|l: &Line| l.text.is_empty()) {
             continue;
         }
-        if body.starts_with('&') || body.starts_with('*') || body.starts_with('!') || body == "---" || body == "..." {
-            return Err(format!("line {no}: anchors, tags and multiple documents aren't supported"));
+        // Only at the left edge: indented, it may be block text ("---" in a script).
+        if (body == "---" || body == "...") && text.len() == body.len() {
+            return Err(format!("line {no}: multiple documents in one file aren't supported"));
         }
         lines.push(Line { no, indent: text.len() - body.len(), text: body, raw: full });
     }
@@ -58,7 +59,91 @@ pub fn parse_yaml(src: &str) -> Result<Value, String> {
     if let Some(l) = p.lines.get(p.pos) {
         return Err(format!("line {}: unexpected indentation", l.no));
     }
-    Ok(v)
+    Anchors { named: std::collections::HashMap::new(), budget: ALIAS_BUDGET }.resolve(v)
+}
+
+/// Parsing leaves `*alias` and `&anchor` as markers; `Anchors` replaces them, in
+/// document order, once the whole file is read.
+const MARK: char = '\u{1}';
+/// Values (counting every nested one) that aliases may copy in all: enough for
+/// real files, far too little for a "billion laughs".
+const ALIAS_BUDGET: usize = 100_000;
+
+fn alias(name: &str) -> Value {
+    Value::String(format!("{MARK}*{name}"))
+}
+
+fn anchored(name: &str, v: Value) -> Value {
+    let mut m = Map::new();
+    m.insert(format!("{MARK}&"), Value::String(name.to_string()));
+    m.insert(format!("{MARK}v"), v);
+    Value::Object(m)
+}
+
+/// `&name rest` → (name, rest); names are letters, digits, '-', '_' and '.'.
+fn anchor_name(s: &str) -> Option<(&str, &str)> {
+    let s = s.strip_prefix('&')?;
+    let end = s.find(|c: char| !(c.is_ascii_alphanumeric() || "-_.".contains(c))).unwrap_or(s.len());
+    (end > 0).then(|| (&s[..end], s[end..].trim_start()))
+}
+
+struct Anchors {
+    named: std::collections::HashMap<String, Value>,
+    budget: usize,
+}
+
+impl Anchors {
+    fn resolve(&mut self, v: Value) -> Result<Value, String> {
+        match v {
+            Value::String(s) if s.starts_with(MARK) && s[MARK.len_utf8()..].starts_with('*') => {
+                let name = &s[MARK.len_utf8() + 1..];
+                let found = self.named.get(name).ok_or_else(|| format!("*{name}: there's no &{name} before it"))?.clone();
+                self.budget = self.budget.checked_sub(size(&found)).ok_or("aliases expand to too much (more than 100,000 values)")?;
+                Ok(found)
+            }
+            Value::Object(m) if m.contains_key(&format!("{MARK}&")) => {
+                let mut m = m;
+                let name = m.remove(&format!("{MARK}&")).and_then(|n| n.as_str().map(String::from)).unwrap_or_default();
+                let inner = self.resolve(m.remove(&format!("{MARK}v")).unwrap_or(Value::Null))?;
+                self.named.insert(name, inner.clone());
+                Ok(inner)
+            }
+            Value::Object(m) => {
+                let mut out = Map::new();
+                let mut merges = Vec::new();
+                for (k, v) in m {
+                    let v = self.resolve(v)?;
+                    if k == "<<" {
+                        merges.push(v);
+                    } else {
+                        out.insert(k, v);
+                    }
+                }
+                // Keys written out win over merged ones; earlier merges win over later ones.
+                for m in merges {
+                    let list = if let Value::Array(a) = m { a } else { vec![m] };
+                    for one in list {
+                        let Value::Object(o) = one else { return Err("<<: merges mappings only".into()) };
+                        for (k, v) in o {
+                            out.entry(k).or_insert(v);
+                        }
+                    }
+                }
+                Ok(Value::Object(out))
+            }
+            Value::Array(a) => Ok(Value::Array(a.into_iter().map(|x| self.resolve(x)).collect::<Result<_, _>>()?)),
+            other => Ok(other),
+        }
+    }
+}
+
+/// How many values `v` holds, itself included.
+fn size(v: &Value) -> usize {
+    1 + match v {
+        Value::Array(a) => a.iter().map(size).sum(),
+        Value::Object(m) => m.values().map(size).sum(),
+        _ => 0,
+    }
 }
 
 fn strip_comment(s: &str) -> &str {
@@ -117,15 +202,24 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
             let rest = text[1..].trim_start();
+            // "- &name …": the item is anchored.
+            let (name, rest) = match anchor_name(rest) {
+                Some((n, r)) => (Some(n), r),
+                None => (None, rest),
+            };
             let col = indent + (text.len() - rest.len());
-            if rest.is_empty() {
-                out.push(self.child(indent)?);
-            } else if split_key(rest).is_some() && !rest.starts_with('{') && !rest.starts_with('"') && !rest.starts_with('\'') {
+            let item = if rest.is_empty() {
+                self.child(indent)?
+            } else if split_key(rest).is_some() && !rest.starts_with('{') && !rest.starts_with('"') && !rest.starts_with('\'') && name.is_none() {
                 // "- key: value" starts a mapping whose keys sit at the column after "- ".
-                out.push(self.map(col, Some((rest, no)))?);
+                self.map(col, Some((rest, no)))?
             } else {
-                out.push(scalar(rest, no)?);
-            }
+                scalar(rest, no)?
+            };
+            out.push(match name {
+                Some(n) => anchored(n, item),
+                None => item,
+            });
         }
         Ok(Value::Array(out))
     }
@@ -154,12 +248,20 @@ impl<'a> Parser<'a> {
             if out.contains_key(&key) {
                 return Err(format!("line {no}: '{key}' appears twice"));
             }
+            // "key: &name …": the value is anchored.
+            let (name, rest) = match anchor_name(rest) {
+                Some((n, r)) => (Some(n), r),
+                None => (None, rest),
+            };
             let v = match rest {
                 "" => self.child(indent)?,
                 r if r.starts_with('|') || r.starts_with('>') => self.text_block(indent, r, no)?,
                 r => scalar(r, no)?,
             };
-            out.insert(key, v);
+            out.insert(key, match name {
+                Some(n) => anchored(n, v),
+                None => v,
+            });
         }
         Ok(Value::Object(out))
     }
@@ -275,8 +377,17 @@ fn scalar(s: &str, no: usize) -> Result<Value, String> {
     if s.starts_with('[') || s.starts_with('{') {
         return flow(s, no);
     }
-    if s.starts_with('&') || s.starts_with('*') || s.starts_with('!') {
-        return Err(format!("line {no}: anchors, aliases and tags aren't supported (quote the value if it's text)"));
+    if let Some(name) = s.strip_prefix('*') {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+            return Err(format!("line {no}: '*{name}' isn't an alias (quote the value if it's text)"));
+        }
+        return Ok(alias(name));
+    }
+    if let Some((name, rest)) = anchor_name(s) {
+        return Ok(anchored(name, if rest.is_empty() { Value::Null } else { scalar(rest, no)? }));
+    }
+    if s.starts_with('&') || s.starts_with('!') {
+        return Err(format!("line {no}: tags aren't supported (quote the value if it's text)"));
     }
     Ok(match s {
         "~" | "null" | "Null" | "NULL" => Value::Null,
@@ -396,6 +507,10 @@ pub struct Job {
     /// Cobertura XML or LCOV files the server reads into a coverage percentage.
     #[serde(default)]
     pub coverage: Vec<String>,
+    /// From a GitHub workflow or a GitLab job: the events it runs on (the
+    /// pipeline's own triggers are what any of its jobs wants). Server-side only.
+    #[serde(skip)]
+    pub when: Option<Triggers>,
 }
 
 /// `cache:` on a job: workspace folders or files under a key (see `ci::cache`).
@@ -455,6 +570,7 @@ pub struct Pipeline {
 pub const CONFIG_PATH: &str = ".gitter/ci.yml";
 pub const SCRIPT_PATH: &str = ".gitter/ci.sh";
 const MAX_JOBS: usize = 100;
+const MAX_STEPS: usize = 100;
 
 /// The pipeline for a plain `.gitter/ci.sh`: one job running it.
 pub fn script_pipeline() -> Pipeline {
@@ -475,6 +591,7 @@ pub fn script_pipeline() -> Pipeline {
             cache: None,
             reports: vec![],
             coverage: vec![],
+            when: None,
         }],
     }
 }
@@ -602,6 +719,9 @@ fn steps(v: &Value, job: &str) -> Result<Vec<Step>, String> {
     if out.is_empty() {
         return Err(format!("jobs.{job}: add at least one step"));
     }
+    if out.len() > MAX_STEPS {
+        return Err(format!("jobs.{job}: at most {MAX_STEPS} steps"));
+    }
     Ok(out)
 }
 
@@ -623,7 +743,12 @@ fn interpolate(s: &str, vars: &[(String, String)]) -> String {
 
 /// Parse a pipeline file (YAML subset) into jobs, expanding matrices.
 pub fn parse(src: &str) -> Result<Pipeline, String> {
-    let v = parse_yaml(src)?;
+    parse_value(parse_yaml(src)?)
+}
+
+/// A pipeline from the value a `.gitter/ci.yml` parses into (also what other
+/// hosts' files are translated into, see `ci::compat`).
+pub fn parse_value(v: Value) -> Result<Pipeline, String> {
     let Value::Object(top) = v else { return Err("the file should be a mapping with 'jobs:'".into()) };
     for k in top.keys() {
         if !matches!(k.as_str(), "on" | "jobs" | "env" | "name") {
@@ -699,6 +824,7 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
                 cache: cache.as_ref().map(|c| Cache { key: interpolate(&c.key, combo), restore_keys: c.restore_keys.iter().map(|r| interpolate(r, combo)).collect(), ..c.clone() }),
                 reports: reports.clone(),
                 coverage: coverage.clone(),
+                when: None,
             });
             if out.len() > MAX_JOBS {
                 return Err(format!("a pipeline can have at most {MAX_JOBS} jobs (after matrix expansion)"));
@@ -948,7 +1074,8 @@ jobs:
         let order: Vec<&String> = v["jobs"].as_object().unwrap().keys().collect();
         assert_eq!(order, ["build", "lint"], "jobs keep file order");
         assert!(parse_yaml("a:\n\tb: 1").is_err());
-        assert!(parse_yaml("a: &x 1").is_err());
+        assert_eq!(parse_yaml("a: &x 1\nb: *x").unwrap(), json!({ "a": 1, "b": 1 }));
+        assert!(parse_yaml("a: !!str 1").is_err(), "tags aren't supported");
         assert!(parse_yaml("a: 1\na: 2").unwrap_err().contains("twice"));
         assert!(parse_yaml("a:\n  - x\n   y: 1").is_err());
     }
@@ -1038,5 +1165,32 @@ jobs:
         for bad in ["* * * *", "60 * * * *", "*/0 * * * *", "a * * * *"] {
             assert!(Cron::parse(bad).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::parse_yaml;
+    use serde_json::json;
+
+    #[test]
+    fn anchors_aliases_and_merge_keys() {
+        let src = ".base: &base\n  image: rust\n  script:\n    - a\nbuild:\n  <<: *base\n  script: [b]\nlist:\n  - &one x\n  - *one\nflow: &f [1, 2]\nagain: *f\nmany:\n  <<: [*base]\n  tags: [t]\nvars: &v {A: '1'}\nuse: {B: *one}\n";
+        let v = parse_yaml(src).unwrap();
+        assert_eq!(v["build"]["image"], "rust");
+        assert_eq!(v["build"]["script"], json!(["b"]), "explicit keys win over merged ones");
+        assert_eq!(v["list"], json!(["x", "x"]));
+        assert_eq!(v["again"], json!([1, 2]));
+        assert_eq!((v["many"]["image"].as_str(), &v["many"]["tags"]), (Some("rust"), &json!(["t"])));
+        assert_eq!((&v["vars"], &v["use"]), (&json!({ "A": "1" }), &json!({ "B": "x" })));
+        assert!(!v.to_string().contains('\u{1}'), "no markers left: {v}");
+        assert!(parse_yaml("a: *nope\n").unwrap_err().contains("nope"));
+        assert!(parse_yaml("a: !reference [x]\n").is_err());
+        // Aliases of aliases can't blow up memory (a "billion laughs").
+        let mut s = String::from("a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n");
+        for i in 1..9 {
+            s += &format!("a{i}: &a{i} [{}]\n", vec![format!("*a{}", i - 1); 10].join(", "));
+        }
+        assert!(parse_yaml(&s).unwrap_err().contains("expand"));
     }
 }
