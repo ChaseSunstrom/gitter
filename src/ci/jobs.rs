@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
@@ -32,7 +33,8 @@ pub fn artifact_path(data: &Path, job: i64) -> PathBuf {
 /// setting only take jobs of repositories owned by admins, and the built-in
 /// runner never takes a run started by an agent's changes.
 pub async fn claim(st: &AppState, runner_id: i64, labels: Vec<String>, builtin: bool) -> R<Option<Lease>> {
-    let mode = st.settings.get().ci;
+    let s = st.settings.get();
+    let mode = s.ci.clone();
     if mode == "off" {
         return Ok(None);
     }
@@ -40,6 +42,7 @@ pub async fn claim(st: &AppState, runner_id: i64, labels: Vec<String>, builtin: 
     let Some(mut lease) = st.db.call(move |c| Ok(queue::claim(c, runner_id, &labels, admins_only, builtin)?)).await? else {
         return Ok(None);
     };
+    lease.limits = queue::Limits { cpus: s.ci_cpus, memory_mb: s.ci_memory_mb, network: s.ci_network };
     let data = &st.cfg.data_dir;
     let _ = tokio::fs::remove_file(log_path(data, lease.job_id)).await;
     let _ = tokio::fs::remove_file(artifact_path(data, lease.job_id)).await;
@@ -96,6 +99,22 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
     let t = token.to_string();
     let done = st.db.call(move |c| Ok(queue::finish(c, job, &t, success, code)?)).await?;
     st.ci_wake.notify_waiters();
+    // A finished run may be the last check a pull request waited on to merge itself.
+    let finished: Option<(i64, String)> = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT r.repo_id, r.sha FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE j.id = ?1 AND r.status IN ('success', 'failure', 'cancelled', 'skipped')",
+                [job],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })
+        .await?;
+    if let Some((repo, sha)) = finished {
+        let st = st.clone();
+        tokio::spawn(async move { crate::protect::auto_merge(&st, repo, Some(sha)).await });
+    }
     Ok(done)
 }
 

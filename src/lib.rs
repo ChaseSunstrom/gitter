@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod langs;
 pub mod lfs;
 pub mod net;
+pub mod protect;
 pub mod ops;
 pub mod registry;
 pub mod repo;

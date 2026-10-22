@@ -570,5 +570,42 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Branch rules: added from settings, they show in the merge box; badges are SVG and public links unfurl.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  let listed = false, gated = false, removed = false, badge = '', og = '';
+  try {
+    await page.goto(BASE + '/alice/hello/settings', { waitUntil: 'networkidle' });
+    await page.click('#rules summary');
+    await page.fill('#rule-form input[name=pattern]', 'main');
+    await page.fill('#rule-form input[name=checks]', 'release-check');
+    await page.click('#rule-form button[type=submit]');
+    await page.waitForSelector('#rules [data-rule-edit]', { timeout: 5000 });
+    listed = (await page.locator('#rules').innerText()).includes('checks: release-check');
+    // An open pull request into main to look at (e2e's own are merged).
+    const num = await page.evaluate(async () => {
+      const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json());
+      await post('/api/repos/alice/hello/contents', { branch: 'main', new_branch: 'ui-rule', message: 'Rule check', changes: [{ path: 'rule.txt', content: 'x\n' }] });
+      return (await post('/api/repos/alice/hello/pulls', { title: 'Waits for checks', head: 'ui-rule', base: 'main' })).number;
+    });
+    await page.goto(`${BASE}/alice/hello/pull/${num}`, { waitUntil: 'networkidle' });
+    gated = (await page.locator('.merge-blocked').innerText().catch(() => '')).includes("release-check hasn't run");
+    await page.goto(BASE + '/alice/hello/settings', { waitUntil: 'networkidle' });
+    await page.click('#rules [data-rule-del]');
+    await page.click('.modal [data-ok]');
+    await page.waitForSelector('#rules [data-rule-del]', { state: 'detached', timeout: 5000 });
+    removed = true;
+    const b = await fetch(BASE + '/api/repos/alice/hello/ci/badge.svg');
+    badge = b.headers.get('content-type') + ' ' + (await b.text()).slice(0, 4);
+    og = await (await fetch(BASE + '/alice/hello')).text();
+  } catch (e) { errors.push(String(e)); }
+  const unfurls = og.includes('<meta property="og:title" content="alice/hello">');
+  if (errors.length || !listed || !gated || !removed || badge !== 'image/svg+xml <svg' || !unfurls) { failed++; console.log('✗ branch rules', { listed, gated, removed, badge, unfurls, errors }); }
+  else console.log('  ok branch rule made in settings blocks the merge box; badge is SVG; public pages unfurl');
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

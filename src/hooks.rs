@@ -14,21 +14,41 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     }
     st.git.maintain_soon(repo.path.clone());
     refresh_size(st, repo.id).await;
-    let gone: Vec<String> = updates.iter().filter(|u| u.new.is_none()).filter_map(|u| u.refname.strip_prefix("refs/heads/").map(String::from)).collect();
-    if !gone.is_empty() {
-        forget_agent_branches(st, repo.id, gone).await;
-    }
+    record_pushers(st, repo.id, user.id, updates).await;
     crate::ci::trigger::on_push(st, repo, user.id, updates).await;
     crate::webhooks::push(st, repo, user.id, updates).await;
 }
 
-/// A deleted branch stops being an agent's: one made later under its name is a new branch.
-pub async fn forget_agent_branches(st: &AppState, repo_id: i64, branches: Vec<String>) {
+/// Who moved each branch last (a scheduled run counts as theirs). A deleted
+/// branch is forgotten, so one made later under its name starts fresh.
+async fn record_pushers(st: &AppState, repo_id: i64, user_id: i64, updates: &[RefUpdate]) {
+    let moved: Vec<(String, bool)> = updates.iter().filter_map(|u| Some((u.refname.strip_prefix("refs/heads/")?.to_string(), u.new.is_some()))).collect();
+    let gone: Vec<String> = moved.iter().filter(|m| !m.1).map(|m| m.0.clone()).collect();
+    let _ = st
+        .db
+        .call(move |c| {
+            for (b, _) in moved.iter().filter(|m| m.1) {
+                c.execute(
+                    "INSERT OR REPLACE INTO branch_pushers (repo_id, branch, user_id, at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![repo_id, b, user_id, crate::db::now()],
+                )?;
+            }
+            Ok(())
+        })
+        .await;
+    if !gone.is_empty() {
+        forget_branches(st, repo_id, gone).await;
+    }
+}
+
+/// A deleted branch stops being an agent's, and its last pusher is forgotten.
+pub async fn forget_branches(st: &AppState, repo_id: i64, branches: Vec<String>) {
     let _ = st
         .db
         .call(move |c| {
             for b in &branches {
                 c.execute("DELETE FROM agent_branches WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![repo_id, b])?;
+                c.execute("DELETE FROM branch_pushers WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![repo_id, b])?;
             }
             Ok(())
         })

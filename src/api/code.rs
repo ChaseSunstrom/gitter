@@ -971,6 +971,9 @@ pub async fn write_contents(
             "Agents can't commit to the default branch: commit to a new branch and open a pull request",
         ));
     }
+    if req.new_branch.is_none() && has_branches {
+        crate::protect::direct(&st, &r, &target, false).await?;
+    }
     // Agents work only on branches agents created, so a person's branch (or one
     // that deploys) is never theirs to rewrite.
     if u.agent().is_some() {

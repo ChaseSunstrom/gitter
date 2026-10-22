@@ -65,7 +65,8 @@ async function listView(meta, q) {
     <div class="grow"><div class="ci-title ellipsis">${r.title || '(no message)'}</div>
       <div class="muted small row wrap-ok"><b>#${r.number}</b><span>${EVENT[r.event] || r.event}</span>
         <span class="mono ci-ref">${icon('branch', 'sm')}${branchOf(r.ref)}</span><span class="mono">${short(r.sha)}</span>
-        ${r.pr_number ? html`<span>PR #${r.pr_number}</span>` : ''}${r.actor ? html`<span>by ${r.actor}</span>` : ''}</div></div>
+        ${r.pr_number ? html`<span>PR #${r.pr_number}</span>` : ''}${r.actor ? html`<span>by ${r.actor}</span>` : ''}
+        ${r.approval === 'needed' ? html`<span class="badge">Waiting for approval</span>` : ''}</div></div>
     <div class="ci-when muted small">${timeEl(r.created_at)}${r.started_at ? html`<div>${icon('clock', 'sm')} ${dur(r.started_at, r.finished_at)}</div>` : ''}</div>
   </a>`);
   const sample = 'jobs:\n  test:\n    steps:\n      - run: make test\n';
@@ -150,13 +151,16 @@ async function runView(meta, number, q) {
       ${run.can_write && !DONE.has(run.status) ? html`<button class="btn sm danger" id="ci-cancel">${icon('stop', 'sm')} Cancel</button>` : ''}
       ${run.can_write && DONE.has(run.status) && run.jobs.length ? html`${run.status !== 'success' ? html`<button class="btn sm" id="ci-rerun">${icon('history', 'sm')} Re-run failed</button>` : ''}
         <button class="btn sm" id="ci-rerun-all">${icon('history', 'sm')} Re-run all</button>` : ''}</div>
-    <div class="muted small row wrap-ok"><b>${LABEL[run.status] || run.status}</b><span>#${run.number}</span><span>${EVENT[run.event] || run.event}</span>
+    <div class="muted small row wrap-ok"><b>${run.approval === 'needed' ? 'Waiting for approval' : LABEL[run.status] || run.status}</b><span>#${run.number}</span><span>${EVENT[run.event] || run.event}</span>
       <a class="mono ci-ref" href="${base}/ci?branch=${encodeURIComponent(branchOf(run.ref))}">${icon('branch', 'sm')}${branchOf(run.ref)}</a>
       <a class="mono" href="${base}/commit/${run.sha}">${short(run.sha)}</a>
       ${run.pr_number ? html`<a href="${base}/pull/${run.pr_number}">PR #${run.pr_number}</a>` : ''}
       ${run.actor ? html`<span>by ${run.actor}</span>` : ''}<span>${timeEl(run.created_at)}</span>
       ${run.started_at ? html`<span>${icon('clock', 'sm')} ${dur(run.started_at, run.finished_at)}</span>` : ''}</div>
     ${run.error ? html`<div class="box box-body ci-error">${icon('x', 'sm')} <b>The pipeline couldn't start:</b> <span class="mono">${run.error}</span></div>` : ''}
+    ${run.approval === 'needed' ? html`<div class="box box-body row wrap-ok ci-approval">${icon('shield', 'sm')}
+      <span class="grow"><b>Waiting for approval.</b> An agent (${run.agent}) wrote the code this run would execute. Read the changes first; once approved it runs on a separate runner, without secrets.</span>
+      ${run.can_write ? html`<button class="btn sm primary" id="ci-approve">Approve and run</button>` : ''}</div>` : ''}
   </div>`;
   const jobHead = () => job ? html`<div class="box-head row wrap-ok">${ciIcon(job.status)}<b class="grow">${job.name}</b>
     ${job.image ? html`<span class="pill mono">${job.image}</span>` : ''}
@@ -274,10 +278,11 @@ async function runView(meta, number, q) {
           await loadJob(el);
           return;
         }
-        const act = e.target.closest('#ci-cancel, #ci-rerun, #ci-rerun-all');
+        const act = e.target.closest('#ci-cancel, #ci-rerun, #ci-rerun-all, #ci-approve');
         if (!act) return;
         await action(act, async () => {
           if (act.id === 'ci-cancel') { await send('POST', `${api}/ci/runs/${number}/cancel`); toast('Run cancelled'); }
+          else if (act.id === 'ci-approve') { await send('POST', `${api}/ci/runs/${number}/approve`); toast('Approved'); }
           else { await send('POST', `${api}/ci/runs/${number}/rerun`, { all: act.id === 'ci-rerun-all' }); toast('Running again'); }
           navigate(location.pathname, { replace: true, scroll: false });
         })(e);

@@ -20,6 +20,8 @@ const MAX_MILESTONES: i64 = 500;
 /// right now: its owner (not an organization), collaborators with write or admin,
 /// and members of the owning organization with write. The same rule as
 /// `repo::access`, so assignments of someone who loses access stop showing.
+/// Site admins aren't assignable everywhere by being admins (as on GitHub): they
+/// need a role on the repository like anyone else.
 pub fn writer_sql(u: &str) -> String {
     format!(
         "(({u} = r.owner_id AND NOT EXISTS (SELECT 1 FROM orgs WHERE id = {u}))
@@ -118,6 +120,10 @@ fn check_title(t: &str) -> R<String> {
     if t.is_empty() || t.chars().count() > 100 {
         return Err(AppError::bad("Milestone titles are 1 to 100 characters"));
     }
+    // `milestone=none` in a filter means "no milestone".
+    if t.eq_ignore_ascii_case("none") {
+        return Err(AppError::bad("Pick another title: \"none\" means no milestone in filters"));
+    }
     Ok(t.to_string())
 }
 
@@ -144,8 +150,15 @@ fn check_due(d: &str) -> R<Option<String>> {
     let b = d.as_bytes();
     let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
     let ok = b.len() == 10 && b[4] == b'-' && b[7] == b'-' && digits(0..4) && digits(5..7) && digits(8..10) && {
-        let (m, day): (u32, u32) = (d[5..7].parse().unwrap_or(0), d[8..10].parse().unwrap_or(0));
-        (1..=12).contains(&m) && (1..=31).contains(&day)
+        let (y, m, day): (u32, u32, u32) = (d[0..4].parse().unwrap_or(0), d[5..7].parse().unwrap_or(0), d[8..10].parse().unwrap_or(0));
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let days = match m {
+            2 if leap => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        (1..=12).contains(&m) && (1..=days).contains(&day)
     };
     if !ok {
         return Err(AppError::bad("Due dates look like 2027-01-31"));
@@ -359,7 +372,14 @@ pub async fn load_templates(st: &AppState, r: &Repo) -> R<(Vec<Template>, Option
     files.sort_by(|a, b| a.name.cmp(&b.name));
     files.truncate(MAX_TEMPLATES);
     let mut issue = vec![];
+    // At most 256 KB of templates per commit, so they can't crowd the shared memo.
+    let mut budget = 256 * 1024u64;
     for f in files {
+        let size = f.size.unwrap_or(0);
+        if size > budget {
+            break;
+        }
+        budget -= size;
         let bytes = st.git.blob(&r.path, &f.oid).await?;
         issue.push(parse_template(&f.name, &String::from_utf8_lossy(&bytes)));
     }
@@ -393,5 +413,7 @@ mod tests {
         let t = parse_template("x.md", "---\r\ntitle: \"[x] \"\r\n---\r\nhi");
         assert_eq!((t.title.as_str(), t.body.as_str()), ("[x] ", "hi"));
         assert!(check_due("2027-13-01").is_err() && check_due("2027-1-01").is_err() && check_due("").unwrap().is_none());
+        assert!(check_due("2027-02-30").is_err() && check_due("2027-02-29").is_err() && check_due("2028-02-29").is_ok() && check_due("2100-02-29").is_err());
+        assert!(check_title("None").is_err() && check_title("v1.0").is_ok());
     }
 }
