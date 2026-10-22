@@ -528,3 +528,111 @@ async fn multi_line_secrets_are_masked_and_streams_resume() {
     assert!(!orphan.exists() && gitter::ci::jobs::log_path(&app.state.cfg.data_dir, id).exists());
     assert_eq!(job_status(&app).await, ["success"]);
 }
+
+// ---------- other hosts' CI files (T-0097)
+
+/// Every job's log of the newest run, joined.
+async fn run_logs(app: &App) -> String {
+    let ids: Vec<i64> = app
+        .state
+        .db
+        .call(|c| Ok(c.prepare("SELECT id FROM ci_jobs WHERE run_id = (SELECT max(id) FROM ci_runs) ORDER BY id")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?))
+        .await
+        .unwrap();
+    ids.iter().map(|id| std::fs::read_to_string(gitter::ci::jobs::log_path(&app.state.cfg.data_dir, *id)).unwrap_or_default()).collect::<Vec<_>>().join("\n")
+}
+
+#[tokio::test]
+async fn compat_github_workflows_run_and_each_event_runs_only_its_workflows() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    let prs = "on: pull_request\njobs:\n  review:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo review\n";
+    commit(&app, &admin, "root1/r", "main", None, ".github/workflows/pr.yml", prs).await;
+    assert!(runs(&app).await.is_empty(), "a pull-request-only workflow doesn't run on a push");
+    let ci = "name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+env:
+  GREETING: hi
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+      - run: |
+          echo \"$GREETING from $GITHUB_REPOSITORY at ${{ github.ref_name }}\"
+          echo \"X=1 2\" >> $GITHUB_ENV
+      - run: echo \"x is $X\"
+      - if: github.event_name == 'pull_request'
+        run: echo only-on-prs
+  after:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo after
+";
+    commit(&app, &admin, "root1/r", "main", None, ".github/workflows/ci.yml", ci).await;
+    assert_eq!(settle(&app).await, "success", "{:?}", runs(&app).await);
+    assert_eq!(pairs(&last_jobs(&app).await), [("CI / build", "success"), ("CI / after", "success")], "pr.yml doesn't run on a push");
+    let log = run_logs(&app).await;
+    assert!(log.contains("hi from root1/r at main") && log.contains("x is 1 2"), "{log}");
+    assert!(log.contains("Notes on .github/workflows/ci.yml") && log.contains("actions/setup-node@v4"), "{log}");
+    assert!(log.contains("Skipped (if: github.event_name == 'pull_request')") && !log.contains("only-on-prs\n"), "{log}");
+    // A pull request runs every workflow that wants pull requests.
+    commit(&app, &admin, "root1/r", "main", Some("feat"), "f.txt", "x\n").await;
+    let (s, _) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "F", "head": "feat", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(settle(&app).await, "success");
+    let last = runs(&app).await.pop().unwrap();
+    assert_eq!(last.0, "pull_request");
+    assert_eq!(pairs(&last_jobs(&app).await), [("CI / build", "success"), ("CI / after", "success"), ("pr / review", "success")]);
+    assert!(run_logs(&app).await.contains("only-on-prs"));
+    // A .gitter/ci.yml wins over them.
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", "jobs:\n  own:\n    steps: [echo own]\n").await;
+    assert_eq!(settle(&app).await, "success");
+    assert_eq!(pairs(&last_jobs(&app).await), [("own", "success")]);
+}
+
+#[tokio::test]
+async fn compat_gitlab_ci_runs_in_stage_order_and_rules_pick_jobs() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "g", "readme": true }))).await;
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    let gl = "stages: [build, test]
+default:
+  before_script:
+    - echo before
+.common: &common
+  variables:
+    WHO: gitlab
+build:
+  stage: build
+  <<: *common
+  script:
+    - echo \"built by $WHO\" > built.txt
+    - cat built.txt
+test:
+  stage: test
+  script: echo \"testing $CI_COMMIT_BRANCH from $CI_PIPELINE_SOURCE\"
+mr only:
+  stage: test
+  script: echo mr
+  rules:
+    - if: $CI_PIPELINE_SOURCE == \"merge_request_event\"
+";
+    commit(&app, &admin, "root1/g", "main", None, ".gitlab-ci.yml", gl).await;
+    assert_eq!(settle(&app).await, "success", "{:?}", runs(&app).await);
+    assert_eq!(pairs(&last_jobs(&app).await), [("build", "success"), ("test", "success")], "the merge-request job sits out a push");
+    let log = run_logs(&app).await;
+    assert!(log.contains("before") && log.contains("built by gitlab") && log.contains("testing main from push"), "{log}");
+    // A broken file shows on the run, as a .gitter/ci.yml would.
+    commit(&app, &admin, "root1/g", "main", None, ".gitlab-ci.yml", "x:\n  stage: nope\n  script: [a]\n").await;
+    let last = runs(&app).await.pop().unwrap();
+    assert!(last.3 == "failure" && last.4.contains("stage 'nope'"), "{last:?}");
+}

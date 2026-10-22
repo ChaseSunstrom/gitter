@@ -71,7 +71,7 @@ async function listView(meta, q) {
   </a>`);
   const sample = 'jobs:\n  test:\n    steps:\n      - run: make test\n';
   const empty = html`<div class="box empty">${icon('zap', 'big')}<h3>No runs yet</h3>
-    <p>Add <code>.gitter/ci.yml</code> (or just a <code>.gitter/ci.sh</code> script) and push: every push and pull request runs it.</p>
+    <p>Add <code>.gitter/ci.yml</code> (or just a <code>.gitter/ci.sh</code> script) and push: every push and pull request runs it. GitHub Actions workflows and <code>.gitlab-ci.yml</code> run too.</p>
     ${meta.can_write ? html`<p><button class="btn primary" id="ci-setup">${icon('play', 'sm')} Set up CI</button></p>` : ''}
     <pre class="setup-cmd" style="text-align:left">${sample}</pre></div>`;
   const flakyBox = flaky.tests.length ? html`<details class="box ci-flaky-box" open><summary class="box-head row">${icon('zap', 'sm')}<b class="grow">Flaky tests</b><span class="counter">${flaky.tests.length}</span></summary>
