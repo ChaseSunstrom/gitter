@@ -528,6 +528,27 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX review_comments_issue ON review_comments(issue_id);
     "#,
+    // v16: traffic, per repository and UTC day (unix time / 86400). Kind 'view' or
+    // 'clone' with name '' is the day's count; 'path' (a page) and 'ref' (a referring
+    // site) rows are the top lists, capped per day. Visitors are hashes of the address
+    // with a random salt held in memory for that day only, so no address is stored.
+    r#"
+    CREATE TABLE traffic (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        day INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(repo_id, day, kind, name)
+    ) WITHOUT ROWID;
+    CREATE TABLE traffic_visitors (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        day INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        PRIMARY KEY(repo_id, day, kind, hash)
+    ) WITHOUT ROWID;
+    "#,
 ];
 
 impl Db {

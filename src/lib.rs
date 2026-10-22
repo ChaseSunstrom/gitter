@@ -75,6 +75,8 @@ pub struct AppState {
     pub signing: Arc<signing::Signing>,
     /// Wakes the webhook sender when a delivery is queued.
     pub hook_wake: Arc<tokio::sync::Notify>,
+    /// Page views and clones counted in memory until the next flush.
+    pub traffic: Arc<api::insights::Traffic>,
 }
 
 impl AppState {
@@ -96,6 +98,7 @@ impl AppState {
             ci_wake: Arc::default(),
             signing: Arc::new(signing::Signing::new(cfg_dir.join("gpg"))),
             hook_wake: Arc::default(),
+            traffic: Arc::default(),
         }
     }
 }

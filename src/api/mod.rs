@@ -4,6 +4,7 @@ pub mod ci;
 pub mod orgs;
 pub mod code;
 pub mod discussions;
+pub mod insights;
 pub mod issues;
 pub mod lifecycle;
 pub mod moderation;
@@ -135,6 +136,10 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/blame"), get(code::blame))
         .route(&format!("{repo}/contents"), post(code::write_contents))
         .route(&format!("{repo}/contributors"), get(code::contributors))
+        .route(&format!("{repo}/graph"), get(insights::graph))
+        .route(&format!("{repo}/history"), get(insights::history))
+        .route(&format!("{repo}/traffic"), get(insights::traffic))
+        .route(&format!("{repo}/traffic/view"), post(insights::view))
         .route(
             &format!("{repo}/labels"),
             get(issues::labels).post(issues::create_label),
@@ -299,6 +304,13 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
         && !matches!(segs[3], "fork" | "deploy-tokens" | "transfer" | "collaborators")
 }
 
+/// POST /repos/{owner}/{repo}/traffic/view: counting a page view, which browsing mustn't
+/// pay for out of the write allowance. Exactly that route, nothing that merely ends like it.
+fn is_view_count(method: &axum::http::Method, path: &str) -> bool {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    *method == axum::http::Method::POST && segs.len() == 5 && segs[0] == "repos" && segs[3] == "traffic" && segs[4] == "view"
+}
+
 /// Per-address limits on all API requests, and per-account limits on changes
 /// (admins exempt), so one client can't flood a public instance.
 pub async fn rate_limit(
@@ -315,7 +327,9 @@ pub async fn rate_limit(
     {
         return AppError::slow_down("Too many requests from your network. Slow down a little.", wait).into_response();
     }
-    let mutating = !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+    // A page-view count isn't a change: browsing mustn't use up the write allowance.
+    let mutating = !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS)
+        && !is_view_count(&parts.method, parts.uri.path());
     if mutating && s.write_rate_per_min > 0 {
         let v = crate::auth::Viewer::from_request_parts(&mut parts, &st).await.ok().and_then(|v| v.0);
         let key = match &v {

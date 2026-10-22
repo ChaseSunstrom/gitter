@@ -121,7 +121,21 @@ export function paintCiStatus(root, meta) {
   }).catch(() => {});
 }
 
+// Traffic: one view per repository page shown, with the outside site that sent the
+// visitor on the first one (the server keeps only its host, and only if it isn't us).
+let referrer = document.referrer, lastView = '';
+function countView(meta) {
+  const page = '/' + location.pathname.split('/').slice(3).join('/');
+  const key = `${meta.owner}/${meta.name}${page}`;
+  if (key === lastView) return; // the same page re-rendered (after starring, say)
+  lastView = key;
+  const body = JSON.stringify({ path: page, referrer });
+  referrer = '';
+  fetch(`/api${repoUrl(meta.owner, meta.name)}/traffic/view`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', keepalive: true, body }).catch(() => {});
+}
+
 export function mountRepoHeader(root, meta) {
+  countView(meta);
   placeTabBar(root);
   paintCiStatus(root, meta);
   $('#report-btn', root)?.addEventListener('click', () => reportDialog({ kind: 'repo', owner: meta.owner, repo: meta.name }, 'repository'));

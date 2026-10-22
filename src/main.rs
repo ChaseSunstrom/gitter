@@ -199,6 +199,8 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
     tokio::spawn(gitter::api::lifecycle::upkeep(st.clone()));
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));
     tokio::spawn(gitter::webhooks::run(st.clone()));
+    tokio::spawn(gitter::api::insights::flush_loop(st.clone()));
+    let (traffic, db) = (st.traffic.clone(), st.db.clone());
     let st2 = st.clone();
     tokio::spawn(async move {
         st2.git.sweep().await;
@@ -220,6 +222,8 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown())
     .await?;
+    // Requests have drained: save the last minute of traffic counts.
+    traffic.flush(&db).await;
     Ok(())
 }
 
