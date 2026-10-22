@@ -49,6 +49,8 @@ pub struct Signing {
     version: AtomicU64,
     /// The keyring is refilled from the database once per process: backups don't carry it.
     synced: tokio::sync::OnceCell<()>,
+    /// How long a tool may take over one signature or key.
+    timeout: Duration,
 }
 
 /// What the API says about a commit's signature.
@@ -74,7 +76,29 @@ struct Check {
     committer_email: String,
     /// The keyring version a GPG check was made with; it's stale once that changes.
     keyring: u64,
+    /// When the key behind a Good GPG check expires (the primary key or the subkey that
+    /// signed, whichever is first): past it the check is redone, and gpg says expired.
+    #[serde(default)]
+    expires: Option<i64>,
+    /// When it was checked.
+    #[serde(default)]
+    at: i64,
 }
+
+/// Is a memoised check still the answer at `now`, with keyring version `ver`?
+fn fresh(c: &Check, ver: u64, now: i64) -> bool {
+    if c.kind == "gpg" && c.keyring != ver {
+        return false;
+    }
+    match c.outcome {
+        Outcome::Good => c.expires.is_none_or(|e| now < e),
+        Outcome::TimedOut => now < c.at + TIMEOUT_MEMO,
+        _ => true,
+    }
+}
+
+/// Seconds a tool's timeout is remembered: a slow signature isn't retried on every view.
+const TIMEOUT_MEMO: i64 = 60;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 enum Outcome {
@@ -85,6 +109,8 @@ enum Outcome {
     Expired,
     Revoked,
     Unsupported,
+    /// The tool took too long: no verdict, tried again after TIMEOUT_MEMO.
+    TimedOut,
 }
 
 /// Why a tool gave no answer.
@@ -92,8 +118,10 @@ enum Outcome {
 enum Fail {
     /// Not installed (or too old to know the command).
     Missing,
-    /// Failed or timed out this time.
+    /// Failed this time.
     Broken,
+    /// Ran out of time.
+    TimedOut,
 }
 
 /// A public key ready to register.
@@ -107,7 +135,12 @@ pub struct NewKey {
 
 impl Signing {
     pub fn new(home: PathBuf) -> Signing {
-        Signing { home, version: AtomicU64::new(0), synced: Default::default() }
+        Signing::with_timeout(home, TOOL_TIMEOUT)
+    }
+
+    /// With tools given `timeout` each (tests use a tiny one).
+    pub fn with_timeout(home: PathBuf, timeout: Duration) -> Signing {
+        Signing { home, version: AtomicU64::new(0), synced: Default::default(), timeout }
     }
 
     /// Call after adding a GPG key, so commits checked without it get checked again.
@@ -147,7 +180,8 @@ impl Signing {
         });
         match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(out)) => Ok(out),
-            _ => Err(Fail::Broken),
+            Ok(Err(_)) => Err(Fail::Broken),
+            Err(_) => Err(Fail::TimedOut),
         }
     }
 
@@ -163,7 +197,7 @@ impl Signing {
     /// A GPG key now registered to an account: into the server's keyring, and
     /// commits checked without it get checked again.
     pub async fn add_gpg_key(&self, git: &Git, key: &str) {
-        if let Err(f) = self.gpg_import(git, &self.home, key.as_bytes(), TOOL_TIMEOUT).await {
+        if let Err(f) = self.gpg_import(git, &self.home, key.as_bytes(), self.timeout).await {
             eprintln!("signing: importing a GPG key failed ({f:?}); it's imported at the next start");
         }
         self.key_added();
@@ -202,26 +236,29 @@ impl Signing {
     }
 
     /// Check one signature over `payload`. Err is the reason it couldn't be checked.
-    async fn check(&self, st: &AppState, payload: &[u8], sig: &str) -> Result<(Outcome, &'static str, Option<String>), &'static str> {
+    async fn check(&self, st: &AppState, payload: &[u8], sig: &str) -> Result<(Outcome, &'static str, Option<String>, Option<i64>), &'static str> {
         let kind = if sig.starts_with("-----BEGIN SSH SIGNATURE-----") {
             "ssh"
         } else if sig.starts_with("-----BEGIN PGP SIGNATURE-----") {
             "gpg"
         } else {
-            return Ok((Outcome::Unsupported, "", None));
+            return Ok((Outcome::Unsupported, "", None, None));
         };
         if sig.len() > MAX_SIG {
-            return Ok((Outcome::Unsupported, kind, None));
+            return Ok((Outcome::Unsupported, kind, None, None));
         }
-        let res = self.run_check(st, kind, payload, sig).await;
-        res.map(|(o, fp)| (o, kind, fp)).map_err(|f| match (f, kind) {
-            (Fail::Missing, "ssh") => "This server can't check SSH signatures (it needs ssh-keygen from OpenSSH 8.4 or newer).",
-            (Fail::Missing, _) => "This server can't check GPG signatures (gpg isn't installed).",
-            (Fail::Broken, _) => "This signature couldn't be checked just now. Reload the page to try again.",
-        })
+        match self.run_check(st, kind, payload, sig).await {
+            Ok((o, fp, exp)) => Ok((o, kind, fp, exp)),
+            // Remembered for a minute, so a signature that hangs the tool isn't run on every view.
+            Err(Fail::TimedOut) => Ok((Outcome::TimedOut, kind, None, None)),
+            Err(Fail::Missing) if kind == "ssh" => Err("This server can't check SSH signatures (it needs ssh-keygen from OpenSSH 8.4 or newer)."),
+            Err(Fail::Missing) => Err("This server can't check GPG signatures (gpg isn't installed)."),
+            Err(Fail::Broken) => Err("This signature couldn't be checked just now. Reload the page to try again."),
+        }
     }
 
-    async fn run_check(&self, st: &AppState, kind: &str, payload: &[u8], sig: &str) -> Result<(Outcome, Option<String>), Fail> {
+    /// The outcome, the key's fingerprint and, for a good GPG signature, when the key expires.
+    async fn run_check(&self, st: &AppState, kind: &str, payload: &[u8], sig: &str) -> Result<(Outcome, Option<String>, Option<i64>), Fail> {
         if kind == "gpg" {
             self.sync(st).await?;
         }
@@ -235,24 +272,37 @@ impl Signing {
         if kind == "ssh" {
             // Checks the signature against the public key inside it; whose key that is, the database says.
             let args = ["-Y", "check-novalidate", "-n", "git", "-s", &f];
-            self.tool(&st.git, "ssh-keygen", &args, payload, TOOL_TIMEOUT).await.and_then(|o| parse_ssh(&o))
+            self.tool(&st.git, "ssh-keygen", &args, payload, self.timeout).await.and_then(|o| parse_ssh(&o)).map(|(o, fp)| (o, fp, None))
         } else {
             // Only signature packets: gpg would otherwise check a signed message carried
             // in the header (and ignore the commit) and still report a good signature.
             if !only_signature_packets(sig) {
-                return Ok((Outcome::Bad, None));
+                return Ok((Outcome::Bad, None, None));
             }
             let args = [
                 "--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--no-auto-key-retrieve", "--trust-model", "always", "--status-fd", "1",
                 "--verify", &f, "-",
             ];
-            let o = self.tool(&st.git, "gpg", &args, payload, TOOL_TIMEOUT).await?;
+            let o = self.tool(&st.git, "gpg", &args, payload, self.timeout).await?;
             let status = String::from_utf8_lossy(&o.stdout);
             // No verdict at all and a failed exit: gpg itself broke (a locked keyring...). Not cached.
             if !o.status.success() && !status.lines().any(|l| SIG_STATUS.iter().any(|k| l.starts_with(k))) {
                 return Err(Fail::Broken);
             }
-            Ok(parse_gpg(&status))
+            let (outcome, fpr) = parse_gpg(&status);
+            let (Outcome::Good, Some(primary), Some(sub)) = (outcome, &fpr, signing_subkey(&status)) else { return Ok((outcome, fpr, None)) };
+            // ponytail: one more gpg run per good GPG check (they're memoised); memo per key if it shows.
+            let args = ["--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--with-colons", "--fixed-list-mode", "--list-keys", primary.as_str()];
+            let o = self.tool(&st.git, "gpg", &args, b"", self.timeout).await?;
+            if !o.status.success() {
+                return Err(Fail::Broken);
+            }
+            let expires = key_expiry(&String::from_utf8_lossy(&o.stdout), primary, sub);
+            // Expired since gpg answered: say so rather than cache a Good that's already over.
+            if expires.is_some_and(|e| e <= crate::db::now()) {
+                return Ok((Outcome::Expired, fpr, None));
+            }
+            Ok((outcome, fpr, expires))
         }
     }
 }
@@ -403,6 +453,33 @@ fn parse_gpg(status: &str) -> (Outcome, Option<String>) {
     (o, fpr)
 }
 
+/// The fingerprint of the (sub)key that made a good GPG signature: VALIDSIG's first field.
+fn signing_subkey(status: &str) -> Option<&str> {
+    status.lines().find_map(|l| l.strip_prefix("[GNUPG:] VALIDSIG ")).and_then(|r| r.split(' ').next())
+}
+
+/// When a key stops being good for signatures by `sub` (the primary key or one of its
+/// subkeys), from `gpg --with-colons --list-keys`: the earlier of the two expiries.
+fn key_expiry(colons: &str, primary: &str, sub: &str) -> Option<i64> {
+    let mut last: Option<i64> = None;
+    let mut soonest: Option<i64> = None;
+    for l in colons.lines() {
+        let f: Vec<&str> = l.split(':').collect();
+        match f[0] {
+            // Field 7 is the expiry (seconds since 1970), empty for never.
+            "pub" | "sub" => last = f.get(6).and_then(|e| e.parse().ok()),
+            "fpr" if f.get(9).is_some_and(|x| *x == primary || *x == sub) => {
+                if let Some(e) = last.take() {
+                    soonest = Some(soonest.map_or(e, |s| s.min(e)));
+                }
+            }
+            "fpr" => last = None,
+            _ => {}
+        }
+    }
+    soonest
+}
+
 /// Check a pasted public key. A GPG key is read in a throwaway keyring; it joins
 /// the server's keyring only once it's registered (`add_gpg_key`).
 pub async fn parse_key(st: &AppState, text: &str) -> R<NewKey> {
@@ -454,9 +531,9 @@ async fn gpg_key(st: &AppState, text: &str) -> R<NewKey> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut db, 0o700);
     db.create(&scratch.0).map_err(|e| AppError::internal(format!("GPG scratch home: {e}")))?;
-    let status = st.signing.gpg_import(&st.git, &scratch.0, text.as_bytes(), TOOL_TIMEOUT).await.map_err(|f| match f {
+    let status = st.signing.gpg_import(&st.git, &scratch.0, text.as_bytes(), st.signing.timeout).await.map_err(|f| match f {
         Fail::Missing => AppError::bad("This server can't read GPG keys (gpg isn't installed)"),
-        Fail::Broken => AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Couldn't read the key just now. Try again."),
+        Fail::Broken | Fail::TimedOut => AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Couldn't read the key just now. Try again."),
     })?;
     let fprs: HashSet<&str> = status
         .lines()
@@ -502,9 +579,10 @@ async fn try_verify(st: &AppState, r: &Repo, shas: &[&str]) -> R<HashMap<String,
     let mut checks: HashMap<String, Result<Check, Verification>> = HashMap::new();
     let mut misses = Vec::new();
     let mut seen = HashSet::new();
+    let now = crate::db::now();
     for sha in shas.iter().copied().filter(|s| seen.insert(*s)) {
         match st.git.memo.get::<Check>(&key(sha)) {
-            Some(c) if c.kind != "gpg" || c.keyring == ver => {
+            Some(c) if fresh(&c, ver, now) => {
                 checks.insert(sha.to_string(), Ok(c));
             }
             _ => misses.push(sha),
@@ -516,7 +594,7 @@ async fn try_verify(st: &AppState, r: &Repo, shas: &[&str]) -> R<HashMap<String,
         match split_signature(&raw) {
             Some((payload, sig)) => todo.push((sha, payload, sig, committer_email)),
             None => {
-                let c = Check { outcome: Outcome::Unsigned, kind: String::new(), fingerprint: None, committer_email, keyring: ver };
+                let c = Check { outcome: Outcome::Unsigned, kind: String::new(), fingerprint: None, committer_email, keyring: ver, expires: None, at: now };
                 st.git.memo.put(key(&sha), &c);
                 checks.insert(sha, Ok(c));
             }
@@ -535,8 +613,8 @@ async fn try_verify(st: &AppState, r: &Repo, shas: &[&str]) -> R<HashMap<String,
         .await;
     for (sha, res, committer_email) in done {
         match res {
-            Ok((outcome, kind, fingerprint)) => {
-                let c = Check { outcome, kind: kind.into(), fingerprint, committer_email, keyring: ver };
+            Ok((outcome, kind, fingerprint, expires)) => {
+                let c = Check { outcome, kind: kind.into(), fingerprint, committer_email, keyring: ver, expires, at: now };
                 st.git.memo.put(key(&sha), &c);
                 checks.insert(sha, Ok(c));
             }
@@ -611,6 +689,7 @@ fn verdict(c: &Check, owners: &[(String, User)]) -> Verification {
         Outcome::Revoked => says("unverified", "The GPG key that made this signature was revoked.".into(), None),
         Outcome::Unsupported => says("unverified", "This kind of signature can't be checked here (only SSH and GPG signatures can).".into(), None),
         Outcome::NoKey => unregistered(),
+        Outcome::TimedOut => unknown("Checking this signature took too long. It's tried again a minute later."),
         Outcome::Good => {
             // Several accounts may have added the same public key: the signature
             // verifies for the one whose email is the committer's.
@@ -768,6 +847,48 @@ mod tests {
         assert!(!only_signature_packets(&arm(&[])));
         assert!(only_signature_packets("-----BEGIN PGP SIGNATURE-----\nVersion: x\n\nwgMBAgM=\n=x\n-----END PGP SIGNATURE-----"));
         assert_eq!(parse_gpg("[GNUPG:] PLAINTEXT 62 0\n[GNUPG:] GOODSIG 4B9A Alice\n[GNUPG:] VALIDSIG S x\n").0, Outcome::Bad);
+    }
+
+    fn check(outcome: Outcome, kind: &str, expires: Option<i64>) -> Check {
+        Check { outcome, kind: kind.into(), fingerprint: None, committer_email: String::new(), keyring: 3, expires, at: 1000 }
+    }
+
+    #[test]
+    fn cached_gpg_good_results_last_until_the_key_expires() {
+        let c = check(Outcome::Good, "gpg", Some(2000));
+        assert!(fresh(&c, 3, 1999));
+        assert!(!fresh(&c, 3, 2000), "expired: checked again (gpg then says so)");
+        assert!(!fresh(&c, 4, 1500), "the keyring changed");
+        assert!(fresh(&check(Outcome::Good, "gpg", None), 3, i64::MAX), "a key that never expires");
+        assert!(fresh(&check(Outcome::Good, "ssh", None), 9, 5000), "SSH checks don't use the keyring");
+        // Expiry for the primary key and the subkey that signed; other subkeys don't count.
+        let colons = "pub:u:255:22:AAAA:1:3000::u:::scSC:\nfpr:::::::::PRIMARY:\nuid:u::::1::X::A <a@x>:\n\
+                      sub:u:255:22:BBBB:1:2500:::::s:\nfpr:::::::::SIGNER:\nsub:u:255:18:CCCC:1:100:::::e:\nfpr:::::::::OTHER:\n";
+        assert_eq!(key_expiry(colons, "PRIMARY", "SIGNER"), Some(2500));
+        assert_eq!(key_expiry(colons, "PRIMARY", "PRIMARY"), Some(3000));
+        assert_eq!(key_expiry("pub:u:255:22:AAAA:1:::u:::scSC:\nfpr:::::::::PRIMARY:\n", "PRIMARY", "PRIMARY"), None);
+        let valid = "[GNUPG:] GOODSIG 4B9A Alice\n[GNUPG:] VALIDSIG SIGNER 2026-10-22 1 0 4 0 22 10 00 PRIMARY\n";
+        assert_eq!(signing_subkey(valid), Some("SIGNER"));
+    }
+
+    #[test]
+    fn tool_timeouts_are_remembered_for_a_minute() {
+        let t = check(Outcome::TimedOut, "ssh", None);
+        assert!(fresh(&t, 3, 1000 + 59));
+        assert!(!fresh(&t, 3, 1000 + 60), "tried again after a minute");
+        assert!(!fresh(&check(Outcome::TimedOut, "gpg", None), 4, 1001), "or once the keyring changes");
+        assert_eq!(verdict(&t, &[]).status, "unknown", "never shown as Bad");
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_runs_too_long_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = Git::new(dir.path().join("repos"), dir.path().join("home"), 4);
+        let s = Signing::with_timeout(dir.path().join("gpg"), Duration::from_millis(50));
+        let r = s.tool(&git, "sleep", &["5"], b"", s.timeout).await;
+        assert!(matches!(r, Err(Fail::TimedOut)), "{r:?}");
+        let r = s.tool(&git, "false", &[], b"", s.timeout).await;
+        assert!(r.is_ok_and(|o| !o.status.success()), "a failing tool still answers");
     }
 
     #[test]

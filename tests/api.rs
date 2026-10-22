@@ -1934,6 +1934,74 @@ async fn signed_commits_gpg_keys_verify_once_registered() {
 }
 
 #[tokio::test]
+async fn signing_gpg_cached_good_results_end_when_the_key_expires() {
+    if !have_tool("gpg") {
+        eprintln!("gpg isn't installed: GPG signature checks skipped");
+        return;
+    }
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    let home = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(home.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let env = [("GNUPGHOME", home.path().to_str().unwrap())];
+    run_tool("gpg", &["--batch", "--passphrase", "", "--quick-gen-key", "Alice <alice@example.com>", "ed25519", "sign", "seconds=6"], &env, None);
+    let colons = run_tool("gpg", &["--batch", "--with-colons", "--list-keys"], &env, None);
+    let fpr = colons.lines().find(|l| l.starts_with("fpr:")).unwrap().split(':').nth(9).unwrap().to_string();
+    let expires: u64 = colons.lines().find(|l| l.starts_with("pub:")).unwrap().split(':').nth(6).unwrap().parse().unwrap();
+    let armored = run_tool("gpg", &["--batch", "--armor", "--export", &fpr], &env, None);
+    let sign = vec!["-c".into(), "gpg.format=openpgp".into(), "-c".into(), format!("user.signingkey={fpr}")];
+    let good = commit_on_main(&repo, "a.txt", "alice@example.com", &sign, &env);
+    add_gpg_signing_key(&app, &alice, &armored, &fpr, &env).await;
+    assert_eq!(commit_verification(&app, &alice, &good).await["status"], "verified", "checked (and cached) while the key is valid");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    tokio::time::sleep(std::time::Duration::from_secs(expires.saturating_sub(now) + 1)).await;
+    let v = commit_verification(&app, &alice, &good).await;
+    assert_eq!(v["status"], "unverified", "the cached Good is re-checked once the key expires: {v}");
+    assert!(v["reason"].as_str().unwrap().contains("expired"), "{v}");
+    let _ = std::process::Command::new("gpgconf").args(["--kill", "all"]).envs(env).status();
+}
+
+#[tokio::test]
+async fn signing_tool_timeouts_are_remembered_for_a_minute() {
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: SSH signature checks skipped");
+        return;
+    }
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("k");
+    run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", key.to_str().unwrap()], &[], None);
+    let ssh = vec!["-c".into(), "gpg.format=ssh".into(), "-c".into(), format!("user.signingkey={}", key.display())];
+    let signed = commit_on_main(&repo, "a.txt", "alice@example.com", &ssh, &[]);
+    // The same server (and cache), with a tool that never answers in time.
+    let mut slow = app.state.clone();
+    slow.signing = std::sync::Arc::new(gitter::signing::Signing::with_timeout(app.state.cfg.data_dir.join("gpg"), std::time::Duration::ZERO));
+    let req = Request::get(format!("/api/repos/alice/r/commit/{signed}")).header("host", "test.local").body(Body::empty()).unwrap();
+    let resp = gitter::router(slow).oneshot(req).await.unwrap();
+    let body: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let v = &body["commit"]["verification"];
+    assert_eq!(v["status"], "unknown", "a timeout is never Bad: {v}");
+    assert!(v["reason"].as_str().unwrap().contains("too long"), "{v}");
+    // Within the minute the commit isn't checked again, even with a tool that would answer.
+    let again = commit_verification(&app, &alice, &signed).await;
+    assert_eq!(&again, v, "remembered, not re-checked");
+}
+
+/// Register GPG key `fpr` (its `armored` public half) for `c`.
+async fn add_gpg_signing_key(app: &App, c: &Client, armored: &str, fpr: &str, env: &[(&str, &str)]) -> Value {
+    let _ = (fpr, env);
+    let (s, k) = app.req(c, "POST", "/api/me/signing-keys", Some(json!({ "key": armored }))).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    k
+}
+
+#[tokio::test]
 async fn signed_commits_keys_are_validated_owned_and_audited() {
     let app = App::new();
     let alice = app.signup("alice").await;
