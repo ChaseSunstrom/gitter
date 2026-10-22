@@ -336,7 +336,7 @@ fn claim(c: &mut Connection, limit: usize) -> rusqlite::Result<Vec<Due>> {
     tx.execute(
         "UPDATE webhook_deliveries SET next_at = NULL, status = 'failed', error = 'Not sent: the repository is suspended or hidden by a moderator'
          WHERE next_at <= ?1 AND hook_id IN (SELECT h.id FROM webhooks h JOIN repos r ON r.id = h.repo_id JOIN users u ON u.id = r.owner_id
-             WHERE u.suspended = 1 OR r.hidden = 1)",
+             WHERE u.suspended = 1 OR r.hidden = 1 OR r.deleted_at IS NOT NULL)",
         [t],
     )?;
     let due: Vec<Due> = {

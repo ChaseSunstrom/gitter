@@ -227,7 +227,7 @@ pub async fn tick(st: &AppState, now: i64) -> R<()> {
     for id in due {
         let found = st
             .db
-            .call(move |c| Ok(c.query_row(&format!("{REPO_SELECT} WHERE r.id = ?1"), [id], row_to_repo).optional()?))
+            .call(move |c| Ok(c.query_row(&format!("{REPO_SELECT} WHERE r.id = ?1 AND r.deleted_at IS NULL"), [id], row_to_repo).optional()?))
             .await?;
         let Some(repo) = found.map(|r| Repo::with_access(st, r, None)) else { continue };
         if repo.hidden || !enabled(st, repo.owner_id).await {

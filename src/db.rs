@@ -438,6 +438,44 @@ const MIGRATIONS: &[&str] = &[
     UPDATE ci_runs SET hooked_at = finished_at;
     CREATE INDEX ci_runs_unhooked ON ci_runs(id) WHERE finished_at IS NOT hooked_at;
     "#,
+    // v13: redirects, transfers, trash, exports
+    r#"
+    -- A trashed repository keeps its row (and its folder in GITTER_DATA/trash) for a week.
+    -- Its name moves to deleted_name and `name` becomes '~<id>', which no real name can
+    -- equal, so the name is free for a new repository meanwhile.
+    ALTER TABLE repos ADD COLUMN deleted_at INTEGER;
+    ALTER TABLE repos ADD COLUMN deleted_name TEXT;
+    -- Old names of renamed or transferred repositories. Ids, not names, so a redirect
+    -- follows the repository through later renames and leaves with a deleted account.
+    CREATE TABLE repo_redirects (
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL COLLATE NOCASE,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(owner_id, name)
+    );
+    CREATE INDEX repo_redirects_repo ON repo_redirects(repo_id);
+    -- One open offer per repository.
+    CREATE TABLE repo_transfers (
+        repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+        from_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        to_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX repo_transfers_to ON repo_transfers(to_id);
+    -- One account data export per account: GITTER_DATA/exports/<user id>-<id>.tar.gz.
+    CREATE TABLE exports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'running',
+        error TEXT NOT NULL DEFAULT '',
+        size INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        expires_at INTEGER
+    );
+    "#,
 ];
 
 impl Db {

@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use axum::body::Body;
-use axum::extract::{Path, Request, State};
+use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -44,7 +44,10 @@ fn index_html() -> Vec<u8> {
         .into_bytes()
 }
 
-pub async fn index() -> Response {
+pub async fn index(State(st): State<AppState>, req: Request) -> Response {
+    if let Some(to) = moved_page(&st, req).await {
+        return redirect(StatusCode::MOVED_PERMANENTLY, &to);
+    }
     let mut r = Response::new(Body::from(index_html()));
     r.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -53,6 +56,76 @@ pub async fn index() -> Response {
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     r
+}
+
+/// A page of a renamed or transferred repository (`/owner/repo/...`): where it
+/// lives now, if the viewer may see it there.
+async fn moved_page(st: &AppState, req: Request) -> Option<String> {
+    let path = req.uri().path().to_string();
+    let mut segs = path.trim_start_matches('/').splitn(3, '/');
+    let (o, n) = (segs.next()?.to_string(), segs.next()?.to_string());
+    let rest = segs.next().map(|r| format!("/{r}")).unwrap_or_default();
+    if !crate::validate::username(&o) || !crate::validate::repo_name(&n) {
+        return None;
+    }
+    let (o2, n2) = (o.clone(), n.clone());
+    let (_, moved) = st.db.call(move |c| Ok(crate::repo::lookup(c, &o2, &n2)?)).await.ok()??;
+    if !moved {
+        return None;
+    }
+    // Moved (rare): look again with the viewer, for collaborators' and org members' roles.
+    let (mut parts, _) = req.into_parts();
+    let viewer = crate::auth::Viewer::from_request_parts(&mut parts, st).await.ok()?.0;
+    let (repo, _) = crate::repo::Repo::locate(st, viewer.as_ref(), &o, &n).await.ok()??;
+    let repo = crate::repo::Repo::with_access(st, repo, viewer.as_ref());
+    let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    repo.can_read.then(|| format!("/{}/{}{rest}{query}", repo.owner, repo.name))
+}
+
+fn redirect(status: StatusCode, to: &str) -> Response {
+    match HeaderValue::from_str(to) {
+        Ok(v) => {
+            let body = axum::Json(serde_json::json!({ "error": "This repository moved", "location": to }));
+            // Not cached: the name can be reused, and private repos redirect only for some viewers.
+            let headers = [(header::LOCATION, v), (header::CACHE_CONTROL, HeaderValue::from_static("no-store")), (header::VARY, HeaderValue::from_static("Cookie"))];
+            (status, headers, body).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Turn the `Moved` mark a handler's 404 carries into a redirect to the same
+/// path at the repository's new place: 301 for reads, 308 for writes (so a
+/// client that follows it repeats the POST instead of turning it into a GET).
+/// Only paths that name the repository (`/api/repos/o/r/…`, `/raw/o/r/…`,
+/// `/archive/o/r/…`) are rewritten; anything else stays a 404.
+pub async fn follow_moved(req: Request, next: Next) -> Response {
+    let (read, uri) = (matches!(*req.method(), Method::GET | Method::HEAD), req.uri().clone());
+    let r = next.run(req).await;
+    let Some(m) = r.extensions().get::<crate::error::Moved>() else { return r };
+    match moved_path(uri.path(), m) {
+        Some(p) => {
+            let to = format!("{p}{}", uri.query().map(|q| format!("?{q}")).unwrap_or_default());
+            redirect(if read { StatusCode::MOVED_PERMANENTLY } else { StatusCode::PERMANENT_REDIRECT }, &to)
+        }
+        None => r,
+    }
+}
+
+fn moved_path(path: &str, m: &crate::error::Moved) -> Option<String> {
+    let mut segs: Vec<&str> = path.split('/').collect();
+    let at = match (segs.get(1), segs.get(2)) {
+        (Some(&"api"), Some(&"repos")) => 3,
+        (Some(&"raw" | &"archive"), _) => 2,
+        _ => return None,
+    };
+    let (o, n) = (*segs.get(at)?, *segs.get(at + 1)?);
+    if !o.eq_ignore_ascii_case(&m.from.0) || !n.eq_ignore_ascii_case(&m.from.1) {
+        return None;
+    }
+    segs[at] = &m.to.0;
+    segs[at + 1] = &m.to.1;
+    Some(segs.join("/"))
 }
 
 pub async fn asset(Path((_v, path)): Path<(String, String)>, req: Request) -> Response {

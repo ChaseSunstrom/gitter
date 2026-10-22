@@ -128,7 +128,7 @@ async fn open(st: &AppState, headers: &HeaderMap, owner: &str, name: &str) -> R<
             AppError::new(StatusCode::NOT_FOUND, "Repository not found")
         }
     };
-    match Repo::load(st, user.as_ref(), owner, name).await {
+    match Repo::find(st, user.as_ref(), owner, name).await {
         Ok(r) if r.can_read => Ok((r, user.is_none())),
         Ok(_) => Err(hidden()),
         Err(e) if e.status == StatusCode::NOT_FOUND => Err(hidden()),

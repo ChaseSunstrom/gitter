@@ -185,6 +185,7 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         Err(e) => eprintln!("sealing two-factor secrets: {}", e.msg),
     }
     tokio::spawn(gitter::ci::upkeep(st.clone()));
+    tokio::spawn(gitter::api::lifecycle::upkeep(st.clone()));
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));
     tokio::spawn(gitter::webhooks::run(st.clone()));
     let st2 = st.clone();

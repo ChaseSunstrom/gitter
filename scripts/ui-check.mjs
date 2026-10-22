@@ -74,13 +74,15 @@ const pages = [
   ['/alice/hello/issues/new', []],
   ['/alice/hello/insights', ['Alice']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
-  ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues', 'Who has access', 'Site admins']],
+  ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues', 'Who has access', 'Site admins', 'Transfer ownership', 'Recently deleted']],
   [`/alice/hello/settings/hooks/${hook.id}`, ['Payload URL', 'Recent deliveries', 'ping', 'issues', 'Delivered', 'Send a ping']],
   ['/alice/hello/settings/hooks/new', ['Add webhook', 'Payload URL', 'Allow private addresses']],
   ['/alice/secret/settings', ['Who has access', 'bob']],
   ['/acme', ['Acme Inc', 'Organization', 'People', 'tools']],
   ['/orgs/acme/settings', ['What members can do', 'Members', 'bob']],
   ['/orgs/new', ['Create an organization']],
+  // Renamed in e2e.sh: the old page address redirects to the new one.
+  ['/alice/old-name', ['new-name', 'README.md']],
   ['/alice/hello/ci', ['CI runs', 'Add CI', '#1']],
   ['/alice/hello/ci/1', ['Add CI', 'build', 'test', 'Say hello', 'Set up job', 'Passed']],
   ['/admin/runners', ['Runners', 'built-in', 'Add a runner']],
@@ -95,7 +97,9 @@ const pages = [
   ['/settings/security', ['Two-factor authentication', 'This browser', 'Security log']],
   ['/admin/audit', ['The log is intact', 'Created the account']],
   ['/settings/appearance', []],
-  ['/admin', ['Site administration', 'Storage']],
+  ['/settings/account', ['Change password', 'Export your data', 'Your export is ready', 'Delete your account']],
+  ['/settings/repositories', ['Transfers', 'bob/present', 'Accept', 'Recently deleted', 'scratch']],
+  ['/admin', ['Site administration', 'Storage', 'Recently deleted repositories', 'alice/scratch']],
   ['/admin/users', ['alice', 'bob']],
   ['/admin/settings', ['Instance name', 'Largest Git LFS file', 'Jobs the built-in runner runs at once']],
   ['/alice/hello/wiki', ['Hello wiki', 'Setup', 'Pages']],
@@ -396,6 +400,25 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   } catch (e) { errors.push(String(e)); }
   if (errors.length) { failed++; console.log('✗ wiki/discussion/snippet/release forms', steps, errors); }
   else console.log(`  ok ${steps.join(', ')} made in the browser`);
+  await page.close();
+}
+
+// Settings → Repositories: accept the transfer e2e.sh offered, and restore the repository it deleted.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  try {
+    await page.goto(BASE + '/settings/repositories', { waitUntil: 'networkidle' });
+    await page.click('[data-offer] [data-accept]');
+    await page.waitForSelector('[data-offer]', { state: 'detached', timeout: 5000 });
+    await page.click('[data-trash] [data-restore]');
+    await page.waitForSelector('[data-trash]', { state: 'detached', timeout: 5000 });
+  } catch (e) { errors.push(String(e)); }
+  const present = (await ctx.request.get(BASE + '/api/repos/alice/present')).status();
+  const scratch = (await ctx.request.get(BASE + '/api/repos/alice/scratch')).status();
+  if (errors.length || present !== 200 || scratch !== 200) { failed++; console.log('✗ settings → repositories', { present, scratch, errors }); }
+  else console.log('  ok a transfer accepted and a deleted repository restored from settings');
   await page.close();
 }
 

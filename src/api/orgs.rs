@@ -397,16 +397,12 @@ pub async fn delete(State(st): State<AppState>, Sudo(u): Sudo, ip: ClientIp, Pat
     if !req.confirm.eq_ignore_ascii_case(&name) {
         return Err(AppError::bad(format!("Type {name} to confirm")));
     }
-    st.db
-        .call(move |c| {
-            let repos: i64 = c.query_row("SELECT count(*) FROM repos WHERE owner_id = ?1", [id], |r| r.get(0))?;
-            if repos > 0 {
-                return Err(AppError::bad("Delete or transfer this organization's repositories first"));
-            }
-            c.execute("DELETE FROM users WHERE id = ?1 AND is_org = 1", [id])?;
-            Ok(())
-        })
-        .await?;
+    let live: i64 = st.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM repos WHERE owner_id = ?1 AND deleted_at IS NULL", [id], |r| r.get(0))?)).await?;
+    if live > 0 {
+        return Err(AppError::bad("Delete or transfer this organization's repositories first"));
+    }
+    // Purges what's left in its trash the way deleting an account does.
+    super::lifecycle::delete_account(&st, &u, name.clone(), &ip.0).await?;
     record(&st.db, Event { actor: Some(&u), subject: None, action: "org_deleted", detail: name, ip: &ip.0 }).await;
     ok()
 }

@@ -150,6 +150,7 @@ pub fn router(st: AppState) -> Router {
         .merge(git_http)
         .merge(ci::http::router())
         .merge(app)
+        .layer(axum::middleware::from_fn(web::follow_moved))
         .layer(axum::middleware::from_fn(web::security_headers))
         .with_state(st)
 }

@@ -1360,10 +1360,18 @@ async fn lfs_limits_storage_slots_and_caching() {
     let (_, me) = app.req(&bob, "GET", "/api/me", None).await;
     assert!(me["storage"]["used"].as_u64().unwrap() <= 2 << 20, "{me}");
 
-    // Deleting the repository frees its LFS files right away.
+    // Deleting the repository frees its LFS files once the trash is emptied.
     let (s, _) = app.req(&bob, "DELETE", "/api/repos/bob/r", Some(json!({ "confirm": "bob/r" }))).await;
     assert_eq!(s, StatusCode::OK);
+    assert!(kept.exists(), "kept while the repository can still be restored");
+    purge_trash(&app).await;
     assert!(!kept.exists(), "no repository holds it any more");
+}
+
+/// Purge everything in the trash, as the upkeep loop does a week after each delete.
+async fn purge_trash(app: &App) {
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET deleted_at = 1 WHERE deleted_at IS NOT NULL", [])?)).await.unwrap();
+    gitter::api::lifecycle::sweep(&app.state).await.unwrap();
 }
 
 fn names(v: &Value, key: &str) -> Vec<String> {
@@ -1449,12 +1457,13 @@ async fn wiki_pages_have_history_conflicts_and_follow_repo_privacy() {
         assert_eq!(app.req(c, "GET", "/api/repos/alice/priv/wiki/Home/history", None).await.0, StatusCode::NOT_FOUND);
     }
 
-    // Deleting the repository deletes its wiki.
+    // Deleting the repository deletes its wiki (when the trash is emptied).
     let id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM repos WHERE name = 'pub'", [], |r| r.get(0))?)).await.unwrap();
     let dir = app.state.cfg.data_dir.join(format!("wikis/{id}.git"));
     assert!(dir.is_dir());
     let (s, _) = app.req(&alice, "DELETE", "/api/repos/alice/pub", Some(json!({ "confirm": "alice/pub" }))).await;
     assert_eq!(s, StatusCode::OK);
+    purge_trash(&app).await;
     assert!(!dir.exists());
 }
 
@@ -1662,6 +1671,293 @@ async fn snippets_and_wikis_count_toward_storage() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
     let (s, e) = app.req(&bob, "POST", "/api/repos/bob/r/wiki", Some(json!({ "name": "Home", "content": "z".repeat(100_000) }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
+}
+
+/// A request as `c` (cookie and Origin), keeping the response headers.
+async fn with_headers(app: &App, c: &Client, method: &str, path: &str, body: Option<Value>) -> (StatusCode, axum::http::HeaderMap) {
+    let mut b = Request::builder().method(method).uri(path).header("host", "test.local").header("origin", ORIGIN);
+    if let Some(cookie) = &c.0 {
+        b = b.header("cookie", format!("gitter_session={cookie}"));
+    }
+    let req = match body {
+        Some(v) => b.header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    };
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    (resp.status(), resp.headers().clone())
+}
+
+fn location(h: &axum::http::HeaderMap) -> String {
+    h.get("location").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+}
+
+#[tokio::test]
+async fn rename_transfer_redirects_old_urls_and_needs_acceptance() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    let anon = Client::default();
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "proj", "readme": true }))).await;
+    let token = |who: Client| {
+        let app = &app;
+        async move { app.req(&who, "POST", "/api/me/tokens", Some(json!({ "name": "git" }))).await.1["token"].as_str().unwrap().to_string() }
+    };
+    let alice_tok = token(alice.clone()).await;
+
+    // Rename: the web and the API answer 301 to the new name, keeping the rest of the path.
+    let (s, r) = app.req(&alice, "PATCH", "/api/repos/alice/proj", Some(json!({ "name": "renamed" }))).await;
+    assert_eq!((s, r["name"].as_str()), (StatusCode::OK, Some("renamed")));
+    let (s, h) = with_headers(&app, &anon, "GET", "/api/repos/alice/proj/issues?state=open", None).await;
+    assert_eq!((s, location(&h).as_str()), (StatusCode::MOVED_PERMANENTLY, "/api/repos/alice/renamed/issues?state=open"));
+    assert_eq!(h.get("cache-control").and_then(|v| v.to_str().ok()), Some("no-store"), "a name can be reused, so redirects aren't cached");
+    let (s, h) = with_headers(&app, &anon, "GET", "/alice/proj/issues", None).await;
+    assert_eq!((s, location(&h).as_str()), (StatusCode::MOVED_PERMANENTLY, "/alice/renamed/issues"));
+    let (s, h) = with_headers(&app, &anon, "GET", "/raw/alice/proj/main/README.md", None).await;
+    assert_eq!((s, location(&h).as_str()), (StatusCode::MOVED_PERMANENTLY, "/raw/alice/renamed/main/README.md"));
+    // Writes keep their method (308), so a client that follows them doesn't turn a POST into a GET.
+    let (s, h) = with_headers(&app, &alice, "POST", "/api/repos/alice/proj/issues", Some(json!({ "title": "x" }))).await;
+    assert_eq!((s, location(&h).as_str()), (StatusCode::PERMANENT_REDIRECT, "/api/repos/alice/renamed/issues"));
+    // Git and Git LFS are served right at the old URL: git doesn't follow redirects when pushing.
+    assert_eq!(status_with(&app, git_refs("proj", "git-upload-pack", &alice_tok)).await, StatusCode::OK);
+    assert_eq!(status_with(&app, git_refs("proj", "git-receive-pack", &alice_tok)).await, StatusCode::OK);
+    let (s, b) = lfs_batch(&app, "alice/proj", Some(&basic("alice", &alice_tok)), "upload", &"a".repeat(64), 1).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+
+    // A private repository's new name isn't given away to people who can't see it.
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "hush", "private": true }))).await;
+    app.req(&alice, "PATCH", "/api/repos/alice/hush", Some(json!({ "name": "hush2" }))).await;
+    assert_eq!(with_headers(&app, &anon, "GET", "/api/repos/alice/hush", None).await.0, StatusCode::NOT_FOUND);
+    let (s, h) = with_headers(&app, &anon, "GET", "/alice/hush", None).await;
+    assert_eq!((s, location(&h).as_str()), (StatusCode::OK, ""), "the app shell, which shows a 404");
+    assert_eq!(with_headers(&app, &alice, "GET", "/api/repos/alice/hush", None).await.0, StatusCode::MOVED_PERMANENTLY);
+
+    // A new repository that takes the old name drops the redirect, for good.
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "proj" }))).await;
+    let (s, v) = app.req(&anon, "GET", "/api/repos/alice/proj", None).await;
+    assert_eq!((s, v["empty"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+    app.req(&alice, "DELETE", "/api/repos/alice/proj", Some(json!({ "confirm": "alice/proj" }))).await;
+    assert_eq!(app.req(&anon, "GET", "/api/repos/alice/proj", None).await.0, StatusCode::NOT_FOUND);
+
+    // Transfers are offers: nothing moves until the recipient accepts.
+    let offer = |to: &str, full: &str| json!({ "to": to, "confirm": full });
+    let (s, _) = app.req(&alice, "POST", "/api/repos/alice/renamed/transfer", Some(offer("bob", "alice/wrong"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "typed confirmation");
+    let (s, _) = app.req(&alice, "POST", "/api/repos/alice/renamed/transfer", Some(offer("nobody-here", "alice/renamed"))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, e) = app.req(&alice, "POST", "/api/repos/alice/renamed/transfer", Some(offer("bob", "alice/renamed"))).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(app.req(&bob, "GET", "/api/repos/bob/renamed", None).await.0, StatusCode::NOT_FOUND);
+    let (_, out) = app.req(&alice, "GET", "/api/repos/alice/renamed/transfer", None).await;
+    assert_eq!(out["offer"]["to"], "bob");
+    let (_, list) = app.req(&bob, "GET", "/api/me/transfers", None).await;
+    let inc = &list["incoming"][0];
+    assert_eq!((inc["repo"].as_str(), inc["from"].as_str()), (Some("alice/renamed"), Some("alice")), "{list}");
+    let accept = format!("/api/me/transfers/{}/accept", inc["id"].as_i64().unwrap());
+    assert_eq!(app.req(&carol, "POST", &accept, None).await.0, StatusCode::NOT_FOUND, "only the recipient accepts");
+
+    // Accepting checks the recipient's repository limit and storage quota.
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "mine" }))).await;
+    let mut set = app.state.settings.get();
+    set.max_repos_per_user = 1;
+    app.state.settings.save(&app.state.db, set.clone()).await.unwrap();
+    let (s, e) = app.req(&bob, "POST", &accept, None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "over the repository limit: {e}");
+    set.max_repos_per_user = 50;
+    set.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, set.clone()).await.unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 2000000 WHERE name = 'renamed'", [])?)).await.unwrap();
+    let (s, e) = app.req(&bob, "POST", &accept, None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "over the storage quota: {e}");
+    set.max_storage_mb = 0;
+    app.state.settings.save(&app.state.db, set).await.unwrap();
+    let (s, e) = app.req(&bob, "POST", &accept, None).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(audit_count(&app, "repo_transferred").await, 1);
+
+    // The old URLs follow it to its new owner; the old git remote works for the new owner only.
+    let (s, h) = with_headers(&app, &anon, "GET", "/api/repos/alice/renamed", None).await;
+    assert_eq!((s, location(&h).as_str()), (StatusCode::MOVED_PERMANENTLY, "/api/repos/bob/renamed"));
+    assert_eq!(app.req(&bob, "GET", "/api/repos/bob/renamed", None).await.1["is_owner"], true);
+    let bob_tok = token(bob.clone()).await;
+    assert_eq!(status_with(&app, git_refs("renamed", "git-receive-pack", &bob_tok)).await, StatusCode::OK);
+    assert_eq!(status_with(&app, git_refs("renamed", "git-receive-pack", &alice_tok)).await, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "GET", "/api/me/transfers", None).await.1["incoming"].as_array().unwrap().len(), 0);
+
+    // Declined and expired offers move nothing.
+    app.req(&bob, "POST", "/api/repos/bob/mine/transfer", Some(offer("carol", "bob/mine"))).await;
+    let (_, l) = app.req(&carol, "GET", "/api/me/transfers", None).await;
+    let id = l["incoming"][0]["id"].as_i64().unwrap();
+    assert_eq!(app.req(&carol, "POST", &format!("/api/me/transfers/{id}/decline"), None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&carol, "POST", &format!("/api/me/transfers/{id}/accept"), None).await.0, StatusCode::NOT_FOUND);
+    app.req(&bob, "POST", "/api/repos/bob/mine/transfer", Some(offer("carol", "bob/mine"))).await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE repo_transfers SET expires_at = 1", [])?)).await.unwrap();
+    assert_eq!(app.req(&carol, "GET", "/api/me/transfers", None).await.1["incoming"].as_array().unwrap().len(), 0);
+    assert_eq!(app.req(&carol, "POST", &format!("/api/me/transfers/{id}/accept"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/bob/mine", None).await.1["is_owner"], true);
+}
+
+#[tokio::test]
+async fn trash_keeps_deleted_repos_for_a_week_then_purges_them() {
+    use sha2::{Digest, Sha256};
+    let app = App::new();
+    let root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "t", "readme": true }))).await;
+    app.req(&bob, "POST", "/api/repos/alice/t/star", None).await;
+    let pw = basic("alice", "correct horse");
+    let data = b"lfs payload\n".repeat(100);
+    let oid = hex::encode(Sha256::digest(&data));
+    assert_eq!(send_raw(&app, "PUT", &format!("/alice/t.git/info/lfs/objects/{oid}"), Some(&pw), data.clone()).await.0, StatusCode::OK);
+    let obj = gitter::lfs::object_path(&app.state.cfg.data_dir, &oid);
+    assert!(obj.is_file());
+    let used = app.req(&alice, "GET", "/api/me", None).await.1["storage"]["used"].as_i64().unwrap();
+    let id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM repos WHERE name = 't'", [], |r| r.get(0))?)).await.unwrap();
+    let data_dir = app.state.cfg.data_dir.clone();
+    let (live, trashed) = (data_dir.join(format!("repos/{id}.git")), data_dir.join(format!("trash/{id}.git")));
+
+    // Deleting moves it to the trash: gone from every view, but kept on disk and still counted.
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/t", Some(json!({ "confirm": "alice/t" }))).await.0, StatusCode::OK);
+    assert!(!live.exists() && trashed.is_dir());
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/t", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/t/issues", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(raw_get(&app, "/raw/alice/t/main/README.md").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(send_raw(&app, "GET", "/alice/t.git/info/refs?service=git-upload-pack", Some(&pw), vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(send_raw(&app, "GET", &format!("/alice/t.git/info/lfs/objects/{oid}"), Some(&pw), vec![]).await.0, StatusCode::NOT_FOUND);
+    for (who, p) in [(&anon, "/api/explore"), (&anon, "/api/users/alice"), (&alice, "/api/search?q=t"), (&alice, "/api/feed"), (&anon, "/api/users/bob/stars"), (&anon, "/api/feed")] {
+        let v = app.req(who, "GET", p, None).await.1.to_string();
+        assert!(!v.contains("\"t\"") && !v.contains("alice/t"), "{p} still shows the deleted repo: {v}");
+    }
+    assert_eq!(app.req(&alice, "GET", "/api/me", None).await.1["storage"]["used"].as_i64().unwrap(), used, "counted until purged");
+    let (_, tr) = app.req(&alice, "GET", "/api/me/trash", None).await;
+    assert_eq!((tr["repos"][0]["id"].as_i64(), tr["repos"][0]["name"].as_str()), (Some(id), Some("t")), "{tr}");
+    assert!(tr["repos"][0]["purge_at"].as_i64().unwrap() > gitter::db::now() + 6 * 86400);
+
+    // The name is free meanwhile; restoring needs it free again.
+    assert_eq!(app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "t" }))).await.0, StatusCode::OK);
+    let restore = format!("/api/me/trash/{id}/restore");
+    assert_eq!(app.req(&alice, "POST", &restore, None).await.0, StatusCode::CONFLICT);
+    assert_eq!(app.req(&bob, "POST", &restore, None).await.0, StatusCode::NOT_FOUND, "only the owner restores");
+    app.req(&alice, "DELETE", "/api/repos/alice/t", Some(json!({ "confirm": "alice/t" }))).await;
+    let (s, e) = app.req(&alice, "POST", &restore, None).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    let (s, r) = app.req(&anon, "GET", "/api/repos/alice/t", None).await;
+    assert_eq!((s, r["empty"].as_bool(), r["stars"].as_i64()), (StatusCode::OK, Some(false), Some(1)), "back with its history and stars");
+    assert!(live.is_dir() && !trashed.exists());
+    assert_eq!(audit_count(&app, "repo_restored").await, 1);
+
+    // A week later the upkeep loop purges it, LFS files included; younger ones stay.
+    app.req(&alice, "DELETE", "/api/repos/alice/t", Some(json!({ "confirm": "alice/t" }))).await;
+    app.state.db.call(move |c| Ok(c.execute("UPDATE repos SET deleted_at = deleted_at - 8 * 86400 WHERE id = ?1", [id])?)).await.unwrap();
+    gitter::api::lifecycle::sweep(&app.state).await.unwrap();
+    assert!(!trashed.exists(), "folder purged");
+    assert!(!obj.exists(), "its LFS file is collected");
+    let gone: i64 = app.state.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM repos WHERE id = ?1", [id], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(gone, 0);
+    assert_eq!(audit_count(&app, "repo_purged").await, 1);
+    let (_, tr) = app.req(&alice, "GET", "/api/me/trash", None).await;
+    let other = tr["repos"][0]["id"].as_i64().expect("the younger one stays");
+
+    // Admins can purge right away.
+    let purge = format!("/api/admin/trash/{other}");
+    assert_eq!(app.req(&alice, "DELETE", &purge, None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&root, "GET", "/api/admin/trash", None).await.1["repos"][0]["name"], "t");
+    assert_eq!(app.req(&root, "DELETE", &purge, None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "GET", "/api/me/trash", None).await.1["repos"].as_array().unwrap().len(), 0);
+    assert!(!data_dir.join(format!("trash/{other}.git")).exists());
+}
+
+#[tokio::test]
+async fn export_and_self_delete_cover_the_whole_account() {
+    use std::io::Read;
+    let app = App::new();
+    let root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "code", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos/alice/code/wiki", Some(json!({ "name": "Home", "content": "wiki words" }))).await;
+    app.req(&alice, "POST", "/api/repos/alice/code/issues", Some(json!({ "title": "Exported issue", "body": "b" }))).await;
+    app.req(&alice, "POST", "/api/repos/alice/code/issues/1/comments", Some(json!({ "body": "Exported comment" }))).await;
+    app.req(&alice, "POST", "/api/repos/alice/code/discussions", Some(json!({ "title": "Exported talk", "category": "general" }))).await;
+    let (_, sn) = app.req(&alice, "POST", "/api/snippets", Some(json!({ "title": "Snip", "files": [{ "name": "a.txt", "content": "hi" }] }))).await;
+    let snip = sn["id"].as_str().unwrap().to_string();
+
+    // The export is built in the background, then downloadable.
+    let (s, e) = app.req(&alice, "POST", "/api/me/export", None).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    let mut status = Value::Null;
+    for _ in 0..400 {
+        status = app.req(&alice, "GET", "/api/me/export", None).await.1;
+        if status["export"]["status"] != "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(status["export"]["status"], "ready", "{status}");
+    let download = |who: &Client| {
+        let req = Request::get("/api/me/export/download").header("host", "test.local").header("cookie", format!("gitter_session={}", who.0.clone().unwrap()));
+        app.router.clone().oneshot(req.body(Body::empty()).unwrap())
+    };
+    let resp = download(&alice).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-disposition"].to_str().unwrap().starts_with("attachment"));
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let mut files = std::collections::HashMap::new();
+    for e in tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..])).entries().unwrap() {
+        let mut e = e.unwrap();
+        let name = e.path().unwrap().to_string_lossy().into_owned();
+        let mut buf = Vec::new();
+        e.read_to_end(&mut buf).unwrap();
+        files.insert(name, String::from_utf8_lossy(&buf).into_owned());
+    }
+    let has = |name: &str, text: &str| files.get(name).is_some_and(|f| f.contains(text));
+    assert!(has("profile.json", "alice@example.com"), "{:?}", files.keys());
+    assert!(has("issues.json", "Exported issue") && has("comments.json", "Exported comment") && has("discussions.json", "Exported talk"));
+    assert!(has("snippets.json", "Snip") && has("security-log.json", "signup"));
+    for f in ["repositories/code.bundle", "wikis/code.bundle", &format!("snippets/{snip}.bundle")] {
+        assert!(files.contains_key(f), "{f} missing: {:?}", files.keys());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("code.bundle");
+    let resp = download(&alice).await.unwrap();
+    let raw = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    tar::Archive::new(flate2::read::GzDecoder::new(&raw[..])).unpack(dir.path().join("x")).unwrap();
+    std::fs::copy(dir.path().join("x/repositories/code.bundle"), &bundle).unwrap();
+    let heads = std::process::Command::new("git").args(["bundle", "list-heads"]).arg(&bundle).output().unwrap();
+    assert!(String::from_utf8_lossy(&heads.stdout).contains("refs/heads/main"), "a real git bundle");
+    assert_eq!(download(&bob).await.unwrap().status(), StatusCode::NOT_FOUND, "everyone downloads only their own");
+
+    // One at a time, and gone after a day.
+    app.state.db.call(|c| Ok(c.execute("UPDATE exports SET status = 'running'", [])?)).await.unwrap();
+    assert_eq!(app.req(&alice, "POST", "/api/me/export", None).await.0, StatusCode::CONFLICT);
+    app.state.db.call(|c| Ok(c.execute("UPDATE exports SET status = 'ready', expires_at = 1", [])?)).await.unwrap();
+    assert_eq!(download(&alice).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // Self-delete: typed username, never the last admin, never with a token; repos (trashed ones too) go with it.
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "old" }))).await;
+    app.req(&alice, "DELETE", "/api/repos/alice/old", Some(json!({ "confirm": "alice/old" }))).await;
+    let ids: Vec<i64> = app.state.db.call(|c| {
+        let mut s = c.prepare("SELECT r.id FROM repos r JOIN users u ON u.id = r.owner_id WHERE u.username = 'alice' ORDER BY r.id")?;
+        Ok(s.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+    }).await.unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(app.req(&root, "DELETE", "/api/me", Some(json!({ "confirm": "root1" }))).await.0, StatusCode::BAD_REQUEST, "the last admin stays");
+    assert_eq!(app.req(&alice, "DELETE", "/api/me", Some(json!({ "confirm": "bob" }))).await.0, StatusCode::BAD_REQUEST);
+    let (_, t) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "all" }))).await;
+    assert_eq!(bearer(&app, "DELETE", "/api/me", t["token"].as_str().unwrap(), Some(json!({ "confirm": "alice" }))).await, StatusCode::FORBIDDEN);
+    let (s, _, cookie) = app.call(&alice, "DELETE", "/api/me", Some(json!({ "confirm": "alice" })), Some(ORIGIN)).await;
+    assert_eq!((s, cookie.as_deref()), (StatusCode::OK, Some("")), "deleted and signed out");
+    assert!(app.req(&alice, "GET", "/api/me", None).await.1["user"].is_null());
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/code", None).await.0, StatusCode::NOT_FOUND);
+    let d = app.state.cfg.data_dir.clone();
+    for p in [format!("repos/{}.git", ids[0]), format!("wikis/{}.git", ids[0]), format!("trash/{}.git", ids[1]), format!("snippets/{snip}.git")] {
+        assert!(!d.join(&p).exists(), "{p} should be gone");
+    }
+    assert_eq!(std::fs::read_dir(d.join("exports")).map(|r| r.count()).unwrap_or(0), 0, "the export file goes too");
+    assert_eq!(audit_count(&app, "user_deleted").await, 1);
 }
 
 // ---------------------------------------------------------------- webhooks
@@ -2170,7 +2466,10 @@ async fn releases_assets_stream_with_quota_counts_and_cleanup() {
     assert!(!data_dir.join(format!("releases/{id}")).exists());
     assert!(data_dir.join(format!("releases/{pid}")).is_dir());
     assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/priv", Some(json!({ "confirm": "alice/priv" }))).await.0, StatusCode::OK);
-    assert!(!data_dir.join(format!("releases/{pid}")).exists());
+    assert!(data_dir.join(format!("releases/{pid}")).is_dir(), "kept while the repo is in the trash");
+    let priv_id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM repos WHERE deleted_name = 'priv'", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(app.req(&admin, "DELETE", &format!("/api/admin/trash/{priv_id}"), None).await.0, StatusCode::OK);
+    assert!(!data_dir.join(format!("releases/{pid}")).exists(), "purging the trash removes them");
     assert!(data_dir.join(format!("releases/{did}")).is_dir());
     let (s, v) = app.req(&admin, "DELETE", "/api/admin/users/alice", Some(json!({ "confirm": "alice" }))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
@@ -2396,4 +2695,45 @@ async fn webhooks_log_drops_and_pause_for_suspended_owners() {
     assert_eq!(s, StatusCode::OK, "{v}");
     gitter::webhooks::tick(&app.state).await;
     assert!(rx.events().is_empty(), "the ping waiting for bob's hook wasn't sent");
+}
+
+#[tokio::test]
+async fn transfers_and_trash_follow_org_ownership() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "proj", "readme": true }))).await;
+    // Admin collaborators manage settings but can't give the repository away.
+    app.req(&alice, "PUT", "/api/repos/alice/proj/collaborators/carol", Some(json!({ "role": "admin" }))).await;
+    let offer = |to: &str| json!({ "to": to, "confirm": "alice/proj" });
+    assert_eq!(app.req(&carol, "POST", "/api/repos/alice/proj/transfer", Some(offer("carol"))).await.0, StatusCode::FORBIDDEN);
+    // To an organization: one of its owners accepts; the old owner's secrets stay behind.
+    app.req(&bob, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await;
+    assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/proj/ci/secrets/TOKEN", Some(json!({ "value": "s3cret" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/proj/transfer", Some(offer("acme"))).await.0, StatusCode::OK);
+    let (_, list) = app.req(&bob, "GET", "/api/me/transfers", None).await;
+    let id = list["incoming"][0]["id"].as_i64().expect("an owner of acme sees the offer");
+    assert_eq!(app.req(&carol, "POST", &format!("/api/me/transfers/{id}/accept"), None).await.0, StatusCode::NOT_FOUND);
+    let (s, v) = app.req(&bob, "POST", &format!("/api/me/transfers/{id}/accept"), None).await;
+    assert_eq!((s, v["owner"].as_str()), (StatusCode::OK, Some("acme")), "{v}");
+    let secrets: i64 = app.state.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM ci_secrets WHERE repo_id = ?1", [id], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(secrets, 0, "CI secrets don't move with the code");
+    // Org owners see and restore its deleted repositories; members don't.
+    app.req(&bob, "PUT", "/api/orgs/acme/members/carol", Some(json!({ "role": "member" }))).await;
+    assert_eq!(app.req(&bob, "DELETE", "/api/repos/acme/proj", Some(json!({ "confirm": "acme/proj" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&carol, "POST", &format!("/api/me/trash/{id}/restore"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&bob, "GET", "/api/me/trash", None).await.1["repos"][0]["name"], "proj");
+    let (s, v) = app.req(&bob, "POST", &format!("/api/me/trash/{id}/restore"), None).await;
+    assert_eq!((s, v["owner"].as_str()), (StatusCode::OK, Some("acme")), "{v}");
+    // A limited token can't list your trash or transfer offers (private repo names).
+    let (_, t) = app.req(&bob, "POST", "/api/me/tokens", Some(json!({ "name": "ci", "scope": "write" }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "GET", "/api/me/trash", &t, None).await, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&app, "GET", "/api/me/transfers", &t, None).await, StatusCode::FORBIDDEN);
+    // Deleting an organization purges what's left in its trash.
+    app.req(&bob, "DELETE", "/api/repos/acme/proj", Some(json!({ "confirm": "acme/proj" }))).await;
+    assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
+    assert!(!app.state.cfg.data_dir.join(format!("trash/{id}.git")).exists());
 }

@@ -690,7 +690,7 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
                 let ev = events(c, "1=1", vec![], None, 40)?;
                 let trending = repo_cards(
                     c,
-                    "WHERE r.is_private = 0 AND r.hidden = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id AND s.created_at > strftime('%s','now') - 7*86400) DESC, r.updated_at DESC LIMIT 8",
+                    "WHERE r.is_private = 0 AND r.hidden = 0 AND r.deleted_at IS NULL ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id AND s.created_at > strftime('%s','now') - 7*86400) DESC, r.updated_at DESC LIMIT 8",
                     vec![],
                 )?;
                 return Ok(json!({ "events": ev, "repos": [], "trending": trending }));
@@ -717,7 +717,7 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
             let global = if ev.len() < 10 { events(c, "1=1", vec![], Some(&u), 30)? } else { vec![] };
             let trending = repo_cards(
                 c,
-                "WHERE r.is_private = 0 AND r.hidden = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) DESC, r.updated_at DESC LIMIT 6",
+                "WHERE r.is_private = 0 AND r.hidden = 0 AND r.deleted_at IS NULL ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) DESC, r.updated_at DESC LIMIT 6",
                 vec![],
             )?;
             Ok(json!({ "events": ev, "global": global, "repos": mine, "trending": trending }))
