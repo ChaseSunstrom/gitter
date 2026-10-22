@@ -146,6 +146,7 @@ function eventRow(c, meta, base) {
     closed: [base.isPr ? 'pr-closed' : 'issue-closed', 'c-red', 'closed this'],
     reopened: [base.isPr ? 'pr' : 'issue', 'c-green', 'reopened this'],
     merged: ['merged', 'c-purple', null],
+    dequeued: ['clock', 'c-red', `queued this, but it left the merge queue: ${c.body}`],
   }[c.kind];
   if (!words) return '';
   const [ic, cls, text] = words;
@@ -189,7 +190,11 @@ function mergeBox(meta, data, pd) {
     <b class="mono">${c.name}</b><span class="muted grow ellipsis">${c.description}</span>${c.url ? html`<a href="${safeUrl(c.url)}" rel="noopener">Details</a>` : ''}</div>`)}</div>` : '';
   const rules = blocked.length ? html`<div class="merge-blocked small"><b>${icon('shield', 'sm')} ${pull.base} is protected. Before merging:</b>
     <ul>${blocked.map((b) => html`<li>${b}</li>`)}</ul></div>` : '';
-  const auto = pull.auto_merge ? html`<div class="row small merge-auto">${icon('zap', 'sm')}<span class="grow">This pull request merges itself (${pull.auto_merge.method === 'squash' ? 'squashed' : pull.auto_merge.method === 'ff' ? 'fast-forward' : 'merge commit'}) once the requirements are met${pull.auto_merge.by ? `, as ${pull.auto_merge.by} asked` : ''}.</span>
+  const queued = pull.rule?.merge_queue;
+  const place = (q) => q.position > 1 ? `number ${q.position} in line` : q.state === 'testing' ? `being tested on top of ${pull.base}` : 'next in line';
+  const auto = queued ? (pull.queue ? html`<div class="row small merge-auto">${icon('clock', 'sm')}<span class="grow">In the <a href="/${meta.owner}/${meta.name}/pulls#merge-queue">merge queue</a>, ${place(pull.queue)}.</span>
+    ${meta.can_write ? html`<button class="btn sm" id="queue-off">Remove from queue</button>` : ''}</div>` : '')
+    : pull.auto_merge ? html`<div class="row small merge-auto">${icon('zap', 'sm')}<span class="grow">This pull request merges itself (${pull.auto_merge.method === 'squash' ? 'squashed' : pull.auto_merge.method === 'ff' ? 'fast-forward' : 'merge commit'}) once the requirements are met${pull.auto_merge.by ? `, as ${pull.auto_merge.by} asked` : ''}.</span>
     ${meta.can_write ? html`<button class="btn sm" id="auto-off">Cancel</button>` : ''}</div>`
     : meta.can_write && pull.mergeable && blocked.length && pd.commits.length ? html`<div class="row small merge-auto"><span class="grow muted">Merge it by itself when the checks pass and the reviews are in.</span>
       <select class="select" id="auto-method" aria-label="Auto-merge method"><option value="merge">Merge commit</option><option value="squash">Squash</option></select>
@@ -197,16 +202,16 @@ function mergeBox(meta, data, pd) {
   return html`<div class="merge-box ${canMerge && !blocked.length ? 'ready' : ''}">
     <div class="row merge-status">${status}${pd.head_sha ? html`<span class="merge-ci" data-ci-sha="${pd.head_sha}" data-ci-label="1"></span>` : ''}</div>
     ${checksList}${rules}${auto}
-    ${canMerge ? html`<form class="merge-form" id="merge-form">
+    ${canMerge && !pull.queue ? html`<form class="merge-form" id="merge-form">
       <select class="select" name="method" aria-label="Merge method">
         <option value="merge">Create a merge commit</option>
         <option value="squash">Squash and merge</option>
-        ${pull.can_ff ? html`<option value="ff">Fast-forward</option>` : ''}
+        ${pull.can_ff && !queued ? html`<option value="ff">Fast-forward</option>` : ''}
       </select>
-      <label class="check small"><input type="checkbox" name="delete_branch" ${pull.head !== meta.default_branch ? '' : 'disabled'}> Delete ${pull.head} after merging</label>
-      ${blocked.length && pull.can_bypass ? html`<label class="check small"><input type="checkbox" name="bypass_rules"> Merge without waiting (you're an admin)</label>` : ''}
+      ${queued ? '' : html`<label class="check small"><input type="checkbox" name="delete_branch" ${pull.head !== meta.default_branch ? '' : 'disabled'}> Delete ${pull.head} after merging</label>`}
+      ${(blocked.length || queued) && pull.can_bypass ? html`<label class="check small"><input type="checkbox" name="bypass_rules"> ${queued ? 'Merge now, skipping the queue' : 'Merge without waiting'} (you're an admin)</label>` : ''}
       <span class="grow"></span>
-      <button class="btn green" type="submit">${icon('merged', 'sm')} Merge pull request</button>
+      <button class="btn green" type="submit">${icon(queued ? 'clock' : 'merged', 'sm')} ${queued ? 'Add to merge queue' : 'Merge pull request'}</button>
     </form>` : !meta.can_write && pull.mergeable ? html`<div class="muted small merge-note">Only people with write access can merge.</div>` : ''}
   </div>`;
 }
@@ -423,11 +428,16 @@ function mountConversation(el, meta, api, data, mdCtx) {
     const btn = mf.querySelector('[type=submit]');
     mf.addEventListener('submit', action(btn, async () => {
       const method = mf.method.value;
+      if (data.pull.rule?.merge_queue && !mf.bypass_rules?.checked) {
+        await send('POST', `${api}/pulls/${issue.number}/queue`, { method });
+        toast('Added to the merge queue');
+        return refresh();
+      }
       const label = { merge: 'Merge', squash: 'Squash and merge', ff: 'Fast-forward' }[method];
       if (data.pull.blocked?.length && !mf.bypass_rules?.checked) return toast('Tick “Merge without waiting” to merge before the requirements are met', 'err');
       const ok = await confirmDialog({ title: `${label} #${issue.number}?`, text: `This updates ${data.pull.base} with the changes from ${data.pull.head}.`, ok: label });
       if (!ok) return;
-      await send('POST', `${api}/pulls/${issue.number}/merge`, { method, delete_branch: mf.delete_branch.checked, bypass_rules: !!mf.bypass_rules?.checked });
+      await send('POST', `${api}/pulls/${issue.number}/merge`, { method, delete_branch: !!mf.delete_branch?.checked, bypass_rules: !!mf.bypass_rules?.checked });
       toast('Pull request merged');
       await refresh();
       document.querySelector('.merged-box')?.classList.add('celebrate');
@@ -444,6 +454,12 @@ function mountConversation(el, meta, api, data, mdCtx) {
   on?.addEventListener('click', action(on, async () => {
     await send('PUT', `${api}/pulls/${issue.number}/auto-merge`, { method: $('#auto-method', el).value });
     toast('It will merge itself when ready');
+    refresh();
+  }));
+  const qoff = $('#queue-off', el);
+  qoff?.addEventListener('click', action(qoff, async () => {
+    await send('DELETE', `${api}/pulls/${issue.number}/queue`);
+    toast('Removed from the merge queue');
     refresh();
   }));
   const off = $('#auto-off', el);

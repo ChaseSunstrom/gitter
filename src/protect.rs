@@ -41,6 +41,9 @@ pub struct Rule {
     /// The rule binds repository admins too.
     #[serde(default)]
     pub enforce_admins: bool,
+    /// Pull requests into these branches merge through the merge queue (`crate::mergequeue`).
+    #[serde(default)]
+    pub merge_queue: bool,
 }
 
 fn yes() -> bool {
@@ -67,7 +70,7 @@ impl Rule {
 
 pub fn load(c: &Connection, repo_id: i64) -> rusqlite::Result<Vec<Rule>> {
     let mut q = c.prepare_cached(
-        "SELECT id, pattern, require_pr, approvals, checks, allow_force_push, allow_deletion, enforce_admins FROM branch_rules WHERE repo_id = ?1 ORDER BY pattern",
+        "SELECT id, pattern, require_pr, approvals, checks, allow_force_push, allow_deletion, enforce_admins, merge_queue FROM branch_rules WHERE repo_id = ?1 ORDER BY pattern",
     )?;
     q.query_map([repo_id], |r| {
         Ok(Rule {
@@ -79,6 +82,7 @@ pub fn load(c: &Connection, repo_id: i64) -> rusqlite::Result<Vec<Rule>> {
             allow_force_push: r.get(5)?,
             allow_deletion: r.get(6)?,
             enforce_admins: r.get(7)?,
+            merge_queue: r.get(8)?,
         })
     })?
     .collect()
@@ -95,7 +99,7 @@ pub fn covers(pattern: &str, branch: &str) -> bool {
 pub fn effective(rules: &[Rule], branch: &str) -> Option<Rule> {
     let mut m = rules.iter().filter(|r| covers(&r.pattern, branch));
     let first = m.next()?.clone();
-    Some(m.fold(first, |mut a, r| {
+    let mut rule = m.fold(first, |mut a, r| {
         a.pattern = format!("{}, {}", a.pattern, r.pattern);
         a.require_pr |= r.require_pr;
         a.approvals = a.approvals.max(r.approvals);
@@ -107,8 +111,12 @@ pub fn effective(rules: &[Rule], branch: &str) -> Option<Rule> {
         a.allow_force_push &= r.allow_force_push;
         a.allow_deletion &= r.allow_deletion;
         a.enforce_admins |= r.enforce_admins;
+        a.merge_queue |= r.merge_queue;
         a
-    }))
+    });
+    // A queue means nothing if changes can go around it.
+    rule.require_pr |= rule.merge_queue;
+    Some(rule)
 }
 
 /// The rules that bind `repo`'s viewer (admins pass the ones not enforced on them).
@@ -216,6 +224,9 @@ pub struct Gate {
     pub rule: Option<Rule>,
     /// Unmet requirements, in words. Empty: nothing in the way.
     pub missing: Vec<String>,
+    /// The ones of them about checks (the merge queue checks its own commit instead).
+    #[serde(skip)]
+    pub missing_checks: Vec<String>,
     /// The viewer is a repository admin the rule isn't enforced on: they may merge anyway.
     pub can_bypass: bool,
     pub checks: Vec<Check>,
@@ -228,15 +239,16 @@ pub async fn gate(st: &AppState, repo: &Repo, issue_id: i64, base_branch: &str, 
         .call(move |c| {
             let checks = checks(c, rid, &sha, &url)?;
             let rule = effective(&load(c, rid)?, &base);
-            let mut missing = Vec::new();
+            let (mut missing, mut missing_checks) = (Vec::new(), Vec::new());
             if let Some(rule) = &rule {
                 for name in &rule.checks {
                     match checks.iter().find(|x| &x.name == name) {
                         Some(x) if x.state == "success" => {}
-                        Some(x) => missing.push(format!("{name} hasn't passed ({})", x.description)),
-                        None => missing.push(format!("{name} hasn't run")),
+                        Some(x) => missing_checks.push(format!("{name} hasn't passed ({})", x.description)),
+                        None => missing_checks.push(format!("{name} hasn't run")),
                     }
                 }
+                missing.extend(missing_checks.iter().cloned());
                 if rule.approvals > 0 {
                     let (approved, changes) = reviews(c, &r2, issue_id, &sha)?;
                     if approved < rule.approvals {
@@ -247,8 +259,9 @@ pub async fn gate(st: &AppState, repo: &Repo, issue_id: i64, base_branch: &str, 
                     }
                 }
             }
-            let can_bypass = repo_admin_passes(&r2, rule.as_ref()) && !missing.is_empty();
-            Ok(Gate { rule, missing, can_bypass, checks })
+            let queued = rule.as_ref().is_some_and(|x| x.merge_queue);
+            let can_bypass = repo_admin_passes(&r2, rule.as_ref()) && (!missing.is_empty() || queued);
+            Ok(Gate { rule, missing, missing_checks, can_bypass, checks })
         })
         .await
 }
@@ -467,7 +480,7 @@ mod tests {
     use super::*;
 
     fn rule(p: &str) -> Rule {
-        Rule { id: 0, pattern: p.into(), require_pr: false, approvals: 0, checks: vec![], allow_force_push: true, allow_deletion: true, enforce_admins: false }
+        Rule { id: 0, pattern: p.into(), require_pr: false, approvals: 0, checks: vec![], allow_force_push: true, allow_deletion: true, enforce_admins: false, merge_queue: false }
     }
 
     #[test]

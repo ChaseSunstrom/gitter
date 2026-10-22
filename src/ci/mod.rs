@@ -35,6 +35,9 @@ pub async fn upkeep(st: AppState) {
             if let Err(e) = trigger::tick(&st, now).await {
                 eprintln!("ci schedule: {}", e.msg);
             }
+            if let Err(e) = crate::mergequeue::tick(&st).await {
+                eprintln!("merge queue: {}", e.msg);
+            }
         }
         tokio::time::sleep(Duration::from_secs(15)).await;
     }

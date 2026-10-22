@@ -765,5 +765,46 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Merge queue: the rule's option in settings, the queue button and state on the pull request, the queue on the list.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const seen = {};
+  try {
+    await page.goto(BASE + '/alice/hello/settings', { waitUntil: 'networkidle' });
+    await page.click('#rules summary');
+    await page.fill('#rule-form input[name=pattern]', 'main');
+    await page.fill('#rule-form input[name=checks]', 'release-check');
+    await page.check('#rule-form input[name=merge_queue]');
+    await page.click('#rule-form button[type=submit]');
+    await page.waitForSelector('#rules [data-rule-edit]', { timeout: 5000 });
+    seen.option = (await page.locator('#rules').innerText()).includes('merge queue');
+    const num = await page.evaluate(async () => {
+      const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json());
+      await post('/api/repos/alice/hello/contents', { branch: 'main', new_branch: 'ui-queue', message: 'Queue check', changes: [{ path: 'queue.txt', content: 'x\n' }] });
+      return (await post('/api/repos/alice/hello/pulls', { title: 'Goes through the queue', head: 'ui-queue', base: 'main' })).number;
+    });
+    await page.goto(`${BASE}/alice/hello/pull/${num}`, { waitUntil: 'networkidle' });
+    seen.button = (await page.locator('#merge-form [type=submit]').innerText()).includes('Add to merge queue');
+    await page.click('#merge-form [type=submit]');
+    await page.waitForSelector('#queue-off', { timeout: 5000 });
+    seen.state = (await page.locator('.merge-auto').innerText()).includes('merge queue');
+    await page.goto(BASE + '/alice/hello/pulls', { waitUntil: 'networkidle' });
+    seen.list = (await page.locator('#merge-queue').innerText()).includes('Goes through the queue');
+    await page.goto(`${BASE}/alice/hello/pull/${num}`, { waitUntil: 'networkidle' });
+    await page.click('#queue-off');
+    await page.waitForSelector('#merge-form', { timeout: 5000 });
+    seen.removed = true;
+    await page.goto(BASE + '/alice/hello/settings', { waitUntil: 'networkidle' });
+    await page.click('#rules [data-rule-del]');
+    await page.click('.modal [data-ok]');
+    await page.waitForSelector('#rules [data-rule-del]', { state: 'detached', timeout: 5000 });
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !(seen.option && seen.button && seen.state && seen.list && seen.removed)) { failed++; console.log('✗ merge queue', { seen, errors }); }
+  else console.log('  ok merge queue option in settings; pull request queued and removed from its page; queue shown on the list');
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

@@ -777,6 +777,26 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX osv_affected_pkg ON osv_affected(ecosystem, name);
     CREATE INDEX osv_affected_vuln ON osv_affected(vuln_id);
     "#,
+    // v24: the merge queue. An entry is tested on a commit made on top of the base
+    // (kept at refs/gitter-queue/<id>); it lands only if that exact commit passes.
+    r#"
+    ALTER TABLE branch_rules ADD COLUMN merge_queue INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE merge_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        issue_id INTEGER NOT NULL UNIQUE REFERENCES issues(id) ON DELETE CASCADE,
+        base TEXT NOT NULL,
+        method TEXT NOT NULL,
+        added_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        head_sha TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'queued',
+        test_sha TEXT,
+        tested_base TEXT,
+        started_at INTEGER,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX merge_queue_repo ON merge_queue(repo_id, base, id);
+    "#,
 ];
 
 impl Db {

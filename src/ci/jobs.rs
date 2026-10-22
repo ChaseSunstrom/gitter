@@ -113,7 +113,10 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
         .await?;
     if let Some((repo, sha)) = finished {
         let st = st.clone();
-        tokio::spawn(async move { crate::protect::auto_merge(&st, repo, Some(sha)).await });
+        tokio::spawn(async move {
+            crate::protect::auto_merge(&st, repo, Some(sha)).await;
+            crate::mergequeue::advance(&st, repo).await;
+        });
     }
     Ok(done)
 }

@@ -204,6 +204,8 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/statuses/{{sha}}"), post(checks::post_status))
         .route(&format!("{repo}/checks/{{sha}}"), get(checks::checks))
         .route(&format!("{repo}/pulls/{{n}}/auto-merge"), put(checks::set_auto_merge).delete(checks::clear_auto_merge))
+        .route(&format!("{repo}/pulls/{{n}}/queue"), post(crate::mergequeue::enqueue).delete(crate::mergequeue::dequeue))
+        .route(&format!("{repo}/merge-queue"), get(crate::mergequeue::list))
         .route(&format!("{repo}/ci/jobs/{{id}}/log"), get(ci::log))
         .route(&format!("{repo}/ci/jobs/{{id}}/log/stream"), get(ci::log_stream))
         .route(&format!("{repo}/ci/jobs/{{id}}/artifacts"), get(ci::artifacts))
