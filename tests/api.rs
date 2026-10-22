@@ -4662,3 +4662,51 @@ async fn merge_queue_lands_in_order_ejects_failures_and_retests() {
     let (s, e) = app.req(&bob, "POST", &queue(p["number"].as_i64().unwrap()), Some(json!({}))).await;
     assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("doesn't use a merge queue"), "{e}");
 }
+
+#[tokio::test]
+async fn releases_follow_collaborator_and_org_access_and_org_deletion_removes_files() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    let dave = app.signup("dave").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "private": true, "readme": true }))).await;
+    let base = "/api/repos/alice/p/releases";
+    // A read collaborator sees releases but can't make, change or delete one; a write collaborator can.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "read" }))).await;
+    assert_eq!(app.req(&bob, "GET", base, None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "POST", base, Some(json!({ "tag": "v1" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&carol, "POST", base, Some(json!({ "tag": "v1" }))).await.0, StatusCode::NOT_FOUND, "a stranger can't even see the private repo");
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    let (s, v) = app.req(&bob, "POST", base, Some(json!({ "tag": "v1" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_i64().unwrap();
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "read" }))).await;
+    assert_eq!(app.req(&bob, "PATCH", &format!("{base}/{id}"), Some(json!({ "title": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "DELETE", &format!("{base}/{id}"), None).await.0, StatusCode::FORBIDDEN);
+
+    // Organization members get the base role: write makes releases, read doesn't.
+    app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "x", "owner": "acme", "private": true, "readme": true }))).await;
+    app.req(&alice, "PUT", "/api/orgs/acme/members/carol", Some(json!({ "role": "member" }))).await;
+    let obase = "/api/repos/acme/x/releases";
+    app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "read" }))).await;
+    assert_eq!(app.req(&carol, "POST", obase, Some(json!({ "tag": "v1" }))).await.0, StatusCode::FORBIDDEN);
+    app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "write" }))).await;
+    let (s, v) = app.req(&carol, "POST", obase, Some(json!({ "tag": "v1" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let rid = v["id"].as_i64().unwrap();
+    assert_eq!(app.req(&dave, "POST", obase, Some(json!({ "tag": "v2" }))).await.0, StatusCode::NOT_FOUND, "non-members stay out");
+
+    // Deleting the organization removes its release files.
+    let (s, _, _) = raw_as(&app, &carol, "POST", &format!("{obase}/{rid}/assets?name=a.bin"), "", b"data".to_vec()).await;
+    assert_eq!(s, StatusCode::OK);
+    let rdir = app.state.cfg.data_dir.join(format!("releases/{rid}"));
+    assert!(rdir.is_dir());
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/acme/x", Some(json!({ "confirm": "acme/x" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
+    assert!(!rdir.exists(), "the organization's release files went with it");
+    let left = app.state.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM releases WHERE id = ?1", [rid], |r| r.get::<_, i64>(0))?)).await.unwrap();
+    assert_eq!(left, 0);
+}
