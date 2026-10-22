@@ -150,20 +150,38 @@ pub fn orphans(c: &rusqlite::Connection, data: &std::path::Path) -> rusqlite::Re
 /// Runs on the database connection, so no upload is between its rename and its row.
 pub async fn sweep(st: &AppState) {
     let data = st.cfg.data_dir.clone();
-    let done = st
-        .db
-        .call(move |c| {
-            for p in orphans(c, &data)? {
+    // A running backup has listed rows whose files it hasn't copied yet: wait for the next hour.
+    let backing_up = std::fs::read_dir(&data).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".backup-tmp-"));
+    if backing_up {
+        return;
+    }
+    let found = st.db.call(move |c| Ok(orphans(c, &data)?)).await;
+    // Removed outside the database call: ids are AUTOINCREMENT, so an orphan can never become valid again.
+    match found {
+        Ok(list) => {
+            for p in list {
                 let gone = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
                 if let Err(e) = gone {
                     eprintln!("warning: couldn't remove {}: {e}", p.display());
                 }
             }
-            Ok(())
-        })
-        .await;
-    if let Err(e) = done {
-        eprintln!("releases sweep: {}", e.msg);
+        }
+        Err(e) => eprintln!("releases sweep: {}", e.msg),
+    }
+}
+
+/// Delete the tag `tag` (made by `make_tag` as `oid`) after its release failed to save, unless a release
+/// other than `own` (0 for a new one) holds that tag now: the winner of a race may rely on it.
+async fn take_back_tag(st: &AppState, r: &Repo, tag: &str, oid: &str, own: i64) {
+    let (rid, t) = (r.id, tag.to_string());
+    let held = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT 1 FROM releases WHERE repo_id = ?1 AND tag = ?2 AND id != ?3", params![rid, t, own], |_| Ok(())).optional()?.is_some()))
+        .await
+        .unwrap_or(true);
+    if !held {
+        let _ = st.git.run(&r.path, &["update-ref", "-d", &format!("refs/tags/{tag}"), oid], None, &[]).await;
+        crate::mirrors::changed(st, r.id).await;
     }
 }
 
@@ -258,7 +276,7 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Path((o, n)):
         }
     }
     let (uid, draft, pre, notes) = (u.id, req.draft, req.prerelease, req.notes);
-    let refname = format!("refs/tags/{tag}");
+    let tag2 = tag.clone();
     let id = st
         .db
         .call(move |c| {
@@ -274,17 +292,9 @@ pub async fn create(State(st): State<AppState>, Authed(u): Authed, Path((o, n)):
     let id = match id {
         Ok(id) => id,
         Err(e) => {
-            // The insert failed: take back the tag made for it, if it's still ours. Unless the release that won
-            // a race holds that tag now (it skipped making it because ours was there): then it stays.
-            let (rid, t) = (r.id, refname.trim_start_matches("refs/tags/").to_string());
-            let held = st
-                .db
-                .call(move |c| Ok(c.query_row("SELECT 1 FROM releases WHERE repo_id = ?1 AND tag = ?2", params![rid, t], |_| Ok(())).optional()?.is_some()))
-                .await
-                .unwrap_or(true);
-            if let Some(oid) = made.filter(|_| !held) {
-                let _ = st.git.run(&r.path, &["update-ref", "-d", &refname, &oid], None, &[]).await;
-                crate::mirrors::changed(&st, r.id).await;
+            // The insert failed: take back the tag made for it (unless a release that won a race holds it).
+            if let Some(oid) = made {
+                take_back_tag(&st, &r, &tag2, &oid, 0).await;
             }
             return Err(e);
         }
@@ -355,6 +365,7 @@ pub async fn update(
     if cur["draft"] == true && !draft {
         add_shas(&st, &r, std::slice::from_mut(&mut cur)).await?;
     }
+    let mut made = None;
     if cur["draft"] == true && !draft && cur["sha"].is_null() {
         // A draft of an existing tag keeps no target: if that tag was deleted, don't guess one.
         let target = cur["target"].as_str().unwrap_or("");
@@ -362,9 +373,10 @@ pub async fn update(
             return Err(AppError::conflict("This release's tag no longer exists. Push it again, or delete this draft and make a new one."));
         }
         let (_, sha) = check_target(&st, &r, target).await?;
-        make_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), &sha, &title).await?;
+        made = Some(make_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), &sha, &title).await?);
     }
-    st.db
+    let saved = st
+        .db
         .call(move |c| {
             // A draft isn't published; publishing it (again) dates it now.
             c.execute(
@@ -375,7 +387,13 @@ pub async fn update(
             )?;
             Ok(())
         })
-        .await?;
+        .await;
+    if let Err(e) = saved {
+        if let Some(oid) = made {
+            take_back_tag(&st, &r, cur["tag"].as_str().unwrap_or(""), &oid, id).await;
+        }
+        return Err(e);
+    }
     ok()
 }
 
