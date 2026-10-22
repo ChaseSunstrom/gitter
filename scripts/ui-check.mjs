@@ -1195,5 +1195,23 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   else console.log(`  ok deployments: ${steps.join(', ')}`);
 }
 
+// Markup: the issue sidebar's Labels block stands on its own, and the Star button says whether it's pressed.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  try {
+    await page.goto(BASE + '/alice/hello/issues/1', { waitUntil: 'networkidle' });
+    const labels = await page.locator('#labels-block .section-title').innerText();
+    if (!labels.includes('Labels')) throw new Error(`labels block: ${labels}`);
+    if (await page.locator('#assignees-block #label-list').count()) throw new Error('the labels sit inside the assignees block');
+    await page.goto(BASE + '/alice/hello', { waitUntil: 'networkidle' });
+    const pressed = await page.locator('#star-btn').getAttribute('aria-pressed');
+    if (!['true', 'false'].includes(pressed)) throw new Error(`aria-pressed=${pressed}`);
+  } catch (e) { errors.push(String(e)); }
+  await page.close();
+  if (errors.length) { failed++; console.log('✗ markup', errors); }
+  else console.log('  ok markup: the Labels block is its own, the Star button has aria-pressed');
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

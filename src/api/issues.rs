@@ -514,11 +514,22 @@ pub async fn show(
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let mut issue = load_issue(&st, &r, num, v.as_ref()).await?;
-    let pr = if issue.is_pr {
+    let mut pr = if issue.is_pr {
         Some(pull_status(&st, &r, &mut issue).await?)
     } else {
         None
     };
+    // Its author offers maintainers edits only while they can push to the fork.
+    if let (Some(p), Some(u)) = (pr.as_mut(), v.as_ref())
+        && issue.from_fork
+    {
+        let fork = issue.head_repo.as_deref().and_then(|h| h.split_once('/'));
+        let can = u.id == issue.author_id && match fork {
+            Some((fo, fname)) => Repo::readable(&st, Some(u), fo, fname).await.is_ok_and(|f| f.can_write),
+            None => false,
+        };
+        p["can_allow_edits"] = json!(can);
+    }
     let (iid, rid) = (issue.id, r.id);
     let vid = v.as_ref().map(|u| u.id).unwrap_or(-1);
     let viewer_admin = v.as_ref().is_some_and(|u| u.is_admin);

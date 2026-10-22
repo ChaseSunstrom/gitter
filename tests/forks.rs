@@ -264,6 +264,9 @@ async fn maintainers_push_to_the_fork_branch_only_when_allowed_and_only_that_bra
     assert_eq!(s, StatusCode::OK, "{v}");
     let n = v["number"].as_i64().unwrap();
     assert_eq!(pr(&app, &alice, "alice/hello", n).await["maintainer_can_modify"], json!(false));
+    // The toggle is for its author, who can push to the fork.
+    assert_eq!(pr(&app, &bob, "alice/hello", n).await["can_allow_edits"], json!(true));
+    assert_eq!(pr(&app, &alice, "alice/hello", n).await["can_allow_edits"], json!(false));
     let (_, t) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "push" }))).await;
     let token = t["token"].as_str().unwrap().to_string();
     let dir = tempfile::tempdir().unwrap();
@@ -326,6 +329,7 @@ async fn maintainers_push_to_the_fork_branch_only_when_allowed_and_only_that_bra
     assert_eq!(s, StatusCode::OK, "{v}");
     let cn = v["number"].as_i64().unwrap();
     assert_eq!(pr(&app, &carol, "carol/hello", cn).await["maintainer_can_modify"], json!(false), "not hers to grant");
+    assert_eq!(pr(&app, &carol, "carol/hello", cn).await["can_allow_edits"], json!(false), "so she isn't offered the toggle");
     assert_eq!(app.req(&carol, "PATCH", &format!("/api/repos/carol/hello/pulls/{cn}"), Some(json!({ "maintainer_can_modify": true }))).await.0, StatusCode::FORBIDDEN);
     app.state.db.call(|c| Ok(c.execute("UPDATE pulls SET maintainer_can_modify = 1", [])?)).await.unwrap();
     assert!(!git(&w, &["push", "-q", &carol_remote, "HEAD:feature"]).status.success(), "a grant its author can't give doesn't count");

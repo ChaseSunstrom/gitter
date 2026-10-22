@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T17:01:52Z
-updated: 2026-10-22T23:03:12Z
+updated: 2026-10-22T23:03:13Z
 inferred_deps: [T-0007]
 inferred_why: T-0007: per-PR previews depend on the CI status pipeline
 base: 6e1ef85012b118f0c31812348206b1ebc277b4cf
@@ -78,6 +78,7 @@ README: the CI bullet and a Deployments and previews paragraph (environment:, pr
 - 2026-10-22T22:12:39Z focused
 - 2026-10-22T22:33:56Z security review (env secrets to untrusted PR runs): not applicable as written. Every CI run's ref is a branch of the repository itself: push runs come from writers, manual runs need write and take refs/heads only, and PR runs exist only for from_fork = 0 (ci/trigger.rs). Fork code never runs automatically, and agent runs get no secrets, the same rule as for repository secrets. Kept the empty rule as 'any branch of this repository'.
 - 2026-10-22T23:03:12Z done
+- 2026-10-22T23:03:13Z committed 17ffacf (35 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses CI's claim/finish hooks, the sealed-secret helpers (security::seal/open), the artifacts tarball the runner already uploads (previews are extracted from it), protect.rs glob matching for branch rules, and the hourly CI sweep for cleanup. No new crate (tar/flate2 are already used for artifacts).

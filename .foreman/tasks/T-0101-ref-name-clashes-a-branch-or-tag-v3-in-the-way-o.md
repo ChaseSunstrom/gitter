@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T19:03:54Z
-updated: 2026-10-22T22:49:30Z
+updated: 2026-10-22T23:16:50Z
 builder: 2026-10-22T22:42:05Z
 builder_proc: archbox-hardened|pid:[4026531836]|4747|8111
 lane: /home/chase/projects/gitter/.claude/worktrees/agent-a9bf0150e64c0871e
@@ -43,6 +43,10 @@ git refuses refs/heads/v3/rc while refs/heads/v3 exists (and the reverse). Today
 - (step 1) `cargo test -q --test api ref_clash` → ✗ exit 101 · test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 78 filtered out; finished in 0.41s / error: test failed, to rerun pass `--test api` [ran] [tree 6b8a41605cc0] (2026-10-22T22:47:12Z)
 - (step 1) `cargo test -q --test api ref_clash` → exit 0 · .. / test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 78 filtered out; finished in 0.47s [ran] [tree 97033f287f6f] (2026-10-22T22:49:29Z)
 - (step 2) `cargo test -q --test api ref_clash` → exit 0 · .. / test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 78 filtered out; finished in 0.48s [ran] [tree 97033f287f6f] (2026-10-22T22:49:30Z)
+- (ac 1) `cargo test -q --test api ref_clash 2>&1 | grep -v "^\s*$" | tail -25` → ✗ exit 1 · error: test failed, to rerun pass `--test api` / ✗ exit 101 (48.0 s; last 16 of 16 lines) [ran] [tree d1e7b5536dda] (2026-10-22T23:07:18Z)
+- (ac 2) `cargo test -q --test api ref_clash 2>&1 | grep -v "^\s*$" | tail -25` → ✗ exit 1 · error: test failed, to rerun pass `--test api` / ✗ exit 101 (48.0 s; last 16 of 16 lines) [ran] [tree d1e7b5536dda] (2026-10-22T23:07:18Z)
+- (step 1) `cargo test -q --test api ref_clash` → exit 0 · ... / test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 78 filtered out; finished in 0.62s [ran] [tree 4f8974c1648b] (2026-10-22T23:16:49Z)
+- (step 2) `cargo test -q --test api ref_clash` → exit 0 · ... / test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 78 filtered out; finished in 0.63s [ran] [tree 4f8974c1648b] (2026-10-22T23:16:50Z)
 ## Log
 - 2026-10-22T19:03:54Z created
 - 2026-10-22T22:42:01Z planned from capture

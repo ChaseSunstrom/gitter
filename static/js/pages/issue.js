@@ -224,7 +224,7 @@ function mergeBox(meta, data, pd) {
       <button class="btn green" type="submit">${icon(queued ? 'clock' : 'merged', 'sm')} ${queued ? 'Add to merge queue' : 'Merge pull request'}</button>
     </form>` : !meta.can_write && pull.mergeable ? html`<div class="muted small merge-note">Only people with write access can merge.</div>` : ''}
     ${pull.from_fork ? html`<div class="muted small merge-note" id="fork-note">${pull.ci_note}
-      ${state.me?.username === issue.author ? html`<label class="check"><input type="checkbox" id="maintainer-edits" ${pull.maintainer_can_modify ? 'checked' : ''}> Allow edits from maintainers (people who can write here may push to ${pull.head} in your fork)</label>`
+      ${pull.can_allow_edits ? html`<label class="check"><input type="checkbox" id="maintainer-edits" ${pull.maintainer_can_modify ? 'checked' : ''}> Allow edits from maintainers (people who can write here may push to ${pull.head} in your fork)</label>`
         : pull.maintainer_can_modify ? html`<div>The author allows edits from maintainers: if you can write here, you may push to ${pull.head} in ${pull.head_repo}.</div>` : ''}</div>` : ''}
   </div>`;
 }
@@ -242,6 +242,7 @@ function sidebar(meta, data, rv) {
         ${data.can_write ? html`<span class="grow"></span><button class="btn ghost sm icon" id="edit-assignees" aria-label="Edit assignees">${icon('settings', 'sm')}</button>` : ''}</div>
       <div class="assignee-list" id="assignee-list">${assigneeList(meta, issue)}</div>
     </div>
+    <div class="side-block" id="labels-block">
       <div class="section-title">${icon('label', 'sm')} Labels
         ${data.can_write ? html`<span class="grow"></span><button class="btn ghost sm icon" id="edit-labels" aria-label="Edit labels">${icon('settings', 'sm')}</button>` : ''}</div>
       <div class="row wrap-ok" id="label-list">${issue.labels.length ? issue.labels.map((l) => labelChip(l, `/${meta.owner}/${meta.name}/issues?label=${encodeURIComponent(l.name)}`)) : html`<span class="muted small">None yet</span>`}</div>
