@@ -22,6 +22,8 @@ c -X POST "$B/api/repos" --data '{"name":"keep","readme":true}' >/dev/null
 c -X POST "$B/api/repos/alice/keep/issues" --data '{"title":"Remember me"}' >/dev/null
 c -X POST "$B/api/repos/alice/keep/wiki" --data '{"name":"Home","content":"Wiki survives"}' >/dev/null
 c -X POST "$B/api/repos/alice/keep/discussions" --data '{"title":"Talk survives","category":"general"}' >/dev/null
+c -X PUT "$B/api/repos/alice/keep/ci/secrets/DEPLOY_KEY" --data '{"value":"kept-secret"}' >/dev/null
+cp "$TMP/a/secret.key" "$TMP/key.orig"
 SNIP=$(c -X POST "$B/api/snippets" --data '{"title":"Snip","secret":true,"files":[{"name":"a.txt","content":"snippet survives"}]}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 SHA=$(curl -sf "$B/api/repos/alice/keep/commits" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commits"][0]["sha"])')
 # A Git LFS file, uploaded the way git-lfs does it (batch, then PUT).
@@ -54,6 +56,7 @@ echo "✓ restore --force in place keeps the old data aside"
 
 GITTER_DATA=$TMP/b $BIN restore - <"$TMP/stream.tar.gz" || fail "restore from stdin"
 GITTER_DATA=$TMP/b $BIN doctor || fail "doctor on restored data"
+cmp -s "$TMP/b/secret.key" "$TMP/key.orig" && [ "$(stat -c %a "$TMP/b/secret.key")" = 600 ] || fail "the server key (CI secrets) must be restored, owner-only"
 echo "✓ restore + doctor"
 
 GITTER_DATA=$TMP/b GITTER_ADDR=127.0.0.1:$PORT2 GITTER_URL=$B2 $BIN >"$TMP/b.log" 2>&1 & P2=$!
@@ -66,5 +69,5 @@ curl -sf "$B2/raw/snippets/$SNIP/latest/a.txt" | grep -q "snippet survives" || f
 git clone -q "$B2/alice/keep.git" "$TMP/clone" && [ -f "$TMP/clone/README.md" ] || fail "clone from restored server"
 curl -sf -H "Origin: $B2" -H 'Content-Type: application/json' -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct horse"}' >/dev/null || fail "login after restore"  # pragma: allowlist secret
 curl -sf "${AUTH[@]}" "$B2/alice/keep.git/info/lfs/objects/$OID" | cmp -s - "$TMP/asset.bin" || fail "LFS file missing or different after restore"
-echo "✓ restored server has the same history, issues, wiki, discussions, snippets, logins, clones and LFS files"
+echo "✓ restored server has the same history, issues, wiki, discussions, snippets, logins, clones, LFS files and the key for CI secrets"
 echo "Backup round-trip passed."

@@ -3,7 +3,7 @@ import { html, state, get, send, bytes, num, timeEl, avatar, toast, action, conf
 import { icon } from '../icons.js';
 import { navigate, refresh, renderTopbar } from '../main.js';
 
-const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['reports', 'flag', 'Reports'], ['audit', 'shield', 'Security log'], ['settings', 'settings', 'Settings']];
+const TABS = [['', 'pulse', 'Overview'], ['users', 'users', 'Accounts'], ['reports', 'flag', 'Reports'], ['audit', 'shield', 'Security log'], ['runners', 'zap', 'CI runners'], ['settings', 'settings', 'Settings']];
 
 function uptime(s) {
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
@@ -104,6 +104,24 @@ async function reports(status) {
   </div>`;
 }
 
+async function runners() {
+  const d = await get('/admin/runners', { fresh: true });
+  const seen = (r) => r.builtin ? 'inside the server' : r.last_seen ? html`last seen ${timeEl(r.last_seen)}` : 'never connected';
+  return html`<div class="stack">
+    <div class="box" id="runners"><div class="box-head"><b>Runners</b><span class="grow"></span><span class="muted small">${d.queued} job(s) waiting</span></div>
+      <div class="list">${d.runners.map((r) => html`<div class="list-row">${icon(r.builtin ? 'zap' : 'monitor', 'sm muted')}
+        <div class="grow"><b>${r.name}</b> ${r.running ? html`<span class="pill">${r.running} running</span>` : ''}
+          <div class="small muted row wrap-ok"><span>${seen(r)}</span><span class="runner-labels">${r.labels.map((l) => html`<span class="pill mono">${l}</span>`)}</span></div></div>
+        ${r.builtin ? html`<a class="btn sm ghost" href="/admin/settings">Settings</a>` : html`<button class="btn sm danger" data-runner-del="${r.id}" data-name="${r.name}">Remove</button>`}</div>`)}</div></div>
+    <div class="box"><div class="box-head"><b>Add a runner</b></div><div class="box-body stack">
+      <p class="muted small">Run CI jobs on another machine: make a token here, then start <code>gitter runner</code> there with it. Jobs that name <code>runs-on</code> labels go to runners that have them all.</p>
+      <form class="row wrap-ok" id="runner-form"><input class="input" name="name" placeholder="Machine name, e.g. build-box" maxlength="60" required style="max-width:280px" aria-label="Runner name">
+        <button class="btn primary" type="submit">Create token</button></form>
+      <div id="runner-new"></div>
+    </div></div>
+  </div>`;
+}
+
 async function invitesBox() {
   const d = await get('/admin/invites', { fresh: true });
   return html`<div class="box" id="invites"><div class="box-head"><b>Invite links</b><span class="grow"></span><span class="muted small">For invite-only sign-up</span></div>
@@ -139,6 +157,11 @@ async function settings() {
       <div class="field" style="width:220px"><label for="s-write">Changes per minute per person</label><input id="s-write" class="input" type="number" min="0" value="${s.write_rate_per_min}"><span class="hint">Posts, edits and pushes. Admins have no limit.</span></div>
       <div class="field" style="width:220px"><label for="s-lfs">Largest Git LFS file (MB)</label><input id="s-lfs" class="input" type="number" min="1" value="${s.max_lfs_mb}"><span class="hint">Per file, checked while uploading.</span></div>
     </div>
+    <div class="field"><label>CI</label><div class="choice">
+      <label><input type="radio" name="ci" value="off" ${s.ci === 'off' ? 'checked' : ''}><span><b>Off</b><br><span class="muted small">No pipelines run.</span></span></label>
+      <label><input type="radio" name="ci" value="admins" ${s.ci === 'admins' ? 'checked' : ''}><span><b>Admins' repositories</b><br><span class="muted small">Jobs run the repository's code. On the built-in runner that's the server itself, with access to its data folder.</span></span></label>
+      <label><input type="radio" name="ci" value="everyone" ${s.ci === 'everyone' ? 'checked' : ''}><span><b>Everyone</b><br><span class="muted small">Any account's pushes run jobs, on separate runners only: the built-in runner still takes just admins' repositories. Use disposable runner machines.</span></span></label></div></div>
+    <div class="field" style="width:220px"><label for="s-builtin">Jobs the built-in runner runs at once</label><input id="s-builtin" class="input" type="number" min="0" max="64" value="${s.builtin_runner_jobs}"><span class="hint">0 turns it off (use separate runners).</span></div>
     <div class="field"><label for="s-ann">Announcement</label><input id="s-ann" class="input" value="${s.announcement}" maxlength="280" placeholder="e.g. Maintenance on Sunday 10:00 UTC">
       <span class="hint">Shown at the top of every page. Leave empty to hide it.</span></div>
     <div><button class="btn primary" id="s-save">Save settings</button></div>
@@ -152,7 +175,8 @@ export default async function (ctx) {
   const tab = ctx.params.tab || '';
   const q = ctx.query.get('q') || '';
   const page = +(ctx.query.get('page') || 1);
-  const inner = tab === 'users' ? await users(q, page) : tab === 'reports' ? await reports(ctx.query.get('status') || 'open') : tab === 'audit' ? await audit(q, page) : tab === 'settings' ? await settings() : await overview();
+  const inner = tab === 'users' ? await users(q, page) : tab === 'reports' ? await reports(ctx.query.get('status') || 'open') : tab === 'audit' ? await audit(q, page)
+    : tab === 'runners' ? await runners() : tab === 'settings' ? await settings() : await overview();
   return {
     title: 'Site administration',
     html: html`<div class="wrap">
@@ -213,6 +237,23 @@ export default async function (ctx) {
           <div class="row"><input class="input mono" readonly value="${r.url}" aria-label="Invite link"><button class="btn primary" type="button" data-copy="${r.url}" data-copy-label="Link copied">Copy</button></div></div>`.s;
         inv.reset();
       }));
+      const rf = $('#runner-form', el);
+      rf?.addEventListener('submit', action(rf.querySelector('button'), async () => {
+        const r = await send('POST', '/admin/runners', { name: rf.name.value.trim() });
+        const cmd = `GITTER_RUNNER_TOKEN=${r.token} gitter runner --url ${location.origin}`;
+        $('#runner-new', el).innerHTML = html`<div class="token-reveal fade"><b>Runner token created</b>
+          <p class="small">Copy it now; it won't be shown again. On the runner machine (it needs git, and docker for jobs with an <code>image</code>):</p>
+          <div class="row"><input class="input mono" readonly value="${cmd}" aria-label="Runner command"><button class="btn primary" type="button" data-copy="${cmd}" data-copy-label="Command copied">Copy</button></div></div>`.s;
+        rf.reset();
+      }));
+      $('#runners', el)?.addEventListener('click', async (e) => {
+        const b = e.target.closest('[data-runner-del]');
+        if (!b) return;
+        if (!(await confirmDialog({ title: `Remove ${b.dataset.name}?`, text: 'Its token stops working, and jobs it was running go back to the queue.', ok: 'Remove', danger: true }))) return;
+        try { await send('DELETE', `/admin/runners/${b.dataset.runnerDel}`); } catch (x) { return toast(x.message, 'err'); }
+        toast('Runner removed');
+        navigate(location.pathname, { replace: true, scroll: false });
+      });
       const form = $('#site-settings', el);
       form?.addEventListener('submit', action($('#s-save', el), async () => {
         const body = {
@@ -224,6 +265,8 @@ export default async function (ctx) {
           api_rate_per_min: +$('#s-api', el).value,
           write_rate_per_min: +$('#s-write', el).value,
           max_lfs_mb: +$('#s-lfs', el).value,
+          ci: $$('input[name=ci]', el).find((r) => r.checked)?.value || 'admins',
+          builtin_runner_jobs: +$('#s-builtin', el).value,
           announcement: $('#s-ann', el).value.trim(),
         };
         const saved = await send('PUT', '/admin/settings', body);

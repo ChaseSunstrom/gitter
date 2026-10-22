@@ -2,13 +2,13 @@
 id: T-0036
 type: FEATURE
 tier: M
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-21T21:33:59Z
-updated: 2026-10-21T21:33:59Z
+updated: 2026-10-21T23:39:31Z
 ---
 # Password_login` matches `email = ?1` while emails are not unique-constrained against usern
 ## Raw request
@@ -27,4 +27,5 @@ updated: 2026-10-21T21:33:59Z
 ## Verification evidence
 ## Log
 - 2026-10-21T21:33:59Z created
+- 2026-10-21T23:39:31Z dropped: not a bug: emails must contain @ (validate::email) and usernames can't, so the OR can't match another account
 ## Follow-ups captured

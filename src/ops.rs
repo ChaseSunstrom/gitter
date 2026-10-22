@@ -128,6 +128,11 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
         tar.follow_symlinks(false);
         tar.append_path_with_name(tmp.join("manifest.json"), "manifest.json")?;
         tar.append_path_with_name(&snap, "gitter.db")?;
+        // The key CI secrets are encrypted with: without it a restore can't read them.
+        let key = cfg.data_dir.join("secret.key");
+        if key.is_file() {
+            tar.append_path_with_name(&key, "secret.key")?;
+        }
         // Only the folders in the snapshot, so one created meanwhile can't show up as an orphan.
         for (s, names) in STORES.iter().zip(&stores) {
             tar.append_dir(s.dir, &cfg.data_dir)?;
@@ -231,6 +236,7 @@ fn inspect_archive(archive: &Path) -> Result<serde_json::Value> {
         let name = path.to_string_lossy().into_owned();
         let known = name == "manifest.json"
             || name == "gitter.db"
+            || name == "secret.key"
             || name == "lfs"
             || name.starts_with("lfs/")
             || STORES.iter().any(|s| name == s.dir || name.starts_with(&format!("{}/", s.dir)));
@@ -376,6 +382,12 @@ fn restore_from(cfg: &Config, data: &Path, archive: &Path, occupied: bool) -> Re
     for name in ["gitter.db", "lfs"].into_iter().chain(STORES.iter().map(|s| s.dir)) {
         std::fs::rename(stage.join(name), data.join(name))
             .with_context(|| format!("couldn't move the restored {name} into place"))?;
+    }
+    let key = stage.join("secret.key");
+    if key.is_file() {
+        #[cfg(unix)]
+        std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        std::fs::rename(&key, data.join("secret.key")).context("couldn't move the restored secret.key into place")?;
     }
     std::fs::remove_dir_all(&stage)?;
     std::fs::create_dir_all(data.join("home"))?;

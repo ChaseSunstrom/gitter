@@ -27,6 +27,7 @@ const ROUTES = [
   ['/:owner/:repo/issues/:n', 'issue', { kind: 'issue' }],
   ['/:owner/:repo/pulls', 'issues', { kind: 'pr' }], ['/:owner/:repo/pull/:n', 'issue', { kind: 'pr', tab: 'conversation' }],
   ['/:owner/:repo/pull/:n/:tab', 'issue', { kind: 'pr' }],
+  ['/:owner/:repo/ci', 'ci'], ['/:owner/:repo/ci/:n', 'ci'],
   ['/:owner/:repo/labels', 'labels'], ['/:owner/:repo/settings', 'reposettings'],
   ['/:owner/:repo/insights', 'insights'], ['/:owner/:repo/search', 'search'],
   ['/:owner/:repo/wiki', 'wiki', { view: 'page' }], ['/:owner/:repo/wiki/_new', 'wiki', { view: 'edit', create: true }],

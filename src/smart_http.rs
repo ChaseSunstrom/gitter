@@ -215,9 +215,12 @@ async fn serve_inner(
     }
     let mut cmd = st.git.command(None);
     // The current push limit overrides whatever was stored when the repo was created.
-    cmd.arg("-c")
-        .arg(format!("receive.maxInputSize={max_push}"))
-        .arg("http-backend")
+    cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
+    if crate::auth::basic_secret(&headers).is_some_and(|s| s.starts_with(crate::ci::queue::JOB_TOKEN_PREFIX)) {
+        // A CI runner fetches the one commit it builds (only commits a ref can reach).
+        cmd.arg("-c").arg("uploadpack.allowReachableSHA1InWant=true");
+    }
+    cmd.arg("http-backend")
         .env("GIT_PROJECT_ROOT", &st.git.root)
         .env("GIT_HTTP_EXPORT_ALL", "1")
         .env("PATH_INFO", format!("/{}.git/{}", repo.id, service_path))

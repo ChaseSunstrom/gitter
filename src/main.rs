@@ -51,6 +51,9 @@ usage:
                                restore a backup into GITTER_DATA (- for stdin; --force moves existing data aside)
   gitter doctor [--fsck]       check git, storage, database and repositories
   gitter bench [--check]       time the main pages on a seeded throwaway instance (--check enforces budgets)
+  gitter runner --url URL --token TOKEN [--labels a,b] [--jobs N] [--work DIR]
+                               run CI jobs for a Gitter server on this machine (token from Site administration → Runners;
+                               or set GITTER_RUNNER_TOKEN)
   gitter --version
 
 Settings come from environment variables; see the README.";
@@ -91,6 +94,26 @@ fn main() -> anyhow::Result<()> {
             println!("All good.");
             Ok(())
         }
+        "runner" => {
+            let known = ["--url", "--token", "--labels", "--jobs", "--work"];
+            for pair in args[1..].chunks(2) {
+                if !known.contains(&pair[0].as_str()) || pair.len() < 2 {
+                    anyhow::bail!("unknown or incomplete option {:?}\n\n{HELP}", pair[0]);
+                }
+            }
+            let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+            let url = flag("--url").ok_or_else(|| anyhow::anyhow!("usage: gitter runner --url https://git.example.com --token grn_…"))?;
+            let token = flag("--token")
+                .or_else(|| std::env::var("GITTER_RUNNER_TOKEN").ok())
+                .ok_or_else(|| anyhow::anyhow!("pass --token or set GITTER_RUNNER_TOKEN"))?;
+            let labels: Vec<String> = flag("--labels").map(|l| l.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+            let jobs: usize = match flag("--jobs") {
+                None => 1,
+                Some(n) => n.parse().ok().filter(|n| (1..=256).contains(n)).ok_or_else(|| anyhow::anyhow!("--jobs takes a number from 1 to 256"))?,
+            };
+            let work = PathBuf::from(flag("--work").unwrap_or_else(|| "gitter-runner-work".into()));
+            runner(url, token, labels, jobs, work)
+        }
         "bench" => tokio::runtime::Runtime::new()?
             .block_on(gitter::bench::run(args.iter().any(|a| a == "--check"))),
         "--version" | "-V" | "version" => {
@@ -109,10 +132,30 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[tokio::main]
-async fn serve(cfg: gitter::Config) -> anyhow::Result<()> {
+async fn runner(url: String, token: String, extra: Vec<String>, jobs: usize, work: PathBuf) -> anyhow::Result<()> {
+    use gitter::ci::runner::{Backend, Runner, default_labels, serve};
+    std::fs::create_dir_all(&work)?;
+    let mut labels = default_labels().await;
+    labels.extend(extra);
+    println!("gitter runner: {} job(s) at once for {url}, labels {}", jobs, labels.join(", "));
+    let r = Runner { backend: std::sync::Arc::new(Backend::remote(&url, &token)), labels, work: work.canonicalize()? };
+    tokio::select! {
+        _ = serve(r, move || jobs, None) => {}
+        _ = stop_signal() => {
+            println!("stopping: killing running steps (their jobs go back to the queue)");
+            gitter::ci::runner::shutdown(std::time::Duration::from_secs(30)).await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
     for d in ["repos", "home"] {
         std::fs::create_dir_all(cfg.data_dir.join(d))?;
     }
+    // Absolute, so paths handed to git and CI jobs (file:// URLs, docker mounts) don't depend on the working directory.
+    cfg.data_dir = cfg.data_dir.canonicalize()?;
     gitter::ops::reconcile(&cfg)?;
     let db = Db::open(&cfg.data_dir.join("gitter.db"))?;
     let addr = cfg.addr.clone();
@@ -136,6 +179,8 @@ async fn serve(cfg: gitter::Config) -> anyhow::Result<()> {
         );
         *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
     }
+    tokio::spawn(gitter::ci::upkeep(st.clone()));
+    tokio::spawn(gitter::ci::runner::builtin(st.clone()));
     let st2 = st.clone();
     tokio::spawn(async move {
         st2.git.sweep().await;
@@ -161,6 +206,14 @@ async fn serve(cfg: gitter::Config) -> anyhow::Result<()> {
 }
 
 async fn shutdown() {
+    stop_signal().await;
+    println!("shutting down");
+    // Kill running CI steps (they're in their own process groups) before exiting.
+    gitter::ci::runner::shutdown(std::time::Duration::from_secs(10)).await;
+}
+
+/// Ctrl-C or SIGTERM.
+async fn stop_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -174,5 +227,4 @@ async fn shutdown() {
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
-    println!("shutting down");
 }

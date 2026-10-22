@@ -20,7 +20,8 @@ export default async function (ctx) {
       <div class="commit-head">
         <div class="spread" style="align-items:flex-start">
           <h1>${c.subject}</h1>
-          <a class="btn sm" href="${base}/tree/${c.sha}">${icon('code', 'sm')} Browse files</a>
+          <div class="row"><span class="ci-slot" data-ci-sha="${c.sha}" data-ci-label="1"></span>
+          <a class="btn sm" href="${base}/tree/${c.sha}">${icon('code', 'sm')} Browse files</a></div>
         </div>
         ${c.body ? html`<pre class="body">${c.body}</pre>` : ''}
       </div>

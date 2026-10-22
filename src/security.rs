@@ -193,6 +193,63 @@ pub async fn use_code(db: &Db, user_id: i64, code: &str) -> R<Option<String>> {
     .await
 }
 
+// ---------- server key: encrypts secrets at rest ----------
+
+/// The instance's 32-byte key in GITTER_DATA/secret.key, created (owner-only) on first use.
+/// It's in the data folder, so backups carry it; anyone with the backup can read the secrets.
+pub fn server_key(data_dir: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    let p = data_dir.join("secret.key");
+    if let Ok(b) = std::fs::read(&p) {
+        // A short file (a disk that filled up mid-write) must not be replaced:
+        // that would silently orphan every secret sealed with the real key.
+        return b.try_into().map_err(|b: Vec<u8>| {
+            std::io::Error::other(format!("{} is {} bytes, not 32: restore it from a backup", p.display(), b.len()))
+        });
+    }
+    let mut k = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut k);
+    std::fs::create_dir_all(data_dir)?;
+    // Written whole to a temp file, then linked into place (never over an existing key),
+    // so a crash or a full disk can't leave a short key behind.
+    let tmp = data_dir.join(format!(".key-{}.tmp", hex::encode(&k[..6])));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(&tmp)?;
+    std::io::Write::write_all(&mut f, &k)?;
+    f.sync_all()?;
+    let linked = std::fs::hard_link(&tmp, &p);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(k),
+        // Another process made it first: use theirs.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => server_key(data_dir),
+        Err(e) => Err(e),
+    }
+}
+
+/// Encrypt with ChaCha20-Poly1305: a random nonce followed by the ciphertext.
+pub fn seal(key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    let c = chacha20poly1305::ChaCha20Poly1305::new(key.into());
+    let mut n = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut n);
+    let mut out = n.to_vec();
+    out.extend(c.encrypt(&n.into(), plain).expect("in-memory encryption cannot fail"));
+    out
+}
+
+pub fn open(key: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    if sealed.len() < 12 {
+        return None;
+    }
+    let c = chacha20poly1305::ChaCha20Poly1305::new(key.into());
+    let (n, ct) = sealed.split_at(12);
+    c.decrypt(n.into(), ct).ok()
+}
+
 // ---------- audit log ----------
 
 /// One security event. `subject` is the account it concerns (shown in that
@@ -347,6 +404,25 @@ mod tests {
         assert_eq!(check_totp(&s, "12345", 0), None);
         assert_eq!(normalize_recovery(" K7QP2MXD "), "k7qp-2mxd");
         assert_eq!(new_recovery_codes().len(), 10);
+    }
+
+    #[test]
+    fn sealed_secrets_round_trip_and_resist_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = server_key(dir.path()).unwrap();
+        assert_eq!(server_key(dir.path()).unwrap(), k, "the key is stable");
+        let s = seal(&k, b"hunter2");
+        assert_ne!(&s[12..], b"hunter2");
+        assert_eq!(open(&k, &s).as_deref(), Some(&b"hunter2"[..]));
+        let mut bad = s.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(open(&k, &bad).is_none());
+        assert!(open(&[7; 32], &s).is_none());
+        // A damaged key is an error, never silently replaced (that would orphan every secret).
+        let bad = tempfile::tempdir().unwrap();
+        std::fs::write(bad.path().join("secret.key"), b"short").unwrap();
+        assert!(server_key(bad.path()).unwrap_err().to_string().contains("not 32"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left behind");
     }
 
     #[test]

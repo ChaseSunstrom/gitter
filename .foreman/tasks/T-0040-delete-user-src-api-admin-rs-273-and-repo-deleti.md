@@ -2,13 +2,13 @@
 id: T-0040
 type: FEATURE
 tier: L
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-21T22:39:49Z
-updated: 2026-10-21T22:39:49Z
+updated: 2026-10-21T23:39:30Z
 ---
 # Delete_user` (src/api/admin.rs:273) and repo deletion have no LFS cleanup hook
 ## Raw request
@@ -27,4 +27,5 @@ updated: 2026-10-21T22:39:49Z
 ## Verification evidence
 ## Log
 - 2026-10-21T22:39:49Z created
+- 2026-10-21T23:39:30Z dropped: fixed in 227e6fb: repo and user deletion collect their LFS objects (lfs::collect)
 ## Follow-ups captured

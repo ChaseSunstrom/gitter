@@ -31,6 +31,19 @@ pub struct Settings {
     /// Changes (posts, edits, pushes) per minute from one account (0 = no limit).
     #[serde(default = "default_write_rate")]
     pub write_rate_per_min: u32,
+    /// Whose repositories run CI: "off", "admins" (repos owned by admins) or "everyone".
+    #[serde(default = "default_ci")]
+    pub ci: String,
+    /// Jobs the runner built into the server runs at once (0 turns it off).
+    #[serde(default = "default_builtin_jobs")]
+    pub builtin_runner_jobs: u32,
+}
+
+fn default_ci() -> String {
+    "admins".into()
+}
+fn default_builtin_jobs() -> u32 {
+    2
 }
 
 fn default_storage() -> u64 {
@@ -60,6 +73,8 @@ impl Settings {
             max_storage_mb: default_storage(),
             api_rate_per_min: default_api_rate(),
             write_rate_per_min: default_write_rate(),
+            ci: default_ci(),
+            builtin_runner_jobs: default_builtin_jobs(),
         }
     }
 
@@ -81,6 +96,12 @@ impl Settings {
         }
         if !matches!(self.signup.as_str(), "open" | "invite" | "closed") {
             return Err(AppError::bad("Sign-up must be open, invite-only or closed"));
+        }
+        if !matches!(self.ci.as_str(), "off" | "admins" | "everyone") {
+            return Err(AppError::bad("CI must be off, admins or everyone"));
+        }
+        if self.builtin_runner_jobs > 64 {
+            return Err(AppError::bad("The built-in runner runs at most 64 jobs at once"));
         }
         if self.max_storage_mb > 10_000_000 {
             return Err(AppError::bad("Storage per account must be under 10 TB (0 means no limit)"));

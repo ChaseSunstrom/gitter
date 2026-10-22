@@ -29,6 +29,7 @@ export function commitRow(meta, c, i = 0) {
       ${c.body ? html`<pre class="body" hidden>${c.body}</pre>` : ''}
     </div>
     <div class="acts">
+      <span class="ci-slot" data-ci-sha="${c.sha}"></span>
       <div class="btn-group"><button class="btn sm icon" data-copy="${c.sha}" data-copy-label="Commit SHA copied" title="Copy full SHA" aria-label="Copy SHA">${icon('copy', 'sm')}</button>
       <a class="btn sm mono" href="${base}/commit/${c.sha}">${short(c.sha)}</a></div>
       <a class="btn sm icon hide-sm" href="${base}/tree/${c.sha}" title="Browse the repository at this point" aria-label="Browse files">${icon('code', 'sm')}</a>

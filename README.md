@@ -10,6 +10,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 - **Command palette:** press `Ctrl K` or `/` to jump to any repository, file, branch or action. Press `?` for every shortcut.
 - **Account security:** optional two-factor sign-in (any authenticator app, with recovery codes), a list of where you're signed in with one-click sign-out, a password re-check before dangerous actions (deleting a repo, making a private repo public, creating tokens), and a tamper-evident security log for you and for admins (`gitter doctor` verifies it). Code views mark hidden Unicode ("Trojan Source" bidi tricks, zero-width characters) and look-alike letters from other alphabets, with a warning above the file or diff.
 - **Safe to run in public:** per-address and per-account rate limits (429 with Retry-After), limits on concurrent git transfers, per-account storage quotas enforced by git itself on push, open / invite-only / closed sign-up with invite links, and a report button on repositories, issues, comments and accounts that feeds an admin queue where moderators dismiss, hide or suspend.
+- **CI built in:** put a `.gitter/ci.yml` (or just a `.gitter/ci.sh`) in a repository and every push and pull request runs it, on a runner inside the server or on your own machines with `gitter runner`. Live logs with colors and a fold per step, secrets, artifacts, matrices, schedules, re-runs, and a pass/fail mark on commits and pull requests.
 - **Themes:** Aurora (the default), Forge, Ultraviolet and Daylight, each in light and dark. Pick one in Settings → Appearance or from the palette.
 
 ## Self-host it (one file)
@@ -83,7 +84,61 @@ Accounts with two-factor authentication need a token for git over HTTPS; the pas
 
 Git LFS works with no setup: `git lfs track '*.psd'`, commit and push as usual. Files are stored once by content under `GITTER_DATA/lfs` (forks share them), each repository can only download the files pushed to it, they count toward the owner's storage quota, the largest file is set in Site administration (2 GB by default), and backups include them. Files no repository uses any more are removed at the next start. The web view shows LFS files as "Stored with Git LFS" with a download link, and raw links serve the real file. File locking and resumable (Range) downloads aren't supported; git-lfs skips locking and restarts an interrupted download.
 
-The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`, `gitter bench [--check]` (`-` as the file means stdout/stdin).
+The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`, `gitter bench [--check]` (`-` as the file means stdout/stdin), and `gitter runner` for CI machines.
+
+## CI
+
+Add `.gitter/ci.yml`:
+
+```yaml
+on:
+  push:
+    branches: [main, "release/*"]
+  pull_request:
+  schedule: ["0 3 * * *"]        # UTC, on the default branch
+  manual:                        # a Run button on the CI tab
+jobs:
+  test:
+    image: rust:1                # optional: run the steps in this docker image
+    matrix: { toolchain: [stable, beta] }
+    env: { RUSTUP_TOOLCHAIN: "${{ matrix.toolchain }}" }
+    steps:
+      - name: Tests
+        run: cargo test
+  docs:
+    paths: ["docs/**"]           # only when these files change
+    steps: [make docs]
+    artifacts: ["site/**"]       # downloadable from the run
+  deploy:
+    needs: [test]
+    timeout: 10m
+    steps:
+      - run: ./deploy.sh "$DEPLOY_KEY"
+```
+
+- Without `on:`, pipelines run on pushes, pull requests and the Run button. A plain `.gitter/ci.sh` is a one-job pipeline that runs that script.
+- Every step runs with `sh -e` in a fresh checkout of the commit. It gets `CI=true` and `GITTER_REPOSITORY`, `GITTER_SHA`, `GITTER_REF`, `GITTER_BRANCH`, `GITTER_EVENT`, `GITTER_RUN_NUMBER`, plus the job's `env`, `MATRIX_*` and the repository's secrets.
+- Secrets live under the repository's **Settings → CI secrets**. They are encrypted at rest with `GITTER_DATA/secret.key`, which backups include, and their values are masked in logs.
+- `needs` waits for other jobs and skips when one of them fails. `runs-on: [gpu]` sends a job to runners with those labels. The default `timeout` is 30 minutes.
+- The YAML is a documented subset: block maps and lists, `|` and `>` text, quotes, and `[a, b]` / `{a: b}`. Anchors and tags give a clear error.
+
+**Runners.** The server runs up to 2 jobs at once itself, for repositories owned by admins only. A job there runs as the server's own user and can read its data folder, so treat pushing to an admin's repository as server access. To add machines, make a token in **Site administration → CI runners**, then run on the machine. It needs git, and docker for jobs with an `image`:
+
+```sh
+GITTER_RUNNER_TOKEN=grn_… gitter runner --url https://git.example.com --labels gpu --jobs 4
+```
+
+Jobs are leased with a heartbeat. A job whose runner dies goes back to the queue, and a runner that lost its lease can't report over the new attempt. Stopping a runner (Ctrl-C or SIGTERM) kills its running steps, and their jobs go back to the queue.
+
+**Who can run CI** is set in Site administration:
+
+- off;
+- admins' repositories (the default);
+- everyone: anyone's jobs go to separate runners, never the built-in one. Use disposable runner machines for this.
+
+Turning CI off stops new runs, re-runs and queued jobs.
+
+**Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts are deleted 30 days after their job, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
 
 ## Configuration
 
@@ -127,5 +182,6 @@ Behind nginx or Caddy, set `GITTER_URL` to the public address. Requests whose `O
 ```sh
 cargo test                     # unit tests
 cd scripts && npm install      # once, for the browser checks (uses Playwright's Chromium, or set CHROME=/path/to/chrome)
-bash scripts/e2e.sh            # real server + git clone/push + every page in headless Chromium
+bash scripts/e2e.sh            # real server + git clone/push + CI + every page in headless Chromium
+bash scripts/ci-e2e.sh         # CI on an external `gitter runner`
 ```

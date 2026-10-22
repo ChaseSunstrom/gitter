@@ -265,6 +265,77 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE repos ADD COLUMN wiki_bytes INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE snippets ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v9: built-in CI
+    r#"
+    CREATE TABLE ci_runners (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        token_hash TEXT UNIQUE,
+        labels TEXT NOT NULL DEFAULT '[]',
+        builtin INTEGER NOT NULL DEFAULT 0,
+        last_seen INTEGER,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE ci_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        number INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        ref TEXT NOT NULL,
+        sha TEXT NOT NULL,
+        pr_number INTEGER,
+        actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        title TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'queued',
+        error TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER,
+        UNIQUE(repo_id, number)
+    );
+    CREATE INDEX ci_runs_sha ON ci_runs(repo_id, sha);
+    CREATE TABLE ci_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES ci_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        key TEXT NOT NULL,
+        spec TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        runner_id INTEGER REFERENCES ci_runners(id) ON DELETE SET NULL,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        lease_until INTEGER,
+        token_hash TEXT,
+        exit_code INTEGER,
+        steps TEXT NOT NULL DEFAULT '[]',
+        -- Why a job was skipped: 'paths' (no matching change) or 'needs' (a job it needs didn't pass).
+        reason TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER
+    );
+    CREATE INDEX ci_jobs_queue ON ci_jobs(status, id);
+    CREATE INDEX ci_jobs_run ON ci_jobs(run_id);
+    CREATE TABLE ci_secrets (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        value BLOB NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(repo_id, name)
+    );
+    CREATE TABLE ci_artifacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES ci_jobs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(job_id, name)
+    );
+    CREATE TABLE ci_schedules (
+        repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+        crons TEXT NOT NULL,
+        last_minute INTEGER NOT NULL DEFAULT 0
+    );
+    "#,
 ];
 
 impl Db {

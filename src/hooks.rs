@@ -6,7 +6,7 @@ use crate::auth::User;
 use crate::repo::Repo;
 use crate::smart_http::RefUpdate;
 
-pub async fn on_push(st: &AppState, repo: &Repo, _user: &User, updates: &[RefUpdate]) {
+pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpdate]) {
     let default_ref = format!("refs/heads/{}", repo.default_branch);
     let empty_before = updates.iter().all(|u| u.old.is_none());
     if empty_before || updates.iter().any(|u| u.refname == default_ref) {
@@ -14,6 +14,7 @@ pub async fn on_push(st: &AppState, repo: &Repo, _user: &User, updates: &[RefUpd
     }
     st.git.maintain_soon(repo.path.clone());
     refresh_size(st, repo.id).await;
+    crate::ci::trigger::on_push(st, repo, user.id, updates).await;
 }
 
 /// Record how much disk a repository uses (for storage quotas and the admin page).

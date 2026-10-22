@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod bench;
+pub mod ci;
 pub mod db;
 pub mod diff;
 pub mod error;
@@ -61,12 +62,17 @@ pub struct AppState {
     pub challenges: Arc<security::Challenges>,
     /// Git transfers in flight per client address.
     pub transfers: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    /// Encrypts CI secrets at rest (GITTER_DATA/secret.key).
+    pub key: Arc<[u8; 32]>,
+    /// Wakes the built-in runner when a job is queued.
+    pub ci_wake: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
     pub fn new(cfg: Config, db: db::Db) -> AppState {
         let git = git::Git::new(cfg.data_dir.join("repos"), cfg.data_dir.join("home"), 64);
         let settings = Arc::new(settings::Live::new(settings::Settings::from_config(&cfg)));
+        let cfg_dir = cfg.data_dir.clone();
         AppState {
             db,
             git,
@@ -77,6 +83,8 @@ impl AppState {
             setup_code: Arc::default(),
             challenges: Arc::default(),
             transfers: Arc::default(),
+            key: Arc::new(security::server_key(&cfg_dir).unwrap_or_else(|e| panic!("can't read or create {}/secret.key: {e}", cfg_dir.display()))),
+            ci_wake: Arc::default(),
         }
     }
 }
@@ -132,6 +140,7 @@ pub fn router(st: AppState) -> Router {
             get(api::code::archive).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),
         )
         .merge(git_http)
+        .merge(ci::http::router())
         .merge(app)
         .layer(axum::middleware::from_fn(web::security_headers))
         .with_state(st)

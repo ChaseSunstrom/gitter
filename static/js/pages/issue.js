@@ -174,7 +174,7 @@ function mergeBox(meta, data, pd) {
   }
   const canMerge = meta.can_write && pull.mergeable && pd.commits.length > 0;
   return html`<div class="merge-box ${canMerge ? 'ready' : ''}">
-    <div class="row merge-status">${status}</div>
+    <div class="row merge-status">${status}${pd.head_sha ? html`<span class="merge-ci" data-ci-sha="${pd.head_sha}" data-ci-label="1"></span>` : ''}</div>
     ${canMerge ? html`<form class="merge-form" id="merge-form">
       <select class="select" name="method" aria-label="Merge method">
         <option value="merge">Create a merge commit</option>

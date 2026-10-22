@@ -69,7 +69,10 @@ const pages = [
   ['/alice/hello/issues/new', []],
   ['/alice/hello/insights', ['Alice']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
-  ['/alice/hello/settings', ['Danger zone']],
+  ['/alice/hello/settings', ['Danger zone', 'CI secrets']],
+  ['/alice/hello/ci', ['CI runs', 'Add CI', '#1']],
+  ['/alice/hello/ci/1', ['Add CI', 'build', 'test', 'Say hello', 'Set up job', 'Passed']],
+  ['/admin/runners', ['Runners', 'built-in', 'Add a runner']],
   ['/alice/hello/edit/main/README.md', ['Commit changes']],
   ['/alice/hello/new/main', ['Commit changes']],
   ['/alice/hello/upload/main', ['Drag files']],
@@ -83,7 +86,7 @@ const pages = [
   ['/settings/appearance', []],
   ['/admin', ['Site administration', 'Storage']],
   ['/admin/users', ['alice', 'bob']],
-  ['/admin/settings', ['Instance name', 'Largest Git LFS file']],
+  ['/admin/settings', ['Instance name', 'Largest Git LFS file', 'Jobs the built-in runner runs at once']],
   ['/alice/hello/wiki', ['Hello wiki', 'Setup', 'Pages']],
   ['/alice/hello/wiki/Setup', ['Run cargo build']],
   ['/alice/hello/wiki/Home/edit', ['Save page', 'Editing Home']],
@@ -105,6 +108,38 @@ const pages = [
 if ((await ctx.request.get(BASE + '/api/repos/alice/media')).ok()) pages.push(['/alice/media/blob/main/big.bin', ['Stored with Git LFS', 'Download', 'Git LFS']]);
 for (const [p, e] of pages) await visit(ctx, p, e);
 await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
+
+// CI: a step's fold opens to its log, and commits show their CI result.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/alice/hello/ci/1', { waitUntil: 'networkidle' });
+  await page.locator('.ci-fold summary', { hasText: 'Say hello' }).click();
+  const shown = await page.locator('.ci-fold[open] .ci-log', { hasText: 'hello from ci' }).count();
+  await page.goto(BASE + '/alice/hello', { waitUntil: 'networkidle' });
+  const badge = await page.locator('.commit-bar .ci-badge .ci-st.ok').count();
+  if (errors.length || !shown || !badge) { failed++; console.log('✗ CI fold or badge', { shown, badge, errors }); }
+  else console.log('  ok CI log folds open per step; the latest commit shows its passing run');
+  await page.close();
+}
+
+// CI: a running job's log streams into the page as it's written.
+{
+  const yml = 'jobs:\n  live:\n    steps:\n      - name: Slow step\n        run: echo first line; sleep 2; echo second line\n';
+  await ctx.request.post(BASE + '/api/repos/alice/hello/contents', { headers: { Origin: BASE }, data: { branch: 'main', message: 'Slow CI', changes: [{ path: '.gitter/ci.yml', content: yml }] } });
+  const runs = await (await ctx.request.get(BASE + '/api/repos/alice/hello/ci/runs')).json();
+  const n = runs.runs[0].number;
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(`${BASE}/alice/hello/ci/${n}`, { waitUntil: 'domcontentloaded' });
+  const got = await page.locator('.ci-fold[open] .ci-log', { hasText: 'second line' }).waitFor({ timeout: 15000 }).then(() => true, () => false);
+  const passed = await page.locator('.ci-head .ci-st.ok').waitFor({ timeout: 10000 }).then(() => true, () => false);
+  if (errors.length || !got || !passed) { failed++; console.log('✗ CI live log', { got, passed, errors }); }
+  else console.log('  ok a running job streams its log live and the page turns green when it passes');
+  await page.close();
+}
 
 // Palette opens with Ctrl+K and finds a file.
 {

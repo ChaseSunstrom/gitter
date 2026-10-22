@@ -2,13 +2,13 @@
 id: T-0035
 type: FEATURE
 tier: M
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-21T21:16:09Z
-updated: 2026-10-21T21:16:09Z
+updated: 2026-10-21T23:39:31Z
 ---
 # Hooks::after_import` (`hooks.rs:19`) is only called by the bench, although its comment say
 ## Raw request
@@ -27,4 +27,5 @@ updated: 2026-10-21T21:16:09Z
 ## Verification evidence
 ## Log
 - 2026-10-21T21:16:09Z created
+- 2026-10-21T23:39:31Z dropped: folded into T-0010 (import by URL will call hooks::after_import)
 ## Follow-ups captured

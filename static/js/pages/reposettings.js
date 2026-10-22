@@ -9,7 +9,10 @@ export default async function (ctx) {
   if (!meta.can_write) throw Object.assign(new Error('Only people who can write to this repository can change its settings'), { status: 403 });
   const api = repoUrl(meta.owner, meta.name);
   const full = `${meta.owner}/${meta.name}`;
-  const deploy = (await get(`${api}/deploy-tokens`, { fresh: true })).tokens;
+  const [deploy, secrets] = await Promise.all([
+    get(`${api}/deploy-tokens`, { fresh: true }).then((d) => d.tokens),
+    get(`${api}/ci/secrets`, { fresh: true }).then((d) => d.secrets),
+  ]);
   const body = html`<div class="mid stack" style="max-width:820px">
     <form class="box" id="general"><div class="box-head"><b>General</b></div><div class="box-body settings-sec">
       <div class="field"><label for="s-name">Repository name</label><input id="s-name" class="input" value="${meta.name}" required>
@@ -34,6 +37,18 @@ export default async function (ctx) {
       ${deploy.length ? html`<div class="list">${deploy.map((t) => html`<div class="list-row"><div class="grow"><b>${t.name}</b> <span class="pill">${t.scope === 'write' ? 'Read and write' : 'Read only'}</span>${t.expired ? html` <span class="pill closed">Expired</span>` : ''}
           <div class="small muted">Created by ${t.created_by} ${timeEl(t.created_at)} · ${t.last_used ? html`last used ${timeEl(t.last_used)}` : 'never used'}${t.expires_at && !t.expired ? html` · expires ${timeEl(t.expires_at)}` : ''}</div></div>
         <button class="btn sm danger" data-dt-del="${t.id}" data-name="${t.name}">Delete</button></div>`)}</div>` : ''}
+    </div></div>
+
+    <div class="box" id="secrets"><div class="box-head"><b>CI secrets</b></div><div class="box-body stack">
+      <p class="muted small">CI jobs get these as environment variables, and their values are masked in logs. They're encrypted on the server and can't be read back, only replaced.</p>
+      <form id="sec-form" class="row wrap-ok">
+        <input class="input mono" name="name" placeholder="NAME" pattern="[A-Za-z_][A-Za-z0-9_]*" title="Letters, digits and _ (saved in capitals)" maxlength="64" required style="max-width:220px" aria-label="Secret name" autocomplete="off" spellcheck="false">
+        <input class="input mono" name="value" type="password" placeholder="Value" required autocomplete="new-password" aria-label="Secret value" style="max-width:320px">
+        <button class="btn primary" type="submit">Save secret</button>
+      </form>
+      ${secrets.length ? html`<div class="list">${secrets.map((s) => html`<div class="list-row">${icon('key', 'sm muted')}<div class="grow"><b class="mono">${s.name}</b>
+          <div class="small muted">Updated ${timeEl(s.updated_at)}</div></div>
+        <button class="btn sm danger" data-sec-del="${s.name}">Delete</button></div>`)}</div>` : ''}
     </div></div>
 
     <div class="box danger-zone"><div class="box-head"><b class="c-red">Danger zone</b></div><div class="list">
@@ -92,6 +107,22 @@ export default async function (ctx) {
         try { await send('DELETE', `${api}/deploy-tokens/${b.dataset.dtDel}`); } catch (x) { return toast(x.message, 'err'); }
         toast('Deploy token deleted');
         navigate(location.pathname, { replace: true });
+      });
+      const sf = $('#sec-form', el);
+      sf.addEventListener('submit', action(sf.querySelector('button'), async () => {
+        const name = sf.name.value.trim().toUpperCase();
+        await send('PUT', `${api}/ci/secrets/${encodeURIComponent(name)}`, { value: sf.value.value });
+        toast(`Saved ${name}`);
+        navigate(location.pathname, { replace: true, scroll: false });
+      }));
+      $('#secrets', el).addEventListener('click', async (e) => {
+        const b = e.target.closest('[data-sec-del]');
+        if (!b) return;
+        const name = b.dataset.secDel;
+        if (!(await confirmDialog({ title: `Delete ${name}?`, text: 'Jobs that use it will no longer get it.', ok: 'Delete', danger: true }))) return;
+        try { await send('DELETE', `${api}/ci/secrets/${encodeURIComponent(name)}`); } catch (x) { return toast(x.message, 'err'); }
+        toast(`Deleted ${name}`);
+        navigate(location.pathname, { replace: true, scroll: false });
       });
       const del = $('#s-del', el);
       del.addEventListener('click', action(del, async () => {

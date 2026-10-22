@@ -235,6 +235,23 @@ else
   echo "· git-lfs not installed and the download failed: LFS client check skipped"
 fi
 
+# --- CI: a push runs the pipeline on the built-in runner
+CI_YML='jobs:\n  build:\n    steps:\n      - name: Say hello\n        run: echo hello from ci && ls src\n    artifacts: [\"src/**\"]\n  test:\n    needs: [build]\n    steps:\n      - run: echo testing\n'
+api POST /repos/alice/hello/contents "{\"branch\":\"main\",\"message\":\"Add CI\",\"changes\":[{\"path\":\".gitter/ci.yml\",\"content\":\"$CI_YML\"}]}"
+ci_status=none
+for _ in $(seq 150); do
+  api GET /repos/alice/hello/ci/runs/1
+  ci_status=$(jq_ 'd["status"]')
+  case "$ci_status" in success|failure|cancelled) break ;; esac
+  sleep 0.2
+done
+[ "$ci_status" = success ] || fail "CI run on the built-in runner ended as $ci_status: $BODY"
+JOB=$(jq_ 'd["jobs"][0]["id"]')
+curl -sf -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/log" | grep -q 'hello from ci' || fail "CI log"
+curl -sf -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/artifacts" -o "$TMP/art.tgz" && tar -tzf "$TMP/art.tgz" | grep -q 'src/main.rs' || fail "CI artifacts"
+curl -sf -N -m 5 -b "$JAR" "$BASE/api/repos/alice/hello/ci/jobs/$JOB/log/stream" | grep -q 'event: status' || fail "CI log stream"
+ok "CI: a push runs jobs in order on the built-in runner, with log, live stream and artifacts"
+
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")
 [ "$code" = 200 ] && grep -q '<html' "$TMP/index.html" || fail "SPA route"

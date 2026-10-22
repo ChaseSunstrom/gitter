@@ -741,6 +741,7 @@ pub async fn create_pull(
     }
     let (rid, uid) = (r.id, u.id);
     let title = req.title.clone();
+    let (head_branch, base_branch) = (req.head.clone(), req.base.clone());
     let num = st
         .db
         .call(move |c| {
@@ -771,6 +772,9 @@ pub async fn create_pull(
         1,
     )
     .await?;
+    if let Err(e) = crate::ci::trigger::on_pull_opened(&st, &r, u.id, num, &head_branch, &base_branch).await {
+        eprintln!("ci: {}#{num}: {}", r.full_name(), e.msg);
+    }
     Ok(Json(json!({ "number": num })))
 }
 

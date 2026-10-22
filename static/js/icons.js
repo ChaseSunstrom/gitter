@@ -70,6 +70,8 @@ const P = {
   filter: '<path d="M3 5h18l-7 8v6l-4 2v-8Z"/>',
   menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
   label: '<path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
+  play: '<path d="M7 4.5v15l12-7.5Z"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   keyboard: '<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/>',
   'git': '<circle cx="12" cy="9.5" r="3.6"/><path d="M15.6 5.9v8.4a4 4 0 0 1-4 4H10"/><circle cx="8.3" cy="18.3" r="1.8" fill="currentColor"/>',
 };

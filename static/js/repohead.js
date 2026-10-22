@@ -27,6 +27,7 @@ const TABS = [
   ['code', 'code', 'Code', ''],
   ['issues', 'issue', 'Issues', '/issues'],
   ['pulls', 'pr', 'Pull requests', '/pulls'],
+  ['ci', 'zap', 'CI', '/ci'],
   ['discussions', 'comment', 'Discussions', '/discussions'],
   ['wiki', 'book', 'Wiki', '/wiki'],
   ['commits', 'history', 'Commits', '/commits'],
@@ -88,8 +89,40 @@ export function placeTabBar(root) {
   });
 }
 
+// ---------- CI status ----------
+export const CI_LABEL = {
+  success: 'Passed', failure: 'Failed', error: 'Lost', cancelled: 'Cancelled', skipped: 'Skipped',
+  running: 'Running', queued: 'Queued', waiting: 'Waiting', pending: 'Not started',
+};
+const CI_ICON = {
+  success: ['check', 'ok'], failure: ['x', 'bad'], error: ['x', 'bad'], cancelled: ['minus', 'off'], skipped: ['minus', 'off'],
+  running: ['pulse', 'run'], queued: ['clock', 'wait'], waiting: ['clock', 'wait'], pending: ['clock', 'wait'],
+};
+
+export function ciIcon(status, cls = '') {
+  const [ic, k] = CI_ICON[status] || CI_ICON.pending;
+  const label = CI_LABEL[status] || status;
+  return html`<span class="ci-st ${k} ${cls}" title="${label}" aria-label="${label}">${icon(ic, 'sm')}</span>`;
+}
+
+/** Fill every `[data-ci-sha]` placeholder under `root` with that commit's latest CI result. */
+export function paintCiStatus(root, meta) {
+  const els = [...root.querySelectorAll('[data-ci-sha]')];
+  const shas = [...new Set(els.map((e) => e.dataset.ciSha))].slice(0, 100);
+  if (!shas.length) return;
+  get(`${repoUrl(meta.owner, meta.name)}/ci/status?shas=${shas.join(',')}`, { fresh: true }).then((m) => {
+    for (const e of els) {
+      const s = m[e.dataset.ciSha];
+      if (!s) continue;
+      const label = e.dataset.ciLabel ? html` <span>${CI_LABEL[s.status] || s.status}</span>` : '';
+      e.innerHTML = html`<a class="ci-badge" href="/${meta.owner}/${meta.name}/ci/${s.number}" title="CI run #${s.number}: ${CI_LABEL[s.status] || s.status}">${ciIcon(s.status)}${label}</a>`.s;
+    }
+  }).catch(() => {});
+}
+
 export function mountRepoHeader(root, meta) {
   placeTabBar(root);
+  paintCiStatus(root, meta);
   $('#report-btn', root)?.addEventListener('click', () => reportDialog({ kind: 'repo', owner: meta.owner, repo: meta.name }, 'repository'));
   const base = repoUrl(meta.owner, meta.name);
   const starBtn = $('#star-btn', root);

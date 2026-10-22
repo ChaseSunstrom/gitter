@@ -239,6 +239,9 @@ pub async fn has_2fa(db: &Db, user_id: i64) -> R<bool> {
 }
 
 pub async fn user_by_token(db: &Db, raw: &str) -> R<Option<User>> {
+    if raw.starts_with(crate::ci::queue::JOB_TOKEN_PREFIX) {
+        return job_user(db, raw).await;
+    }
     if !raw.starts_with(TOKEN_PREFIX) {
         return Ok(None);
     }
@@ -268,6 +271,35 @@ pub async fn user_by_token(db: &Db, raw: &str) -> R<Option<User>> {
         Ok(u)
     })
     .await
+}
+
+/// A running CI job's token reads its own repository, like a read-only deploy
+/// token, until the attempt ends.
+async fn job_user(db: &Db, raw: &str) -> R<Option<User>> {
+    let hash = sha256_hex(raw);
+    db.call(move |c| {
+        Ok(c.query_row(
+            "SELECT u.id, u.username, u.display_name, u.email, u.is_admin, r.repo_id FROM ci_jobs j
+             JOIN ci_runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id JOIN users u ON u.id = p.owner_id
+             WHERE j.token_hash = ?1 AND j.status = 'running' AND u.suspended = 0",
+            [hash],
+            |r| {
+                let mut u = User::from_row(r)?;
+                u.limits = Some(Limits { scope: Scope::Read, repo_id: Some(r.get("repo_id")?) });
+                Ok(u)
+            },
+        )
+        .optional()?)
+    })
+    .await
+}
+
+/// The password (or token) of a Basic Authorization header.
+pub fn basic_secret(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let b64 = v.strip_prefix("Basic ").or_else(|| v.strip_prefix("basic "))?;
+    let dec = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?).ok()?;
+    dec.split_once(':').map(|(_, s)| s.to_string())
 }
 
 /// Username + password, or username + access token (used by git over HTTP).

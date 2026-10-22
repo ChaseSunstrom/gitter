@@ -1,5 +1,6 @@
 pub mod account;
 pub mod admin;
+pub mod ci;
 pub mod code;
 pub mod discussions;
 pub mod issues;
@@ -13,7 +14,7 @@ use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use rusqlite::types::Value;
 use serde::Serialize;
@@ -60,6 +61,8 @@ pub fn router() -> Router<AppState> {
         .route("/admin/audit", get(security::admin_log))
         .route("/admin/invites", get(admin::invites).post(admin::create_invite))
         .route("/admin/invites/{id}", delete(admin::delete_invite))
+        .route("/admin/runners", get(ci::runners).post(ci::create_runner))
+        .route("/admin/runners/{id}", delete(ci::delete_runner))
         .route("/admin/reports", get(moderation::queue))
         .route("/admin/reports/{id}/resolve", post(moderation::resolve))
         .route("/reports", post(moderation::report))
@@ -135,6 +138,16 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/pulls/{{n}}/merge"),
             post(issues::merge_pull),
         )
+        .route(&format!("{repo}/ci/runs"), get(ci::runs).post(ci::start))
+        .route(&format!("{repo}/ci/runs/{{n}}"), get(ci::run))
+        .route(&format!("{repo}/ci/runs/{{n}}/cancel"), post(ci::cancel))
+        .route(&format!("{repo}/ci/runs/{{n}}/rerun"), post(ci::rerun))
+        .route(&format!("{repo}/ci/jobs/{{id}}/log"), get(ci::log))
+        .route(&format!("{repo}/ci/jobs/{{id}}/log/stream"), get(ci::log_stream))
+        .route(&format!("{repo}/ci/jobs/{{id}}/artifacts"), get(ci::artifacts))
+        .route(&format!("{repo}/ci/status"), get(ci::statuses))
+        .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
+        .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
         .route(&format!("{repo}/wiki"), get(wiki::pages).post(wiki::create))
         .route(
             &format!("{repo}/wiki/{{page}}"),

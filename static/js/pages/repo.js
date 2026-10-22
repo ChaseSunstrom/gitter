@@ -42,6 +42,7 @@ function lastCommitBar(meta, c, count, path) {
     ${avatar(c.author_email || c.author_name, 22)}
     <b class="nowrap">${c.author_name}</b>
     <a class="grow ellipsis muted commit-msg" href="${base}/commit/${c.sha}" title="${c.subject}">${c.subject}</a>
+    <span class="ci-slot" data-ci-sha="${c.sha}"></span>
     <a class="sha hide-sm" href="${base}/commit/${c.sha}">${short(c.sha)}</a>
     <span class="muted small nowrap hide-sm">${timeEl(c.commit_time)}</span>
     ${count != null ? html`<a class="btn ghost sm" href="${base}/commits/${encPath(state.rev)}${path ? '/' + encPath(path) : ''}">${icon('history', 'sm')}<b>${num(count)}</b><span class="hide-sm">${count === 1 ? 'commit' : 'commits'}</span></a>` : ''}
