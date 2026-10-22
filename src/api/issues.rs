@@ -1069,6 +1069,7 @@ pub(crate) struct MergePlan {
 /// for the merge queue, which checks the commit it makes rather than the head,
 /// so only the rule's other requirements (approvals) are looked at here.
 pub(crate) async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq, queued: bool) -> R<MergePlan> {
+    crate::mirrors::refuse_writes(r)?;
     let issue = load_issue(st, r, num, Some(u)).await?;
     if !issue.is_pr {
         return Err(AppError::not_found());
@@ -1230,6 +1231,7 @@ pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, p
             .delete_ref(&r.path, &format!("refs/heads/{head_b}"))
             .await;
         crate::hooks::forget_branches(st, r.id, vec![head_b.clone()]).await;
+        crate::mirrors::changed(st, r.id).await;
     }
     Ok(())
 }

@@ -843,5 +843,39 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Mirrors: e2e.sh's synced pull mirror shows its badge and settings; a push mirror added there
+// to a remote that isn't there fails in the server's loop and shows on the admin overview.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('pageerror', (e) => errors.push(String(e)));
+  let badge = '', listed = false, added = false, failing = false;
+  try {
+    await page.goto(BASE + '/alice/hello-mirror', { waitUntil: 'networkidle' });
+    badge = await page.locator('.mirror-badge').innerText();
+    await page.goto(BASE + '/alice/hello-mirror/settings/mirrors', { waitUntil: 'networkidle' });
+    listed = (await page.locator('#pull-mirror').innerText()).includes('/alice/hello.git');
+    await page.click('#add-push summary');
+    await page.fill('#add-push input[name=url]', BASE + '/alice/no-such-repo.git');
+    await page.check('#add-push input[name=allow_private]');
+    await page.click('#add-push button[type=submit]');
+    await page.waitForSelector('#push-mirrors .mirror-row', { timeout: 5000 });
+    added = true;
+    for (let i = 0; i < 40 && !failing; i++) {
+      await page.waitForTimeout(500);
+      const o = await (await page.request.get(BASE + '/api/admin/overview')).json();
+      failing = o.failing_mirrors.some((m) => m.name === 'hello-mirror' && m.direction === 'push');
+    }
+    await page.goto(BASE + '/admin', { waitUntil: 'networkidle' });
+    failing = failing && (await page.locator('#failing-mirrors').innerText()).includes('alice/hello-mirror');
+    await page.goto(BASE + '/alice/hello-mirror/settings/mirrors', { waitUntil: 'networkidle' });
+    failing = failing && (await page.locator('#push-mirrors').innerText()).includes('Failing');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !badge.includes('mirror of') || !listed || !added || !failing) { failed++; console.log('✗ mirrors', { badge, listed, added, failing, errors }); }
+  else console.log('  ok mirror badge; Settings → Mirrors lists the pull mirror and adds a push mirror; its failure shows there and on the admin overview');
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

@@ -917,6 +917,7 @@ pub async fn write_contents(
     Json(req): Json<WriteReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    crate::mirrors::refuse_writes(&r)?;
     if !validate::ref_name(&req.branch) {
         return Err(AppError::bad("That isn't a valid branch name"));
     }

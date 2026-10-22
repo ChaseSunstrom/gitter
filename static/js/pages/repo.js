@@ -59,6 +59,10 @@ function entryIcon(e) {
 function emptyRepo(meta) {
   const url = meta.clone_url;
   const base = `/${meta.owner}/${meta.name}`;
+  if (meta.mirror) {
+    return html`<div class="box empty-setup fade"><div class="box-body stack"><h2 style="font-size:18px">Waiting for the first sync</h2>
+      <p class="muted">This repository mirrors <span class="mono">${meta.mirror.url}</span>. Its branches and tags show up here once they're fetched.${meta.can_admin ? html` See how it's going in <a href="${base}/settings/mirrors">Settings → Mirrors</a>.` : ''}</p></div></div>`;
+  }
   return html`<div class="box empty-setup fade">
     <div class="box-body stack">
       <div><h2 style="font-size:18px">Let's get some code in here</h2><p class="muted">This repository is empty. Push an existing project or create the first file.</p></div>

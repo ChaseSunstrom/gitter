@@ -132,6 +132,10 @@ export default async function (ctx) {
       })}</div>` : ''}
     </div>
 
+    <div class="box" id="mirrors"><div class="box-head"><b>Mirrors</b><span class="grow"></span><a class="btn sm" href="/${full}/settings/mirrors">${icon('settings', 'sm')} Manage mirrors</a></div>
+      <div class="box-body"><p class="muted small">${meta.mirror ? html`This repository mirrors <b class="mono">${meta.mirror.url}</b> and is read-only here.` : 'Follow a remote repository (pull mirror), or push this one to other servers after every change (push mirrors).'}</p></div>
+    </div>
+
     <div class="box danger-zone"><div class="box-head"><b class="c-red">Danger zone</b></div><div class="list">
       <div class="list-row"><div class="grow"><b>Change visibility</b><div class="muted small">This repository is <b>${meta.private ? 'private' : 'public'}</b>. ${meta.private ? 'Making it public lets anyone see and clone it.' : 'Making it private hides it from everyone without access.'}</div></div>
         <button class="btn danger" id="s-vis">${icon(meta.private ? 'globe' : 'lock', 'sm')} Make ${meta.private ? 'public' : 'private'}</button></div>

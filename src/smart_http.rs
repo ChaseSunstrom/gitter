@@ -162,6 +162,9 @@ pub async fn open(st: &AppState, user: Option<&User>, owner: &str, name: &str, p
     if push && !repo.can_write {
         return Err(AppError::new(StatusCode::FORBIDDEN, "You don't have push access to this repository"));
     }
+    if push {
+        crate::mirrors::refuse_writes(&repo)?;
+    }
     Ok(repo)
 }
 
@@ -457,7 +460,7 @@ fn parse_cgi_headers(b: &[u8]) -> (StatusCode, Vec<(String, String)>) {
     (status, out)
 }
 
-async fn ref_map(st: &AppState, repo: &Repo) -> Result<HashMap<String, String>, AppError> {
+pub async fn ref_map(st: &AppState, repo: &Repo) -> Result<HashMap<String, String>, AppError> {
     let out = st
         .git
         .ok(

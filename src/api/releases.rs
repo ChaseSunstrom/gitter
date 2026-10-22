@@ -239,6 +239,7 @@ async fn check_target(st: &AppState, r: &Repo, raw: &str) -> R<(String, String)>
 
 /// Point `refs/tags/<tag>` at a new annotated tag of commit `sha`, unless the tag appears meanwhile.
 async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title: &str) -> R<()> {
+    crate::mirrors::refuse_writes(r)?;
     let (name, email) = u.signature();
     // mktag checks the object strictly: no angle brackets or line breaks in the name, no NULs.
     let name: String = name.chars().filter(|c| !matches!(c, '<' | '>' | '\n' | '\r' | '\0')).collect();
@@ -248,7 +249,9 @@ async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title
     st.git
         .update_ref(&r.path, &format!("refs/tags/{tag}"), &oid, None)
         .await
-        .map_err(|_| AppError::conflict("That tag was just created by someone else. Try again."))
+        .map_err(|_| AppError::conflict("That tag was just created by someone else. Try again."))?;
+    crate::mirrors::changed(st, r.id).await;
+    Ok(())
 }
 
 #[derive(Deserialize)]

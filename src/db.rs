@@ -847,6 +847,35 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX repo_watches_repo ON repo_watches(repo_id, level);
     "#,
+    // v26: repository mirrors. A pull mirror (at most one per repository, which is then
+    // read-only here) fetches its remote's branches and tags every interval_secs; push
+    // mirrors push this repository's to their remote after each change. The row is its own queue:
+    // next_at is when to sync next (NULL: nothing waiting), running_until a lease on a
+    // sync in progress, so a burst of pushes is one mirror push.
+    r#"
+    CREATE TABLE mirrors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        direction TEXT NOT NULL CHECK (direction IN ('pull', 'push')),
+        url TEXT NOT NULL,
+        username TEXT NOT NULL DEFAULT '',
+        -- The password or token, sealed with GITTER_DATA/secret.key; NULL for none.
+        secret BLOB,
+        -- Set by a site admin only: may reach loopback and private addresses.
+        allow_private INTEGER NOT NULL DEFAULT 0,
+        interval_secs INTEGER NOT NULL DEFAULT 28800,
+        next_at INTEGER,
+        running_until INTEGER,
+        failures INTEGER NOT NULL DEFAULT 0,
+        last_ok_at INTEGER,
+        last_tried_at INTEGER,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX mirrors_one_pull ON mirrors(repo_id) WHERE direction = 'pull';
+    CREATE INDEX mirrors_repo ON mirrors(repo_id);
+    CREATE INDEX mirrors_due ON mirrors(next_at);
+    "#,
 ];
 
 impl Db {

@@ -1,5 +1,5 @@
 // Shared repository chrome: header, tabs, branch picker, clone menu, breadcrumbs.
-import { html, state, get, send, popover, closePop, toastErr, num, encPath, esc, modal, action, $, toast, reportDialog } from './lib.js';
+import { html, state, get, send, popover, closePop, toastErr, num, encPath, esc, modal, action, $, toast, reportDialog, timeEl } from './lib.js';
 import { icon } from './icons.js';
 import { navigate, refresh } from './main.js';
 
@@ -65,6 +65,7 @@ export function repoHeader(meta, tab) {
     </div>
     ${meta.hidden ? html`<div class="mod-banner">${icon('eye', 'sm')} A moderator hid this repository. Only its admins and the site's admins can see it.</div>` : ''}
     ${meta.fork_of ? html`<div class="forked muted small">${icon('fork', 'sm')} forked from <a href="/${meta.fork_of.owner}/${meta.fork_of.name}">${meta.fork_of.owner}/${meta.fork_of.name}</a></div>` : ''}
+    ${meta.mirror ? html`<div class="forked muted small mirror-badge" title="Read-only here: it changes only when it syncs from its remote">${icon('download', 'sm')} mirror of <span class="mono">${meta.mirror.url}</span>${meta.mirror.last_ok_at ? html` · synced ${timeEl(meta.mirror.last_ok_at)}` : ' · not synced yet'}</div>` : ''}
     <nav class="tabs repo-tabs" aria-label="Repository">
       ${TABS.filter(([k]) => k !== 'settings' || meta.can_admin).map(([k, ic, label, path]) => html`<a href="${base}${path}" class="${tab === k ? 'on' : ''}" data-tab="${k}">
         ${icon(ic, 'sm')}<span>${label}</span>${counts[k] ? html`<span class="counter">${num(counts[k])}</span>` : ''}</a>`)}

@@ -505,6 +505,7 @@ pub async fn apply(
     Json(req): Json<ApplyReq>,
 ) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    crate::mirrors::refuse_writes(&r)?;
     let (issue, branch, head, _) = pull(&st, &r, num, Some(&u)).await?;
     crate::protect::direct(&st, &r, &branch, false).await?;
     if issue.state != "open" {
