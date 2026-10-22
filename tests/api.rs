@@ -1368,6 +1368,64 @@ async fn lfs_limits_storage_slots_and_caching() {
     assert!(!kept.exists(), "no repository holds it any more");
 }
 
+#[test]
+fn lifecycle_settings_export_refuses_on_low_disk() {
+    use gitter::api::lifecycle::check_room;
+    assert!(check_room(Some(100), 60).is_err());
+    assert!(check_room(Some(120), 60).is_ok());
+    assert!(check_room(None, u64::MAX).is_ok(), "unknown free space doesn't block");
+}
+
+#[tokio::test]
+async fn lifecycle_settings_windows_transfer_flag_and_late_size_refresh() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let carol = app.signup("carol").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "readme": true }))).await;
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/carol", Some(json!({ "role": "admin" }))).await;
+    // can_transfer: the owner and site admins, not an admin collaborator or a stranger.
+    for (who, want) in [(&alice, true), (&admin, true), (&carol, false), (&Client::default(), false)] {
+        assert_eq!(app.req(who, "GET", "/api/repos/alice/p", None).await.1["can_transfer"], want);
+    }
+    // An organization's repository: its owners see it, its admins don't.
+    let dave = app.signup("dave").await;
+    let erin = app.signup("erin").await;
+    app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await;
+    app.req(&alice, "PUT", "/api/orgs/acme/members/dave", Some(json!({ "role": "owner" }))).await;
+    app.req(&alice, "PUT", "/api/orgs/acme/members/erin", Some(json!({ "role": "admin" }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "o", "owner": "acme" }))).await;
+    for (who, want) in [(&dave, true), (&erin, false)] {
+        let (s, v) = app.req(who, "GET", "/api/repos/acme/o", None).await;
+        assert_eq!((s, &v["can_transfer"]), (StatusCode::OK, &json!(want)), "{v}");
+    }
+    // The windows follow the settings.
+    let (_, mut cur) = app.req(&admin, "GET", "/api/admin/settings", None).await;
+    cur["trash_days"] = json!(2);
+    cur["transfer_offer_days"] = json!(3);
+    assert_eq!(app.req(&admin, "PUT", "/api/admin/settings", Some(cur.clone())).await.0, StatusCode::OK);
+    cur["trash_days"] = json!(0);
+    assert_eq!(app.req(&admin, "PUT", "/api/admin/settings", Some(cur)).await.0, StatusCode::BAD_REQUEST);
+    let offer = json!({ "to": "carol", "confirm": "alice/p" });
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/p/transfer", Some(offer)).await.0, StatusCode::OK);
+    let (_, o) = app.req(&alice, "GET", "/api/repos/alice/p/transfer", None).await;
+    let left = o["offer"]["expires_at"].as_i64().unwrap() - gitter::db::now();
+    assert!((3 * 86400 - 60..=3 * 86400).contains(&left), "{o}");
+    app.req(&alice, "DELETE", "/api/repos/alice/p/transfer", None).await;
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/p", Some(json!({ "confirm": "alice/p" }))).await.0, StatusCode::OK);
+    let (_, tr) = app.req(&alice, "GET", "/api/me/trash", None).await;
+    let (id, at) = (tr["repos"][0]["id"].as_i64().unwrap(), tr["repos"][0]["deleted_at"].as_i64().unwrap());
+    assert_eq!(tr["repos"][0]["purge_at"].as_i64().unwrap(), at + 2 * 86400);
+    // A size refresh arriving after the trash move leaves the recorded size alone.
+    app.state.db.call(move |c| Ok(c.execute("UPDATE repos SET size_bytes = 12345 WHERE id = ?1", [id])?)).await.unwrap();
+    gitter::hooks::refresh_size(&app.state, id).await;
+    let size: i64 = app.state.db.call(move |c| Ok(c.query_row("SELECT size_bytes FROM repos WHERE id = ?1", [id], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(size, 12345);
+    // Past the window the sweep purges it.
+    app.state.db.call(move |c| Ok(c.execute("UPDATE repos SET deleted_at = deleted_at - 3 * 86400 WHERE id = ?1", [id])?)).await.unwrap();
+    assert_eq!(gitter::api::lifecycle::sweep(&app.state).await.unwrap(), 1);
+}
+
 /// Purge everything in the trash, as the upkeep loop does a week after each delete.
 async fn purge_trash(app: &App) {
     app.state.db.call(|c| Ok(c.execute("UPDATE repos SET deleted_at = 1 WHERE deleted_at IS NOT NULL", [])?)).await.unwrap();

@@ -45,6 +45,16 @@ pub struct Settings {
     /// Whether job containers may reach the network (a job can still turn it off).
     #[serde(default = "default_true")]
     pub ci_network: bool,
+    /// Days a deleted repository stays restorable.
+    #[serde(default = "default_week")]
+    pub trash_days: u32,
+    /// Days a transfer offer waits for an answer.
+    #[serde(default = "default_week")]
+    pub transfer_offer_days: u32,
+}
+
+fn default_week() -> u32 {
+    7
 }
 
 fn default_ci_cpus() -> u32 {
@@ -96,6 +106,8 @@ impl Settings {
             ci_cpus: default_ci_cpus(),
             ci_memory_mb: default_ci_memory(),
             ci_network: true,
+            trash_days: 7,
+            transfer_offer_days: 7,
         }
     }
 
@@ -126,6 +138,9 @@ impl Settings {
         }
         if self.builtin_runner_jobs > 64 {
             return Err(AppError::bad("The built-in runner runs at most 64 jobs at once"));
+        }
+        if !(1..=365).contains(&self.trash_days) || !(1..=365).contains(&self.transfer_offer_days) {
+            return Err(AppError::bad("Trash and transfer offers last 1 to 365 days"));
         }
         if self.max_storage_mb > 10_000_000 {
             return Err(AppError::bad("Storage per account must be under 10 TB (0 means no limit)"));

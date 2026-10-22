@@ -1050,5 +1050,5 @@ pub async fn search(
 fn instance_info(st: &AppState) -> serde_json::Value {
     let s = st.settings.get();
     let needs_setup = st.setup_code.lock().map(|c| c.is_some()).unwrap_or(false);
-    json!({ "name": s.instance_name, "announcement": s.announcement, "needs_setup": needs_setup })
+    json!({ "name": s.instance_name, "announcement": s.announcement, "needs_setup": needs_setup, "trash_days": s.trash_days, "transfer_offer_days": s.transfer_offer_days })
 }

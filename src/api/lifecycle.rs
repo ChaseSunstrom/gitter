@@ -1,6 +1,6 @@
 //! What happens to repositories and accounts over their life: transfers to
 //! another account (an offer the recipient accepts), the trash (a deleted
-//! repository is kept for a week, then purged), the account data export and
+//! repository is kept for the retention window, then purged), the account data export and
 //! deleting your own account.
 
 use std::path::{Path as FsPath, PathBuf};
@@ -24,10 +24,29 @@ use crate::error::{AppError, R};
 use crate::repo::{Repo, add_redirect, claim_name};
 use crate::security::{Event, record};
 
-/// How long a deleted repository stays restorable.
-pub const TRASH_SECS: i64 = 7 * 86400;
-/// How long a transfer offer waits for an answer.
-pub const OFFER_SECS: i64 = 7 * 86400;
+/// What `repos.name` becomes while a repository sits in the trash (ids are unique, real names can't start with '~').
+const TRASH_NAME: &str = "'~' || id";
+
+/// SQL that moves a repository into the trash (`cond` is appended to the WHERE; ?1 = id, ?2 = now).
+fn trash_sql(cond: &str) -> String {
+    format!("UPDATE repos SET deleted_at = ?2, deleted_name = name, name = {TRASH_NAME} WHERE id = ?1{cond}")
+}
+
+fn trash_secs(st: &AppState) -> i64 {
+    st.settings.get().trash_days as i64 * 86400
+}
+
+/// Refuse a data export when the disk can't hold about twice the account's stored size
+/// (the bundles, then the archive). An unknown free size (no `df`) lets it through.
+pub fn check_room(free: Option<u64>, used: u64) -> R<()> {
+    match free {
+        Some(f) if f < used.saturating_mul(2) => Err(AppError::new(
+            axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            "The server is low on disk space for an export of your data right now. Try again later.",
+        )),
+        _ => Ok(()),
+    }
+}
 /// How long a finished data export can be downloaded.
 pub const EXPORT_SECS: i64 = 86400;
 
@@ -53,7 +72,7 @@ pub fn live_repos(c: &Connection, payer: i64) -> rusqlite::Result<i64> {
 
 /// May `u` give away or bring back a repository of `owner_id`: the owner, an
 /// owner of the organization that owns it, or a site admin (not admin collaborators).
-fn owns(c: &Connection, u: &User, owner_id: i64) -> rusqlite::Result<bool> {
+pub fn owns(c: &Connection, u: &User, owner_id: i64) -> rusqlite::Result<bool> {
     if u.is_admin || u.id == owner_id {
         return Ok(true);
     }
@@ -125,6 +144,7 @@ pub async fn offer_transfer(
     if !req.confirm.trim().eq_ignore_ascii_case(&r.full_name()) {
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
+    let offer_secs = st.settings.get().transfer_offer_days as i64 * 86400;
     let to = req.to.trim().to_string();
     let (rid, from) = (r.id, r.owner_id);
     let to_id = st
@@ -140,7 +160,7 @@ pub async fn offer_transfer(
             let t = now();
             c.execute(
                 "INSERT OR REPLACE INTO repo_transfers(repo_id, from_id, to_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![rid, from, id, t, t + OFFER_SECS],
+                params![rid, from, id, t, t + offer_secs],
             )?;
             Ok(id)
         })
@@ -284,10 +304,7 @@ pub async fn trash(st: &AppState, r: &Repo) -> R<()> {
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
-            tx.execute(
-                "UPDATE repos SET deleted_at = ?2, deleted_name = name, name = '~' || id WHERE id = ?1 AND deleted_at IS NULL",
-                params![id, now()],
-            )?;
+            tx.execute(&trash_sql(" AND deleted_at IS NULL"), params![id, now()])?;
             tx.execute("DELETE FROM repo_transfers WHERE repo_id = ?1", [id])?;
             tx.commit()?;
             // Its CI stops: queued jobs never start, running ones stop at their next heartbeat.
@@ -357,12 +374,12 @@ pub async fn purge(st: &AppState, id: i64, actor: Option<&User>, ip: &str) -> R<
 }
 
 /// Trashed repositories matching `cond` (over `r`), newest first.
-fn trashed(c: &Connection, cond: &str, p: impl rusqlite::Params) -> rusqlite::Result<Vec<Value>> {
+fn trashed(c: &Connection, secs: i64, cond: &str, p: impl rusqlite::Params) -> rusqlite::Result<Vec<Value>> {
     rows(
         c,
         &format!(
             "SELECT r.id, r.deleted_name AS name, u.username AS owner, r.description, r.is_private AS private, r.deleted_at,
-                r.deleted_at + {TRASH_SECS} AS purge_at,
+                r.deleted_at + {secs} AS purge_at,
                 EXISTS (SELECT 1 FROM repos x WHERE x.owner_id = r.owner_id AND x.name = r.deleted_name) AS name_taken
              FROM repos r JOIN users u ON u.id = r.owner_id WHERE r.deleted_at IS NOT NULL AND {cond} ORDER BY r.deleted_at DESC LIMIT 500"
         ),
@@ -374,13 +391,15 @@ fn trashed(c: &Connection, cond: &str, p: impl rusqlite::Params) -> rusqlite::Re
 pub async fn my_trash(State(st): State<AppState>, Authed(u): Authed) -> J<Value> {
     let uid = u.id;
     let cond = "(r.owner_id = ?1 OR r.owner_id IN (SELECT org_id FROM org_members WHERE user_id = ?1 AND role = 'owner'))";
-    let repos = st.db.call(move |c| Ok(trashed(c, cond, [uid])?)).await?;
+    let secs = trash_secs(&st);
+    let repos = st.db.call(move |c| Ok(trashed(c, secs, cond, [uid])?)).await?;
     Ok(Json(json!({ "repos": repos })))
 }
 
 /// Every repository in the trash, for admins.
 pub async fn all_trash(State(st): State<AppState>, _a: Admin) -> J<Value> {
-    let repos = st.db.call(|c| Ok(trashed(c, "1 = 1", [])?)).await?;
+    let secs = trash_secs(&st);
+    let repos = st.db.call(move |c| Ok(trashed(c, secs, "1 = 1", [])?)).await?;
     Ok(Json(json!({ "repos": repos })))
 }
 
@@ -421,15 +440,16 @@ pub async fn restore(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp
         .await?;
     if let Err(e) = move_dir(&trash_path(&st, id), &st.git.repo_path(id)).await {
         st.db
-            .call(move |c| Ok(c.execute("UPDATE repos SET deleted_at = ?2, deleted_name = name, name = '~' || id WHERE id = ?1", params![id, now()])?))
+            .call(move |c| Ok(c.execute(&trash_sql(""), params![id, now()])?))
             .await?;
         return Err(AppError::internal(format!("restoring repository {id}: {e}")));
     }
+    crate::hooks::refresh_size(&st, id).await;
     record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "repo_restored", detail: format!("{owner}/{name}"), ip: &ip.0 }).await;
     Ok(Json(json!({ "owner": owner, "name": name })))
 }
 
-/// Admins can empty a repository from the trash without waiting the week.
+/// Admins can empty a repository from the trash without waiting out the retention window.
 pub async fn purge_now(State(st): State<AppState>, Admin(me): Admin, _s: Sudo, ip: ClientIp, Path(id): Path<i64>) -> J<Value> {
     if !purge(&st, id, Some(&me), &ip.0).await? {
         return Err(AppError::not_found());
@@ -437,16 +457,16 @@ pub async fn purge_now(State(st): State<AppState>, Admin(me): Admin, _s: Sudo, i
     ok()
 }
 
-/// Hourly: purge repositories trashed over a week ago, and drop expired offers
+/// Hourly: purge repositories trashed past the retention window, and drop expired offers
 /// and exports. Returns how many repositories were purged.
 pub async fn sweep(st: &AppState) -> R<usize> {
-    let t = now();
+    let (t, keep) = (now(), trash_secs(st));
     let (due, gone) = st
         .db
         .call(move |c| {
             let due: Vec<i64> = {
                 let mut q = c.prepare("SELECT id FROM repos WHERE deleted_at IS NOT NULL AND deleted_at < ?1")?;
-                q.query_map([t - TRASH_SECS], |r| r.get(0))?.collect::<Result<_, _>>()?
+                q.query_map([t - keep], |r| r.get(0))?.collect::<Result<_, _>>()?
             };
             c.execute("DELETE FROM repo_transfers WHERE expires_at < ?1", [t])?;
             let gone: Vec<(i64, i64)> = {
@@ -481,7 +501,7 @@ pub async fn upkeep(st: AppState) {
     }
     loop {
         match sweep(&st).await {
-            Ok(n) if n > 0 => println!("trash: purged {n} repositories deleted over a week ago"),
+            Ok(n) if n > 0 => println!("trash: purged {n} repositories deleted past the retention window"),
             Ok(_) => {}
             Err(e) => eprintln!("trash sweep: {}", e.msg),
         }
@@ -568,10 +588,12 @@ pub async fn delete_me(State(st): State<AppState>, Sudo(u): Sudo, ip: ClientIp, 
 
 /// Start building your data export in the background (one at a time).
 pub async fn start_export(State(st): State<AppState>, Sudo(u): Sudo) -> J<Value> {
+    let uid = u.id;
+    let used = st.db.call(move |c| Ok(c.query_row(&format!("SELECT {}", crate::repo::STORAGE_USED), [uid], |r| r.get::<_, i64>(0))?)).await?;
+    check_room(super::admin::free_space(&st.cfg.data_dir).await, used.max(0) as u64)?;
     if let Err(wait) = st.limiter.check(&format!("export:{}", u.id), 10, 86400) {
         return Err(AppError::slow_down("You've made a lot of exports today. Try again tomorrow.", wait));
     }
-    let uid = u.id;
     let (id, old) = st
         .db
         .call(move |c| {

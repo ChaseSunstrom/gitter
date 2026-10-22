@@ -1,5 +1,5 @@
 // Account settings: profile, account (password, export, delete), repositories (transfers, trash), access tokens, appearance.
-import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName, bytes, busy, startOAuth } from '../lib.js';
+import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName, bytes, plural, busy, startOAuth } from '../lib.js';
 import { icon } from '../icons.js';
 import { refresh, renderTopbar, setTheme, getTheme, SKINS, getSkin, setSkin } from '../main.js';
 
@@ -79,11 +79,11 @@ function reposTab(tr, trash) {
     <button class="btn sm" data-restore ${r.name_taken ? 'disabled' : ''}>Restore</button></div>`);
   return html`<div class="stack settings-form">
     <h2>Transfers</h2>
-    <p class="muted">Repositories someone offered to you. Accepting makes you the owner: issues, pull requests, stars and history come with it, and its old address leads to its new one. Offers end after 7 days.</p>
+    <p class="muted">Repositories someone offered to you. Accepting makes you the owner: issues, pull requests, stars and history come with it, and its old address leads to its new one. Offers end after ${plural(state.instance?.transfer_offer_days ?? 7, 'day')}.</p>
     ${incoming.length ? html`<div class="box list">${incoming}</div>` : html`<p class="muted small">No offers waiting for you.</p>`}
     ${outgoing.length ? html`<h3 class="section-title">Offers you made</h3><div class="box list">${outgoing}</div>` : ''}
     <h2 style="margin-top:18px">Recently deleted</h2>
-    <p class="muted">Deleted repositories stay here for 7 days, then they're gone for good. Until then they still count toward your storage.</p>
+    <p class="muted">Deleted repositories stay here for ${plural(state.instance?.trash_days ?? 7, 'day')}, then they're gone for good. Until then they still count toward your storage.</p>
     ${deleted.length ? html`<div class="box list">${deleted}</div>` : html`<p class="muted small">Nothing deleted lately.</p>`}
   </div>`;
 }
