@@ -24,6 +24,8 @@ pub struct Reply {
     pub body: Vec<u8>,
     /// Response headers, names in lowercase.
     pub headers: Vec<(String, String)>,
+    /// More than the cap arrived; `body` is the first part.
+    pub truncated: bool,
 }
 
 impl Reply {
@@ -138,12 +140,26 @@ impl Resolver for PublicOnly {
 
 /// POST `body` to `url`. Blocking: call it from `spawn_blocking`. Any HTTP
 /// status is a reply (a redirect is not followed); Err says why there was none.
+/// A longer reply is cut and marked `truncated` (the caller only logs it).
 pub fn post(url: &str, headers: &[(&str, String)], body: &[u8], allow_private: bool) -> Result<Reply, String> {
-    fetch(url, headers, Some(body), allow_private, MAX_REPLY)
+    fetch_lenient(url, headers, Some(body), allow_private, MAX_REPLY)
 }
 
+/// Start of the error for a reply past the cap.
+pub const TOO_BIG: &str = "The reply was larger than";
+
 /// POST `body` (or GET without one), reading at most `cap` bytes of the reply.
+/// For a body that gets parsed: a longer reply is an Err, never a partial body.
 pub fn fetch(url: &str, headers: &[(&str, String)], body: Option<&[u8]>, allow_private: bool, cap: u64) -> Result<Reply, String> {
+    let r = fetch_lenient(url, headers, body, allow_private, cap)?;
+    if r.truncated {
+        return Err(format!("{TOO_BIG} {} KB", cap.div_ceil(1024)));
+    }
+    Ok(r)
+}
+
+/// Like `fetch`, but a reply past `cap` comes back cut to `cap` with `truncated` set.
+pub fn fetch_lenient(url: &str, headers: &[(&str, String)], body: Option<&[u8]>, allow_private: bool, cap: u64) -> Result<Reply, String> {
     check_url(url)?;
     let cfg = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
@@ -165,8 +181,10 @@ pub fn fetch(url: &str, headers: &[(&str, String)], body: Option<&[u8]>, allow_p
     let headers = resp.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_ascii_lowercase(), v.to_str().ok()?.to_string()))).collect();
     let mut out = Vec::new();
     // A reply cut short (a stall past the time limit) still counts by its status.
-    let _ = resp.body_mut().as_reader().take(cap).read_to_end(&mut out);
-    Ok(Reply { status: resp.status().as_u16(), body: out, headers })
+    let _ = resp.body_mut().as_reader().take(cap + 1).read_to_end(&mut out);
+    let truncated = out.len() as u64 > cap;
+    out.truncate(cap as usize);
+    Ok(Reply { status: resp.status().as_u16(), body: out, headers, truncated })
 }
 
 fn describe(e: ureq::Error) -> String {
@@ -200,6 +218,31 @@ mod tests {
         ] {
             assert!(!public(bad), "{bad} must be refused");
         }
+    }
+
+    /// One-shot local server that answers any request with `n` body bytes.
+    fn serve(n: usize) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n");
+            let _ = s.write_all(&vec![b'x'; n]);
+        });
+        url
+    }
+
+    #[test]
+    fn a_reply_past_the_cap_is_an_error_for_fetch_and_marked_for_post() {
+        let e = fetch(&serve(2000), &[], None, true, 1000).err().expect("cut-off reply must fail");
+        assert!(e.starts_with(TOO_BIG), "{e}");
+        let r = fetch(&serve(1000), &[], None, true, 1000).expect("exactly the cap is complete");
+        assert!(!r.truncated && r.body.len() == 1000);
+        let r = fetch_lenient(&serve(2000), &[], None, true, 1000).unwrap();
+        assert!(r.truncated && r.body.len() == 1000);
     }
 
     #[test]

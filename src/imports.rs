@@ -159,7 +159,7 @@ async fn get(src: &Source, url: &str) -> Result<Got, String> {
     let r = match r {
         Ok(r) => r,
         // Refused addresses won't change; anything else (no answer, a timeout) may.
-        Err(e) if e.starts_with("Not contacted") || e.starts_with("Use an") => return Err(src.redact(&e)),
+        Err(e) if e.starts_with("Not contacted") || e.starts_with("Use an") || e.starts_with(net::TOO_BIG) => return Err(src.redact(&e)),
         Err(e) => return Ok(Got::Retry(src.redact(&e))),
     };
     let limited = r.status == 429 || (r.status == 403 && (r.header("x-ratelimit-remaining") == Some("0") || r.header("retry-after").is_some()));
