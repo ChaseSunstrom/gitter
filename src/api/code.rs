@@ -614,6 +614,7 @@ pub async fn commits(
     let mut list = st.git.log(&r.path, &lq).await?;
     let more = list.len() > per;
     list.truncate(per);
+    crate::signing::annotate(&st, &r, &mut list).await;
     Ok(Json(
         json!({ "sha": sha, "commits": list, "has_more": more, "page": page }),
     ))
@@ -649,11 +650,12 @@ pub async fn commit(
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let sha = resolve_rev(&st, &r, Some(&sha)).await?;
-    let info = st
+    let mut info = st
         .git
         .commit_info(&r.path, &sha)
         .await?
         .ok_or_else(AppError::not_found)?;
+    crate::signing::annotate(&st, &r, std::slice::from_mut(&mut info)).await;
     let parent = info.parents.first().cloned();
     let d = diff_of(&st, &r.path, parent.as_deref(), &sha, &fq).await?;
     Ok(Json(json!({ "commit": info, "diff": d })))
@@ -752,7 +754,7 @@ pub async fn blame(
         return Err(AppError::bad("This file is too large to blame"));
     }
     let key = format!("bl:{}:{sha}:{path}", r.id);
-    let chunks = match st.git.memo.get::<serde_json::Value>(&key) {
+    let mut chunks = match st.git.memo.get::<serde_json::Value>(&key) {
         Some(c) => c,
         None => {
             let out = st.git.blame(&r.path, &sha, &path).await?;
@@ -761,6 +763,16 @@ pub async fn blame(
             c
         }
     };
+    // Signatures are looked up apart from the memoised blame: they change when keys do.
+    if let Some(list) = chunks.as_array_mut() {
+        let shas: Vec<String> = list.iter().filter_map(|c| c["sha"].as_str().map(String::from)).collect();
+        let found = crate::signing::verify(&st, &r, &shas.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        for c in list {
+            if let Some(v) = c["sha"].as_str().and_then(|s| found.get(s)) {
+                c["verification"] = json!(v);
+            }
+        }
+    }
     Ok(Json(
         json!({ "sha": sha, "path": path, "chunks": chunks, "language": crate::langs::detect(&path).map(|l| l.0) }),
     ))

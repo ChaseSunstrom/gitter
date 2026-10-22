@@ -1663,3 +1663,224 @@ async fn snippets_and_wikis_count_toward_storage() {
     let (s, e) = app.req(&bob, "POST", "/api/repos/bob/r/wiki", Some(json!({ "name": "Home", "content": "z".repeat(100_000) }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
 }
+
+// ---------- signed commits ----------
+
+/// Whether a command-line tool is installed (being able to start it is enough).
+fn have_tool(tool: &str) -> bool {
+    let quiet = || std::process::Stdio::null();
+    std::process::Command::new(tool).arg("--help").stdout(quiet()).stderr(quiet()).status().is_ok()
+}
+
+/// Run a program away from the user's git config; panics with its stderr on failure. Returns stdout.
+fn run_tool(prog: &str, args: &[&str], env: &[(&str, &str)], input: Option<&[u8]>) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(prog)
+        .args(args)
+        .envs(env.iter().copied())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.unwrap_or_default()).unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{prog} {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Add `file` on top of main as `email`, signed when `sign` holds the git options for it. Returns the sha.
+fn commit_on_main(repo: &std::path::Path, file: &str, email: &str, sign: &[String], env: &[(&str, &str)]) -> String {
+    let gd = format!("--git-dir={}", repo.display());
+    let mut env = env.to_vec();
+    env.extend([("GIT_AUTHOR_NAME", "Alice"), ("GIT_AUTHOR_EMAIL", email), ("GIT_COMMITTER_NAME", "Alice"), ("GIT_COMMITTER_EMAIL", email)]);
+    let git = |args: &[&str], input: Option<&[u8]>| {
+        let mut a = vec![gd.as_str()];
+        a.extend(args);
+        run_tool("git", &a, &env, input).trim().to_string()
+    };
+    let head = git(&["rev-parse", "main"], None);
+    let blob = git(&["hash-object", "-w", "--stdin"], Some(file.as_bytes()));
+    let listing = git(&["ls-tree", "main"], None);
+    let tree = git(&["mktree"], Some(format!("{listing}\n100644 blob {blob}\t{file}\n").as_bytes()));
+    let mut args: Vec<&str> = sign.iter().map(String::as_str).collect();
+    args.extend(["commit-tree", "-p", head.as_str(), "-m", file, tree.as_str()]);
+    if !sign.is_empty() {
+        args.push("-S");
+    }
+    let sha = git(&args, None);
+    git(&["update-ref", "refs/heads/main", &sha], None);
+    sha
+}
+
+/// A copy of signed commit `sha` with its message changed but the signature kept.
+fn tamper(repo: &std::path::Path, sha: &str) -> String {
+    let gd = format!("--git-dir={}", repo.display());
+    let raw = run_tool("git", &[&gd, "cat-file", "commit", sha], &[], None);
+    let forged = raw.replace("\n\n", "\n\nchanged after signing: ");
+    run_tool("git", &[&gd, "hash-object", "-t", "commit", "-w", "--stdin"], &[], Some(forged.as_bytes())).trim().to_string()
+}
+
+async fn commit_verification(app: &App, c: &Client, sha: &str) -> Value {
+    let (s, v) = app.req(c, "GET", &format!("/api/repos/alice/r/commit/{sha}"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    v["commit"]["verification"].clone()
+}
+
+#[tokio::test]
+async fn signed_commits_ssh_keys_verify_and_say_why_not() {
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: SSH signature checks skipped");
+        return;
+    }
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    let dir = tempfile::tempdir().unwrap();
+    let (key, other) = (dir.path().join("k"), dir.path().join("o"));
+    for k in [&key, &other] {
+        run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", k.to_str().unwrap()], &[], None);
+    }
+    let pubfile = dir.path().join("k.pub");
+    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": std::fs::read_to_string(&pubfile).unwrap() }))).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    assert_eq!((k["kind"].as_str(), k["title"].as_str()), (Some("ssh"), Some("laptop")), "the key's comment is the default title");
+    let fp = k["fingerprint"].as_str().unwrap().to_string();
+    let listed = run_tool("ssh-keygen", &["-l", "-f", pubfile.to_str().unwrap()], &[], None);
+    assert_eq!(listed.split_whitespace().nth(1), Some(fp.as_str()), "same fingerprint as ssh-keygen");
+
+    let ssh = |k: &std::path::Path| vec!["-c".into(), "gpg.format=ssh".into(), "-c".into(), format!("user.signingkey={}", k.display())];
+    let good = commit_on_main(&repo, "a.txt", "alice@example.com", &ssh(&key), &[]);
+    let noreply = commit_on_main(&repo, "b.txt", "1+alice@users.noreply.gitter", &ssh(&key), &[]);
+    let wrong_email = commit_on_main(&repo, "c.txt", "mallory@example.com", &ssh(&key), &[]);
+    let unknown = commit_on_main(&repo, "d.txt", "alice@example.com", &ssh(&other), &[]);
+    let plain = commit_on_main(&repo, "e.txt", "alice@example.com", &[], &[]);
+    let tampered = tamper(&repo, &good);
+
+    let (s, list) = app.req(&alice, "GET", "/api/repos/alice/r/commits?rev=main", None).await;
+    assert_eq!(s, StatusCode::OK, "{list}");
+    let v = |list: &Value, sha: &str| list["commits"].as_array().unwrap().iter().find(|c| c["sha"] == sha).unwrap()["verification"].clone();
+    let g = v(&list, &good);
+    assert_eq!((g["status"].as_str(), g["signer"].as_str(), g["key_fingerprint"].as_str()), (Some("verified"), Some("alice"), Some(fp.as_str())), "{g}");
+    assert_eq!(v(&list, &noreply)["status"], "verified", "the account's no-reply address counts as its email");
+    let w = v(&list, &wrong_email);
+    assert_eq!(w["status"], "unverified");
+    assert!(w["reason"].as_str().unwrap().contains("committer email"), "{w}");
+    let u = v(&list, &unknown);
+    assert_eq!(u["status"], "unverified");
+    assert!(u["reason"].as_str().unwrap().contains("isn't registered"), "{u}");
+    assert_eq!(v(&list, &plain)["status"], "unsigned");
+
+    // The commit page and blame say the same.
+    let t = commit_verification(&app, &alice, &tampered).await;
+    assert_eq!(t["status"], "unverified");
+    assert!(t["reason"].as_str().unwrap().contains("doesn't match"), "{t}");
+    assert_eq!(commit_verification(&app, &alice, &good).await["status"], "verified");
+    let (_, bl) = app.req(&alice, "GET", "/api/repos/alice/r/blame?rev=main&path=a.txt", None).await;
+    assert_eq!(bl["chunks"][0]["verification"]["status"], "verified", "{bl}");
+
+    // Removing the key takes "Verified" away at once.
+    let (s, _) = app.req(&alice, "DELETE", &format!("/api/me/signing-keys/{}", k["id"]), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, list) = app.req(&alice, "GET", "/api/repos/alice/r/commits?rev=main", None).await;
+    assert_eq!(v(&list, &good)["status"], "unverified");
+}
+
+#[tokio::test]
+async fn signed_commits_gpg_keys_verify_once_registered() {
+    if !have_tool("gpg") {
+        eprintln!("gpg isn't installed: GPG signature checks skipped");
+        return;
+    }
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    let home = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(home.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let env = [("GNUPGHOME", home.path().to_str().unwrap())];
+    run_tool("gpg", &["--batch", "--passphrase", "", "--quick-gen-key", "Alice <alice@example.com>", "ed25519", "sign", "never"], &env, None);
+    let colons = run_tool("gpg", &["--batch", "--with-colons", "--list-keys"], &env, None);
+    let fpr = colons.lines().find(|l| l.starts_with("fpr:")).unwrap().split(':').nth(9).unwrap().to_string();
+    let armored = run_tool("gpg", &["--batch", "--armor", "--export", &fpr], &env, None);
+    let sign = vec!["-c".into(), "gpg.format=openpgp".into(), "-c".into(), format!("user.signingkey={fpr}")];
+    let good = commit_on_main(&repo, "a.txt", "alice@example.com", &sign, &env);
+    let tampered = tamper(&repo, &good);
+
+    let before = commit_verification(&app, &alice, &good).await;
+    assert_eq!(before["status"], "unverified", "{before}");
+    assert!(before["reason"].as_str().unwrap().contains("isn't registered"), "{before}");
+    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "title": "work", "key": armored }))).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    assert_eq!((k["kind"].as_str(), k["fingerprint"].as_str()), (Some("gpg"), Some(fpr.as_str())));
+    let after = commit_verification(&app, &alice, &good).await;
+    assert_eq!((after["status"].as_str(), after["signer"].as_str()), (Some("verified"), Some("alice")), "adding a key re-checks commits seen before: {after}");
+    assert_eq!(after["key_fingerprint"], fpr.as_str());
+    let t = commit_verification(&app, &alice, &tampered).await;
+    assert_eq!(t["status"], "unverified");
+    assert!(t["reason"].as_str().unwrap().contains("doesn't match"), "{t}");
+
+    // A restart without the keyring (a restore doesn't carry it) rebuilds it from the database.
+    std::fs::remove_dir_all(app.state.cfg.data_dir.join("gpg")).unwrap();
+    let fresh = gitter::router(gitter::AppState::new((*app.state.cfg).clone(), app.state.db.clone()));
+    let req = Request::get(format!("/api/repos/alice/r/commit/{good}")).header("host", "test.local").body(Body::empty()).unwrap();
+    let resp = fresh.oneshot(req).await.unwrap();
+    let body: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["commit"]["verification"]["status"], "verified", "{body}");
+    let _ = std::process::Command::new("gpgconf").args(["--kill", "all"]).envs(env).status();
+}
+
+#[tokio::test]
+async fn signed_commits_keys_are_validated_owned_and_audited() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFxsPyhOovC3igNqTo8u07KB2pQB9asL+9wpOgr9jf9G test";
+    let add = |c: &Client, k: String| {
+        let c = c.clone();
+        let app = &app;
+        async move { app.req(&c, "POST", "/api/me/signing-keys", Some(json!({ "key": k }))).await }
+    };
+    for (bad, why) in [
+        ("hello".to_string(), "not a key"),
+        (key.replace("ssh-ed25519", "ssh-rsa"), "the type doesn't match the key"),
+        (format!("{key}\n{key}"), "two keys"),
+        (format!("ssh-ed25519 {}", "A".repeat(17_000)), "over 16 KB"),
+    ] {
+        let (s, e) = add(&alice, bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{why}: {e}");
+    }
+    let (s, e) = add(&alice, "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA==\n-----END OPENSSH PRIVATE KEY-----\n".into()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("private"), "{e}");
+
+    let (s, k) = add(&alice, format!("  {key}\n")).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    assert_eq!(k["fingerprint"], "SHA256:tOn8xeW71HpDpSvWJO1qQFsmVDC03PosHw9pOnPgg1M");
+    assert_eq!(add(&alice, key.into()).await.0, StatusCode::CONFLICT, "already added");
+    assert_eq!(add(&bob, key.into()).await.0, StatusCode::CONFLICT, "one key belongs to one account");
+    let (_, theirs) = app.req(&bob, "GET", "/api/me/signing-keys", None).await;
+    assert_eq!(theirs["keys"].as_array().unwrap().len(), 0);
+    app.req(&bob, "DELETE", &format!("/api/me/signing-keys/{}", k["id"]), None).await;
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    assert_eq!(mine["keys"].as_array().unwrap().len(), 1, "bob can't remove alice's key");
+    assert_eq!(audit_count(&app, "signing_key_added").await, 1);
+
+    // Adding or removing a key is a sensitive action: it needs a recent password.
+    app.state.db.call(|c| Ok(c.execute("UPDATE sessions SET verified_at = verified_at - 3600", [])?)).await.unwrap();
+    let (s, e) = app.req(&alice, "DELETE", &format!("/api/me/signing-keys/{}", k["id"]), None).await;
+    assert_eq!((s, e["code"].as_str()), (StatusCode::FORBIDDEN, Some("reauth")));
+    app.req(&alice, "POST", "/api/auth/reauth", Some(json!({ "password": "correct horse" }))).await;
+    let (s, _) = app.req(&alice, "DELETE", &format!("/api/me/signing-keys/{}", k["id"]), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    assert_eq!(mine["keys"].as_array().unwrap().len(), 0);
+    assert_eq!(audit_count(&app, "signing_key_deleted").await, 1);
+}

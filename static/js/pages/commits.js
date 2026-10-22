@@ -1,5 +1,5 @@
 // Commit history for a branch (optionally one path), with message/author search.
-import { html, state, get, avatar, timeEl, short, encPath, day, debounce, $ } from '../lib.js';
+import { html, state, get, avatar, timeEl, short, encPath, day, debounce, $, sigBadge } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, splitRev, repoPage, mountRepoHeader, refPicker, mountRefPicker, crumbs } from '../repohead.js';
 import { navigate } from '../main.js';
@@ -29,6 +29,7 @@ export function commitRow(meta, c, i = 0) {
       ${c.body ? html`<pre class="body" hidden>${c.body}</pre>` : ''}
     </div>
     <div class="acts">
+      ${sigBadge(c.verification)}
       <span class="ci-slot" data-ci-sha="${c.sha}"></span>
       <div class="btn-group"><button class="btn sm icon" data-copy="${c.sha}" data-copy-label="Commit SHA copied" title="Copy full SHA" aria-label="Copy SHA">${icon('copy', 'sm')}</button>
       <a class="btn sm mono" href="${base}/commit/${c.sha}">${short(c.sha)}</a></div>

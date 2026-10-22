@@ -565,6 +565,100 @@ pub async fn delete_token(
     ok()
 }
 
+pub async fn list_signing_keys(State(st): State<AppState>, Authed(u): Authed) -> J<serde_json::Value> {
+    let keys = st
+        .db
+        .call(move |c| {
+            let mut s = c.prepare("SELECT id, kind, title, fingerprint, created_at FROM signing_keys WHERE user_id = ?1 ORDER BY id DESC")?;
+            let v = s
+                .query_map([u.id], |r| {
+                    Ok(json!({ "id": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?, "title": r.get::<_, String>(2)?,
+                               "fingerprint": r.get::<_, String>(3)?, "created_at": r.get::<_, i64>(4)? }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await?;
+    Ok(Json(json!({ "keys": keys })))
+}
+
+#[derive(Deserialize)]
+pub struct SigningKeyReq {
+    #[serde(default)]
+    title: String,
+    key: String,
+}
+
+/// Register an SSH or GPG public key for commit signatures. A sensitive action:
+/// whoever adds a key can make commits that show as Verified for this account.
+pub async fn add_signing_key(
+    State(st): State<AppState>,
+    Sudo(u): Sudo,
+    ip: ClientIp,
+    Json(req): Json<SigningKeyReq>,
+) -> J<serde_json::Value> {
+    let title = req.title.trim().to_string();
+    if title.chars().count() > 80 {
+        return Err(AppError::bad("Keep the title to 80 characters"));
+    }
+    let k = crate::signing::parse_key(&st, &req.key).await?;
+    let title = match (title.is_empty(), k.label.trim()) {
+        (false, _) => title,
+        (true, "") => format!("{} key", k.kind.to_uppercase()),
+        (true, label) => label.chars().take(80).collect(),
+    };
+    let (uid, kind, fp, key) = (u.id, k.kind, k.fingerprint.clone(), k.key);
+    let row = st
+        .db
+        .call(move |c| {
+            if c.query_row("SELECT 1 FROM signing_keys WHERE fingerprint = ?1", [&fp], |_| Ok(())).optional()?.is_some() {
+                return Err(AppError::conflict("That key is already added to an account"));
+            }
+            let n: i64 = c.query_row("SELECT count(*) FROM signing_keys WHERE user_id = ?1", [uid], |r| r.get(0))?;
+            if n >= 50 {
+                return Err(AppError::bad("You have 50 signing keys already. Remove some first."));
+            }
+            let at = now();
+            c.execute(
+                "INSERT INTO signing_keys(user_id, kind, title, key, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![uid, kind, title, key, fp, at],
+            )?;
+            Ok(json!({ "id": c.last_insert_rowid(), "kind": kind, "title": title, "fingerprint": fp, "created_at": at }))
+        })
+        .await?;
+    if kind == "gpg" {
+        st.signing.key_added();
+    }
+    let detail = format!("{} key {}", kind.to_uppercase(), k.fingerprint);
+    record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "signing_key_added", detail, ip: &ip.0 }).await;
+    Ok(Json(row))
+}
+
+pub async fn delete_signing_key(
+    State(st): State<AppState>,
+    Sudo(u): Sudo,
+    ip: ClientIp,
+    Path(id): Path<i64>,
+) -> J<serde_json::Value> {
+    let uid = u.id;
+    let gone: Option<(String, String)> = st
+        .db
+        .call(move |c| {
+            let k = c
+                .query_row("SELECT kind, fingerprint FROM signing_keys WHERE id = ?1 AND user_id = ?2", [id, uid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            c.execute("DELETE FROM signing_keys WHERE id = ?1 AND user_id = ?2", [id, uid])?;
+            Ok(k)
+        })
+        .await?;
+    // A GPG key stays in the keyring; without its row it verifies nothing.
+    if let Some((kind, fp)) = gone {
+        let detail = format!("{} key {fp}", kind.to_uppercase());
+        record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "signing_key_deleted", detail, ip: &ip.0 }).await;
+    }
+    ok()
+}
+
 #[derive(Serialize)]
 pub struct EventOut {
     kind: String,

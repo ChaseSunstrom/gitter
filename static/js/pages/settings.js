@@ -3,7 +3,7 @@ import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, a
 import { icon } from '../icons.js';
 import { refresh, renderTopbar, setTheme, getTheme, SKINS, getSkin, setSkin } from '../main.js';
 
-const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Password'], ['security', 'lock', 'Security'], ['tokens', 'key', 'Access tokens'], ['appearance', 'sun', 'Appearance']];
+const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Password'], ['security', 'lock', 'Security'], ['tokens', 'key', 'Access tokens'], ['signing', 'edit', 'Signing keys'], ['appearance', 'sun', 'Appearance']];
 
 function nav(tab) {
   return html`<nav class="settings-nav" aria-label="Settings">${TABS.map(([k, ic, label]) =>
@@ -65,6 +65,26 @@ function tokensTab(tokens) {
           <div class="small muted">Created ${timeEl(t.created_at)} · ${t.last_used ? html`Last used ${timeEl(t.last_used)}` : 'Never used'}${t.expires_at && !t.expired ? html` · expires ${timeEl(t.expires_at)}` : ''}</div></div>
         <button class="btn sm danger" data-del="${t.id}" data-name="${t.name}">${icon('trash', 'sm')} Delete</button></div>`)}</div>`
       : html`<div class="box empty small">${icon('key', 'big')}<h3>No tokens yet</h3><p>Generate one to push from scripts or other machines.</p></div>`}
+  </div>`;
+}
+
+function signingTab(keys) {
+  const me = state.me;
+  return html`<div class="stack settings-form">
+    <h2>Signing keys</h2>
+    <p class="muted">Commits you sign with one of these keys show as <b>Verified</b> when their committer email is your account's email
+      (or <code>${me.id}+${me.username}@users.noreply.gitter</code>). Paste an SSH public key (the <code>.pub</code> file) or a GPG public key (<code>gpg --armor --export you@example.com</code>).</p>
+    <form id="sk-form" class="box"><div class="box-body stack">
+      <div class="field"><label for="sk-title">Title <span class="muted">(optional)</span></label><input class="input" id="sk-title" name="title" maxlength="80" placeholder="e.g. laptop"></div>
+      <div class="field"><label for="sk-key">Public key</label><textarea class="textarea mono" id="sk-key" name="key" rows="4" required spellcheck="false" placeholder="ssh-ed25519 AAAA… or -----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>
+        <span class="hint">To sign with an SSH key: <code>git config gpg.format ssh</code>, <code>git config user.signingkey ~/.ssh/id_ed25519.pub</code>, then <code>git commit -S</code>.</span></div>
+      <div class="row"><button class="btn primary" type="submit">${icon('plus', 'sm')} Add key</button></div>
+    </div></form>
+    ${keys.length ? html`<div class="box list">${keys.map((k) => html`<div class="list-row signing-key">
+        ${icon('key', 'muted')}<div class="grow"><b>${k.title}</b> <span class="pill">${k.kind === 'ssh' ? 'SSH' : 'GPG'}</span>
+          <div class="small muted"><code class="mono">${k.fingerprint}</code> · added ${timeEl(k.created_at)}</div></div>
+        <button class="btn sm danger" data-sk-del="${k.id}" data-name="${k.title}">${icon('trash', 'sm')} Remove</button></div>`)}</div>`
+      : html`<div class="box empty small">${icon('key', 'big')}<h3>No signing keys yet</h3><p>Add one to have your signed commits show as Verified.</p></div>`}
   </div>`;
 }
 
@@ -133,6 +153,7 @@ export default async function (ctx) {
   let inner;
   if (tab === 'profile') { const m = await get('/me', { fresh: true }); inner = profileTab(m.profile, m.storage); }
   else if (tab === 'tokens') inner = tokensTab((await get('/me/tokens', { fresh: true })).tokens);
+  else if (tab === 'signing') inner = signingTab((await get('/me/signing-keys', { fresh: true })).keys);
   else if (tab === 'account') inner = accountTab();
   else if (tab === 'security') {
     const [sec, log] = await Promise.all([get('/me/security', { fresh: true }), get('/me/audit', { fresh: true })]);
@@ -202,6 +223,25 @@ export default async function (ctx) {
           if (!ok) return;
           try { await send('DELETE', `/me/tokens/${b.dataset.del}`); } catch (err) { return toast(err.message, 'err'); }
           toast('Token deleted');
+          refresh();
+        });
+      }
+      const sk = $('#sk-form', el);
+      if (sk) {
+        sk.addEventListener('submit', action(sk.querySelector('[type=submit]'), async () => {
+          const f = Object.fromEntries(new FormData(sk));
+          if (!f.key.trim()) return;
+          await send('POST', '/me/signing-keys', { title: f.title, key: f.key });
+          toast('Signing key added');
+          refresh();
+        }));
+        $('.settings-body', el).addEventListener('click', async (e) => {
+          const b = e.target.closest('[data-sk-del]');
+          if (!b) return;
+          const ok = await confirmDialog({ title: `Remove “${b.dataset.name}”?`, text: 'Commits signed with this key will show as Unverified.', ok: 'Remove key', danger: true });
+          if (!ok) return;
+          try { await send('DELETE', `/me/signing-keys/${b.dataset.skDel}`); } catch (err) { return toast(err.message, 'err'); }
+          toast('Signing key removed');
           refresh();
         });
       }

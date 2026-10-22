@@ -245,6 +245,22 @@ export function popover(anchor, content, { align = 'left', onMount, width } = {}
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && openPop) closePop(); });
 addEventListener('scroll', () => { if (openPop && !openPop.matches(':hover')) closePop(); }, { passive: true });
 
+// ---------- commit signatures ----------
+const SIG = { verified: 'Verified', unverified: 'Unverified', unknown: "Can't verify" };
+/** A commit's signature badge (nothing for unsigned commits). Clicking it says why. */
+export function sigBadge(v) {
+  const label = SIG[v?.status];
+  return label ? html`<button type="button" class="sig-badge ${v.status}" data-sig="${JSON.stringify(v)}" title="Why ${label.toLowerCase()}?">${label}</button>` : '';
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest?.('[data-sig]');
+  if (!b) return;
+  const v = JSON.parse(b.dataset.sig);
+  popover(b, html`<div class="sig-pop"><b class="sig-badge ${v.status}">${SIG[v.status]}</b><p>${v.reason}</p>
+    ${v.signer ? html`<p class="small">Key owner: <a href="/${enc(v.signer)}">${v.signer}</a></p>` : ''}
+    ${v.key_fingerprint ? html`<p class="small muted">Key <code class="mono">${v.key_fingerprint}</code></p>` : ''}</div>`, { width: 320, align: 'right' });
+});
+
 // ---------- misc ----------
 export const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 export function busy(btn, on = true) { if (!btn) return; btn.classList.toggle('busy', on); btn.disabled = on; }

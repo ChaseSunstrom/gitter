@@ -336,6 +336,20 @@ const MIGRATIONS: &[&str] = &[
         last_minute INTEGER NOT NULL DEFAULT 0
     );
     "#,
+    // v12: signing keys. A key belongs to one account (the fingerprint is unique), so a
+    // good signature names exactly one owner. kind is 'ssh' or 'gpg'.
+    r#"
+    CREATE TABLE signing_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX signing_keys_user ON signing_keys(user_id);
+    "#,
 ];
 
 impl Db {

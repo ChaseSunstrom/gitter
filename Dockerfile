@@ -11,7 +11,9 @@ COPY static static
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 FROM alpine:3.22
-RUN apk add --no-cache git git-daemon tini \
+# ssh-keygen checks SSH-signed commits. gpg (for GPG-signed ones) would add about 16 MB,
+# so it's left out: add `gpg` here to check those too; without it they show "Can't verify".
+RUN apk add --no-cache git git-daemon tini openssh-keygen \
  && adduser -D -H -h /data -u 1000 gitter \
  && mkdir /data && chown gitter:gitter /data
 COPY --from=build /src/target/release/gitter /usr/local/bin/gitter
