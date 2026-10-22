@@ -185,6 +185,13 @@ pub async fn favicon(req: Request) -> Response {
     serve_file("favicon.svg", &req, false)
 }
 
+/// The web app manifest (installs Gitter as an app), with versioned icon URLs.
+pub async fn manifest() -> Response {
+    let raw = Assets::get("manifest.webmanifest").map(|f| f.data.into_owned()).unwrap_or_default();
+    let body = String::from_utf8_lossy(&raw).replace("__V__", version());
+    ([(header::CONTENT_TYPE, "application/manifest+json"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+}
+
 pub async fn robots() -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain")],
@@ -247,7 +254,10 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    // Only raw PDFs set their own (SAMEORIGIN, for the file viewer's frame).
+    if !h.contains_key("x-frame-options") {
+        h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    }
     h.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("strict-origin-when-cross-origin"),

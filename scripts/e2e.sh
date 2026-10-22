@@ -16,7 +16,8 @@ ok() { pass=$((pass + 1)); echo "✓ $*"; }
 cargo build -q
 GITTER_DATA="$TMP/data" GITTER_ADDR="127.0.0.1:$PORT" GITTER_URL="$BASE" ./target/debug/gitter >"$LOG" 2>&1 &
 PID=$!
-trap 'kill $PID ${HOOK_PID:-} 2>/dev/null; rm -rf "$TMP"' EXIT
+# Let the server finish shutting down (its CI jobs write into the data folder) before cleaning up.
+trap 'st=$?; kill $PID ${HOOK_PID:-} 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$TMP" 2>/dev/null || { sleep 1; rm -rf "$TMP"; }; exit $st' EXIT
 for _ in $(seq 50); do curl -sf "$BASE/robots.txt" >/dev/null && break; sleep 0.1; done
 SETUP=$(grep -o 'setup=[A-Za-z0-9_-]*' "$LOG" | head -1 | cut -d= -f2)
 [ -n "$SETUP" ] || fail "first boot should print a setup link"

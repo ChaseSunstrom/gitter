@@ -79,7 +79,7 @@ export default async function (ctx) {
           const c = await get(`${api}/commit/${v.commit.sha}?${q}`);
           if (my !== seq) return;
           const key = `${owner}/${repo}@${v.commit.sha}`;
-          box.innerHTML = `${head}${diffView(c.diff, { owner, repo, sha: v.commit.sha, key })}`;
+          box.innerHTML = `${head}${diffView(c.diff, { owner, repo, sha: v.commit.sha, base: c.commit.parents[0], key })}`;
           mountDiff(box, c.diff, { key, load: (qs) => get(`${api}/commit/${v.commit.sha}?${qs}`).then((x) => x.diff.files[0]) });
         } catch (e) { if (my === seq) toastErr(e); }
       };

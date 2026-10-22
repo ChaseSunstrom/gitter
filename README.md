@@ -233,6 +233,19 @@ Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_
 - It has its own rate limit (120 calls a minute) and its changes count apart from yours.
 - Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".
 
+## Viewers, reverts, uploads and the demo
+
+- **Rich file views:** CSV and TSV files show as a table (the first 1,000 rows and 200 columns; click a column to sort, numbers as numbers), Jupyter notebooks render their markdown, highlighted code and text and image outputs, STL models (ASCII or binary, up to a million triangles) turn in 3D (drag to orbit, scroll to zoom, double-click to reset), PDFs open in the page, and audio and video files play. **Code** next to **Preview** shows the source of the text ones. Nothing pushed runs: notebook HTML and script outputs show as their source, markdown is sanitized, and files come from `/raw` with a sandbox (files that really are PDFs go without one, since browsers won't show a PDF in a sandbox; the browser's PDF viewer keeps a PDF's own scripts apart from the site, and only Gitter's pages may frame them).
+- **Image diffs:** a changed picture in a commit, comparison or pull request shows the two versions side by side (2-up), as a swipe, or as onion skin.
+- **Revert from the web:** **Revert** on a commit page, or on a merged pull request, puts the inverse change on a new branch (`revert-<sha>` or `revert-pr-<n>`) and opens a pull request into the branch it landed on, so it goes through review like anything else. When later changes touch the same lines, the error names the files: revert it locally with `git revert` instead.
+- **Drag and drop:** drop files or folders anywhere on a folder or file page to upload them into that folder (with the usual commit message and new-branch choice).
+- **Install it as an app:** Gitter has a web app manifest, so browsers offer to install it (Chrome and Edge: the install icon in the address bar; iOS: Share → Add to Home Screen).
+- **`gitter demo`:** seeds an empty `GITTER_DATA` with three people (alice is the admin, plus bob and carol, all with one password it prints), repositories with history, a fork and a file for each viewer, issues with comments, an open pull request with an approving review and a merged one, CI runs (queued until the server starts), wiki pages and a discussion, then starts the server, reachable from this machine only unless `GITTER_ADDR` is set. It refuses a directory that already has anything in it.
+
+  ```sh
+  GITTER_DATA=/tmp/gitter-demo gitter demo
+  ```
+
 ## Configuration
 
 Everything is optional. The defaults are tuned for a single small server, and the sign-up mode and limits can be changed later in Site administration (the UI value wins over the variable).

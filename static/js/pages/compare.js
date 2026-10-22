@@ -69,7 +69,7 @@ export default async function (ctx) {
           <a class="grow ellipsis" href="${root}/commit/${c.sha}">${c.subject}</a>
           <span class="muted small hide-sm">${c.author_name} · ${timeEl(c.commit_time)}</span>
           <a class="sha" href="${root}/commit/${c.sha}">${short(c.sha)}</a></div>`)}</div></div>
-      ${diffView(d.diff, { owner, repo, sha: d.head_sha })}
+      ${diffView(d.diff, { owner, repo, sha: d.head_sha, base: d.merge_base || d.base_sha })}
     </div>`;
   }
 

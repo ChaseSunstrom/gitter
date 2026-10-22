@@ -18,6 +18,7 @@ pub mod snippets;
 pub mod webhooks;
 pub mod wiki;
 pub mod mcp;
+pub mod revert;
 
 use std::net::SocketAddr;
 
@@ -138,6 +139,7 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/compare"), get(code::compare))
         .route(&format!("{repo}/blame"), get(code::blame))
         .route(&format!("{repo}/contents"), post(code::write_contents))
+        .route(&format!("{repo}/revert"), post(revert::revert))
         .route(&format!("{repo}/contributors"), get(code::contributors))
         .route(&format!("{repo}/graph"), get(insights::graph))
         .route(&format!("{repo}/history"), get(insights::history))

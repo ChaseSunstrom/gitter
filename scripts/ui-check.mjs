@@ -519,6 +519,123 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Rich viewers (CSV, PDF, notebook, STL, audio, video), image diff modes, drag-and-drop upload, revert.
+{
+  const { deflateSync } = await import('node:zlib');
+  const crcTable = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+  const crc = (b) => { let c = 0xffffffff; for (const x of b) c = crcTable[(c ^ x) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length); const td = Buffer.concat([Buffer.from(type), data]); const c = Buffer.alloc(4); c.writeUInt32BE(crc(td)); return Buffer.concat([len, td, c]); };
+  const png = ([r, g, b]) => { const w = 8, rows = []; for (let y = 0; y < w; y++) rows.push(Buffer.from([0, ...Array.from({ length: w }, () => [r, g, b]).flat()]));
+    const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(w, 4); ihdr[8] = 8; ihdr[9] = 2;
+    return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(Buffer.concat(rows))), chunk('IEND', Buffer.alloc(0))]); };
+  const stl = Buffer.alloc(84 + 4 * 50);
+  stl.writeUInt32LE(4, 80);
+  const tri = [[0, 0, 0, 1, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 0, 0, 0, 1], [1, 0, 0, 0, 0, 1, 0, 1, 0]];
+  tri.forEach((t, i) => t.forEach((v, k) => stl.writeFloatLE(v, 84 + i * 50 + 12 + k * 4)));
+  const wav = Buffer.alloc(44 + 8000, 128);
+  wav.write('RIFF', 0); wav.writeUInt32LE(36 + 8000, 4); wav.write('WAVEfmt ', 8); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(8000, 24); wav.writeUInt32LE(8000, 28); wav.writeUInt16LE(1, 32); wav.writeUInt16LE(8, 34); wav.write('data', 36); wav.writeUInt32LE(8000, 40);
+  const pdf = '%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj 3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n';
+  const nb = JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: { language_info: { name: 'python' } }, cells: [
+    { cell_type: 'markdown', metadata: {}, source: ['# Notebook title\n', 'Some **bold** text <a href="javascript:window.__pwned=1" onclick="window.__pwned=1">link</a>'] },
+    { cell_type: 'code', execution_count: 1, metadata: {}, source: 'print("hi")', outputs: [{ output_type: 'stream', name: 'stdout', text: ['printed hi\n'] }] },
+    { cell_type: 'code', execution_count: 2, metadata: {}, source: 'show()', outputs: [
+      { output_type: 'display_data', metadata: {}, data: { 'image/png': png([200, 30, 30]).toString('base64'), 'text/plain': '<Figure>' } },
+      { output_type: 'display_data', metadata: {}, data: { 'text/html': '<script>window.__pwned=1</script><b onmouseover="window.__pwned=1">table</b>' } }] },
+  ] });
+  const b64 = (b) => Buffer.from(b).toString('base64');
+  const put = async (message, changes, branch = 'main', new_branch) => (await (await ctx.request.post(BASE + '/api/repos/alice/hello/contents', { headers: { Origin: BASE },
+    data: { branch, new_branch, message, changes: changes.map(([path, data]) => ({ path, content: b64(data), base64: true })) } })).json());
+  await put('Add viewer samples', [['view/table.csv', 'name,n\nb,10\na,2\nc,33\n'], ['view/doc.pdf', pdf], ['view/nb.ipynb', nb], ['view/tetra.stl', stl],
+    ['view/song.wav', wav], ['view/clip.webm', Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0])]], 'main', 'viewers');
+  await put('Add a picture', [['pic.png', png([20, 120, 220])]], 'main', 'pictures');
+  const { sha: picSha } = await put('Recolour the picture', [['pic.png', png([240, 160, 20])]], 'pictures');
+
+  const page = await ctx.newPage();
+  const errors = [], steps = [];
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const go = (p) => page.goto(BASE + p, { waitUntil: 'networkidle' });
+  try {
+    await go('/alice/hello/blob/viewers/view/table.csv');
+    const firstCell = () => page.locator('.csv-table tbody tr:first-child td:first-child').innerText();
+    if ((await page.locator('.csv-table tbody tr').count()) !== 3) throw new Error('CSV table rows');
+    await page.click('.csv-table th button[data-col="1"]');
+    const asc = await firstCell();
+    await page.click('.csv-table th button[data-col="1"]');
+    if (asc !== 'a' || (await firstCell()) !== 'c') throw new Error(`CSV numeric sort: ${asc}`);
+    steps.push('CSV sorts');
+    await go('/alice/hello/blob/viewers/view/doc.pdf');
+    const frame = await page.getAttribute('iframe.pdf-view', 'src');
+    const head = await ctx.request.get(BASE + frame);
+    if (head.headers()['content-type'] !== 'application/pdf' || !head.headers()['content-security-policy'].includes("frame-ancestors 'self'")) throw new Error('PDF frame headers');
+    steps.push('PDF frame');
+    await go('/alice/hello/blob/viewers/view/nb.ipynb');
+    const nbText = await page.locator('.notebook').innerText();
+    const nbOk = nbText.includes('Notebook title') && nbText.includes('printed hi') && nbText.includes('<script>')
+      && (await page.locator('.notebook .nb-md strong').count()) === 1 && (await page.locator('.notebook .nb-out img').count()) === 1
+      && (await page.locator('.notebook b, .notebook script').count()) === 0 && !(await page.evaluate(() => window.__pwned));
+    if (!nbOk) throw new Error('notebook: ' + nbText.slice(0, 300));
+    steps.push('notebook (HTML output as text, nothing ran)');
+    await go('/alice/hello/blob/viewers/view/tetra.stl');
+    await page.locator('.stl-note', { hasText: /triangles|WebGL/ }).waitFor({ timeout: 5000 });
+    const stlNote = await page.locator('.stl-note').innerText();
+    if (!stlNote.includes('4 triangles')) throw new Error('STL: ' + stlNote);
+    await page.locator('.stl-view canvas').dragTo(page.locator('.stl-view canvas'), { sourcePosition: { x: 50, y: 50 }, targetPosition: { x: 150, y: 90 } });
+    await page.locator('.stl-view canvas').click({ clickCount: 2 });
+    steps.push('STL in WebGL');
+    await go('/alice/hello/blob/viewers/view/song.wav');
+    const dur = await page.locator('.media-view audio').evaluate((a) => new Promise((res) => (a.readyState >= 1 ? res(a.duration) : a.addEventListener('loadedmetadata', () => res(a.duration)))));
+    if (!(dur > 0.9 && dur < 1.1)) throw new Error('audio duration ' + dur);
+    await go('/alice/hello/blob/viewers/view/clip.webm');
+    if ((await page.locator('.media-view video[controls]').count()) !== 1) throw new Error('video player');
+    steps.push('audio and video players');
+    await go(`/alice/hello/commit/${picSha}`);
+    await page.locator('.imgdiff-2up img').first().waitFor();
+    const loaded = await page.locator('.imgdiff-2up img').evaluateAll((imgs) => imgs.filter((i) => i.complete && i.naturalWidth === 8).length);
+    await page.click('button[data-imode="swipe"]');
+    await page.locator('.imgdiff-stack input[type=range]').evaluate((r) => { r.value = '30'; r.dispatchEvent(new Event('input', { bubbles: true })); });
+    const clip = await page.locator('.imgdiff-layers .top').evaluate((i) => getComputedStyle(i).clipPath);
+    await page.click('button[data-imode="onion"]');
+    const op = await page.locator('.imgdiff-layers .top').evaluate((i) => getComputedStyle(i).opacity);
+    if (loaded !== 2 || !clip.includes('30%') || op !== '0.3' || !(await page.locator('.imgdiff-2up').isHidden())) throw new Error(`image diff: ${loaded} ${clip} ${op}`);
+    steps.push('image diff 2-up, swipe, onion skin');
+    // Drop a file on a file page: it opens the upload with that file, ready to commit.
+    await go('/alice/hello/blob/main/README.md');
+    const dt = await page.evaluateHandle(() => { const d = new DataTransfer(); d.items.add(new File(['dropped from the browser\n'], 'dropped.txt', { type: 'text/plain' })); return d; });
+    await page.dispatchEvent('.markdown-body', 'dragenter', { dataTransfer: dt });
+    await page.dispatchEvent('.markdown-body', 'drop', { dataTransfer: dt });
+    await page.waitForURL(/\/upload\/main$/);
+    await page.locator('#up-list', { hasText: 'dropped.txt' }).waitFor({ timeout: 5000 });
+    await page.click('#cm-go');
+    await page.waitForURL(/\/tree\/main$/);
+    if (!(await ctx.request.get(BASE + '/raw/alice/hello/main/dropped.txt')).ok()) throw new Error('dropped file not committed');
+    steps.push('drag-and-drop upload');
+    // Revert that commit from its page, then the merged pull request from its page.
+    const last = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json()).commits[0].sha;
+    await go(`/alice/hello/commit/${last}`);
+    await page.click('#revert');
+    await page.click('.modal [data-ok]');
+    await page.waitForURL(/\/pull\/\d+$/);
+    await page.locator('#page', { hasText: 'Revert "Add dropped.txt via upload"' }).waitFor({ timeout: 5000 });
+    await go('/alice/hello/pull/2');
+    await page.click('#revert-pr');
+    await page.click('.modal [data-ok]');
+    await page.waitForURL(/\/pull\/\d+$/);
+    await page.locator('#page', { hasText: 'Revert "Add lib"' }).waitFor({ timeout: 5000 });
+    steps.push('revert a commit and a merged pull request');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length) { failed++; console.log('✗ viewers, image diff, drop upload, revert', steps, errors); }
+  else console.log(`  ok ${steps.join(', ')}`);
+  await page.close();
+  // The branches above started CI runs: let them finish, so the server stops with nothing running.
+  for (let i = 0; i < 120; i++) {
+    const { runs } = await (await ctx.request.get(BASE + '/api/repos/alice/hello/ci/runs')).json();
+    if (!runs.some((r) => r.status === 'queued' || r.status === 'running')) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
 // Milestones, assignees and templates: a milestone with progress, set from the issue sidebar
 // with an assignee; the template chooser fills a new issue; the PR template starts a PR.
 {
