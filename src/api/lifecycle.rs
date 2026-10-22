@@ -233,10 +233,13 @@ pub async fn accept(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp,
             claim_name(&tx, to_id, &name)?;
             tx.execute("UPDATE repos SET owner_id = ?2, updated_at = ?3 WHERE id = ?1", params![id, to_id, now()])?;
             // The old owner's keys to it and credentials in it: deploy tokens, CI secrets,
-            // and webhooks (their URLs and secrets) don't move with the code.
+            // webhooks (their URLs and secrets) and mirror passwords don't move with the code.
             tx.execute("DELETE FROM tokens WHERE repo_id = ?1", [id])?;
             tx.execute("DELETE FROM ci_secrets WHERE repo_id = ?1", [id])?;
             tx.execute("DELETE FROM webhooks WHERE repo_id = ?1", [id])?;
+            // Push mirrors send the code where the old owner chose; a pull mirror keeps its remote, without their password.
+            tx.execute("DELETE FROM mirrors WHERE repo_id = ?1 AND direction = 'push'", [id])?;
+            tx.execute("UPDATE mirrors SET username = '', secret = NULL, allow_private = 0 WHERE repo_id = ?1", [id])?;
             tx.execute("DELETE FROM repo_transfers WHERE repo_id = ?1", [id])?;
             tx.commit()?;
             Ok((from_id, from, to, name))

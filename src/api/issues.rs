@@ -1021,6 +1021,7 @@ pub(crate) async fn merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i
 }
 
 async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq) -> R<serde_json::Value> {
+    crate::mirrors::refuse_writes(r)?;
     let issue = load_issue(st, r, num, Some(u)).await?;
     if !issue.is_pr {
         return Err(AppError::not_found());
@@ -1172,6 +1173,7 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
             .delete_ref(&r.path, &format!("refs/heads/{head_b}"))
             .await;
         crate::hooks::forget_branches(st, r.id, vec![head_b.clone()]).await;
+        crate::mirrors::changed(st, r.id).await;
     }
     Ok(json!({ "sha": new_sha }))
 }

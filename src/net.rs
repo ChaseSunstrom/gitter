@@ -74,6 +74,33 @@ pub fn is_public(ip: IpAddr) -> bool {
     }
 }
 
+/// One message for "doesn't resolve" and "private", without the address: whoever
+/// sets a URL reads it back, and mustn't be able to map internal names.
+const NOT_PUBLIC: &str = "Not contacted: the host doesn't resolve to a public address (private or reserved addresses aren't allowed)";
+
+/// For a program that connects by itself (git, through curl): `url`'s host
+/// looked up once with every address checked, as a curl resolve entry
+/// (`host:port:addr,...`) that makes it connect to exactly those. None when the
+/// URL holds an address (already checked: there's nothing to look up). Blocking.
+pub fn pin(url: &str) -> Result<Option<String>, String> {
+    let uri = check_url(url)?;
+    let host = uri.host().unwrap_or_default();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
+    if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        return if is_public(ip) { Ok(None) } else { Err(NOT_PUBLIC.into()) };
+    }
+    // curl drops a trailing dot before it looks in its resolve list, so the entry wouldn't match.
+    if host.ends_with('.') {
+        return Err("Leave the trailing dot out of the host name".into());
+    }
+    let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port)).map_err(|_| NOT_PUBLIC.to_string())?.collect();
+    if addrs.is_empty() || addrs.iter().any(|a| !is_public(a.ip())) {
+        return Err(NOT_PUBLIC.into());
+    }
+    let list: Vec<String> = addrs.iter().map(|a| if a.is_ipv6() { format!("[{}]", a.ip()) } else { a.ip().to_string() }).collect();
+    Ok(Some(format!("{host}:{port}:{}", list.join(","))))
+}
+
 /// Resolves like ureq does, but refuses the lot if any address isn't public.
 /// ureq connects to what this returns, so the check and the connection can't disagree.
 #[derive(Debug)]
@@ -81,9 +108,7 @@ struct PublicOnly;
 
 impl Resolver for PublicOnly {
     fn resolve(&self, uri: &Uri, config: &ureq::config::Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        // One message for "doesn't resolve" and "private", without the address: whoever
-        // sets a hook URL reads it back, and mustn't be able to map internal names.
-        let refuse = || ureq::Error::Io(std::io::Error::other("Not contacted: the host doesn't resolve to a public address (private or reserved addresses aren't allowed)"));
+        let refuse = || ureq::Error::Io(std::io::Error::other(NOT_PUBLIC));
         let addrs = match DefaultResolver::default().resolve(uri, config, timeout) {
             Ok(a) => a,
             Err(ureq::Error::HostNotFound) => return Err(refuse()),
@@ -165,5 +190,13 @@ mod tests {
         assert!(check_url("https://user:pw@example.com/").is_err());
         assert!(check_url("example.com/hook").is_err());
         assert!(check_url("https://exa mple.com/").is_err());
+    }
+
+    #[test]
+    fn pins_only_public_hosts() {
+        assert_eq!(pin("https://1.1.1.1/x.git"), Ok(None));
+        for bad in ["http://127.0.0.1/x", "http://[::1]:8080/x", "http://localhost/x", "http://169.254.169.254/", "http://2130706433/", "https://example.com./x"] {
+            assert!(pin(bad).is_err(), "{bad} must be refused");
+        }
     }
 }

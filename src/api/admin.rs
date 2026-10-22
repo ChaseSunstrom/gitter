@@ -120,6 +120,7 @@ pub async fn overview(State(st): State<AppState>, _a: Admin) -> J<serde_json::Va
                 "open_pulls": n("SELECT count(*) FROM issues WHERE is_pr = 1 AND state = 'open'")?,
                 "events_today": c.query_row("SELECT count(*) FROM events WHERE created_at > ?1", [day], |r| r.get::<_, i64>(0))?,
                 "recent_users": recent,
+                "failing_mirrors": crate::mirrors::failing(c)?,
             }))
         })
         .await?;
@@ -252,6 +253,7 @@ pub async fn update_user(
                 // Only admins may point hooks at private addresses: a former admin's own repos lose that.
                 if !a {
                     tx.execute("UPDATE webhooks SET allow_private = 0 WHERE repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)", [id])?;
+                    tx.execute("UPDATE mirrors SET allow_private = 0 WHERE repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)", [id])?;
                 }
             }
             if let Some(s) = p.suspended {

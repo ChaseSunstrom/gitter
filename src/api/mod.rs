@@ -9,6 +9,7 @@ pub mod insights;
 pub mod issues;
 pub mod lifecycle;
 pub mod milestones;
+pub mod mirrors;
 pub mod moderation;
 pub mod releases;
 pub mod repos;
@@ -218,6 +219,9 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/hooks/{{id}}/ping"), post(webhooks::ping))
         .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}"), get(webhooks::delivery))
         .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}/redeliver"), post(webhooks::redeliver))
+        .route(&format!("{repo}/mirrors"), get(mirrors::list).post(mirrors::create))
+        .route(&format!("{repo}/mirrors/{{id}}"), patch(mirrors::update).delete(mirrors::remove))
+        .route(&format!("{repo}/mirrors/{{id}}/sync"), post(mirrors::sync))
         .route(&format!("{repo}/releases"), get(releases::list).post(releases::create))
         .route(&format!("{repo}/releases/latest"), get(releases::latest))
         .route(
@@ -341,8 +345,8 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
     if l.agent.is_some() {
         return agent_may(method, &segs);
     }
-    // Webhooks are the repository's configuration, and their URLs can hold credentials.
-    if segs.len() >= 4 && segs[0] == "repos" && segs[3] == "hooks" {
+    // Webhooks and mirrors are the repository's configuration, and hold credentials.
+    if segs.len() >= 4 && segs[0] == "repos" && matches!(segs[3], "hooks" | "mirrors") {
         return false;
     }
     if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
