@@ -384,6 +384,13 @@ pub struct Job {
     pub artifacts: Vec<String>,
     /// Runner labels the job needs.
     pub runs_on: Vec<String>,
+    /// `network: false`: the job's container gets no network at all.
+    #[serde(default = "yes")]
+    pub network: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,6 +418,7 @@ pub fn script_pipeline() -> Pipeline {
             steps: vec![Step { name: SCRIPT_PATH.into(), run: format!("sh {SCRIPT_PATH}") }],
             artifacts: vec![],
             runs_on: vec![],
+            network: true,
         }],
     }
 }
@@ -577,7 +585,7 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
         }
         let Value::Object(m) = spec else { return Err(format!("jobs.{key}: expected steps and settings")) };
         for k in m.keys() {
-            if !matches!(k.as_str(), "steps" | "image" | "needs" | "env" | "matrix" | "paths" | "timeout" | "artifacts" | "runs-on" | "name") {
+            if !matches!(k.as_str(), "steps" | "image" | "needs" | "env" | "matrix" | "paths" | "timeout" | "artifacts" | "runs-on" | "name" | "network") {
                 return Err(format!("jobs.{key}: unknown setting '{k}'"));
             }
         }
@@ -594,6 +602,11 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
         if image.as_ref().is_some_and(|i| i.len() > 256) {
             return Err(format!("jobs.{key}.image: too long"));
         }
+        let network = match m.get("network") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(format!("jobs.{key}.network: true or false")),
+        };
         let matrix = matrix(m.get("matrix"), key)?;
         let title = m.get("name").and_then(Value::as_str).unwrap_or(key).to_string();
         for combo in &matrix {
@@ -620,6 +633,7 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
                 steps: steps.iter().map(|s| Step { name: interpolate(&s.name, combo), run: interpolate(&s.run, combo) }).collect(),
                 artifacts: strings(m.get("artifacts").unwrap_or(&Value::Null), &format!("jobs.{key}.artifacts"))?,
                 runs_on: strings(m.get("runs-on").unwrap_or(&Value::Null), &format!("jobs.{key}.runs-on"))?,
+                network,
             });
             if out.len() > MAX_JOBS {
                 return Err(format!("a pipeline can have at most {MAX_JOBS} jobs (after matrix expansion)"));

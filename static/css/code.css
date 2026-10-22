@@ -138,3 +138,47 @@
 .uni.bidi { color: var(--red, #c0392b); background: color-mix(in srgb, var(--red, #c0392b) 14%, transparent); border-color: color-mix(in srgb, var(--red, #c0392b) 45%, transparent); }
 .uni-mix { text-decoration: wavy underline var(--amber, #b45309); text-underline-offset: 3px; }
 .uni-warn { padding: 10px 14px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--amber, #b45309) 10%, var(--surface)); font-size: 13px; }
+
+/* Rich file viewers (viewers.js) */
+.csv-scroll { overflow: auto; max-height: 75vh; }
+.csv-table { border-collapse: collapse; font-size: 13px; min-width: 100%; }
+.csv-table th, .csv-table td { border-bottom: 1px solid var(--line); padding: 5px 12px; text-align: left; white-space: nowrap; }
+.csv-table th { position: sticky; top: 0; background: var(--surface-2); z-index: 1; }
+.csv-table th button { all: unset; cursor: pointer; font-weight: 600; }
+.csv-table th[aria-sort="ascending"] button::after { content: " ▲"; font-size: 9px; }
+.csv-table th[aria-sort="descending"] button::after { content: " ▼"; font-size: 9px; }
+.csv-table tbody tr:hover { background: var(--line-hl); }
+.csv-more { padding: 8px 14px; margin: 0; }
+.pdf-view { display: block; width: 100%; height: 80vh; border: 0; background: var(--bg-sunk); }
+.media-view { padding: 24px; display: grid; place-items: center; }
+.media-view audio { width: min(100%, 520px); }
+.media-view video { max-width: 100%; max-height: 70vh; }
+.stl-view { position: relative; }
+.stl-view canvas { display: block; width: 100%; height: 60vh; cursor: grab; touch-action: none; background: radial-gradient(circle at 50% 40%, var(--surface-2), var(--bg-sunk)); }
+.stl-view canvas:active { cursor: grabbing; }
+.stl-note { padding: 8px 14px; border-top: 1px solid var(--line); }
+.notebook { padding: 12px 16px; display: grid; gap: 10px; }
+.nb-cell.nb-md { padding: 4px 0; }
+.nb-in { display: grid; grid-template-columns: 52px minmax(0, 1fr); align-items: start; }
+.nb-prompt { font-family: var(--font-mono); font-size: 12px; color: var(--faint); padding-top: 10px; }
+.nb-src { margin: 0; padding: 10px 12px; background: var(--bg-sunk); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; font-size: 13px; }
+.nb-out { margin: 6px 0 0 52px; overflow-x: auto; font-size: 13px; }
+pre.nb-out, .nb-out pre { padding: 6px 12px; white-space: pre-wrap; }
+.nb-out img { max-width: 100%; background: #fff; }
+.nb-err { color: var(--red); background: color-mix(in srgb, var(--red) 8%, transparent); border-radius: 6px; }
+.imgdiff { padding: 12px; display: grid; gap: 12px; justify-items: center; }
+.imgdiff-2up { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
+.imgdiff figure { margin: 0; display: grid; gap: 6px; justify-items: center; }
+.imgdiff figure img { max-width: min(100%, 420px); max-height: 50vh; border: 2px solid var(--del-line); }
+.imgdiff figure.add img { border-color: var(--add-line); }
+.imgdiff figcaption { font-size: 12px; color: var(--muted); }
+.imgdiff-stack { display: grid; gap: 10px; justify-items: center; }
+.imgdiff-layers { display: grid; }
+.imgdiff-layers img { grid-area: 1 / 1; max-width: min(100%, 640px); max-height: 60vh; }
+.imgdiff[data-imode="swipe"] .imgdiff-layers .top { clip-path: inset(0 0 0 var(--pos)); }
+.imgdiff[data-imode="onion"] .imgdiff-layers .top { opacity: var(--op); }
+.imgdiff-stack input[type=range] { width: min(100%, 320px); }
+.file-box { position: relative; }
+.file-box.drop-on { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.file-box.drop-on::after { content: "Drop files to upload here"; position: absolute; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--surface) 82%, transparent);
+  font-weight: 600; color: var(--accent); border-radius: var(--r); font-size: 16px; z-index: 6; }

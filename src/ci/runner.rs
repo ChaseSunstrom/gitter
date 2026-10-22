@@ -520,6 +520,9 @@ async fn steps(source: Option<(String, &'static str, String)>, l: &Lease, ws: &P
     }
     let env = job_env(l, ws, home);
     let docker_ok = l.job.image.is_none() || Command::new("docker").arg("version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.is_ok_and(|s| s.success());
+    if l.job.image.is_none() && !(l.limits.network && l.job.network) {
+        note(tx, "33", "This job names no image, so it runs as a plain process on the runner: turning the network off only applies to containers.").await;
+    }
     let mut failed: Option<i32> = None;
     for (i, step) in l.job.steps.iter().enumerate() {
         if failed.is_some() || halted(stop) {
@@ -545,6 +548,7 @@ async fn steps(source: Option<(String, &'static str, String)>, l: &Lease, ws: &P
             Some(image) => {
                 let mut c = Command::new("docker");
                 c.args(["run", "--rm", "--init", "--name", &container, "-v", &format!("{}:/workspace", ws.display()), "-w", "/workspace"]);
+                c.args(sandbox(l));
                 // Values go through the environment, never the command line.
                 for (k, _) in env.iter().filter(|(k, _)| !matches!(k.as_str(), "PATH" | "HOME" | "LANG" | "TZ") && !k.starts_with("DOCKER_")) {
                     c.args(["-e", k]);
@@ -579,7 +583,7 @@ async fn steps(source: Option<(String, &'static str, String)>, l: &Lease, ws: &P
             let owner = format!("{}:{}", m.uid(), m.gid());
             let mount = format!("{}:/workspace", ws.display());
             let _ = Command::new("docker")
-                .args(["run", "--rm", "-v", &mount, "--entrypoint", "chown", image, "-R", &owner, "/workspace"])
+                .args(["run", "--rm", "--network", "none", "-v", &mount, "--entrypoint", "chown", image, "-R", &owner, "/workspace"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -587,6 +591,29 @@ async fn steps(source: Option<(String, &'static str, String)>, l: &Lease, ws: &P
         }
     }
     (failed.is_none() && !halted(stop), Some(failed.unwrap_or(0)))
+}
+
+/// `docker run` flags that keep a job inside its container: no new privileges
+/// (setuid binaries can't escalate), the capabilities a build never needs
+/// dropped, a process limit, the site's CPU and memory limits, and no network
+/// when the site or the job turns it off. Nothing from the host is mounted
+/// but the workspace (never the docker socket).
+fn sandbox(l: &Lease) -> Vec<String> {
+    let mut a: Vec<String> = ["--security-opt", "no-new-privileges", "--pids-limit", "4096"].map(String::from).into();
+    for cap in ["NET_RAW", "MKNOD", "SYS_CHROOT", "SETFCAP", "AUDIT_WRITE"] {
+        a.extend(["--cap-drop".into(), cap.into()]);
+    }
+    if l.limits.cpus > 0 {
+        a.extend(["--cpus".into(), l.limits.cpus.to_string()]);
+    }
+    if l.limits.memory_mb > 0 {
+        let m = format!("{}m", l.limits.memory_mb);
+        a.extend(["--memory".into(), m.clone(), "--memory-swap".into(), m]);
+    }
+    if !(l.limits.network && l.job.network) {
+        a.extend(["--network".into(), "none".into()]);
+    }
+    a
 }
 
 /// Pack the files matching the job's `artifacts` globs into one .tar.gz and send it.

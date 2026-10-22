@@ -6,6 +6,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 - **Insights:** Commits → Graph draws every branch with its merges, lane by lane. A file's History button steps through each version of it, following renames, with a slider and the diff of each. The Insights tab shows contributors, weekly commit activity and languages, and to the repository's admins its traffic: views and clones (fetches count too) per day for two weeks, unique visitors, referring sites and popular pages.
 - **Releases:** publish a version from a tag (or a new tag at a branch), with markdown notes, files to download (with download counts) and the source code as zip and tar.gz. Drafts stay with the maintainers, pre-releases are marked, and the repository page shows the latest release.
 - **Collaboration:** issues, labels, pull requests with server-side merge (merge commit, squash or fast-forward), comments in markdown, stars and forks.
+- **Milestones, assignees, templates:** milestones (a title, a due date and a description) gather issues and pull requests and show how many are done; the Milestones page lists them with their progress, and issue lists filter by milestone and by assignee (Assigned to me). People with write access set an issue's or pull request's milestone and up to 10 assignees from its sidebar, and only people with write access can be assigned: someone who loses it stops showing as assigned (and comes back if it's given back). Markdown files in `.gitter/ISSUE_TEMPLATE/` on the default branch are offered when opening an issue, with optional front matter (`name`, `about`, `title`, `labels`; the labels apply whoever opens it), and `.gitter/pull_request_template.md` starts every pull request's description.
 - **Code review:** click a line number in a pull request's Files changed (shift-click for a range) to comment there. Comments form threads with replies that can be resolved; ones whose lines changed since are marked outdated. Gather comments into a review and submit it as Approve, Request changes or Comment (not on your own pull request); the latest decision of each reviewer shows on the pull request and in the list. A ```` ```suggestion ```` block proposes replacement lines, and anyone who can push applies it as a commit with one click (refused if those lines changed meanwhile).
 - **Teams:** add collaborators to a repository as Read (see and clone), Write (push, manage issues and pull requests) or Admin (settings, access, deploy tokens, CI secrets), and see in plain words who can do what in Settings → Who has access. Organizations own repositories for a group: owners manage everything, and members get the organization's base permission (none, read or write) on all of its repositories. An organization shares its creator's repository limit and storage quota, and who belongs to it is visible to its members only. Write access includes running CI: pushes run the repository's pipelines with its secrets, so give Write to people you'd trust with those.
 - **Wikis, discussions, snippets:** every repository has a markdown wiki with page history (its own git repository, private when the repo is) and a discussions forum with General, Q&A, Ideas and Announcements categories, marked answers and upvotes. Snippets share a few files, public or secret (only the link finds it), with every edit kept as a revision.
@@ -134,13 +135,26 @@ jobs:
 - `needs` waits for other jobs and skips when one of them fails. `runs-on: [gpu]` sends a job to runners with those labels. The default `timeout` is 30 minutes.
 - The YAML is a documented subset: block maps and lists, `|` and `>` text, quotes, and `[a, b]` / `{a: b}`. Anchors and tags give a clear error.
 
-**Runners.** The server runs up to 2 jobs at once itself, for repositories owned by admins only. A job there runs as the server's own user and can read its data folder, so treat pushing to an admin's repository as server access. To add machines, make a token in **Site administration → CI runners**, then run on the machine. It needs git, and docker for jobs with an `image`:
+**Runners.** The server runs up to 2 jobs at once itself, only for repositories owned by admins and only for runs a site admin started: their push or merge, their press of Run, or a schedule on a branch they last pushed. A collaborator's push to an admin's repository waits for a separate runner. A job on the built-in runner without an `image` runs as the server's own user and can read its data folder. To add machines, make a token in **Site administration → CI runners**, then run on the machine. It needs git, and docker for jobs with an `image`:
 
 ```sh
 GITTER_RUNNER_TOKEN=grn_… gitter runner --url https://git.example.com --labels gpu --jobs 4
 ```
 
+**Sandbox.** A job with an `image` runs in a container that gets only its workspace mounted (never the docker socket), no new privileges, a few capabilities dropped (raw sockets, device nodes, chroot), at most 4096 processes, and the site's CPU and memory limits (2 CPUs and 4 GB unless the admin changes them; 0 is no limit). `network: false` on a job, or turning the network off site-wide, gives the container no network. Jobs without an `image` run as plain processes on the runner, so register runners on machines you're happy to have run your repositories' code.
+
+**Approval.** A run started by an agent's changes (see AI agents) waits until someone with write access reads the changes and presses **Approve and run**. It then goes to a separate runner, without secrets.
+
 Jobs are leased with a heartbeat. A job whose runner dies goes back to the queue, and a runner that lost its lease can't report over the new attempt. Stopping a runner (Ctrl-C or SIGTERM) kills its running steps, and their jobs go back to the queue.
+
+**Branch rules, checks and auto-merge.** In a repository's **Settings → Branch rules**, admins protect the branches matching a pattern (`main`, `release/*`; `*` stays within one part of the name, `**` spans parts, and `main` doesn't cover `fix/main`). A rule can:
+
+- require pull requests: no direct pushes or web edits;
+- require approving reviews of the pull request's latest commit (a later push needs a new approval) from people with write access, any of whom can also block by requesting changes;
+- require checks to pass on the pull request's head: CI job names (a job skipped because one it needs failed counts as failed), or contexts of commit statuses that other systems post with `POST /api/repos/OWNER/REPO/statuses/SHA` (`{"state": "success", "context": "deploy", "target_url": "https://…"}`; states are pending, success, failure and error). Anyone with write access can post statuses, so a status named like a CI job can only make that check worse;
+- allow or refuse force-pushes and deleting the branch (refused unless allowed).
+
+Rules apply to git pushes (through a pre-receive hook, before anything moves), web edits, branch deletion and merges. Repository admins may bypass them unless the rule says it applies to admins too, and a bypassed merge has to be asked for. Merging past the rules is in the security log. **Merge when ready** on a pull request merges it by itself, with the method chosen, once its checks pass and its reviews are in; a push to the branch by anyone else than whoever asked cancels it. A CI badge for a README: `![CI](https://git.example.com/api/repos/OWNER/REPO/ci/badge.svg)` (add `?branch=NAME` for another branch). Links to public repositories, issues and pull requests unfurl in chat apps.
 
 **Who can run CI** is set in Site administration:
 
@@ -214,7 +228,7 @@ Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_
 
 - It reaches only the repositories you picked (not even other public ones) and only the tools you ticked.
 - It can't change settings, collaborators or webhooks, see CI secrets, tokens or your account, or merge pull requests. `commit_files` starts a new branch (`new_branch`) or adds to one an agent started, never the default branch or a person's branch; then `open_pull_request`. Agents hold at most 100 branches per repository (deleting one frees its place).
-- Any CI run of an agent's branch, whoever pushed, gets no CI secrets, since the agent wrote the workflow and reads the log, and the built-in runner (the server itself) never takes it: it waits for a runner you registered. Once a person merges the work, it runs like anyone's.
+- Any CI run of an agent's branch, whoever pushed, waits for your approval, gets no CI secrets (the agent wrote the workflow and reads the log), and never runs on the built-in runner (the server itself): once approved it goes to a runner you registered. Once a person merges the work, it runs like anyone's.
 - The token works only at `/mcp`: not for git, the REST API or the web.
 - It has its own rate limit (120 calls a minute) and its changes count apart from yours.
 - Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".
@@ -227,8 +241,22 @@ Add your public key in **Settings → SSH keys** (Ed25519, ECDSA, or RSA of 2048
 
 - The SSH user name doesn't matter (`git@` is usual): the key says who you are. Access is exactly git over HTTP's: private repositories are "not found" without access, pushing needs write access, renamed and transferred repositories answer at their old path, and suspended accounts are refused. Pushes run the same post-push work (CI, webhooks, the feed, size and storage checks).
 - Only `git-upload-pack`, `git-receive-pack` and `git-upload-archive` run, on an `owner/repository` path. There's no shell, no other command, no port or agent forwarding, and no environment except `GIT_PROTOCOL`.
-- Limits: the git transfer limits per address are shared with HTTP (transfers at once, starts per minute), at most 512 connections in all, a connection must sign in and start its command within 30 seconds, unknown keys are counted per address, and a command with nothing moving for 2 minutes is stopped.
+- Branch rules apply to SSH pushes exactly as to HTTPS ones, and a removed key or suspended account stops at the next command.
+- Limits: each git command takes the same per-address transfer limits as HTTP (transfers at once, starts per minute); an address opens at most 120 connections a minute, at most 512 are open in all, a connection must sign in and start its command within 30 seconds, unknown keys are counted per address (a registered key always gets in), a command with nothing moving for 2 minutes is stopped, and a shared connection (`ControlMaster`) can run one command after another.
 - Deploy keys aren't supported yet: use a deploy token over HTTPS.
+
+## Viewers, reverts, uploads and the demo
+
+- **Rich file views:** CSV and TSV files show as a table (the first 1,000 rows and 200 columns; click a column to sort, numbers as numbers), Jupyter notebooks render their markdown, highlighted code and text and image outputs, STL models (ASCII or binary, up to a million triangles) turn in 3D (drag to orbit, scroll to zoom, double-click to reset), PDFs open in the page, and audio and video files play. **Code** next to **Preview** shows the source of the text ones. Nothing pushed runs: notebook HTML and script outputs show as their source, markdown is sanitized, and files come from `/raw` with a sandbox (files that really are PDFs go without one, since browsers won't show a PDF in a sandbox; the browser's PDF viewer keeps a PDF's own scripts apart from the site, and only Gitter's pages may frame them).
+- **Image diffs:** a changed picture in a commit, comparison or pull request shows the two versions side by side (2-up), as a swipe, or as onion skin.
+- **Revert from the web:** **Revert** on a commit page, or on a merged pull request, puts the inverse change on a new branch (`revert-<sha>` or `revert-pr-<n>`) and opens a pull request into the branch it landed on, so it goes through review like anything else. When later changes touch the same lines, the error names the files: revert it locally with `git revert` instead.
+- **Drag and drop:** drop files or folders anywhere on a folder or file page to upload them into that folder (with the usual commit message and new-branch choice).
+- **Install it as an app:** Gitter has a web app manifest, so browsers offer to install it (Chrome and Edge: the install icon in the address bar; iOS: Share → Add to Home Screen).
+- **`gitter demo`:** seeds an empty `GITTER_DATA` with three people (alice is the admin, plus bob and carol, all with one password it prints), repositories with history, a fork and a file for each viewer, issues with comments, an open pull request with an approving review and a merged one, CI runs (queued until the server starts), wiki pages and a discussion, then starts the server, reachable from this machine only unless `GITTER_ADDR` is set. It refuses a directory that already has anything in it.
+
+  ```sh
+  GITTER_DATA=/tmp/gitter-demo gitter demo
+  ```
 
 ## Configuration
 

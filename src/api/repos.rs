@@ -608,10 +608,11 @@ pub async fn delete_branch(
     if q.name == r.default_branch {
         return Err(AppError::bad("You can't delete the default branch"));
     }
+    crate::protect::direct(&st, &r, &q.name, true).await?;
     st.git
         .delete_ref(&r.path, &format!("refs/heads/{}", q.name))
         .await?;
-    crate::hooks::forget_agent_branches(&st, r.id, vec![q.name.clone()]).await;
+    crate::hooks::forget_branches(&st, r.id, vec![q.name.clone()]).await;
     touch(&st.db, r.id, false).await?;
     ok()
 }

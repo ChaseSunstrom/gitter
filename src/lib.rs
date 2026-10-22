@@ -4,6 +4,7 @@ pub mod bench;
 pub mod ci;
 pub mod cli;
 pub mod db;
+pub mod demo;
 pub mod diff;
 pub mod error;
 pub mod git;
@@ -11,6 +12,7 @@ pub mod hooks;
 pub mod langs;
 pub mod lfs;
 pub mod net;
+pub mod protect;
 pub mod ops;
 pub mod registry;
 pub mod repo;
@@ -146,6 +148,7 @@ pub fn router(st: AppState) -> Router {
         .route("/favicon.svg", get(web::favicon))
         .route("/favicon.ico", get(web::favicon))
         .route("/robots.txt", get(web::robots))
+        .route("/manifest.webmanifest", get(web::manifest))
         .route("/healthz", get(api::admin::healthz))
         .fallback(get(web::index))
         // Binary downloads (release files, raw binaries) gain little from gzip and

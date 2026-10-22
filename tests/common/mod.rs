@@ -23,6 +23,8 @@ pub struct Client(pub Option<String>);
 
 impl App {
     pub fn new() -> App {
+        // Git runs the built binary as the pre-receive hook (branch rules).
+        let _ = gitter::protect::HOOK_EXE.set(env!("CARGO_BIN_EXE_gitter").into());
         let dir = tempfile::tempdir().unwrap();
         for d in ["repos", "home"] {
             std::fs::create_dir_all(dir.path().join(d)).unwrap();

@@ -57,7 +57,7 @@ async fn run(cwd: &Path, prog: &str, args: &[&str], key: &Key) -> (bool, String)
             c.env_remove(k);
         }
     }
-    let out = tokio::time::timeout(std::time::Duration::from_secs(60), c.output()).await.expect("command hung").unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), c.output()).await.unwrap_or_else(|_| panic!("command hung: {prog} {args:?}")).unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), text)
 }
@@ -154,6 +154,18 @@ async fn git_over_ssh_follows_the_http_access_rules() {
     }
     assert_eq!(pushes(&app, "priv").await, before_pushes + 1, "the push is in the feed");
     assert!(size(&app, "priv").await > before_size, "the size is refreshed");
+
+    // Branch rules hold over SSH too (the shared transfer command adds the hook).
+    let rule = json!({ "pattern": "main", "enforce_admins": true });
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/priv/branch-rules", Some(rule)).await.0, StatusCode::OK);
+    std::fs::write(work.join("more.txt"), "more\n").unwrap();
+    assert!(run(&work, "git", &["add", "."], &ak).await.0);
+    assert!(run(&work, "git", &["commit", "-qm", "Straight to main"], &ak).await.0);
+    let (ok, out) = run(&work, "git", &["push", "origin", "HEAD:main"], &ak).await;
+    assert!(!ok && out.contains("main is protected"), "{out}");
+    // A second command on the same connection works (ssh connection sharing).
+    let (ok, out) = run(&work, "git", &["push", "origin", "HEAD:refs/heads/topic"], &ak).await;
+    assert!(ok, "{out}");
 
     let bwork = dir.join("bob-pub");
     std::fs::write(bwork.join("evil.txt"), "x\n").unwrap();

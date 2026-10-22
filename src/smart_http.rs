@@ -195,12 +195,20 @@ pub async fn push_limit(st: &AppState, repo: &Repo, push: bool) -> Result<u64, A
     }
 }
 
-/// `git` set up for a transfer; callers add the service and its arguments.
-pub fn transfer_command(st: &AppState, max_push: u64) -> tokio::process::Command {
+/// `git` set up for a transfer over any transport; callers add the service and
+/// its arguments. `receives`: this transfer takes a push, so the pre-receive
+/// hook checks it against the branch rules binding the pusher before any ref moves.
+pub async fn transfer_command(st: &AppState, repo: &Repo, user: Option<&User>, max_push: u64, receives: bool) -> Result<tokio::process::Command, AppError> {
     let mut cmd = st.git.command(None);
     // The current push limit overrides whatever was stored when the repo was created.
     cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
-    cmd
+    if receives && let Some((dir, rules)) = crate::protect::push_hook(st, repo).await? {
+        cmd.arg("-c").arg(format!("core.hooksPath={}", dir.display())).env("GITTER_RULES", rules);
+    }
+    if let Some(u) = user {
+        cmd.env("REMOTE_USER", &u.username);
+    }
+    Ok(cmd)
 }
 
 /// A refusal from the shared checks as git over HTTP says it: anonymous
@@ -257,7 +265,7 @@ async fn serve_inner(
         Ok(m) => m,
         Err(e) => return Ok(refuse(e, false)),
     };
-    let mut cmd = transfer_command(&st, max_push);
+    let mut cmd = transfer_command(&st, &repo, user.as_ref(), max_push, push && is_post).await?;
     if crate::auth::basic_secret(&headers).is_some_and(|s| s.starts_with(crate::ci::queue::JOB_TOKEN_PREFIX)) {
         // A CI runner fetches the one commit it builds (only commits a ref can reach).
         cmd.arg("-c").arg("uploadpack.allowReachableSHA1InWant=true");
@@ -270,9 +278,6 @@ async fn serve_inner(
         .env("QUERY_STRING", req.uri().query().unwrap_or(""))
         .env("REMOTE_ADDR", "127.0.0.1")
         .stdin(Stdio::piped());
-    if let Some(u) = &user {
-        cmd.env("REMOTE_USER", &u.username);
-    }
     for (h, var) in [
         (header::CONTENT_TYPE.as_str(), "CONTENT_TYPE"),
         ("content-encoding", "HTTP_CONTENT_ENCODING"),

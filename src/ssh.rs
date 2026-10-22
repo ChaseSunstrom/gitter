@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rand::RngCore;
@@ -33,6 +33,8 @@ const LINGER: Duration = Duration::from_secs(10);
 const IDLE_SECS: i64 = 120;
 /// SSH connections open at once, from everyone (each address also has the git transfer limit).
 const MAX_CONNECTIONS: usize = 512;
+/// New connections one address may open a minute (before signing in).
+const CONNECTS_PER_MIN: u32 = 120;
 /// Unknown keys offered from one address per minute before every key from there is refused.
 const KEY_FAILS_PER_MIN: u32 = 60;
 /// What a clone or fetch may send (its wants and haves).
@@ -111,9 +113,11 @@ async fn accept(st: AppState, listener: tokio::net::TcpListener, config: Arc<rus
         };
         let Ok(conn) = open.clone().try_acquire_owned() else { continue };
         let ip = peer.ip().to_canonical().to_string();
-        // The same per-address limits as git over HTTP: starts per minute and transfers at once.
-        let Ok(slot) = http::start(&st, &ip) else { continue };
-        tokio::spawn(connection(st.clone(), config.clone(), sock, ip, (conn, slot)));
+        // Connections per address per minute; git's transfer limits apply once a command starts.
+        if st.limiter.check(&format!("ssh-conn:{}", crate::auth::ip_bucket(&ip)), CONNECTS_PER_MIN, 60).is_err() {
+            continue;
+        }
+        tokio::spawn(connection(st.clone(), config.clone(), sock, ip, conn));
     }
 }
 
@@ -122,20 +126,39 @@ async fn connection(
     config: Arc<russh::server::Config>,
     sock: tokio::net::TcpStream,
     ip: String,
-    _held: (tokio::sync::OwnedSemaphorePermit, http::Slot),
+    _held: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let (started, done) = (Arc::new(AtomicBool::new(false)), Arc::new(tokio::sync::Notify::new()));
-    let conn = Conn { st, ip, user: None, protocol: None, channel: None, started: started.clone(), done: done.clone(), stdin: None };
+    let (started, done, running) = (Arc::new(AtomicBool::new(false)), Arc::new(tokio::sync::Notify::new()), Arc::new(AtomicUsize::new(0)));
+    let conn = Conn {
+        st,
+        ip,
+        user: None,
+        key: None,
+        protocol: None,
+        channel: None,
+        execed: false,
+        started: started.clone(),
+        done: done.clone(),
+        running: running.clone(),
+        stdin: None,
+    };
     let Ok(Ok(session)) = tokio::time::timeout(START_DEADLINE, russh::server::run_stream(config, sock, conn)).await else {
         return;
     };
     let handle = session.handle();
-    // Sign in and start a command in time, and go soon after it ends (clients close by themselves).
+    // Sign in and start a command in time; then stay while commands run, and a
+    // little after the last (a shared connection may send another), then go.
     let lifetime = async {
         tokio::time::sleep(START_DEADLINE).await;
         if started.load(Ordering::Relaxed) {
-            done.notified().await;
-            tokio::time::sleep(LINGER).await;
+            loop {
+                while running.load(Ordering::Relaxed) > 0 {
+                    done.notified().await;
+                }
+                if tokio::time::timeout(LINGER, done.notified()).await.is_err() && running.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+            }
         }
         let _ = handle.disconnect(russh::Disconnect::ByApplication, "Closing the connection".into(), String::new()).await;
         // The session ends on its own now; don't wait for it forever.
@@ -147,17 +170,24 @@ async fn connection(
     }
 }
 
-/// One SSH connection: at most one session channel running one git command.
+/// One SSH connection: one session channel at a time, each running one git
+/// command (a shared connection opens another channel for the next).
 struct Conn {
     st: AppState,
     ip: String,
     user: Option<User>,
+    /// The key it signed in with, looked up again when a command starts.
+    key: Option<PublicKey>,
     /// GIT_PROTOCOL from the client (`version=2`).
     protocol: Option<String>,
     channel: Option<ChannelId>,
+    /// The open channel has had its command.
+    execed: bool,
+    /// Some command has started on this connection.
     started: Arc<AtomicBool>,
-    /// Told when the command has ended.
+    /// Told when a command starts or ends.
     done: Arc<tokio::sync::Notify>,
+    running: Arc<AtomicUsize>,
     /// The running command's input.
     stdin: Option<mpsc::Sender<Vec<u8>>>,
 }
@@ -192,13 +222,13 @@ impl russh::server::Handler for Conn {
     type Error = anyhow::Error;
 
     async fn auth_publickey_offered(&mut self, _user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        if self.st.limiter.blocked(&self.fail_key(), KEY_FAILS_PER_MIN) {
-            return Ok(Auth::reject());
-        }
+        // A registered key always gets in: someone else's failures on a shared address don't lock it out.
         if key_owner(&self.st, key, false).await.map_err(|e| anyhow::anyhow!(e.msg))?.is_some() {
             return Ok(Auth::Accept);
         }
-        self.st.limiter.fail(&self.fail_key(), 60);
+        if !self.st.limiter.blocked(&self.fail_key(), KEY_FAILS_PER_MIN) {
+            self.st.limiter.fail(&self.fail_key(), 60);
+        }
         Ok(Auth::reject())
     }
 
@@ -207,6 +237,7 @@ impl russh::server::Handler for Conn {
         match key_owner(&self.st, key, true).await.map_err(|e| anyhow::anyhow!(e.msg))? {
             Some(u) => {
                 self.user = Some(u);
+                self.key = Some(key.clone());
                 Ok(Auth::Accept)
             }
             None => Ok(Auth::reject()),
@@ -219,6 +250,7 @@ impl russh::server::Handler for Conn {
             return Ok(());
         }
         self.channel = Some(channel.id());
+        self.execed = false;
         reply.accept().await;
         // Input arrives through `data`; a kept Channel nobody reads would stall the connection.
         drop(channel);
@@ -269,14 +301,21 @@ impl russh::server::Handler for Conn {
     }
 
     async fn exec_request(&mut self, channel: ChannelId, data: &[u8], s: &mut Session) -> Result<(), Self::Error> {
-        if self.channel != Some(channel) || self.started.swap(true, Ordering::Relaxed) {
+        if self.channel != Some(channel) || self.execed {
             s.channel_failure(channel)?;
             return Ok(());
         }
+        self.execed = true;
+        self.started.store(true, Ordering::Relaxed);
         s.channel_success(channel)?;
-        let (Some(user), Some((service, owner, name))) = (self.user.clone(), parse_command(data)) else {
+        // Looked up again: a key removed, or an account suspended, since sign-in stops here.
+        let user = match &self.key {
+            Some(k) => key_owner(&self.st, k, false).await.map_err(|e| anyhow::anyhow!(e.msg))?,
+            None => None,
+        };
+        let (Some(user), Some((service, owner, name))) = (user, parse_command(data)) else {
             self.done.notify_one();
-            return finish(s, channel, "ERROR: Gitter runs only git-upload-pack, git-receive-pack and git-upload-archive on owner/repository.git.\n");
+            return finish(s, channel, "ERROR: Gitter runs only git-upload-pack, git-receive-pack and git-upload-archive on owner/repository.git, for a registered key.\n");
         };
         let (tx, rx) = mpsc::channel(64);
         self.stdin = Some(tx);
@@ -292,10 +331,19 @@ impl russh::server::Handler for Conn {
             channel,
             input: rx,
         };
-        let done = self.done.clone();
+        /// Counts the command as ended even if it panics.
+        struct Ended(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+                self.1.notify_one();
+            }
+        }
+        self.running.fetch_add(1, Ordering::Relaxed);
+        let ended = Ended(self.running.clone(), self.done.clone());
         tokio::spawn(async move {
+            let _ended = ended;
             job.run().await;
-            done.notify_one();
         });
         Ok(())
     }
@@ -316,8 +364,11 @@ impl russh::server::Handler for Conn {
         Ok(())
     }
 
-    async fn channel_close(&mut self, _channel: ChannelId, _s: &mut Session) -> Result<(), Self::Error> {
+    async fn channel_close(&mut self, channel: ChannelId, _s: &mut Session) -> Result<(), Self::Error> {
         self.stdin = None;
+        if self.channel == Some(channel) {
+            self.channel = None;
+        }
         Ok(())
     }
 }
@@ -346,7 +397,7 @@ fn parse_command(cmd: &[u8]) -> Option<(&'static str, String, String)> {
         Some(q) => q.strip_suffix('\'')?,
         None => arg,
     };
-    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = path.strip_prefix('/').unwrap_or(path).trim_end_matches('/');
     let (owner, repo) = path.split_once('/')?;
     let bare = repo.strip_suffix(".git").unwrap_or(repo);
     if !crate::validate::name(owner, 39) || !crate::validate::name(bare, 100) {
@@ -382,6 +433,8 @@ impl Job {
 
     async fn serve(self) -> R<()> {
         let Job { st, user, ip, service, owner, name, protocol, handle, channel, mut input } = self;
+        // The same per-address limits as git over HTTP: starts per minute and transfers at once.
+        let _slot = http::start(&st, &ip)?;
         let push = service == "receive-pack";
         let repo = http::open(&st, Some(&user), &owner, &name, push).await?;
         if service == "upload-pack" {
@@ -390,7 +443,7 @@ impl Job {
         let before = if push { Some(http::before_push(&st, &repo, Some(&user)).await?) } else { None };
         let _permit = st.git.permit_stream().await?;
         let max_push = http::push_limit(&st, &repo, push).await?;
-        let mut cmd = http::transfer_command(&st, max_push);
+        let mut cmd = http::transfer_command(&st, &repo, Some(&user), max_push, push).await?;
         cmd.arg(service);
         if service == "upload-pack" {
             cmd.arg("--strict");
