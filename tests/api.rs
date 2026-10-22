@@ -2561,6 +2561,48 @@ async fn web_branch_tags_conflict_only_when_the_tag_exists() {
     assert!(!e["error"].as_str().unwrap().contains("someone else"), "{e}");
 }
 
+#[tokio::test]
+async fn releases_failed_insert_takes_back_its_new_tag() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "t", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    app.state
+        .db
+        .call(|c| Ok(c.execute_batch("CREATE TRIGGER no_releases BEFORE INSERT ON releases BEGIN SELECT RAISE(ABORT, 'lost'); END;")?))
+        .await
+        .unwrap();
+    let (s, e) = app.req(&alice, "POST", "/api/repos/alice/t/releases", Some(json!({ "tag": "v9" }))).await;
+    assert_ne!(s, StatusCode::OK, "{e}");
+    assert!(insights_git(&repo, &["tag", "-l", "v9"]).trim().is_empty(), "the tag made for the failed release is taken back");
+
+    // Publishing a draft makes its tag; if saving then fails, the tag goes again.
+    app.state.db.call(|c| Ok(c.execute_batch("DROP TRIGGER no_releases;")?)).await.unwrap();
+    let (_, d) = app.req(&alice, "POST", "/api/repos/alice/t/releases", Some(json!({ "tag": "v10", "draft": true }))).await;
+    let url = format!("/api/repos/alice/t/releases/{}", d["id"]);
+    app.state
+        .db
+        .call(|c| Ok(c.execute_batch("CREATE TRIGGER no_updates BEFORE UPDATE ON releases BEGIN SELECT RAISE(ABORT, 'nope'); END;")?))
+        .await
+        .unwrap();
+    let (s, e) = app.req(&alice, "PATCH", &url, Some(json!({ "draft": false }))).await;
+    assert_ne!(s, StatusCode::OK, "{e}");
+    assert!(insights_git(&repo, &["tag", "-l", "v10"]).trim().is_empty(), "the tag made on publishing is taken back");
+}
+
+#[tokio::test]
+async fn releases_sweep_waits_while_a_backup_runs() {
+    let app = App::new();
+    let data = app.state.cfg.data_dir.clone();
+    std::fs::create_dir_all(data.join("releases/77")).unwrap();
+    std::fs::create_dir_all(data.join(".backup-tmp-abc")).unwrap();
+    gitter::api::releases::sweep(&app.state).await;
+    assert!(data.join("releases/77").exists(), "nothing is removed during a backup");
+    std::fs::remove_dir(data.join(".backup-tmp-abc")).unwrap();
+    gitter::api::releases::sweep(&app.state).await;
+    assert!(!data.join("releases/77").exists());
+}
+
 /// A raw-body request as `c` (release asset uploads and downloads): status, headers, body.
 async fn raw_as(app: &App, c: &Client, method: &str, path: &str, ctype: &str, body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
     let mut b = Request::builder().method(method).uri(path).header("host", "test.local").header("origin", ORIGIN);
@@ -2782,9 +2824,14 @@ async fn releases_assets_stream_with_quota_counts_and_cleanup() {
     // Deleting an asset, a release, the repository or the account removes the files.
     assert_eq!(app.req(&bob, "DELETE", &url, None).await.0, StatusCode::FORBIDDEN);
     assert_eq!(app.req(&alice, "DELETE", &url, None).await.0, StatusCode::OK);
+    // Deleted files stay until the sweep, so a backup that listed their rows still finds them.
+    assert!(file.exists());
+    gitter::api::releases::sweep(&app.state).await;
     assert!(!file.exists());
     assert_eq!(raw_as(&app, &anon, "GET", &url, "", vec![]).await.0, StatusCode::NOT_FOUND);
     assert_eq!(app.req(&alice, "DELETE", &format!("/api/repos/alice/app/releases/{id}"), None).await.0, StatusCode::OK);
+    assert!(data_dir.join(format!("releases/{id}")).exists());
+    gitter::api::releases::sweep(&app.state).await;
     assert!(!data_dir.join(format!("releases/{id}")).exists());
     assert!(data_dir.join(format!("releases/{pid}")).is_dir());
     assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/priv", Some(json!({ "confirm": "alice/priv" }))).await.0, StatusCode::OK);

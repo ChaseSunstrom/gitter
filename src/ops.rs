@@ -112,6 +112,15 @@ fn release_files(db: &Connection) -> Result<Vec<(String, String)>> {
     Ok(files.collect::<Result<_, _>>()?)
 }
 
+/// `releases/<id>` folders whose release is gone from the database (none before the table exists).
+fn orphan_release_dirs(db: &Connection, data: &Path) -> Result<Vec<PathBuf>> {
+    let table = db.query_row("SELECT 1 FROM sqlite_master WHERE name = 'release_assets'", [], |_| Ok(())).optional()?;
+    if table.is_none() {
+        return Ok(vec![]);
+    }
+    Ok(crate::api::releases::orphans(db, data)?.into_iter().filter(|p| p.is_dir()).collect())
+}
+
 /// Container registry blobs the database refers to, as (`registry/sha256/ab/<hex>`, hex);
 /// none before the table exists.
 fn registry_files(db: &Connection) -> Result<Vec<(String, String)>> {
@@ -638,6 +647,11 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
             report(damaged == 0, format!("{damaged} {what} don't match their hash"));
         }
     }
+    let stray = orphan_release_dirs(&conn, data)?.len();
+    if stray > 0 {
+        // Not a problem: deleted releases leave their folder until the hourly sweep or the next start.
+        report(true, format!("{stray} folders in releases/ with no release in the database (removed by the next sweep)"));
+    }
     Ok(problems)
 }
 
@@ -686,6 +700,13 @@ pub fn reconcile(cfg: &Config) -> Result<()> {
                 std::fs::rename(e.path(), &to)?;
                 eprintln!("moved unknown folder {}/{name} to {}", s.dir, to.display());
             }
+        }
+    }
+    // Release folders a deleted release left behind (the hourly sweep does the same later).
+    for p in orphan_release_dirs(&conn, &cfg.data_dir)? {
+        match std::fs::remove_dir_all(&p) {
+            Ok(()) => eprintln!("removed release folder {} (no such release)", p.display()),
+            Err(e) => eprintln!("warning: couldn't remove {}: {e}", p.display()),
         }
     }
     Ok(())
@@ -743,6 +764,27 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn reconcile_removes_release_folders_without_a_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_for(dir.path());
+        let db = crate::db::Db::open(&dir.path().join("gitter.db")).unwrap();
+        drop(db);
+        let conn = Connection::open(dir.path().join("gitter.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users(id, username, pass_hash, created_at) VALUES (1, 'a', 'x', 0);
+             INSERT INTO repos(id, owner_id, name, created_at, updated_at) VALUES (1, 1, 'r', 0, 0);
+             INSERT INTO releases(id, repo_id, tag, created_at) VALUES (5, 1, 'v1', 0);",
+        )
+        .unwrap();
+        for d in ["releases/5", "releases/7"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        assert_eq!(orphan_release_dirs(&conn, dir.path()).unwrap().len(), 1);
+        reconcile(&cfg).unwrap();
+        assert!(dir.path().join("releases/5").is_dir() && !dir.path().join("releases/7").exists());
     }
 
     #[test]
