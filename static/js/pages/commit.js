@@ -1,5 +1,5 @@
 // One commit: message, authorship, parents and the full diff.
-import { html, state, get, avatar, timeEl, short, fullDate } from '../lib.js';
+import { html, state, get, avatar, timeEl, short, fullDate, sigBadge } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
 import { diffView, mountDiff } from '../diffview.js';
@@ -29,6 +29,7 @@ export default async function (ctx) {
         ${avatar(c.author_email || c.author_name, 22)}
         <span><b>${c.author_name}</b> authored ${timeEl(c.author_time)}</span>
         ${sameCommitter ? '' : html`<span class="muted">· ${c.committer_name} committed ${timeEl(c.commit_time)}</span>`}
+        ${sigBadge(c.verification)}
         <span class="grow"></span>
         <span class="muted small">${c.parents.length === 0 ? 'Root commit' : c.parents.length === 1 ? '1 parent' : `${c.parents.length} parents`}</span>
         ${c.parents.map((p) => html`<a class="sha" href="${base}/commit/${p}">${short(p)}</a>`)}

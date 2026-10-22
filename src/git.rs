@@ -798,6 +798,9 @@ pub struct Commit {
     pub commit_time: i64,
     pub subject: String,
     pub body: String,
+    /// Filled in by `signing::annotate` where a page shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::signing::Verification>,
 }
 
 pub fn parse_log(s: &str) -> Vec<Commit> {
@@ -824,6 +827,7 @@ pub fn parse_log(s: &str) -> Vec<Commit> {
                 commit_time: f[7].parse().unwrap_or(0),
                 subject,
                 body,
+                verification: None,
             })
         })
         .collect()

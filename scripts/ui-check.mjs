@@ -94,6 +94,7 @@ const pages = [
   ['/explore?sort=stars', ['hello']],
   ['/settings', []],
   ['/settings/tokens', ['cli']],
+  ['/settings/signing', ['Signing keys', 'Public key']],
   ['/settings/security', ['Two-factor authentication', 'This browser', 'Security log']],
   ['/admin/audit', ['The log is intact', 'Created the account']],
   ['/settings/appearance', []],
@@ -123,6 +124,27 @@ const pages = [
 if ((await ctx.request.get(BASE + '/api/repos/alice/media')).ok()) pages.push(['/alice/media/blob/main/big.bin', ['Stored with Git LFS', 'Download', 'Git LFS']]);
 for (const [p, e] of pages) await visit(ctx, p, e);
 await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
+
+// Signed commits (e2e.sh pushes one when ssh-keygen is installed): the key is listed in
+// settings; the list, the commit page and blame show Verified, and the badge says why.
+if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.length) {
+  await visit(ctx, '/settings/signing', ['Signing keys', 'e2e laptop', 'SSH']);
+  const log = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json()).commits;
+  const signed = log.find((c) => c.subject === 'Signed commit')?.sha;
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const badges = {};
+  for (const [name, path] of [['list', '/alice/hello/commits'], ['commit', `/alice/hello/commit/${signed}`], ['blame', '/alice/hello/blame/main/README.md']]) {
+    await page.goto(BASE + path, { waitUntil: 'networkidle' });
+    badges[name] = await page.locator('.sig-badge.verified').count();
+  }
+  await page.locator('button.sig-badge.verified').first().click();
+  const why = await page.locator('.sig-pop').innerText().catch(() => '');
+  if (errors.length || !badges.list || !badges.commit || !badges.blame || !why.includes("alice's SSH key")) { failed++; console.log('✗ signature badges', { signed, badges, why, errors }); }
+  else console.log('  ok signing keys are listed; commits, the commit page and blame show Verified, and the badge says why');
+  await page.close();
+}
 
 // CI: a step's fold opens to its log, and commits show their CI result.
 {

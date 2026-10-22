@@ -1,5 +1,5 @@
 // Repository code views: file tree (with README), single file, and blame.
-import { html, raw, state, get, copy, timeEl, avatar, bytes, plural, short, encPath, enc, esc, num, $, popover, closePop, safeUrl, langOf, send, toast, confirmDialog, action } from '../lib.js';
+import { html, raw, state, get, copy, timeEl, avatar, bytes, plural, short, encPath, enc, esc, num, $, popover, closePop, safeUrl, langOf, send, toast, confirmDialog, action, sigBadge } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, splitRev, repoPage, mountRepoHeader, refPicker, mountRefPicker, crumbs } from '../repohead.js';
 import { codeBlock, highlightInto, mountLineSelection } from '../codeview.js';
@@ -305,7 +305,7 @@ async function blameView(meta, rev, path) {
   const rows = d.chunks.map((c) => html`<div class="blame-chunk">
     <div class="blame-meta" style="--heat:${heat(c.time, min, max)}">
       <div class="row">${avatar(c.author, 16)}<a class="ellipsis grow" href="${base}/commit/${c.sha}" title="${c.summary}">${c.summary}</a></div>
-      <div class="row muted tiny"><a class="sha" href="${base}/commit/${c.sha}">${short(c.sha)}</a><span>${c.author}</span><span class="grow"></span>${timeEl(c.time)}
+      <div class="row muted tiny"><a class="sha" href="${base}/commit/${c.sha}">${short(c.sha)}</a>${sigBadge(c.verification)}<span>${c.author}</span><span class="grow"></span>${timeEl(c.time)}
       <a class="btn ghost sm icon" title="Blame before this change" href="${base}/blame/${c.sha}~1/${encPath(path)}" aria-label="Blame prior revision">${icon('history', 'sm')}</a></div>
     </div>
     <div class="code blame-code" style="--digits:${String(c.start + c.lines.length).length}">${raw(c.lines.map((l, i) => `<div class="cl" id="L${c.start + i}"><a class="ln" href="#L${c.start + i}" data-ln="${c.start + i}"></a><div class="lc">${revealHidden(esc(l)) || ' '}</div></div>`).join(''))}</div>

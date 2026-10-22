@@ -476,6 +476,23 @@ const MIGRATIONS: &[&str] = &[
         expires_at INTEGER
     );
     "#,
+    // v14: signing keys. kind is 'ssh' or 'gpg'. A fingerprint is unique per account, not
+    // across accounts: registering someone else's public key gains nothing (a signature
+    // only verifies for the account whose email is the committer's), and can't lock them out.
+    r#"
+    CREATE TABLE signing_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(user_id, fingerprint)
+    );
+    CREATE INDEX signing_keys_fingerprint ON signing_keys(fingerprint);
+    CREATE INDEX signing_keys_user ON signing_keys(user_id);
+    "#,
 ];
 
 impl Db {

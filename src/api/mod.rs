@@ -64,6 +64,11 @@ pub fn router() -> Router<AppState> {
             get(account::list_tokens).post(account::create_token),
         )
         .route("/me/tokens/{id}", delete(account::delete_token))
+        .route(
+            "/me/signing-keys",
+            get(account::list_signing_keys).post(account::add_signing_key),
+        )
+        .route("/me/signing-keys/{id}", delete(account::delete_signing_key))
         .route("/users/{user}", get(account::profile))
         .route("/users/{user}/stars", get(account::user_stars))
         .route("/feed", get(account::feed))

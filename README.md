@@ -12,6 +12,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 - **Speed:** pages prefetch on hover, the UI has no framework, and diffs render lazily, so even huge commits stay smooth.
 - **Command palette:** press `Ctrl K` or `/` to jump to any repository, file, branch or action. Press `?` for every shortcut.
 - **Account security:** optional two-factor sign-in (any authenticator app, with recovery codes), a list of where you're signed in with one-click sign-out, a password re-check before dangerous actions (deleting a repo, making a private repo public, creating tokens), and a tamper-evident security log for you and for admins (`gitter doctor` verifies it). Code views mark hidden Unicode ("Trojan Source" bidi tricks, zero-width characters) and look-alike letters from other alphabets, with a warning above the file or diff.
+- **Signed commits:** add SSH or GPG public keys in Settings → Signing keys, and commits you sign show a Verified badge in history, on the commit page and in blame (Unverified, with the reason, when the key is unknown, the email doesn't match or the commit was changed after signing).
 - **Safe to run in public:** per-address and per-account rate limits (429 with Retry-After), limits on concurrent git transfers, per-account storage quotas enforced by git itself on push, open / invite-only / closed sign-up with invite links, and a report button on repositories, issues, comments and accounts that feeds an admin queue where moderators dismiss, hide or suspend.
 - **CI built in:** put a `.gitter/ci.yml` (or just a `.gitter/ci.sh`) in a repository and every push and pull request runs it, on a runner inside the server or on your own machines with `gitter runner`. Live logs with colors and a fold per step, secrets, artifacts, matrices, schedules, re-runs, and a pass/fail mark on commits and pull requests.
 - **Themes:** Aurora (the default), Forge, Ultraviolet and Daylight, each in light and dark. Pick one in Settings → Appearance or from the palette.
@@ -21,7 +22,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 ```sh
 git clone <this repository> gitter && cd gitter
 echo GITTER_URL=https://git.example.com > .env   # the address people will use
-docker compose up -d                             # builds a ~45 MB image the first time
+docker compose up -d                             # builds a ~70 MB image the first time
 docker compose logs gitter                       # open the one-time setup link it prints
 ```
 
@@ -86,6 +87,8 @@ git clone https://git.example.com/alice/project.git   # username: anything, pass
 Accounts with two-factor authentication need a token for git over HTTPS; the password alone is refused.
 
 Git LFS works with no setup: `git lfs track '*.psd'`, commit and push as usual. Files are stored once by content under `GITTER_DATA/lfs` (forks share them), each repository can only download the files pushed to it, they count toward the owner's storage quota, the largest file is set in Site administration (2 GB by default), and backups include them. Files no repository uses any more are removed at the next start. The web view shows LFS files as "Stored with Git LFS" with a download link, and raw links serve the real file. File locking and resumable (Range) downloads aren't supported; git-lfs skips locking and restarts an interrupted download.
+
+Signed commits: add your public key in Settings → Signing keys (an SSH `.pub` line or a GPG `--armor --export` block), then sign as usual (`git config gpg.format ssh`, `git config user.signingkey ~/.ssh/id_ed25519.pub`, `git commit -S`). A commit is **Verified** when its signature is good, the key is on an account, and the committer email is that account's email or its no-reply address (`<id>+<name>@users.noreply.gitter`). Accounts have one email and Gitter doesn't confirm it by mail, so Verified means "signed by this account's key", not "this person owns that address"; the badge names that account (**Verified · alice**). Several accounts may add the same public key (adding someone else's gains nothing: it only verifies commits whose committer email is yours). Checking needs `ssh-keygen` (OpenSSH 8.4+) and `gpg` on the server (`gitter doctor` says which are there); without one, those commits show "Can't verify". The Docker image has both. Only detached signatures count: a signed message pasted into a commit's signature header doesn't verify it. Registered GPG keys are kept in a keyring under `GITTER_DATA/gpg`, refilled from the database after each start, so backups don't need it.
 
 Release files upload by streaming, so they can be as big as Git LFS files (the same limit), and they count toward the owner's storage quota too. They're stored under `GITTER_DATA/releases`, always download as attachments, stay as private as their repository, and backups include them. A draft's new tag is made when it's published, and deleting a release deletes its files but keeps its tag. From a script: `curl -H "Authorization: Bearer $TOKEN" --data-binary @app.tar.gz "$URL/api/repos/OWNER/REPO/releases/ID/assets?name=app.tar.gz"`.
 

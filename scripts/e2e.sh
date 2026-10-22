@@ -243,6 +243,21 @@ api GET "/search?q=hel"
 [ "$(jq_ 'd["repos"][0]["name"]')" = hello ] || fail "search"
 ok "profile, feed, search"
 
+# --- signed commits: an SSH-signed push by a registered key shows as verified
+if command -v ssh-keygen >/dev/null; then
+  ssh-keygen -q -t ed25519 -N '' -C e2e -f "$TMP/sign"
+  api POST /me/signing-keys "{\"title\":\"e2e laptop\",\"key\":\"$(cat "$TMP/sign.pub")\"}"
+  (cd "$W" && git pull -q --ff-only && echo "Signed line" >> README.md \
+    && git -c gpg.format=ssh -c user.signingkey="$TMP/sign" commit -qS -am "Signed commit" \
+    && git push -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/hello.git" main) || fail "signed commit push"  # pragma: allowlist secret
+  api GET "/repos/alice/hello/commits?rev=main"
+  [ "$(jq_ 'd["commits"][0]["verification"]["status"]')" = verified ] || fail "signed commit should be verified: $BODY"
+  [ "$(jq_ 'd["commits"][1]["verification"]["status"]')" = unsigned ] || fail "unsigned commit: $BODY"
+  ok "SSH-signed commit by a registered key is verified"
+else
+  echo "· ssh-keygen not installed: signed commit check skipped"
+fi
+
 # --- Git LFS with the real client (the official static build, cached outside the repo)
 LFS_VER=v3.8.0
 LFS_SUM=e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d

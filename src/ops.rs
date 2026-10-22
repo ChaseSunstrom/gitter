@@ -485,6 +485,13 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
         }
         Err(e) => report(false, format!("git is not installed: {e}")),
     }
+    // Optional, so never a problem: without one, commits signed that way show "Can't verify".
+    for (tool, arg, kind) in [("gpg", "--version", "GPG"), ("ssh-keygen", "-?", "SSH")] {
+        match Command::new(tool).arg(arg).output() {
+            Ok(_) => println!("✓ {tool} is installed: {kind} commit signatures are checked"),
+            Err(_) => println!("! {tool} isn't installed: {kind}-signed commits show \"Can't verify\""),
+        }
+    }
     let data = &cfg.data_dir;
     let probe = data.join(".write-test");
     let writable = std::fs::write(&probe, b"ok").is_ok();

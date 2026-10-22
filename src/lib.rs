@@ -14,6 +14,7 @@ pub mod ops;
 pub mod repo;
 pub mod security;
 pub mod settings;
+pub mod signing;
 pub mod smart_http;
 pub mod validate;
 pub mod web;
@@ -69,6 +70,8 @@ pub struct AppState {
     pub key: Arc<[u8; 32]>,
     /// Wakes the built-in runner when a job is queued.
     pub ci_wake: Arc<tokio::sync::Notify>,
+    /// Checks commit signatures (GITTER_DATA/gpg holds the GPG keyring).
+    pub signing: Arc<signing::Signing>,
     /// Wakes the webhook sender when a delivery is queued.
     pub hook_wake: Arc<tokio::sync::Notify>,
 }
@@ -90,6 +93,7 @@ impl AppState {
             transfers: Arc::default(),
             key: Arc::new(security::server_key(&cfg_dir).unwrap_or_else(|e| panic!("can't read or create {}/secret.key: {e}", cfg_dir.display()))),
             ci_wake: Arc::default(),
+            signing: Arc::new(signing::Signing::new(cfg_dir.join("gpg"))),
             hook_wake: Arc::default(),
         }
     }
