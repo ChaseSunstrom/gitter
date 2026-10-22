@@ -1,5 +1,5 @@
 // Issue and pull request lists.
-import { html, get, enc, timeEl, num, $, popover } from '../lib.js';
+import { html, get, enc, timeEl, num, $, popover, agentBadge } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
 import { navigate } from '../main.js';
@@ -72,7 +72,7 @@ export default async function (ctx) {
       <div class="grow" style="min-width:0">
         <div class="issue-line"><a class="issue-title" href="${href}">${it.title}</a>
           ${it.labels.map((l) => labelChip(l, link({ label: l.name })))}</div>
-        <div class="muted small">#${it.number} ${verb} ${timeEl(when)} by <a href="${link({ author: it.author })}">${it.author}</a>
+        <div class="muted small">#${it.number} ${verb} ${timeEl(when)} by <a href="${link({ author: it.author })}">${it.author}</a> ${agentBadge(it.agent, it.author)}
           ${it.is_pr && it.head ? html`<span class="hide-sm"> · ${icon('branch', 'sm inline')} ${it.head} → ${it.base}</span>` : ''}</div>
       </div>
       ${it.comments ? html`<a class="muted small row nowrap" href="${href}" title="${it.comments} comments">${icon('comment', 'sm')}${it.comments}</a>` : ''}

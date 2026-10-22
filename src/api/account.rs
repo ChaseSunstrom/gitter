@@ -437,24 +437,30 @@ pub async fn list_tokens(State(st): State<AppState>, Authed(u): Authed) -> J<ser
             token_rows(c, cond, u.id)
         })
         .await?;
-    Ok(Json(json!({ "tokens": rows })))
+    let tools: Vec<_> = super::mcp::TOOLS.iter().filter(|t| t.name != "list_repos").map(|t| json!({ "name": t.name, "title": t.title })).collect();
+    Ok(Json(json!({ "tokens": rows, "agent_tools": tools })))
 }
 
 /// Tokens matching `cond` (over table `t`, one integer parameter), newest first.
 pub fn token_rows(c: &rusqlite::Connection, cond: &str, param: i64) -> R<Vec<serde_json::Value>> {
     let mut s = c.prepare(&format!(
         "SELECT t.id, t.name, t.created_at, t.last_used, t.scope, t.expires_at, u.username,
-            (SELECT ou.username || '/' || r.name FROM repos r JOIN users ou ON ou.id = r.owner_id WHERE r.id = t.repo_id)
+            (SELECT ou.username || '/' || r.name FROM repos r JOIN users ou ON ou.id = r.owner_id WHERE r.id = t.repo_id),
+            t.kind, t.tools,
+            (SELECT group_concat(ou.username || '/' || r.name, ' ') FROM token_repos tr JOIN repos r ON r.id = tr.repo_id
+             JOIN users ou ON ou.id = r.owner_id WHERE tr.token_id = t.id AND r.deleted_at IS NULL)
          FROM tokens t JOIN users u ON u.id = t.user_id WHERE {cond} ORDER BY t.id DESC"
     ))?;
     let v = s
         .query_map([param], |r| {
             let expires: Option<i64> = r.get(5)?;
+            let list = |s: Option<String>, sep: char| -> Vec<String> { s.unwrap_or_default().split(sep).filter(|x| !x.is_empty()).map(String::from).collect() };
             Ok(json!({
                 "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?, "created_at": r.get::<_, i64>(2)?,
                 "last_used": r.get::<_, Option<i64>>(3)?, "scope": r.get::<_, String>(4)?, "expires_at": expires,
                 "expired": expires.is_some_and(|e| e <= now()), "created_by": r.get::<_, String>(6)?,
-                "repo": r.get::<_, Option<String>>(7)?,
+                "repo": r.get::<_, Option<String>>(7)?, "kind": r.get::<_, String>(8)?,
+                "tools": list(r.get(9)?, ','), "repos": list(r.get(10)?, ' '),
             }))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -472,6 +478,15 @@ pub struct TokenReq {
     pub repo: String,
     /// Days until it stops working; none means never.
     pub expires_days: Option<i64>,
+    /// "agent" for an agent token: MCP only, to `repos` and `tools`.
+    #[serde(default)]
+    pub kind: String,
+    /// An agent token's repositories, "owner/name" each.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// An agent token's MCP tools (see `api::mcp::TOOLS`).
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 fn all_scope() -> String {
@@ -480,8 +495,41 @@ fn all_scope() -> String {
 
 impl TokenReq {
     pub fn deploy(name: String, write: bool, expires_days: Option<i64>) -> TokenReq {
-        TokenReq { name, scope: if write { "write" } else { "read" }.into(), repo: String::new(), expires_days }
+        TokenReq { name, scope: if write { "write" } else { "read" }.into(), repo: String::new(), expires_days, kind: String::new(), repos: vec![], tools: vec![] }
     }
+}
+
+/// An agent token's checked repositories (id, full name) and tools.
+type AgentGrant = (Vec<(i64, String)>, Vec<String>);
+
+async fn agent_grant(st: &AppState, u: &User, req: &TokenReq) -> R<AgentGrant> {
+    let mut repos: Vec<(i64, String)> = Vec::new();
+    if req.repos.is_empty() || req.repos.len() > super::mcp::MAX_REPOS {
+        return Err(AppError::bad(format!("Pick 1 to {} repositories for the agent", super::mcp::MAX_REPOS)));
+    }
+    for full in &req.repos {
+        let (o, n) = full.trim().split_once('/').ok_or_else(|| AppError::bad("Write each repository as owner/name"))?;
+        let r = crate::repo::Repo::readable(st, Some(u), o, n).await?;
+        if !repos.iter().any(|x| x.0 == r.id) {
+            repos.push((r.id, r.full_name()));
+        }
+    }
+    let mut tools: Vec<String> = Vec::new();
+    if req.tools.len() > super::mcp::TOOLS.len() {
+        return Err(AppError::bad("That's more tools than there are"));
+    }
+    for t in &req.tools {
+        let Some(tool) = super::mcp::tool(t).filter(|x| x.name != "list_repos") else {
+            return Err(AppError::bad(format!("There's no agent tool called “{}”", t.chars().take(40).collect::<String>())));
+        };
+        if !tools.iter().any(|x| x == tool.name) {
+            tools.push(tool.name.to_string());
+        }
+    }
+    if tools.is_empty() {
+        return Err(AppError::bad("Pick at least one tool for the agent"));
+    }
+    Ok((repos, tools))
 }
 
 /// Make a token for `u`, optionally tied to `repo_id`. Returns the secret (shown once).
@@ -490,7 +538,15 @@ pub async fn issue_token(st: &AppState, u: &User, ip: &str, req: TokenReq, repo:
     if name.is_empty() || name.len() > 80 {
         return Err(AppError::bad("Give the token a name (up to 80 characters)"));
     }
-    let scope = crate::auth::Scope::parse(&req.scope).ok_or_else(|| AppError::bad("Access must be read, write or all"))?;
+    let agent = match req.kind.as_str() {
+        "" | "user" => None,
+        "agent" if repo.is_some() => return Err(AppError::bad("Give an agent token its repositories in repos")),
+        "agent" => Some(agent_grant(st, u, &req).await?),
+        _ => return Err(AppError::bad("Kind must be user or agent")),
+    };
+    // Agents read and write (issues, pull requests, branches), never administer.
+    let scope = if agent.is_some() { Some(crate::auth::Scope::Write) } else { crate::auth::Scope::parse(&req.scope) };
+    let scope = scope.ok_or_else(|| AppError::bad("Access must be read, write or all"))?;
     if let Some(d) = req.expires_days
         && !(1..=3650).contains(&d)
     {
@@ -498,21 +554,37 @@ pub async fn issue_token(st: &AppState, u: &User, ip: &str, req: TokenReq, repo:
     }
     let expires = req.expires_days.map(|d| now() + d * 86400);
     let (raw, hash) = new_secret(TOKEN_PREFIX);
-    let (uid, n2, rid) = (u.id, name.clone(), repo.as_ref().map(|r| r.0));
+    let (uid, n2, rid, grant) = (u.id, name.clone(), repo.as_ref().map(|r| r.0), agent.clone());
     st.db
         .call(move |c| {
-            let n: i64 = c.query_row("SELECT count(*) FROM tokens WHERE user_id = ?1", [uid], |r| r.get(0))?;
+            let tx = c.transaction()?;
+            let n: i64 = tx.query_row("SELECT count(*) FROM tokens WHERE user_id = ?1", [uid], |r| r.get(0))?;
             if n >= 50 {
                 return Err(AppError::bad("You have 50 tokens already. Delete some first."));
             }
-            c.execute(
-                "INSERT INTO tokens(user_id, name, token_hash, created_at, scope, repo_id, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![uid, n2, hash, now(), scope.as_str(), rid, expires],
+            let (kind, tools) = match &grant {
+                Some((_, tools)) => ("agent", tools.join(",")),
+                None => ("user", String::new()),
+            };
+            tx.execute(
+                "INSERT INTO tokens(user_id, name, token_hash, created_at, scope, repo_id, expires_at, kind, tools) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![uid, n2, hash, now(), scope.as_str(), rid, expires, kind, tools],
             )?;
+            let id = tx.last_insert_rowid();
+            for (repo_id, _) in grant.iter().flat_map(|g| &g.0) {
+                tx.execute("INSERT INTO token_repos(token_id, repo_id) VALUES (?1, ?2)", [id, *repo_id])?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await?;
-    let mut detail = format!("{name} ({} access", scope.as_str());
+    let mut detail = match &agent {
+        Some((repos, tools)) => {
+            let repos: Vec<&str> = repos.iter().map(|r| r.1.as_str()).collect();
+            format!("{name} (agent for {}; tools: {}", repos.join(", "), tools.join(", "))
+        }
+        None => format!("{name} ({} access", scope.as_str()),
+    };
     if let Some((_, full)) = &repo {
         detail.push_str(&format!(" to {full}"));
     }
@@ -531,6 +603,7 @@ pub async fn create_token(
     Json(req): Json<TokenReq>,
 ) -> J<serde_json::Value> {
     let repo = match req.repo.trim() {
+        _ if req.kind == "agent" => None,
         "" => None,
         full => {
             let (o, n) = full.split_once('/').ok_or_else(|| AppError::bad("Write the repository as owner/name"))?;
@@ -668,6 +741,8 @@ pub struct EventOut {
     target: String,
     count: i64,
     created_at: i64,
+    /// The agent token that did it for `user`, if one did.
+    agent: Option<String>,
 }
 
 fn events(
@@ -678,7 +753,7 @@ fn events(
     limit: i64,
 ) -> rusqlite::Result<Vec<EventOut>> {
     let sql = format!(
-        "SELECT e.kind, u.username, ou.username || '/' || r.name, e.title, e.target, e.count, e.created_at
+        "SELECT e.kind, u.username, ou.username || '/' || r.name, e.title, e.target, e.count, e.created_at, e.agent
          FROM events e JOIN users u ON u.id = e.user_id
          LEFT JOIN repos r ON r.id = e.repo_id LEFT JOIN users ou ON ou.id = r.owner_id
          WHERE ({cond}) AND (e.repo_id IS NULL OR {VISIBLE})
@@ -698,6 +773,7 @@ fn events(
             target: r.get(4)?,
             count: r.get(5)?,
             created_at: r.get(6)?,
+            agent: r.get(7)?,
         })
     })?
     .collect()

@@ -246,8 +246,9 @@ pub fn access(repo: &Repo, viewer: Option<&User>) -> Access {
         admin: level >= ROLE_ADMIN,
     };
     if let Some(l) = viewer.and_then(|u| u.limits.as_ref()) {
-        if l.repo_id.is_some_and(|id| id != repo.id) {
-            a = Access { read: public, write: false, admin: false };
+        if !l.covers(repo.id) {
+            // An agent token reaches only the repositories it was given, even public ones.
+            a = Access { read: public && l.agent.is_none(), write: false, admin: false };
         }
         if l.scope == crate::auth::Scope::Read {
             a.write = false;
@@ -320,10 +321,11 @@ pub async fn record_event(
     count: i64,
 ) -> R<()> {
     let (kind, title, target) = (kind.to_string(), title.to_string(), target.to_string());
+    let agent = crate::auth::acting_agent();
     db.call(move |c| {
         c.execute(
-            "INSERT INTO events(user_id, repo_id, kind, title, target, count, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            rusqlite::params![user_id, repo_id, kind, title, target, count, now()],
+            "INSERT INTO events(user_id, repo_id, kind, title, target, count, created_at, agent) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![user_id, repo_id, kind, title, target, count, now(), agent],
         )?;
         Ok(())
     })
@@ -404,11 +406,19 @@ mod tests {
         assert_eq!(rw(access(&with(ROLE_WRITE, true), Some(&user(2, false)))), (false, false, false), "hidden: admins only");
         assert_eq!(rw(access(&with(ROLE_ADMIN, true), Some(&user(2, false)))), (true, true, true));
         // Limited tokens.
-        let lim = |scope, repo_id| User { limits: Some(crate::auth::Limits { scope, repo_id }), ..user(1, false) };
+        let lim = |scope, repo_id| User { limits: Some(crate::auth::Limits { scope, repo_id, agent: None }), ..user(1, false) };
         use crate::auth::Scope;
         assert_eq!(rw(access(&repo(1, true), Some(&lim(Scope::Read, None)))), (true, false, false));
         assert_eq!(rw(access(&repo(1, true), Some(&lim(Scope::Write, Some(1))))), (true, true, false), "only full tokens administer");
         assert_eq!(rw(access(&repo(1, true), Some(&lim(Scope::Write, Some(7))))), (false, false, false));
         assert_eq!(rw(access(&repo(1, false), Some(&lim(Scope::All, Some(7))))), (true, false, false));
+        // Agent tokens: their repositories only, even public ones, and never as admin.
+        let id = repo(1, false).id;
+        let agent = |repos: Vec<i64>| {
+            let a = crate::auth::Agent { token_id: 1, name: "bot".into(), repos, tools: vec![] };
+            User { limits: Some(crate::auth::Limits { scope: Scope::Write, repo_id: None, agent: Some(std::sync::Arc::new(a)) }), ..user(1, false) }
+        };
+        assert_eq!(rw(access(&repo(1, true), Some(&agent(vec![id])))), (true, true, false));
+        assert_eq!(rw(access(&repo(1, false), Some(&agent(vec![id + 1])))), (false, false, false));
     }
 }

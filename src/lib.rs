@@ -120,14 +120,8 @@ pub fn router(st: AppState) -> Router {
         .layer(DefaultBodyLimit::disable());
 
     let app = Router::new()
-        .nest(
-            "/api",
-            api::router()
-                .layer(DefaultBodyLimit::max(40 * 1024 * 1024))
-                .layer(axum::middleware::from_fn_with_state(st.clone(), api::scope_guard))
-                .layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit))
-                .layer(axum::middleware::from_fn_with_state(st.clone(), web::csrf)),
-        )
+        .nest("/api", api::guarded(&st))
+        .route("/mcp", post(api::mcp::handle).get(api::mcp::no_stream).delete(api::mcp::no_stream))
         .route(
             "/raw/{owner}/{repo}/{*rest}",
             get(api::code::raw).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),

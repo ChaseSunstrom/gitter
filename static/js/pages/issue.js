@@ -1,5 +1,5 @@
 // A single issue or pull request: conversation, commits and changed files.
-import { html, raw, state, get, send, action, timeEl, avatar, short, plural, $, popover, closePop, confirmDialog, toast, toastErr, encPath, reportDialog } from '../lib.js';
+import { html, raw, state, get, send, action, timeEl, avatar, short, plural, $, popover, closePop, confirmDialog, toast, toastErr, encPath, reportDialog, agentBadge } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader, placeTabBar } from '../repohead.js';
 import { renderMarkdown, preloadLangs } from '../md.js';
@@ -116,12 +116,12 @@ function mountHeader(el, api, issue) {
 
 // ---------------------------------------------------------------- conversation
 
-function card({ id, author, time, edited, bodyHtml, actions, tag = '' }) {
+function card({ id, author, time, edited, bodyHtml, actions, tag = '', agent = null }) {
   return html`<div class="tl-item tl-comment" id="${id}">
     <a href="/${author}" class="tl-avatar hide-sm">${avatar(author, 36)}</a>
     <div class="comment-card">
       <div class="comment-head">
-        <a href="/${author}" class="row"><span class="show-sm">${avatar(author, 20)}</span><b>${author}</b></a>
+        <a href="/${author}" class="row"><span class="show-sm">${avatar(author, 20)}</span><b>${author}</b></a>${agentBadge(agent, author)}
         <span class="muted small">commented <a href="#${id}">${timeEl(time)}</a>${edited ? ' · edited' : ''}</span>
         ${tag ? html`<span class="tag-private">${tag}</span>` : ''}
         <span class="grow"></span>
@@ -211,10 +211,10 @@ function conversation(meta, data, pd, mdCtx) {
   const { issue } = data;
   const base = { isPr: issue.is_pr, base: data.pull?.base };
   const items = [
-    card({ id: 'issue-body', author: issue.author, time: issue.created_at, tag: 'Author',
+    card({ id: 'issue-body', author: issue.author, time: issue.created_at, tag: 'Author', agent: issue.agent,
       bodyHtml: issue.body.trim() ? raw(renderMarkdown(issue.body, mdCtx)) : html`<p class="muted"><em>No description provided.</em></p>` }),
     ...data.comments.map((c) => c.kind === 'comment'
-      ? card({ id: `comment-${c.id}`, author: c.author, time: c.created_at, edited: c.updated_at > c.created_at + 5, tag: c.author === issue.author ? 'Author' : '',
+      ? card({ id: `comment-${c.id}`, author: c.author, time: c.created_at, edited: c.updated_at > c.created_at + 5, tag: c.author === issue.author ? 'Author' : '', agent: c.agent,
         bodyHtml: c.hidden && !c.body ? html`<p class="muted"><em>A moderator hid this comment.</em></p>`
           : html`${c.hidden ? html`<p class="mod-note">${icon('eye', 'sm')} A moderator hid this comment; only you and admins can read it.</p>` : ''}${raw(renderMarkdown(c.body, mdCtx))}` })
       : eventRow(c, meta, base)),

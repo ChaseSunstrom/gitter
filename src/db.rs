@@ -493,6 +493,23 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX signing_keys_fingerprint ON signing_keys(fingerprint);
     CREATE INDEX signing_keys_user ON signing_keys(user_id);
     "#,
+    // v15: agent tokens (kind 'agent': only through /mcp, to the repositories in
+    // token_repos and the comma-separated MCP tools in `tools`), and what agents did
+    // (`agent` names the token, kept when the token is deleted). A CI run an agent
+    // started gets no secrets.
+    r#"
+    ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'user';
+    ALTER TABLE tokens ADD COLUMN tools TEXT NOT NULL DEFAULT '';
+    CREATE TABLE token_repos (
+        token_id INTEGER NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        PRIMARY KEY(token_id, repo_id)
+    );
+    ALTER TABLE events ADD COLUMN agent TEXT;
+    ALTER TABLE issues ADD COLUMN agent TEXT;
+    ALTER TABLE comments ADD COLUMN agent TEXT;
+    ALTER TABLE ci_runs ADD COLUMN agent TEXT;
+    "#,
 ];
 
 impl Db {

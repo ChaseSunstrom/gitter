@@ -962,6 +962,13 @@ pub async fn write_contents(
         }
         None => req.branch.clone(),
     };
+    // The default branch is protected from agents: their changes go through pull requests.
+    if u.agent().is_some() && (target == r.default_branch || !has_branches) {
+        return Err(AppError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "Agents can't commit to the default branch: commit to a new branch and open a pull request",
+        ));
+    }
     let expect_old = if req.new_branch.is_some() {
         None
     } else {

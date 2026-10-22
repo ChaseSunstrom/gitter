@@ -2989,3 +2989,251 @@ async fn transfers_and_trash_follow_org_ownership() {
     assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
     assert!(!app.state.cfg.data_dir.join(format!("trash/{id}.git")).exists());
 }
+
+// ---------------------------------------------------------------- MCP and agent tokens
+
+const AGENT_TOOLS: &[&str] = &[
+    "search_code", "read_file", "list_tree", "list_issues", "get_issue", "create_issue", "comment",
+    "open_pull_request", "list_ci_runs", "get_ci_run", "get_ci_log", "commit_files",
+];
+
+/// One raw body POSTed to /mcp with `token` (None: no Authorization header).
+async fn mcp_raw(app: &App, token: Option<&str>, body: &str) -> (StatusCode, Value) {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "test.local")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = app.router.clone().oneshot(b.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+    let s = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (s, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+async fn mcp(app: &App, token: &str, method: &str, params: Value) -> Value {
+    let (s, v) = mcp_raw(app, Some(token), &json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": params }).to_string()).await;
+    assert_eq!(s, StatusCode::OK, "{method}: {v}");
+    assert_eq!((v["jsonrpc"].as_str(), v["id"].as_i64()), (Some("2.0"), Some(7)), "{v}");
+    v
+}
+
+/// tools/call: (isError, text).
+async fn tool(app: &App, token: &str, name: &str, args: Value) -> (bool, String) {
+    let v = mcp(app, token, "tools/call", json!({ "name": name, "arguments": args })).await;
+    let r = &v["result"];
+    assert!(r.is_object(), "{name}: {v}");
+    (r["isError"].as_bool().unwrap_or(false), r["content"][0]["text"].as_str().unwrap_or_default().to_string())
+}
+
+async fn agent_token(app: &App, who: &Client, repos: &[&str], tools: &[&str]) -> String {
+    let (s, t) = app
+        .req(who, "POST", "/api/me/tokens", Some(json!({ "name": "helper", "kind": "agent", "repos": repos, "tools": tools, "expires_days": 30 })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    t["token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn mcp_serves_initialize_tools_list_and_every_tool() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "proj", "readme": true }))).await;
+    let t = agent_token(&app, &alice, &["alice/proj"], AGENT_TOOLS).await;
+    let (_, list) = app.req(&alice, "GET", "/api/me/tokens", None).await;
+    let row = &list["tokens"][0];
+    assert_eq!((row["kind"].as_str(), row["repos"][0].as_str()), (Some("agent"), Some("alice/proj")), "{row}");
+    assert_eq!(row["tools"].as_array().unwrap().len(), AGENT_TOOLS.len());
+
+    let v = mcp(&app, &t, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "test", "version": "1" } })).await;
+    assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(v["result"]["serverInfo"]["name"], "gitter");
+    assert!(v["result"]["capabilities"]["tools"].is_object(), "{v}");
+    let (s, _) = mcp_raw(&app, Some(&t), r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "notifications get no reply");
+    assert_eq!(mcp(&app, &t, "ping", json!({})).await["result"], json!({}));
+    let v = mcp(&app, &t, "tools/list", json!({})).await;
+    let tools = v["result"]["tools"].as_array().unwrap();
+    for n in AGENT_TOOLS {
+        let d = tools.iter().find(|x| x["name"] == *n).unwrap_or_else(|| panic!("{n} listed"));
+        assert_eq!(d["inputSchema"]["type"], "object", "{d}");
+    }
+
+    // Reads.
+    let (e, txt) = tool(&app, &t, "list_repos", json!({})).await;
+    assert!(!e && txt.contains("alice/proj"), "{txt}");
+    let (e, txt) = tool(&app, &t, "list_tree", json!({ "repo": "alice/proj" })).await;
+    assert!(!e && txt.contains("README.md"), "{txt}");
+    let (e, txt) = tool(&app, &t, "read_file", json!({ "repo": "alice/proj", "path": "README.md" })).await;
+    assert!(!e && txt.contains("# proj"), "{txt}");
+    let (e, txt) = tool(&app, &t, "search_code", json!({ "repo": "alice/proj", "query": "proj" })).await;
+    assert!(!e && txt.contains("README.md"), "{txt}");
+
+    // Writes, each marked as the agent's.
+    let (e, txt) = tool(&app, &t, "create_issue", json!({ "repo": "alice/proj", "title": "Flaky test", "body": "Seen twice" })).await;
+    assert!(!e, "{txt}");
+    let (e, txt) = tool(&app, &t, "comment", json!({ "repo": "alice/proj", "number": 1, "body": "Looking into it" })).await;
+    assert!(!e, "{txt}");
+    let (_, issue) = app.req(&alice, "GET", "/api/repos/alice/proj/issues/1", None).await;
+    assert_eq!((issue["issue"]["agent"].as_str(), issue["comments"][0]["agent"].as_str()), (Some("helper"), Some("helper")), "{issue}");
+    let change = json!([{ "path": "fix.txt", "content": "fixed\n" }]);
+    let (e, txt) = tool(&app, &t, "commit_files", json!({ "repo": "alice/proj", "branch": "main", "message": "Fix", "files": change })).await;
+    assert!(e && txt.contains("default branch"), "agents never commit to the default branch: {txt}");
+    let (e, txt) = tool(&app, &t, "commit_files", json!({ "repo": "alice/proj", "branch": "main", "new_branch": "agent/fix", "message": "Fix", "files": change })).await;
+    assert!(!e && txt.contains("agent/fix"), "{txt}");
+    let (e, txt) = tool(&app, &t, "open_pull_request", json!({ "repo": "alice/proj", "head": "agent/fix", "base": "main", "title": "Fix it" })).await;
+    assert!(!e, "{txt}");
+    let (e, txt) = tool(&app, &t, "list_issues", json!({ "repo": "alice/proj" })).await;
+    assert!(!e && txt.contains("Flaky test") && !txt.contains("Fix it"), "{txt}");
+    let (e, txt) = tool(&app, &t, "list_issues", json!({ "repo": "alice/proj", "pulls": true })).await;
+    assert!(!e && txt.contains("Fix it"), "{txt}");
+    let (e, txt) = tool(&app, &t, "get_issue", json!({ "repo": "alice/proj", "number": 2 })).await;
+    assert!(!e && txt.contains("agent/fix"), "{txt}");
+    let (e, txt) = tool(&app, &t, "list_ci_runs", json!({ "repo": "alice/proj" })).await;
+    assert!(!e, "{txt}");
+    assert!(tool(&app, &t, "get_ci_run", json!({ "repo": "alice/proj", "number": 1 })).await.0, "no such run");
+    assert!(tool(&app, &t, "get_ci_log", json!({ "repo": "alice/proj", "job_id": 999 })).await.0, "no such job");
+
+    // The feed and the audit log say an agent did it, and which token.
+    let kinds: Vec<String> = app
+        .state
+        .db
+        .call(|c| {
+            let mut q = c.prepare("SELECT kind FROM events WHERE agent = 'helper' ORDER BY id")?;
+            Ok(q.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(kinds, ["issue", "comment", "push", "pull"]);
+    let (_, log) = app.req(&alice, "GET", "/api/me/audit", None).await;
+    let acts: Vec<String> = log["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "agent_action")
+        .map(|e| e["detail"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(acts.len(), 4, "one entry per change: {acts:?}");
+    assert!(acts.iter().all(|d| d.starts_with("helper: ")), "{acts:?}");
+    assert!(acts.iter().any(|d| d.contains("create_issue alice/proj")), "{acts:?}");
+
+    // Protocol errors.
+    assert_eq!(mcp(&app, &t, "resources/list", json!({})).await["error"]["code"], -32601);
+    assert_eq!(mcp_raw(&app, Some(&t), "not json").await.1["error"]["code"], -32700);
+    assert_eq!(mcp_raw(&app, Some(&t), "[]").await.1["error"]["code"], -32600);
+    assert_eq!(mcp(&app, &t, "tools/call", json!({ "name": "nope", "arguments": {} })).await["error"]["code"], -32602);
+    assert_eq!(mcp(&app, &t, "tools/call", json!({ "name": "read_file", "arguments": { "path": "x" } })).await["error"]["code"], -32602);
+    assert_eq!(mcp(&app, &t, "tools/call", json!({ "name": "read_file", "arguments": { "repo": "../../me", "path": "x" } })).await["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn mcp_agent_tokens_only_reach_their_repos_and_tools() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    for (who, name, private) in [(&alice, "proj", false), (&alice, "secret", true), (&bob, "pub", false)] {
+        app.req(who, "POST", "/api/repos", Some(json!({ "name": name, "private": private, "readme": true }))).await;
+    }
+    // Repositories and tools are checked when the token is made.
+    for (repos, tools, want) in [
+        (json!(["alice/proj"]), json!(["nope"]), StatusCode::BAD_REQUEST),
+        (json!([]), json!(["read_file"]), StatusCode::BAD_REQUEST),
+        (json!(["alice/proj"]), json!([]), StatusCode::BAD_REQUEST),
+        (json!(["alice/missing"]), json!(["read_file"]), StatusCode::NOT_FOUND),
+        (json!(["bob/secret"]), json!(["read_file"]), StatusCode::NOT_FOUND),
+    ] {
+        let (s, v) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "x", "kind": "agent", "repos": repos, "tools": tools }))).await;
+        assert_eq!(s, want, "{repos} {tools}: {v}");
+    }
+    let t = agent_token(&app, &alice, &["alice/proj"], &["read_file", "create_issue"]).await;
+    let v = mcp(&app, &t, "tools/list", json!({})).await;
+    let mut names: Vec<&str> = v["result"]["tools"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["create_issue", "list_repos", "read_file"]);
+    let v = mcp(&app, &t, "tools/call", json!({ "name": "comment", "arguments": { "repo": "alice/proj", "number": 1, "body": "hi" } })).await;
+    assert_eq!(v["error"]["code"], -32602, "a tool it wasn't given: {v}");
+    let readme = |repo: &str| json!({ "repo": repo, "path": "README.md" });
+    assert!(!tool(&app, &t, "read_file", readme("alice/proj")).await.0);
+    assert!(tool(&app, &t, "read_file", readme("alice/secret")).await.0, "its owner's other repos are out of reach");
+    assert!(tool(&app, &t, "read_file", readme("bob/pub")).await.0, "public repos it wasn't given too");
+    assert!(tool(&app, &t, "create_issue", json!({ "repo": "bob/pub", "title": "spam" })).await.0);
+
+    // The token does nothing outside /mcp: not the API, git, raw files, settings, secrets, tokens or merges.
+    for (m, p) in [
+        ("GET", "/api/me"),
+        ("GET", "/api/repos/alice/proj"),
+        ("GET", "/api/repos/alice/secret/blob?path=README.md"),
+        ("GET", "/api/me/tokens"),
+        ("POST", "/api/me/tokens"),
+        ("PATCH", "/api/repos/alice/proj"),
+        ("GET", "/api/repos/alice/proj/ci/secrets"),
+        ("GET", "/api/repos/alice/proj/collaborators"),
+        ("GET", "/api/repos/alice/proj/hooks"),
+        ("POST", "/api/repos/alice/proj/pulls/1/merge"),
+        ("GET", "/raw/alice/secret/main/README.md"),
+    ] {
+        assert_eq!(bearer(&app, m, p, &t, Some(json!({}))).await, StatusCode::FORBIDDEN, "{m} {p}");
+    }
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("alice:{t}"));
+    let req = Request::builder()
+        .uri("/alice/secret.git/info/refs?service=git-upload-pack")
+        .header("authorization", format!("Basic {basic}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(status_with(&app, req).await, StatusCode::FORBIDDEN, "no git with an agent token");
+
+    // /mcp itself takes only agent tokens.
+    assert_eq!(mcp_raw(&app, None, r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).await.0, StatusCode::UNAUTHORIZED);
+    let (_, full) = app.req(&alice, "POST", "/api/me/tokens", Some(json!({ "name": "laptop" }))).await;
+    let full = full["token"].as_str().unwrap();
+    assert_eq!(mcp_raw(&app, Some(full), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).await.0, StatusCode::FORBIDDEN);
+
+    // Agents have their own rate limit, apart from their owner's.
+    let mut limited = false;
+    for _ in 0..300 {
+        if mcp_raw(&app, Some(&t), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).await.0 == StatusCode::TOO_MANY_REQUESTS {
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited, "an agent token is rate limited");
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/proj/issues", Some(json!({ "title": "still me" }))).await.0, StatusCode::OK);
+    // Deleting the token stops it at once.
+    let (_, list) = app.req(&alice, "GET", "/api/me/tokens", None).await;
+    let id = list["tokens"].as_array().unwrap().iter().find(|x| x["kind"] == "agent").unwrap()["id"].as_i64().unwrap();
+    app.req(&alice, "DELETE", &format!("/api/me/tokens/{id}"), None).await;
+    assert_eq!(mcp_raw(&app, Some(&t), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_agent_ci_runs_get_no_secrets() {
+    let app = App::new();
+    let root = app.signup("root1").await;
+    app.req(&root, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let (s, _) = app.req(&root, "PUT", "/api/repos/root1/r/ci/secrets/TOKEN", Some(json!({ "value": "hunter2-secret" }))).await;
+    assert_eq!(s, StatusCode::OK);
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    let t = agent_token(&app, &root, &["root1/r"], &["commit_files", "list_ci_runs", "get_ci_run", "get_ci_log"]).await;
+    let ci = "jobs:\n  build:\n    steps: [\"echo token=[$TOKEN] $(echo $TOKEN | base64)\"]\n";
+    let (e, txt) = tool(&app, &t, "commit_files", json!({ "repo": "root1/r", "branch": "main", "new_branch": "agent/ci", "message": "CI", "files": [{ "path": ".gitter/ci.yml", "content": ci }] })).await;
+    assert!(!e, "{txt}");
+    for _ in 0..300 {
+        let s: String = app.state.db.call(|c| Ok(c.query_row("SELECT status FROM ci_runs", [], |r| r.get(0))?)).await.unwrap_or_default();
+        if matches!(s.as_str(), "success" | "failure") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (e, txt) = tool(&app, &t, "get_ci_run", json!({ "repo": "root1/r", "number": 1 })).await;
+    let v: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
+    assert!(!e && v["status"] == "success", "{txt}");
+    let job = v["jobs"][0]["id"].as_i64().unwrap();
+    assert!(!tool(&app, &t, "list_ci_runs", json!({ "repo": "root1/r" })).await.0);
+    let (e, log) = tool(&app, &t, "get_ci_log", json!({ "repo": "root1/r", "job_id": job })).await;
+    assert!(!e && log.contains("token=[]") && log.contains("gets no CI secrets"), "a run an agent started gets no secrets: {log}");
+    assert!(!log.contains("aHVudGVy"), "{log}");
+}

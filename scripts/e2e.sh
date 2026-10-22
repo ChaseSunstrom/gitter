@@ -393,6 +393,30 @@ done
 [ "$(jq_ '[x["status"] for x in d["deliveries"]]')" = "['ok', 'ok']" ] || fail "webhook delivery log: $BODY"
 ok "webhooks: a local receiver gets a signed ping and issue event, and the delivery log shows both"
 
+# --- MCP server and agent tokens
+api POST /me/tokens '{"name":"e2e agent","kind":"agent","repos":["alice/hello"],"tools":["read_file","create_issue"],"expires_days":1}'
+AGENT=$(jq_ 'd["token"]')
+mcp() { curl -s -X POST -H "Authorization: Bearer $AGENT" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' --data "$1" "$BASE/mcp"; }
+out=$(mcp '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}')
+grep -q '"protocolVersion":"2025-06-18"' <<<"$out" || fail "mcp initialize: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+python3 -c 'import json,sys; t=sorted(x["name"] for x in json.loads(sys.argv[1])["result"]["tools"]); assert t == ["create_issue","list_repos","read_file"], t' "$out" || fail "mcp tools/list: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"alice/hello","path":"src/main.rs"}}}')
+grep -q 'println' <<<"$out" || fail "mcp read_file: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_issue","arguments":{"repo":"alice/hello","title":"Filed by an agent"}}}')
+N=$(python3 -c 'import json,sys; r=json.loads(sys.argv[1])["result"]; assert not r["isError"], r; print(json.loads(r["content"][0]["text"])["number"])' "$out") || fail "mcp create_issue: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"comment","arguments":{"repo":"alice/hello","number":1,"body":"x"}}}')
+grep -q '"code":-32602' <<<"$out" || fail "a tool the agent wasn't given should be refused: $out"
+api GET "/repos/alice/hello/issues/$N"
+[ "$(jq_ 'd["issue"]["agent"]')" = "e2e agent" ] || fail "the issue should be marked as the agent's: $BODY"
+api GET /me/audit
+grep -q "e2e agent: create_issue alice/hello #$N" <<<"$BODY" || fail "the audit log should name the agent token: $BODY"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $AGENT" "$BASE/api/me")
+[ "$code" = 403 ] || fail "agent token on the REST API should be refused, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -u "x:$AGENT" "$BASE/alice/hello.git/info/refs?service=git-receive-pack")
+[ "$code" = 403 ] || fail "agent token should not work for git pushes, got $code"
+ok "MCP: initialize, tools/list and tool calls with an agent token; its issue is marked and audited; no REST or git"
+
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")
 [ "$code" = 200 ] && grep -q '<html' "$TMP/index.html" || fail "SPA route"

@@ -170,6 +170,33 @@ Times are Unix seconds. Any 2xx answer counts as delivered. Anything else, no an
 
 Deliveries only go to public internet addresses: the host name is looked up once and the connection goes to the checked address, so loopback, private, link-local, shared (100.64/10), multicast and reserved addresses are refused, DNS rebinding included. A site admin can tick **Allow private addresses** on a webhook to reach the server's own network; it switches off again if someone who isn't an admin changes the URL, or when its repository's owner stops being an admin. Hooks of a suspended account or a moderator-hidden repository don't send. Each receiver gets one delivery at a time, so a slow one doesn't hold up the others; issue, pull request and comment bodies are cut at 16 KB, and when 100 deliveries are already waiting for a receiver, new events are dropped and the drop is logged on the webhook's page. The secret is encrypted at rest with `GITTER_DATA/secret.key`.
 
+## AI agents (MCP)
+
+Gitter is an [MCP](https://modelcontextprotocol.io) server at `/mcp` (JSON-RPC 2.0 over the streamable HTTP transport, plain JSON replies). In **Settings → Access tokens**, pick **Agent (MCP)**, the repositories (up to 20) and the tools the agent may use, then add the server to your agent. For Claude Code, `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "gitter": {
+      "type": "http",
+      "url": "https://git.example.com/mcp",
+      "headers": { "Authorization": "Bearer gtr_your_agent_token" }
+    }
+  }
+}
+```
+
+or `claude mcp add --transport http gitter https://git.example.com/mcp --header "Authorization: Bearer gtr_…"`.
+
+Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_issues`, `get_issue`, `create_issue`, `comment`, `open_pull_request`, `list_ci_runs`, `get_ci_run`, `get_ci_log` and `commit_files`. Each call is an ordinary API request made as you, so the agent can never do more than you can, and less:
+
+- It reaches only the repositories you picked (not even other public ones) and only the tools you ticked.
+- It can't change settings, collaborators or webhooks, see CI secrets, tokens or your account, merge pull requests, or commit to a default branch: `commit_files` goes to another branch (or a new one), then `open_pull_request`.
+- A CI run an agent starts (by committing or opening a pull request) gets no CI secrets, since the agent writes the workflow and reads the log. A later push by a person runs with secrets as usual.
+- The token works only at `/mcp`: not for git, the REST API or the web.
+- It has its own rate limit (120 calls a minute) and its changes count apart from yours.
+- Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".
+
 ## Configuration
 
 Everything is optional. The defaults are tuned for a single small server, and the sign-up mode and limits can be changed later in Site administration (the UI value wins over the variable).
@@ -202,7 +229,7 @@ Behind nginx or Caddy, set `GITTER_URL` to the public address. Requests whose `O
 
 - Repository and user names are checked against a strict pattern, and repositories, wikis and snippets live on disk under their numeric or random id, so no user input ever becomes a path. Secret snippets have 128-bit random ids.
 - Private repositories answer "not found" to everyone without access: through the web, the API, raw files, archives, search and git.
-- Access is one rule for every route: owners and site admins can do everything; collaborators and organization members get their role; a token can only narrow it (read-only tokens never write, only full-access tokens administer, and a deploy token sees other repositories as if signed out). Organizations can't sign in.
+- Access is one rule for every route: owners and site admins can do everything; collaborators and organization members get their role; a token can only narrow it (read-only tokens never write, only full-access tokens administer, a deploy token sees other repositories as if signed out, and an agent token sees only its own). Organizations can't sign in.
 - Sessions are random 256-bit tokens, stored hashed and sent as `HttpOnly; SameSite=Lax` cookies. Writes made with a session cookie must come from this site's own pages, which blocks cross-site request forgery.
 - Passwords use Argon2id. Login and sign-up are rate limited.
 - User markdown is sanitized with DOMPurify, and the app ships a strict Content Security Policy.

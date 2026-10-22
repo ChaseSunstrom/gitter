@@ -95,13 +95,19 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
         Ok(p) => p.jobs.iter().map(|j| !j.paths.is_empty() && s.files.as_ref().is_some_and(|f| !any_glob(&j.paths, f))).collect(),
         Err(_) => vec![],
     };
+    // A run an agent started is marked, and gets no secrets (`jobs::claim`).
+    let (agent, repo_id) = (crate::auth::acting_agent(), repo.id);
     let number = st
         .db
         .call(move |c| {
-            Ok(match pipeline {
+            let n = match pipeline {
                 Ok(p) => queue::create_run(c, &run, &p.jobs, &skip)?.1,
                 Err(e) => queue::create_failed_run(c, &run, &e)?,
-            })
+            };
+            if agent.is_some() {
+                c.execute("UPDATE ci_runs SET agent = ?1 WHERE repo_id = ?2 AND number = ?3", rusqlite::params![agent, repo_id, n])?;
+            }
+            Ok(n)
         })
         .await?;
     st.ci_wake.notify_waiters();
