@@ -212,6 +212,17 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         Ok(n) => println!("sealed {n} two-factor secret(s) with the server key"),
         Err(e) => eprintln!("sealing two-factor secrets: {}", e.msg),
     }
+    // Git over SSH, when asked for. GITTER_SSH_PORT is the port clone URLs show, if it's mapped to another.
+    if let Ok(ssh_addr) = std::env::var("GITTER_SSH_ADDR")
+        && !ssh_addr.trim().is_empty()
+    {
+        let port = match env("GITTER_SSH_PORT", "").as_str() {
+            "" => None,
+            p => Some(p.parse::<u16>().map_err(|_| anyhow::anyhow!("GITTER_SSH_PORT must be a port number, not {p:?}"))?),
+        };
+        let bound = gitter::ssh::start(&st, ssh_addr.trim(), port).await?;
+        println!("git over SSH on {bound}");
+    }
     tokio::spawn(gitter::ci::upkeep(st.clone()));
     tokio::spawn(gitter::api::lifecycle::upkeep(st.clone()));
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));

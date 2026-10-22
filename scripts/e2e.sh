@@ -13,8 +13,9 @@ pass=0
 fail() { echo "✗ $*"; echo "--- server log"; tail -30 "$LOG"; exit 1; }
 ok() { pass=$((pass + 1)); echo "✓ $*"; }
 
+SSH_PORT=$((PORT + 1))
 cargo build -q
-GITTER_DATA="$TMP/data" GITTER_ADDR="127.0.0.1:$PORT" GITTER_URL="$BASE" ./target/debug/gitter >"$LOG" 2>&1 &
+GITTER_DATA="$TMP/data" GITTER_ADDR="127.0.0.1:$PORT" GITTER_SSH_ADDR="127.0.0.1:$SSH_PORT" GITTER_URL="$BASE" ./target/debug/gitter >"$LOG" 2>&1 &
 PID=$!
 # Let the server finish shutting down (its CI jobs write into the data folder) before cleaning up.
 trap 'st=$?; kill $PID ${HOOK_PID:-} 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$TMP" 2>/dev/null || { sleep 1; rm -rf "$TMP"; }; exit $st' EXIT
@@ -267,6 +268,26 @@ if command -v ssh-keygen >/dev/null; then
   ok "SSH-signed commit by a registered key is verified"
 else
   echo "· ssh-keygen not installed: signed commit check skipped"
+fi
+
+# --- git over SSH: clone and push with a key added in Settings → SSH keys
+if command -v ssh >/dev/null && command -v ssh-keygen >/dev/null; then
+  ssh-keygen -q -t ed25519 -N '' -C e2e -f "$TMP/auth"
+  api POST /me/ssh-keys "{\"title\":\"e2e ssh\",\"key\":\"$(cat "$TMP/auth.pub")\"}"
+  api GET /repos/alice/hello
+  [ "$(jq_ 'd["ssh_url"]')" = "ssh://git@127.0.0.1:$SSH_PORT/alice/hello.git" ] || fail "repo should offer its SSH URL: $BODY"
+  export GIT_SSH_COMMAND="ssh -F /dev/null -i $TMP/auth -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+  git clone -q "ssh://git@127.0.0.1:$SSH_PORT/alice/hello.git" "$TMP/ssh-clone" || fail "clone over SSH"
+  (cd "$TMP/ssh-clone" && echo "Over SSH" >> README.md && git -c user.name=Alice -c user.email=alice@example.com commit -qam "Pushed over SSH" && git push -q origin main) || fail "push over SSH"
+  # shellcheck disable=SC2086 # the command is words on purpose
+  $GIT_SSH_COMMAND -p "$SSH_PORT" git@127.0.0.1 ls >/dev/null 2>&1 && fail "SSH must not run other commands"
+  unset GIT_SSH_COMMAND
+  api GET "/repos/alice/hello/commits?rev=main"
+  [ "$(jq_ 'd["commits"][0]["subject"]')" = "Pushed over SSH" ] || fail "SSH push should land: $BODY"
+  (cd "$W" && git pull -q --ff-only) || fail "pull after SSH push"
+  ok "git over SSH clones and pushes with a key from Settings, and runs nothing else"
+else
+  echo "· ssh not installed: git over SSH check skipped"
 fi
 
 # --- Git LFS with the real client (the official static build, cached outside the repo)

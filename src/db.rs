@@ -708,6 +708,20 @@ const MIGRATIONS: &[&str] = &[
     INSERT OR IGNORE INTO branch_pushers (repo_id, branch, user_id, at)
         SELECT repo_id, title, user_id, max(created_at) FROM events WHERE kind = 'push' AND repo_id IS NOT NULL AND title != '' GROUP BY repo_id, title;
     "#,
+    // v22: SSH keys that sign in to git over SSH (apart from signing_keys, like GitHub).
+    // A key belongs to one account, so the fingerprint alone says whose it is.
+    r#"
+    CREATE TABLE ssh_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        last_used INTEGER
+    );
+    CREATE INDEX ssh_keys_user ON ssh_keys(user_id);
+    "#,
 ];
 
 impl Db {

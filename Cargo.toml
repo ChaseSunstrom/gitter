@@ -18,6 +18,8 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.8"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8.13.0"
+# Git over SSH. ring (already here for rustls) instead of aws-lc-rs, which needs cmake to build.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha1 = "0.10"

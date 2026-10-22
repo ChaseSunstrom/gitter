@@ -180,6 +180,10 @@ export function mountRepoHeader(root, meta) {
       <div class="row" style="padding:0 6px 8px"><input class="input sm mono" readonly value="git clone ${meta.clone_url}" aria-label="Clone command">
         <button class="btn sm icon" data-copy="git clone ${meta.clone_url}" data-copy-label="Command copied" aria-label="Copy">${icon('terminal', 'sm')}</button></div>
       <p class="tiny muted" style="padding:0 8px 8px">Push with your password or an <a href="/settings/tokens" class="c-accent">access token</a>.</p>
+      ${meta.ssh_url ? html`<div class="menu-head">Clone with SSH</div>
+      <div class="row" style="padding:2px 6px 8px"><input class="input sm mono" readonly value="${meta.ssh_url}" aria-label="SSH clone URL" id="ssh-url">
+        <button class="btn sm icon" data-copy="${meta.ssh_url}" data-copy-label="SSH URL copied" aria-label="Copy SSH URL">${icon('copy', 'sm')}</button></div>
+      <p class="tiny muted" style="padding:0 8px 8px">Uses one of your <a href="/settings/ssh" class="c-accent">SSH keys</a>.</p>` : ''}
       ${meta.empty ? '' : html`<div class="menu-sep"></div>
       <a class="menu-item" href="/archive/${meta.owner}/${meta.name}/${encPath(rev)}.zip" download>${icon('download', 'sm')} Download ZIP</a>
       <a class="menu-item" href="/archive/${meta.owner}/${meta.name}/${encPath(rev)}.tar.gz" download>${icon('download', 'sm')} Download tar.gz</a>`}</div>`,

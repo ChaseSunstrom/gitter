@@ -75,6 +75,8 @@ pub fn router() -> Router<AppState> {
             get(account::list_signing_keys).post(account::add_signing_key),
         )
         .route("/me/signing-keys/{id}", delete(account::delete_signing_key))
+        .route("/me/ssh-keys", get(account::list_ssh_keys).post(account::add_ssh_key))
+        .route("/me/ssh-keys/{id}", delete(account::delete_ssh_key))
         .route("/users/{user}", get(account::profile))
         .route("/users/{user}/stars", get(account::user_stars))
         .route("/feed", get(account::feed))

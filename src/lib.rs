@@ -20,6 +20,7 @@ pub mod security;
 pub mod settings;
 pub mod signing;
 pub mod smart_http;
+pub mod ssh;
 pub mod validate;
 pub mod web;
 pub mod webhooks;
@@ -80,6 +81,8 @@ pub struct AppState {
     pub hook_wake: Arc<tokio::sync::Notify>,
     /// Page views and clones counted in memory until the next flush.
     pub traffic: Arc<api::insights::Traffic>,
+    /// How git over SSH clone URLs start (`ssh://git@host:2222/`); unset while it's off.
+    pub ssh_url: Arc<std::sync::OnceLock<String>>,
 }
 
 impl AppState {
@@ -102,6 +105,7 @@ impl AppState {
             signing: Arc::new(signing::Signing::new(cfg_dir.join("gpg"))),
             hook_wake: Arc::default(),
             traffic: Arc::default(),
+            ssh_url: Arc::default(),
         }
     }
 }

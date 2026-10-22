@@ -233,6 +233,18 @@ Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_
 - It has its own rate limit (120 calls a minute) and its changes count apart from yours.
 - Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".
 
+## Git over SSH
+
+Off by default. Set `GITTER_SSH_ADDR` (for example `0.0.0.0:2222`) and Gitter also serves clone, fetch and push over SSH, from its own built-in SSH server: no system `sshd` to set up. Its host key is made on first start in `GITTER_DATA/ssh_host_ed25519_key` (back it up, or clients will warn that the host changed). Clone URLs use the host name in `GITTER_URL` and the port listened on; when that port is mapped to another one (a container's `2222` published as `22`), set `GITTER_SSH_PORT` to the public port. On port 22 URLs look like `git@git.example.com:alice/hello.git`, otherwise `ssh://git@git.example.com:2222/alice/hello.git`. With Docker Compose, add `- "22:2222"` under `ports` and `GITTER_SSH_ADDR: 0.0.0.0:2222` and `GITTER_SSH_PORT: 22` under `environment`.
+
+Add your public key in **Settings → SSH keys** (Ed25519, ECDSA, or RSA of 2048 bits or more; these sign you in, apart from signing keys). A key belongs to one account. Then the clone menu shows the SSH URL too.
+
+- The SSH user name doesn't matter (`git@` is usual): the key says who you are. Access is exactly git over HTTP's: private repositories are "not found" without access, pushing needs write access, renamed and transferred repositories answer at their old path, and suspended accounts are refused. Pushes run the same post-push work (CI, webhooks, the feed, size and storage checks).
+- Only `git-upload-pack`, `git-receive-pack` and `git-upload-archive` run, on an `owner/repository` path. There's no shell, no other command, no port or agent forwarding, and no environment except `GIT_PROTOCOL`.
+- Branch rules apply to SSH pushes exactly as to HTTPS ones, and a removed key or suspended account stops at the next command.
+- Limits: each git command takes the same per-address transfer limits as HTTP (transfers at once, starts per minute); an address opens at most 120 connections a minute, at most 512 are open in all, a connection must sign in and start its command within 30 seconds, unknown keys are counted per address (a registered key always gets in), a command with nothing moving for 2 minutes is stopped, and a shared connection (`ControlMaster`) can run one command after another.
+- Deploy keys aren't supported yet: use a deploy token over HTTPS.
+
 ## Viewers, reverts, uploads and the demo
 
 - **Rich file views:** CSV and TSV files show as a table (the first 1,000 rows and 200 columns; click a column to sort, numbers as numbers), Jupyter notebooks render their markdown, highlighted code and text and image outputs, STL models (ASCII or binary, up to a million triangles) turn in 3D (drag to orbit, scroll to zoom, double-click to reset), PDFs open in the page, and audio and video files play. **Code** next to **Preview** shows the source of the text ones. Nothing pushed runs: notebook HTML and script outputs show as their source, markdown is sanitized, and files come from `/raw` with a sandbox (files that really are PDFs go without one, since browsers won't show a PDF in a sandbox; the browser's PDF viewer keeps a PDF's own scripts apart from the site, and only Gitter's pages may frame them).
@@ -267,7 +279,7 @@ Behind nginx or Caddy, set `GITTER_URL` to the public address. Requests whose `O
 - **`src/`** is the server, built on axum and tokio.
   - It stores accounts, issues and pull requests in SQLite (WAL mode, run on the blocking pool).
   - It reads and writes code by calling the `git` CLI with argument vectors, a scrubbed environment, no hooks, timeouts and a concurrency cap.
-  - Clone, fetch and push go through `git http-backend`.
+  - Clone, fetch and push go through `git http-backend`, or over SSH (`src/ssh.rs`, russh) straight to `git upload-pack` and `git receive-pack`, with the same checks.
   - Web edits and merges use plumbing commands (`read-tree`, `merge-tree --write-tree`, `commit-tree`, `update-ref` with an expected old value), so no working copies are needed and concurrent changes are detected.
 - **`static/`** is the web app. It is plain ES modules embedded into the binary, with a small router, a safe `html` template tag that escapes everything by default, and per-page modules loaded on demand.
   - Asset URLs carry a content hash, so browsers cache them forever.
