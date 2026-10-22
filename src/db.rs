@@ -364,6 +364,36 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX repo_collaborators_user ON repo_collaborators(user_id);
     "#,
+    // v11: releases. Asset files live in GITTER_DATA/releases/<release id>/<asset id>;
+    // AUTOINCREMENT so a new row never reuses the folder of a deleted one.
+    r#"
+    CREATE TABLE releases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        tag TEXT NOT NULL,
+        -- A draft's new tag is made at this branch or commit when it's published ('' once the tag exists).
+        target TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        draft INTEGER NOT NULL DEFAULT 0,
+        prerelease INTEGER NOT NULL DEFAULT 0,
+        author_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        published_at INTEGER,
+        UNIQUE(repo_id, tag)
+    );
+    CREATE TABLE release_assets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        release_id INTEGER NOT NULL REFERENCES releases(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+        sha256 TEXT NOT NULL DEFAULT '',
+        downloads INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        UNIQUE(release_id, name)
+    );
+    "#,
 ];
 
 impl Db {

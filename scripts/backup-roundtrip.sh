@@ -33,6 +33,10 @@ AUTH=(-u 'alice:correct horse')  # pragma: allowlist secret
 curl -sf "${AUTH[@]}" -H 'Content-Type: application/vnd.git-lfs+json' -X POST "$B/alice/keep.git/info/lfs/objects/batch" \
   --data "{\"operation\":\"upload\",\"objects\":[{\"oid\":\"$OID\",\"size\":$SIZE}]}" | grep -q '"upload"' || fail "LFS batch upload"
 curl -sf "${AUTH[@]}" -X PUT --data-binary @"$TMP/asset.bin" "$B/alice/keep.git/info/lfs/objects/$OID" >/dev/null || fail "LFS upload"
+# A release with a file.
+RID=$(c -X POST "$B/api/repos/alice/keep/releases" --data '{"tag":"v1","title":"Kept release"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+AID=$(curl -sf -b "$TMP/jar" -H "Origin: $B" --data-binary @"$TMP/asset.bin" "$B/api/repos/alice/keep/releases/$RID/assets?name=asset.bin" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || fail "release file upload"
 
 GITTER_DATA=$TMP/a $BIN backup "$TMP/backup.tar.gz" || fail "backup"
 [ -s "$TMP/backup.tar.gz" ] || fail "backup file is empty"
@@ -69,5 +73,6 @@ curl -sf "$B2/raw/snippets/$SNIP/latest/a.txt" | grep -q "snippet survives" || f
 git clone -q "$B2/alice/keep.git" "$TMP/clone" && [ -f "$TMP/clone/README.md" ] || fail "clone from restored server"
 curl -sf -H "Origin: $B2" -H 'Content-Type: application/json' -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct horse"}' >/dev/null || fail "login after restore"  # pragma: allowlist secret
 curl -sf "${AUTH[@]}" "$B2/alice/keep.git/info/lfs/objects/$OID" | cmp -s - "$TMP/asset.bin" || fail "LFS file missing or different after restore"
-echo "✓ restored server has the same history, issues, wiki, discussions, snippets, logins, clones, LFS files and the key for CI secrets"
+curl -sf "$B2/api/repos/alice/keep/releases/$RID/assets/$AID" | cmp -s - "$TMP/asset.bin" || fail "release file missing or different after restore"
+echo "✓ restored server has the same history, issues, wiki, discussions, snippets, logins, clones, LFS files, release files and the key for CI secrets"
 echo "Backup round-trip passed."

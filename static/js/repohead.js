@@ -30,6 +30,7 @@ const TABS = [
   ['ci', 'zap', 'CI', '/ci'],
   ['discussions', 'comment', 'Discussions', '/discussions'],
   ['wiki', 'book', 'Wiki', '/wiki'],
+  ['releases', 'tag', 'Releases', '/releases'],
   ['commits', 'history', 'Commits', '/commits'],
   ['branches', 'branch', 'Branches', '/branches'],
   ['insights', 'chart', 'Insights', '/insights'],

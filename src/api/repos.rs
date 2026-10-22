@@ -214,10 +214,11 @@ pub async fn show(
                     .optional()?,
                 None => None,
             };
-            Ok((stars, starred, forks, issues, pulls, language, parent))
+            let releases = super::releases::summary(c, rid)?;
+            Ok((stars, starred, forks, issues, pulls, language, parent, releases))
         })
         .await?;
-    let (stars, starred, forks, issues, pulls, language, parent) = counts;
+    let (stars, starred, forks, issues, pulls, language, parent, (releases, latest_release)) = counts;
     let parent = parent
         .filter(|p| !p.2)
         .map(|p| json!({ "owner": p.0, "name": p.1 }));
@@ -227,6 +228,7 @@ pub async fn show(
         "updated_at": r.updated_at, "pushed_at": r.pushed_at, "language": language,
         "empty": branches.is_empty(), "branches": branches, "tags": tags,
         "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
+        "releases": releases, "latest_release": latest_release,
         "fork_of": parent, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
     })))
@@ -364,15 +366,17 @@ pub async fn remove(
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
     let id = r.id;
-    let lfs = st
+    let (lfs, releases) = st
         .db
         .call(move |c| {
             let oids = crate::lfs::held_by(c, false, id)?;
+            let releases = super::releases::ids_of(c, false, id)?;
             c.execute("DELETE FROM repos WHERE id = ?1", [id])?;
-            Ok(oids)
+            Ok((oids, releases))
         })
         .await?;
     crate::lfs::collect(&st, lfs).await;
+    super::releases::remove_files(&st, releases).await;
     if let Err(e) = tokio::fs::remove_dir_all(&r.path).await {
         eprintln!("removing {}: {e}", r.path.display());
     }

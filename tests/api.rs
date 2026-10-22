@@ -1664,6 +1664,240 @@ async fn snippets_and_wikis_count_toward_storage() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
 }
 
+/// A raw-body request as `c` (release asset uploads and downloads): status, headers, body.
+async fn raw_as(app: &App, c: &Client, method: &str, path: &str, ctype: &str, body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut b = Request::builder().method(method).uri(path).header("host", "test.local").header("origin", ORIGIN);
+    if !ctype.is_empty() {
+        b = b.header("content-type", ctype);
+    }
+    if let Some(cookie) = &c.0 {
+        b = b.header("cookie", format!("gitter_session={cookie}"));
+    }
+    let resp = app.router.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+    let (s, h) = (resp.status(), resp.headers().clone());
+    (s, h, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+}
+
+async fn repo_id(app: &App, name: &'static str) -> i64 {
+    app.state.db.call(move |c| Ok(c.query_row("SELECT id FROM repos WHERE name = ?1", [name], |r| r.get(0))?)).await.unwrap()
+}
+
+#[tokio::test]
+async fn releases_from_tags_drafts_latest_and_access() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    for (n, private) in [("app", false), ("priv", true)] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n, "private": private, "readme": true }))).await;
+    }
+    let base = "/api/repos/alice/app/releases";
+    let path = app.state.git.repo_path(repo_id(&app, "app").await);
+    let (_, br) = app.req(&alice, "GET", "/api/repos/alice/app/branches", None).await;
+    let main = br["branches"][0]["sha"].as_str().unwrap().to_string();
+
+    // An existing tag is used as it is: the target only matters for a new one.
+    app.state.git.ok(&path, &["tag", "v0.9", "main"]).await.unwrap();
+    let (s, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v0.9", "target": "nope" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // A new tag at a branch: an annotated tag at its head.
+    let (s, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v1.0", "target": "main", "title": "First", "notes": "Hello **world**" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let v1 = v["id"].as_i64().unwrap();
+    let kind = app.state.git.ok(&path, &["cat-file", "-t", "refs/tags/v1.0"]).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&kind).trim(), "tag");
+    let (_, r) = app.req(&anon, "GET", &format!("{base}/{v1}"), None).await;
+    assert_eq!((r["tag"].as_str(), r["sha"].as_str(), r["title"].as_str(), r["author"].as_str()), (Some("v1.0"), Some(main.as_str()), Some("First"), Some("alice")), "{r}");
+
+    // One release per tag; bad names, unknown targets and non-writers are refused.
+    assert_eq!(app.req(&alice, "POST", base, Some(json!({ "tag": "v1.0" }))).await.0, StatusCode::CONFLICT);
+    for bad in [json!({ "tag": "../x" }), json!({ "tag": "v9", "target": "nope" }), json!({ "tag": "" }), json!({ "tag": "v9", "notes": "x".repeat(70_000) })] {
+        assert_eq!(app.req(&alice, "POST", base, Some(bad.clone())).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(app.req(&bob, "POST", base, Some(json!({ "tag": "v2" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&anon, "POST", base, Some(json!({ "tag": "v2" }))).await.0, StatusCode::UNAUTHORIZED);
+
+    // Drafts are for writers only, listed first; prereleases are never the latest.
+    let (_, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v2.0", "title": "Two", "draft": true }))).await;
+    let v2 = v["id"].as_i64().unwrap();
+    let tag_names = || async { names(&app.req(&Client::default(), "GET", "/api/repos/alice/app/tags", None).await.1["tags"], "name") };
+    assert!(!tag_names().await.contains(&"v2.0".to_string()), "a draft's new tag waits until it's published");
+    assert_eq!(app.req(&alice, "POST", base, Some(json!({ "tag": "v3", "target": "nope", "draft": true }))).await.0, StatusCode::BAD_REQUEST);
+    app.req(&alice, "POST", base, Some(json!({ "tag": "v1.1-rc", "prerelease": true }))).await;
+    let tags = |v: &Value| names(&v["releases"], "tag");
+    assert_eq!(tags(&app.req(&anon, "GET", base, None).await.1), ["v1.1-rc", "v1.0", "v0.9"]);
+    assert_eq!(tags(&app.req(&alice, "GET", base, None).await.1), ["v2.0", "v1.1-rc", "v1.0", "v0.9"]);
+    assert_eq!(app.req(&bob, "GET", &format!("{base}/{v2}"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&anon, "GET", &format!("{base}/latest"), None).await.1["tag"], "v1.0");
+    let (_, repo) = app.req(&anon, "GET", "/api/repos/alice/app", None).await;
+    assert_eq!((repo["latest_release"]["tag"].as_str(), repo["releases"].as_i64()), (Some("v1.0"), Some(3)), "{repo}");
+
+    // Publishing a draft makes it the latest; edits need write access.
+    let (s, v) = app.req(&alice, "PATCH", &format!("{base}/{v2}"), Some(json!({ "draft": false, "notes": "Now out" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, r) = app.req(&anon, "GET", &format!("{base}/{v2}"), None).await;
+    assert_eq!((r["draft"].as_bool(), r["notes"].as_str(), r["title"].as_str()), (Some(false), Some("Now out"), Some("Two")), "{r}");
+    assert!(r["published_at"].as_i64().is_some(), "{r}");
+    assert_eq!(r["sha"], main.as_str(), "publishing made the tag at the default branch: {r}");
+    assert!(tag_names().await.contains(&"v2.0".to_string()));
+    assert_eq!(app.req(&anon, "GET", &format!("{base}/latest"), None).await.1["tag"], "v2.0");
+    assert_eq!(app.req(&bob, "PATCH", &format!("{base}/{v1}"), Some(json!({ "title": "pwned" }))).await.0, StatusCode::FORBIDDEN);
+
+    // A draft of an existing tag that's deleted later isn't published at a guessed commit.
+    app.state.git.ok(&path, &["tag", "v4", "main"]).await.unwrap();
+    let (_, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v4", "draft": true }))).await;
+    let v4 = v["id"].as_i64().unwrap();
+    app.state.git.ok(&path, &["tag", "-d", "v4"]).await.unwrap();
+    assert_eq!(app.req(&alice, "PATCH", &format!("{base}/{v4}"), Some(json!({ "draft": false }))).await.0, StatusCode::CONFLICT);
+
+    // Private repositories keep their releases private.
+    app.req(&alice, "POST", "/api/repos/alice/priv/releases", Some(json!({ "tag": "v1" }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/priv/releases", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&anon, "GET", "/api/repos/alice/priv/releases/latest", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tags(&app.req(&alice, "GET", "/api/repos/alice/priv/releases", None).await.1), ["v1"]);
+
+    // Deleting a release keeps its tag.
+    assert_eq!(app.req(&bob, "DELETE", &format!("{base}/{v2}"), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "DELETE", &format!("{base}/{v2}"), None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&anon, "GET", &format!("{base}/{v2}"), None).await.0, StatusCode::NOT_FOUND);
+    let (_, t) = app.req(&anon, "GET", "/api/repos/alice/app/tags", None).await;
+    assert!(names(&t["tags"], "name").contains(&"v2.0".to_string()), "{t}");
+    assert_eq!(audit_count(&app, "release_deleted").await, 1);
+}
+
+#[tokio::test]
+async fn releases_assets_stream_with_quota_counts_and_cleanup() {
+    use sha2::{Digest, Sha256};
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    for (n, private) in [("app", false), ("priv", true)] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n, "private": private, "readme": true }))).await;
+    }
+    let release = |repo: &'static str, body: Value| {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", &format!("/api/repos/alice/{repo}/releases"), Some(body)).await.1["id"].as_i64().unwrap() }
+    };
+    let upload = |url: String, name: &str, body: Vec<u8>| {
+        let (app, alice, url) = (&app, alice.clone(), format!("{url}?name={name}"));
+        async move {
+            let (s, _, b) = raw_as(app, &alice, "POST", &url, "", body).await;
+            (s, serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null))
+        }
+    };
+    let data_dir = app.state.cfg.data_dir.clone();
+    let id = release("app", json!({ "tag": "v1" })).await;
+    let assets = format!("/api/repos/alice/app/releases/{id}/assets");
+    let data = b"#!/bin/sh\necho hi\n".repeat(100);
+
+    // Uploads stream in; the name is cut down to a safe file name.
+    let (s, _, b) = raw_as(&app, &alice, "POST", &format!("{assets}?name=dist%2F..%2Fmy%20tool%22.sh"), "text/x-sh", data.clone()).await;
+    let a: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+    assert_eq!(s, StatusCode::OK, "{a}");
+    assert_eq!((a["name"].as_str(), a["size"].as_u64(), a["content_type"].as_str()), (Some("my.tool..sh"), Some(data.len() as u64), Some("text/x-sh")), "{a}");
+    assert_eq!(a["sha256"], hex::encode(Sha256::digest(&data)));
+    let aid = a["id"].as_i64().unwrap();
+    let file = data_dir.join(format!("releases/{id}/{aid}"));
+    assert!(file.is_file());
+    assert_eq!(upload(assets.clone(), "my.tool..sh", data.clone()).await.0, StatusCode::CONFLICT);
+    assert_eq!(upload(assets.clone(), "", data.clone()).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(raw_as(&app, &bob, "POST", &format!("{assets}?name=x"), "", data.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(raw_as(&app, &anon, "POST", &format!("{assets}?name=x"), "", data.clone()).await.0, StatusCode::UNAUTHORIZED);
+
+    // Anyone who can read the repo downloads it as an attachment, and each download counts.
+    let url = format!("{assets}/{aid}");
+    let (s, h, got) = raw_as(&app, &anon, "GET", &url, "", vec![]).await;
+    assert_eq!((s, got == data), (StatusCode::OK, true));
+    assert_eq!(h["content-disposition"], "attachment; filename=\"my.tool..sh\"");
+    assert_eq!(h["content-type"], "application/octet-stream");
+    raw_as(&app, &bob, "GET", &url, "", vec![]).await;
+    let (_, r) = app.req(&anon, "GET", &format!("/api/repos/alice/app/releases/{id}"), None).await;
+    assert_eq!(r["assets"][0]["downloads"], 2, "{r}");
+    // Downloads aren't gzipped, so browsers know their size.
+    let req = Request::get(&url).header("host", "test.local").header("accept-encoding", "gzip").body(Body::empty()).unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.headers().get("content-encoding").is_none() && resp.headers()["content-length"] == data.len().to_string().as_str());
+    // Files past the API's 40 MB body cap stream in too.
+    let (s, big) = upload(assets.clone(), "big.bin", vec![0u8; 41 << 20]).await;
+    assert_eq!(s, StatusCode::OK, "{big}");
+    assert_eq!(app.req(&alice, "DELETE", &format!("{assets}/{}", big["id"]), None).await.0, StatusCode::OK);
+
+    // Private repositories' and drafts' assets: only for those who may see them, never cached.
+    let pid = release("priv", json!({ "tag": "v1" })).await;
+    let (_, pa) = upload(format!("/api/repos/alice/priv/releases/{pid}/assets"), "secret.bin", b"secret".to_vec()).await;
+    let purl = format!("/api/repos/alice/priv/releases/{pid}/assets/{}", pa["id"]);
+    let did = release("app", json!({ "tag": "v2", "draft": true })).await;
+    let (_, da) = upload(format!("/api/repos/alice/app/releases/{did}/assets"), "next.bin", b"draft".to_vec()).await;
+    let durl = format!("/api/repos/alice/app/releases/{did}/assets/{}", da["id"]);
+    for u in [&purl, &durl] {
+        assert_eq!(raw_as(&app, &anon, "GET", u, "", vec![]).await.0, StatusCode::NOT_FOUND, "{u}");
+        assert_eq!(raw_as(&app, &bob, "GET", u, "", vec![]).await.0, StatusCode::NOT_FOUND, "{u}");
+        let (s, h, _) = raw_as(&app, &alice, "GET", u, "", vec![]).await;
+        assert_eq!(s, StatusCode::OK, "{u}");
+        assert!(h["cache-control"].to_str().unwrap().contains("no-store"), "{u}");
+    }
+    // An asset id doesn't open through another repository's or release's URL.
+    assert_eq!(raw_as(&app, &alice, "GET", &format!("{assets}/{}", pa["id"]), "", vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(raw_as(&app, &alice, "GET", &format!("{assets}/{}", da["id"]), "", vec![]).await.0, StatusCode::NOT_FOUND);
+
+    // A release holds at most 1000 files.
+    let many = release("app", json!({ "tag": "many" })).await;
+    app.state
+        .db
+        .call(move |c| {
+            for i in 0..1000 {
+                c.execute("INSERT INTO release_assets(release_id, name, size, created_at) VALUES (?1, ?2, 0, 0)", rusqlite::params![many, format!("f{i}")])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(upload(format!("/api/repos/alice/app/releases/{many}/assets"), "one-more", b"x".to_vec()).await.0, StatusCode::BAD_REQUEST);
+
+    // Assets count toward the owner's storage, in total and per file; refused uploads leave nothing.
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 0", [])?)).await.unwrap();
+    let (_, me) = app.req(&alice, "GET", "/api/me", None).await;
+    assert_eq!(me["storage"]["used"], data.len() + 6 + 5, "{me}");
+    let big = vec![1u8; 700 * 1024];
+    assert_eq!(upload(assets.clone(), "a.bin", big.clone()).await.0, StatusCode::OK);
+    assert_eq!(upload(assets.clone(), "b.bin", big.clone()).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    let mut s = app.state.settings.get();
+    (s.max_storage_mb, s.max_lfs_mb) = (0, 1);
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    assert_eq!(upload(assets.clone(), "huge.bin", vec![2u8; (1 << 20) + 1]).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    // Parallel uploads can't overshoot the quota together.
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 2;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    let (x, y) = tokio::join!(upload(assets.clone(), "c.bin", big.clone()), upload(assets.clone(), "d.bin", big.clone()));
+    let mut got = [x.0, y.0];
+    got.sort();
+    assert_eq!(got, [StatusCode::OK, StatusCode::PAYLOAD_TOO_LARGE]);
+    let (_, me) = app.req(&alice, "GET", "/api/me", None).await;
+    assert!(me["storage"]["used"].as_u64().unwrap() <= 2 << 20, "{me}");
+    assert_eq!(std::fs::read_dir(data_dir.join("releases/tmp")).unwrap().count(), 0, "no temp files left");
+
+    // Deleting an asset, a release, the repository or the account removes the files.
+    assert_eq!(app.req(&bob, "DELETE", &url, None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "DELETE", &url, None).await.0, StatusCode::OK);
+    assert!(!file.exists());
+    assert_eq!(raw_as(&app, &anon, "GET", &url, "", vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&alice, "DELETE", &format!("/api/repos/alice/app/releases/{id}"), None).await.0, StatusCode::OK);
+    assert!(!data_dir.join(format!("releases/{id}")).exists());
+    assert!(data_dir.join(format!("releases/{pid}")).is_dir());
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/priv", Some(json!({ "confirm": "alice/priv" }))).await.0, StatusCode::OK);
+    assert!(!data_dir.join(format!("releases/{pid}")).exists());
+    assert!(data_dir.join(format!("releases/{did}")).is_dir());
+    let (s, v) = app.req(&admin, "DELETE", "/api/admin/users/alice", Some(json!({ "confirm": "alice" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(!data_dir.join(format!("releases/{did}")).exists());
+}
+
 #[tokio::test]
 async fn totp_secrets_are_sealed_at_rest() {
     use gitter::security::{seal_totp_secrets, step_now, totp_code, use_code};
