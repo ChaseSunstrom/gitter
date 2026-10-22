@@ -99,6 +99,9 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
     let t = token.to_string();
     let done = st.db.call(move |c| Ok(queue::finish(c, job, &t, success, code)?)).await?;
     st.ci_wake.notify_waiters();
+    if done {
+        crate::api::notifications::ci_finished(st, job).await;
+    }
     // A finished run may be the last check a pull request waited on to merge itself.
     let finished: Option<(i64, String)> = st
         .db

@@ -220,3 +220,15 @@
 .top-list { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 6px; }
 .top-list li { display: flex; gap: 10px; font-size: 13px; }
 @media (max-width: 860px) { .traffic-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* Notifications inbox */
+.notif-row { align-items: center; }
+.notif-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.notif-row.unread .notif-dot { background: var(--accent); }
+.notif-row.unread .notif-title { font-weight: 600; }
+.notif-row:not(.unread) .notif-title { color: var(--ink-2); }
+.notif-main { min-width: 0; }
+.notif-title { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--ink); }
+.notif-repo { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.notif-acts { gap: 2px; opacity: .55; transition: opacity .12s; }
+.notif-row:hover .notif-acts, .notif-acts:focus-within { opacity: 1; }

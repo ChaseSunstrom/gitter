@@ -1,7 +1,7 @@
 // A single issue or pull request: conversation, commits and changed files.
 import { html, raw, state, get, send, action, timeEl, avatar, short, plural, $, popover, closePop, confirmDialog, toast, toastErr, encPath, reportDialog, agentBadge, safeUrl } from '../lib.js';
 import { icon } from '../icons.js';
-import { loadRepo, repoUrl, repoPage, mountRepoHeader, placeTabBar, ciIcon } from '../repohead.js';
+import { loadRepo, repoUrl, repoPage, mountRepoHeader, placeTabBar, ciIcon, subscribeBlock, mountSubscribe } from '../repohead.js';
 import { renderMarkdown, preloadLangs } from '../md.js';
 import { mdEditor, mountMdEditor, clearDraft } from '../mdeditor.js';
 import { diffView, mountDiff } from '../diffview.js';
@@ -242,6 +242,7 @@ function sidebar(meta, data, rv) {
       <div class="section-title">${icon('users', 'sm')} ${plural(participants.length, 'participant')}</div>
       <div class="row wrap-ok">${participants.map((p) => html`<a href="/${p}" title="${p}">${avatar(p, 26)}</a>`)}</div>
     </div>
+    ${subscribeBlock()}
     <div class="side-block">
       <button class="btn sm" data-copy="${location.origin}${location.pathname}" data-copy-label="Link copied">${icon('link', 'sm')} Copy link</button>
     </div>
@@ -293,6 +294,7 @@ function conversation(meta, data, pd, mdCtx, rv) {
 function mountConversation(el, meta, api, data, mdCtx) {
   const { issue } = data;
   mountMdEditor(el, mdCtx);
+  mountSubscribe(el, `${api}/issues/${issue.number}/subscription`);
 
   // Composer: comment, and optionally close/reopen in the same step.
   const form = $('#composer', el);

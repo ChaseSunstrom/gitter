@@ -1,7 +1,7 @@
 // Repository discussions: the list (by category), a new thread, and a thread with replies, answer and votes.
 import { html, raw, state, get, send, action, timeEl, avatar, num, plural, $, popover, closePop, confirmDialog, toast, toastErr } from '../lib.js';
 import { icon } from '../icons.js';
-import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
+import { loadRepo, repoUrl, repoPage, mountRepoHeader, subscribeBlock, mountSubscribe } from '../repohead.js';
 import { renderMarkdown, preloadLangs } from '../md.js';
 import { mdEditor, mountMdEditor, clearDraft } from '../mdeditor.js';
 import { navigate, refresh } from '../main.js';
@@ -158,6 +158,7 @@ async function showView(ctx) {
     </header>
     ${answer ? html`<div class="box box-body row small answer-box">${icon('check', 'sm c-green')}<span class="grow">Answered by <b>${answer.author}</b></span><a class="btn sm" href="#reply-${answer.id}">View answer</a></div>` : ''}
     <div class="timeline">${items}${composer}</div>
+    ${subscribeBlock()}
   </div>`;
   return {
     title: `${d.title} · Discussion #${d.number} · ${owner}/${repo}`,
@@ -165,6 +166,7 @@ async function showView(ctx) {
     mount(el) {
       mountRepoHeader(el, meta);
       mountMdEditor(el, mdCtx);
+      mountSubscribe(el, `${api}/subscription`);
       const form = $('#composer', el);
       form?.addEventListener('submit', action(form.querySelector('[type=submit]'), async () => {
         const text = $('#reply-body', form).value.trim();

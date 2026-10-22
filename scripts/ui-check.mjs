@@ -765,6 +765,43 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Notifications: a @mention shows in alice's inbox and on the bell; marking all read
+// clears the badge; the issue page offers unsubscribe and the repo header the watch levels.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('pageerror', (e) => errors.push(String(e)));
+  let listed = false, badge = '', cleared = false, sub = '', watch = '';
+  try {
+    // A fresh account (bob has two-factor sign-in on by now).
+    const bob = await browser.newContext();
+    const lr = await bob.request.post(BASE + '/api/auth/signup', { headers: { Origin: BASE }, data: { username: 'nina', email: 'nina@example.com', password: 'nina horse battery' } });
+    if (!lr.ok()) throw new Error(`nina signup: ${lr.status()}`);
+    const ir = await bob.request.post(BASE + '/api/repos/alice/hello/issues', { headers: { Origin: BASE }, data: { title: 'Ping for the inbox', body: 'Hey @alice, a look?' } });
+    if (!ir.ok()) throw new Error(`issue: ${ir.status()}`);
+    const num = (await ir.json()).number;
+    await bob.close();
+    await page.goto(BASE + '/notifications?filter=mentions', { waitUntil: 'networkidle' });
+    listed = (await page.locator('#page').innerText()).includes('Ping for the inbox');
+    badge = await page.locator('#notif-badge').innerText();
+    await page.goto(BASE + '/notifications', { waitUntil: 'networkidle' });
+    await page.click('#read-all');
+    await page.waitForSelector('#notif-badge', { state: 'hidden', timeout: 5000 });
+    cleared = true;
+    await page.goto(`${BASE}/alice/hello/issues/${num}`, { waitUntil: 'networkidle' });
+    await page.waitForSelector('#sub-btn:not([disabled])', { timeout: 5000 });
+    sub = await page.locator('#sub-btn').innerText();
+    await page.click('#watch-btn');
+    await page.waitForSelector('.watch-opt[aria-checked="true"]', { timeout: 5000 });
+    watch = await page.locator('.watch-opt[aria-checked="true"]').innerText();
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !listed || !/^\d+\+?$/.test(badge.trim()) || !cleared || !sub.includes('Unsubscribe') || !watch.includes('All activity')) {
+    failed++; console.log('✗ notifications', { listed, badge, cleared, sub, watch, errors });
+  } else console.log('  ok mention in the inbox and on the bell; mark all read clears the badge; subscribe and watch controls');
+  await page.close();
+}
+
 // Merge queue: the rule's option in settings, the queue button and state on the pull request, the queue on the list.
 {
   const page = await ctx.newPage();

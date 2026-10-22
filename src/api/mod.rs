@@ -19,6 +19,7 @@ pub mod snippets;
 pub mod webhooks;
 pub mod wiki;
 pub mod mcp;
+pub mod notifications;
 pub mod revert;
 
 use std::net::SocketAddr;
@@ -275,6 +276,21 @@ pub fn router() -> Router<AppState> {
             get(snippets::show).put(snippets::update).delete(snippets::delete),
         )
         .route("/snippets/{id}/revisions", get(snippets::revisions))
+        .route("/notifications", get(notifications::list))
+        .route("/notifications/count", get(notifications::count))
+        .route("/notifications/read", post(notifications::read_all))
+        .route("/notifications/{id}/read", post(notifications::read))
+        .route("/notifications/{id}/done", post(notifications::done))
+        .route("/notifications/{id}/unsubscribe", post(notifications::unsubscribe))
+        .route(&format!("{repo}/subscription"), get(notifications::watch).put(notifications::set_watch))
+        .route(
+            &format!("{repo}/issues/{{n}}/subscription"),
+            get(notifications::subscription::<false>).put(notifications::set_subscription::<false>),
+        )
+        .route(
+            &format!("{repo}/discussions/{{n}}/subscription"),
+            get(notifications::subscription::<true>).put(notifications::set_subscription::<true>),
+        )
         .fallback(|| async { AppError::not_found() })
 }
 

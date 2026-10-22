@@ -44,6 +44,11 @@ p { margin: 0; }
 .topnav { display: flex; align-items: center; gap: 4px; margin-left: auto; }
 .topnav a.nav { padding: 6px 10px; border-radius: 8px; color: var(--ink-2); font-weight: 500; }
 .topnav a.nav:hover, .topnav a.nav.on { background: var(--hover); color: var(--ink); }
+.notif-btn { position: relative; }
+.notif-btn.on { background: var(--hover); }
+.notif-badge { position: absolute; top: 1px; right: -2px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: var(--accent);
+  color: #fff; font-size: 10px; font-weight: 700; line-height: 16px; text-align: center; box-shadow: 0 0 0 2px var(--bg); pointer-events: none; }
+.notif-badge[hidden] { display: none; }
 .progress { position: fixed; top: 0; left: 0; height: 3px; width: 0; z-index: 100; background: var(--grad);
   box-shadow: 0 0 12px var(--brand-2); opacity: 0; transition: width .4s var(--ease), opacity .3s; }
 .progress.on { opacity: 1; }

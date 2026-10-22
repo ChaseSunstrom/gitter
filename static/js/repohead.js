@@ -50,6 +50,7 @@ export function repoHeader(meta, tab) {
         ${meta.private ? html`<span class="tag-private">Private</span>` : html`<span class="tag-private">Public</span>`}
       </div>
       <div class="repo-actions">
+        ${state.me ? html`<button class="btn sm" id="watch-btn" aria-haspopup="menu">${icon('eye', 'sm')}<span>Watch</span>${icon('chev-down', 'sm')}</button>` : ''}
         <div class="btn-group">
           <button class="btn sm star-btn ${meta.starred ? 'on' : ''}" id="star-btn" aria-pressed="${meta.starred}">${icon('star', 'sm')}<span>${meta.starred ? 'Starred' : 'Star'}</span></button>
           <a class="btn sm" href="${base}/insights" title="Stargazers"><span class="count" id="star-count">${num(meta.stars)}</span></a>
@@ -90,6 +91,28 @@ export function placeTabBar(root) {
     bar.style.left = target.left + 'px'; bar.style.width = target.width + 'px';
     window.__lastTab = { key: tabs.className, ...target };
   });
+}
+
+// ---------- thread subscriptions ----------
+/** A sidebar block to subscribe to or unsubscribe from a thread (signed in only). */
+export const subscribeBlock = () => state.me ? html`<div class="side-block" id="sub-block">
+  <div class="section-title">${icon('bell', 'sm')} Notifications</div>
+  <button class="btn sm" id="sub-btn" disabled>${icon('bell', 'sm')} <span>Subscribe</span></button>
+  <p class="muted small" id="sub-note"></p></div>` : '';
+
+/** Wire `subscribeBlock` to `url` (…/issues/N/subscription or …/discussions/N/subscription). */
+export function mountSubscribe(root, url) {
+  const btn = $('#sub-btn', root);
+  if (!btn) return;
+  const paint = (s) => {
+    btn.disabled = false;
+    btn.dataset.on = s.subscribed ? '1' : '';
+    btn.querySelector('span').textContent = s.subscribed ? 'Unsubscribe' : 'Subscribe';
+    $('#sub-note', root).textContent = s.ignoring ? 'You’re ignoring this repository.'
+      : s.subscribed ? 'You’re getting notifications for this thread.' : 'You’re not getting notifications for this thread.';
+  };
+  get(url, { fresh: true }).then(paint).catch(() => { btn.closest('.side-block')?.remove(); });
+  btn.addEventListener('click', action(btn, async () => paint(await send('PUT', url, { subscribed: !btn.dataset.on }))));
 }
 
 // ---------- CI status ----------
@@ -142,6 +165,25 @@ export function mountRepoHeader(root, meta) {
   paintCiStatus(root, meta);
   $('#report-btn', root)?.addEventListener('click', () => reportDialog({ kind: 'repo', owner: meta.owner, repo: meta.name }, 'repository'));
   const base = repoUrl(meta.owner, meta.name);
+  $('#watch-btn', root)?.addEventListener('click', async (e) => {
+    const anchor = e.currentTarget;
+    let level;
+    try { level = (await get(base + '/subscription', { fresh: true })).level; } catch (err) { toastErr(err); return; }
+    const opt = (v, title, text) => html`<button class="menu-item watch-opt" role="menuitemradio" aria-checked="${String(level === v)}" data-level="${v}">
+      ${icon(level === v ? 'check' : 'minus', 'sm')}<span class="grow"><b>${title}</b><span class="muted small" style="display:block">${text}</span></span></button>`;
+    popover(anchor, html`<div class="menu-head">Notifications</div>
+      ${opt('participating', 'Participating and @mentions', 'Only threads you take part in or are mentioned in.')}
+      ${opt('watching', 'All activity', 'Every issue, pull request and discussion here.')}
+      ${opt('ignoring', 'Ignore', 'Nothing from here, not even @mentions.')}`, {
+      align: 'right', width: 300,
+      onMount: (p) => p.addEventListener('click', async (ev) => {
+        const b = ev.target.closest('[data-level]');
+        if (!b) return;
+        closePop();
+        try { await send('PUT', base + '/subscription', { level: b.dataset.level }); toast(b.dataset.level === 'watching' ? 'Watching' : b.dataset.level === 'ignoring' ? 'Ignoring' : 'Participating and @mentions'); } catch (err) { toastErr(err); }
+      }),
+    });
+  });
   const starBtn = $('#star-btn', root);
   starBtn?.addEventListener('click', async () => {
     if (!state.me) return navigate('/login?next=' + encodeURIComponent(location.pathname));

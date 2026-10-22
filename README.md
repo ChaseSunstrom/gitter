@@ -278,6 +278,22 @@ Add your public key in **Settings → SSH keys** (Ed25519, ECDSA, or RSA of 2048
   GITTER_DATA=/tmp/gitter-demo gitter demo
   ```
 
+## Notifications
+
+The bell in the top bar opens **/notifications**, one row per thread (issue, pull request, discussion, failed CI run) with why you got it, newest first. Filter by **Unread**, **Participating** (not just watching), **Mentions**, **Done** or a repository; mark one read (opening it does too), mark it **done** (it comes back only when there's news), **unsubscribe** from its thread, or mark everything read. The bell shows the unread count, refreshed as you move around and every minute.
+
+Who hears of what:
+
+- **Taking part.** The author of an issue, pull request or discussion, everyone who commented or reviewed, its assignees, and people @mentioned in it hear of new comments, reviews, closes, reopens and merges.
+- **@mentions** of `@username` in issue, pull request, comment, review and discussion bodies notify that person and subscribe them to the thread. Mentions in code (spans, fenced or indented blocks) and email addresses don't count; a body counts at most 50, and at most 200 of an author's mentions an hour count. Edits don't notify.
+- **Assignments** tell the person assigned (only them).
+- **Failed CI runs** tell whoever pushed or started the run.
+- **Watching.** The **Watch** menu in a repository's header: *Participating and @mentions* (the default), *All activity* (every new thread and everything in it; a repository's owner watches it by default) or *Ignore* (nothing, not even @mentions). On an issue, pull request or discussion, **Subscribe** / **Unsubscribe** overrides that for the one thread; a new @mention still reaches you after unsubscribing.
+
+You're never notified of what you did yourself, and an agent acts as its owner, so its owner isn't told of its work. Only people who can read the repository now are notified, under exactly the rule that governs viewing it (private repositories, collaborators and org roles, moderator-hidden repositories and issues, the trash); the inbox and the count check it again when they're read, so losing access to a repository hides its notifications. Deploy and agent tokens can't read the inbox. There's no email delivery (Gitter has no mail settings).
+
+API: `GET /api/notifications?filter=all|unread|participating|mentions|done&repo=OWNER/REPO&page=N`, `GET /api/notifications/count`, `POST /api/notifications/{id}/read|done|unsubscribe`, `POST /api/notifications/read` (`{"repo": "OWNER/REPO"}` optional), `GET|PUT /api/repos/OWNER/REPO/subscription` (`{"level": "participating|watching|ignoring"}`), `GET|PUT /api/repos/OWNER/REPO/issues/N/subscription` and `…/discussions/N/subscription` (`{"subscribed": true|false}`).
+
 ## Configuration
 
 Everything is optional. The defaults are tuned for a single small server, and the sign-up mode and limits can be changed later in Site administration (the UI value wins over the variable).
