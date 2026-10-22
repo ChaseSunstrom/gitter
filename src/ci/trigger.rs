@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use super::compat;
 use super::config::{self, Filter, Pipeline, any_glob, glob};
 use super::queue::{self, NewRun};
 use crate::AppState;
@@ -26,9 +27,10 @@ pub async fn enabled(st: &AppState, owner_id: i64) -> bool {
     }
 }
 
-/// The pipeline at `sha`: `.gitter/ci.yml`, else `.gitter/ci.sh`, else none.
+/// The pipeline at `sha`: `.gitter/ci.yml`, else `.gitter/ci.sh`, else the
+/// GitHub workflows, else `.gitlab-ci.yml` (translated), else none.
 /// Err is a broken config, shown on the run it would have started.
-pub async fn pipeline_at(st: &AppState, repo: &Path, sha: &str) -> R<Option<Result<Pipeline, String>>> {
+pub async fn pipeline_at(st: &AppState, repo: &Path, sha: &str, default_branch: &str) -> R<Option<Result<Pipeline, String>>> {
     if let Some((oid, kind, size)) = st.git.stat(repo, sha, config::CONFIG_PATH).await?
         && kind == "blob"
     {
@@ -46,7 +48,83 @@ pub async fn pipeline_at(st: &AppState, repo: &Path, sha: &str) -> R<Option<Resu
     {
         return Ok(Some(Ok(config::script_pipeline())));
     }
+    // Other hosts' files.
+    let mut workflows = Vec::new();
+    for e in st.git.ls_tree(repo, sha, compat::GITHUB_DIR).await? {
+        if e.kind != "blob" || !(e.name.ends_with(".yml") || e.name.ends_with(".yaml")) {
+            continue;
+        }
+        if workflows.len() == compat::MAX_WORKFLOWS {
+            return Ok(Some(Err(format!("{}: at most {} workflow files", compat::GITHUB_DIR, compat::MAX_WORKFLOWS))));
+        }
+        match text_at(st, repo, &e.path, &e.oid, e.size).await? {
+            Ok(t) => workflows.push((e.path.clone(), t)),
+            Err(e) => return Ok(Some(Err(e))),
+        }
+    }
+    // Workflows that never run here (tags, releases, reusable ones) are no pipeline.
+    if !workflows.is_empty()
+        && let Some(p) = compat::github(&workflows).transpose()
+    {
+        return Ok(Some(p));
+    }
+    if let Some((oid, kind, size)) = st.git.stat(repo, sha, compat::GITLAB_FILE).await?
+        && kind == "blob"
+    {
+        return Ok(Some(match text_at(st, repo, compat::GITLAB_FILE, &oid, Some(size)).await? {
+            Ok(t) => compat::gitlab(&t, default_branch),
+            Err(e) => Err(e),
+        }));
+    }
     Ok(None)
+}
+
+/// A pipeline file's text, within the size limit.
+async fn text_at(st: &AppState, repo: &Path, path: &str, oid: &str, size: Option<u64>) -> R<Result<String, String>> {
+    if size.unwrap_or(0) > config::MAX_CONFIG_BYTES {
+        return Ok(Err(format!("{path} is larger than {} KB", config::MAX_CONFIG_BYTES / 1024)));
+    }
+    let data = st.git.blob(repo, oid).await?;
+    Ok(String::from_utf8(data).map_err(|_| format!("{path} isn't UTF-8 text")))
+}
+
+/// The jobs that run for this event. Jobs from GitHub workflows or GitLab rules
+/// carry their own triggers: only those wanting this event stay (and `needs` on
+/// jobs left out are dropped, as GitLab does). None: nothing runs.
+pub fn pick(p: Result<Pipeline, String>, event: &str, branch: &str, files: &Option<Vec<String>>) -> Option<Result<Pipeline, String>> {
+    let Ok(p) = p else { return Some(p) };
+    let wanted = |t: &config::Triggers| match event {
+        "push" => t.push.as_ref().is_some_and(|f| wants(f, branch, files)),
+        "pull_request" | "merge_queue" => t.pull_request.as_ref().is_some_and(|f| wants(f, branch, files)),
+        "manual" => t.manual,
+        // ponytail: a schedule runs every workflow that has one, not only the one whose cron fired.
+        "schedule" => !t.schedule.is_empty(),
+        _ => true,
+    };
+    // A job left out hands its own needs on, so order holds across it (GitLab stages).
+    let needs_of: std::collections::HashMap<String, Vec<String>> = p.jobs.iter().map(|j| (j.key.clone(), j.needs.clone())).collect();
+    let mut jobs: Vec<config::Job> = p.jobs.into_iter().filter(|j| j.when.as_ref().is_none_or(wanted)).collect();
+    if jobs.len() == needs_of.len() {
+        return Some(Ok(Pipeline { triggers: p.triggers, jobs }));
+    }
+    let keys: Vec<String> = jobs.iter().map(|j| j.key.clone()).collect();
+    for j in &mut jobs {
+        let (mut out, mut todo, mut seen) = (Vec::new(), j.needs.clone(), std::collections::HashSet::new());
+        while let Some(n) = todo.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            if keys.contains(&n) {
+                out.push(n);
+            } else if let Some(more) = needs_of.get(&n) {
+                todo.extend(more.iter().cloned());
+            }
+        }
+        out.sort();
+        out.dedup();
+        j.needs = out;
+    }
+    (!jobs.is_empty()).then_some(Ok(Pipeline { triggers: p.triggers, jobs }))
 }
 
 /// Files changed between `old` and `new`; None when every file counts (a new
@@ -137,7 +215,7 @@ pub async fn on_push(st: &AppState, repo: &Repo, actor_id: i64, updates: &[RefUp
 }
 
 async fn on_branch(st: &AppState, repo: &Repo, actor_id: i64, u: &RefUpdate, branch: &str, new: &str) -> R<()> {
-    let found = pipeline_at(st, &repo.path, new).await?;
+    let found = pipeline_at(st, &repo.path, new, &repo.default_branch).await?;
     if branch == repo.default_branch {
         let crons = match &found {
             Some(Ok(p)) => p.triggers.schedule.clone(),
@@ -149,9 +227,11 @@ async fn on_branch(st: &AppState, repo: &Repo, actor_id: i64, u: &RefUpdate, bra
     let files = changed(st, &repo.path, u.old.as_deref(), new).await;
     let triggers = pipeline.as_ref().map(|p| p.triggers.clone()).unwrap_or_default();
     // A broken file shows up on the push that brought it.
-    if pipeline.is_err() || triggers.push.as_ref().is_some_and(|f| wants(f, branch, &files)) {
+    if (pipeline.is_err() || triggers.push.as_ref().is_some_and(|f| wants(f, branch, &files)))
+        && let Some(p) = pick(pipeline.clone(), "push", branch, &files)
+    {
         let s = Start { event: "push", refname: u.refname.clone(), sha: new.into(), pr_number: None, actor_id: Some(actor_id), files: files.clone() };
-        start(st, repo, pipeline.clone(), s).await?;
+        start(st, repo, p, s).await?;
     }
     let Some(f) = triggers.pull_request else { return Ok(()) };
     let (id, b) = (repo.id, branch.to_string());
@@ -166,9 +246,11 @@ async fn on_branch(st: &AppState, repo: &Repo, actor_id: i64, u: &RefUpdate, bra
         })
         .await?;
     for (number, base) in prs {
-        if wants(&f, &base, &files) {
+        if wants(&f, &base, &files)
+            && let Some(p) = pick(pipeline.clone(), "pull_request", &base, &files)
+        {
             let s = Start { event: "pull_request", refname: u.refname.clone(), sha: new.into(), pr_number: Some(number), actor_id: Some(actor_id), files: files.clone() };
-            start(st, repo, pipeline.clone(), s).await?;
+            start(st, repo, p, s).await?;
         }
     }
     Ok(())
@@ -182,7 +264,7 @@ pub async fn on_pull_opened(st: &AppState, repo: &Repo, _opener: i64, number: i6
         return Ok(());
     }
     let Some(head_sha) = st.git.resolve(&repo.path, &format!("refs/heads/{head}")).await? else { return Ok(()) };
-    let Some(pipeline) = pipeline_at(st, &repo.path, &head_sha).await? else { return Ok(()) };
+    let Some(pipeline) = pipeline_at(st, &repo.path, &head_sha, &repo.default_branch).await? else { return Ok(()) };
     let wanted = match &pipeline {
         Ok(p) => p.triggers.pull_request.clone(),
         Err(_) => Some(Filter::default()),
@@ -194,7 +276,9 @@ pub async fn on_pull_opened(st: &AppState, repo: &Repo, _opener: i64, number: i6
         None => None,
     };
     let files = changed(st, &repo.path, from.as_deref(), &head_sha).await;
-    if wants(&f, base, &files) {
+    if wants(&f, base, &files)
+        && let Some(pipeline) = pick(pipeline, "pull_request", base, &files)
+    {
         // The run is the head branch's code, so it's on behalf of whoever last pushed it,
         // not whoever opened the pull request (an admin opening one doesn't vouch for it).
         let s = Start { event: "pull_request", refname: format!("refs/heads/{head}"), sha: head_sha, pr_number: Some(number), actor_id: pusher(st, repo.id, head).await?, files };
@@ -227,14 +311,16 @@ pub async fn on_queue(st: &AppState, repo: &Repo, q: Queued<'_>) -> R<()> {
     if !enabled(st, repo.owner_id).await {
         return Ok(());
     }
-    let Some(pipeline) = pipeline_at(st, &repo.path, q.sha).await? else { return Ok(()) };
+    let Some(pipeline) = pipeline_at(st, &repo.path, q.sha, &repo.default_branch).await? else { return Ok(()) };
     let wanted = match &pipeline {
         Ok(p) => p.triggers.pull_request.clone(),
         Err(_) => Some(Filter::default()),
     };
     let Some(f) = wanted else { return Ok(()) };
     let files = changed(st, &repo.path, Some(q.base_sha), q.sha).await;
-    if wants(&f, q.base, &files) {
+    if wants(&f, q.base, &files)
+        && let Some(pipeline) = pick(pipeline, "merge_queue", q.base, &files)
+    {
         let refname = format!("{}/{}", crate::mergequeue::REF_PREFIX, q.entry);
         let s = Start { event: "merge_queue", refname, sha: q.sha.into(), pr_number: Some(q.number), actor_id: pusher(st, repo.id, q.head).await?, files };
         start(st, repo, pipeline, s).await?;
@@ -298,7 +384,7 @@ pub async fn tick(st: &AppState, now: i64) -> R<()> {
 async fn scheduled(st: &AppState, repo: &Repo) -> R<()> {
     let refname = format!("refs/heads/{}", repo.default_branch);
     let Some(sha) = st.git.resolve(&repo.path, &refname).await? else { return Ok(()) };
-    if let Some(p) = pipeline_at(st, &repo.path, &sha).await? {
+    if let Some(p) = pipeline_at(st, &repo.path, &sha, &repo.default_branch).await?.and_then(|p| pick(p, "schedule", &repo.default_branch, &None)) {
         // A scheduled run is on behalf of whoever last moved the branch.
         let (id, b) = (repo.id, repo.default_branch.clone());
         let actor_id: Option<i64> = st
