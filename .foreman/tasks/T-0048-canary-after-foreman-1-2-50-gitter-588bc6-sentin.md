@@ -2,13 +2,13 @@
 id: T-0048
 type: FIX
 tier: M
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-21T23:48:09Z
-updated: 2026-10-21T23:48:09Z
+updated: 2026-10-22T00:47:31Z
 group: Foreman tooling and canary failures
 ---
 # Canary after Foreman 1.2.50: ✗ gitter-588bc6: Sentinel: 20 past check(s) from 10 finished
@@ -27,4 +27,5 @@ group: Foreman tooling and canary failures
 ## Verification evidence
 ## Log
 - 2026-10-21T23:48:09Z created
+- 2026-10-22T00:47:31Z dropped: fm sentinel re-run: 20 past checks, 0 failing now
 ## Follow-ups captured

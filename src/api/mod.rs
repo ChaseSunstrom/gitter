@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod moderation;
 pub mod releases;
 pub mod repos;
+pub mod reviews;
 pub mod security;
 pub mod snippets;
 pub mod webhooks;
@@ -165,6 +166,12 @@ pub fn router() -> Router<AppState> {
         )
         .route(&format!("{repo}/pulls"), post(issues::create_pull))
         .route(&format!("{repo}/pulls/{{n}}/diff"), get(issues::pull_diff))
+        .route(&format!("{repo}/pulls/{{n}}/reviews"), get(reviews::list).post(reviews::submit))
+        .route(&format!("{repo}/pulls/{{n}}/reviews/pending"), delete(reviews::discard))
+        .route(&format!("{repo}/pulls/{{n}}/comments"), post(reviews::comment))
+        .route(&format!("{repo}/pulls/{{n}}/comments/{{id}}"), patch(reviews::edit).delete(reviews::delete))
+        .route(&format!("{repo}/pulls/{{n}}/comments/{{id}}/resolve"), post(reviews::resolve))
+        .route(&format!("{repo}/pulls/{{n}}/comments/{{id}}/apply"), post(reviews::apply))
         .route(
             &format!("{repo}/pulls/{{n}}/merge"),
             post(issues::merge_pull),
@@ -288,11 +295,20 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
     if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
         return true;
     }
-    // Writes: only inside a repository (/repos/{owner}/{repo}/{thing}...), never forking it.
+    // Writes: only inside a repository (/repos/{owner}/{repo}/{thing}...), never forking it,
+    // and never granting access (deploy tokens, collaborators) or giving the repository away:
+    // a leaked token mustn't leave access behind once it's revoked.
     l.scope != crate::auth::Scope::Read
         && segs.len() >= 4
         && segs[0] == "repos"
-        && !matches!(segs[3], "fork" | "deploy-tokens" | "transfer")
+        && !matches!(segs[3], "fork" | "deploy-tokens" | "transfer" | "collaborators")
+}
+
+/// POST /repos/{owner}/{repo}/traffic/view: counting a page view, which browsing mustn't
+/// pay for out of the write allowance. Exactly that route, nothing that merely ends like it.
+fn is_view_count(method: &axum::http::Method, path: &str) -> bool {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    *method == axum::http::Method::POST && segs.len() == 5 && segs[0] == "repos" && segs[3] == "traffic" && segs[4] == "view"
 }
 
 /// Per-address limits on all API requests, and per-account limits on changes
@@ -313,7 +329,7 @@ pub async fn rate_limit(
     }
     // A page-view count isn't a change: browsing mustn't use up the write allowance.
     let mutating = !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS)
-        && !parts.uri.path().ends_with("/traffic/view");
+        && !is_view_count(&parts.method, parts.uri.path());
     if mutating && s.write_rate_per_min > 0 {
         let v = crate::auth::Viewer::from_request_parts(&mut parts, &st).await.ok().and_then(|v| v.0);
         let key = match &v {

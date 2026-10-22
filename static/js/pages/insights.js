@@ -79,7 +79,7 @@ export default async function (ctx) {
   const [c, l, t] = await Promise.all([
     get(`${repoUrl(owner, repo)}/contributors`),
     get(`${repoUrl(owner, repo)}/languages`).catch(() => ({ languages: [] })),
-    meta.can_admin ? get(`${repoUrl(owner, repo)}/traffic`, { fresh: true }).catch(() => null) : null,
+    meta.can_admin ? get(`${repoUrl(owner, repo)}/traffic`, { fresh: true }).catch((e) => ({ error: e.message })) : null,
   ]);
   const people = c.contributors;
   const top = Math.max(1, ...people.map((p) => p.commits));
@@ -96,7 +96,7 @@ export default async function (ctx) {
     </div>
     <div class="box"><div class="box-head">${icon('pulse', 'sm')}<b>Commit activity</b><span class="grow"></span><span class="muted small">${plural(yearCommits, 'commit')} in the last year</span></div>
       <div class="box-body chart-wrap">${meta.empty ? html`<p class="muted">No commits yet.</p>` : activityChart(c.weeks)}</div></div>
-    ${t ? trafficBox(t) : ''}
+    ${t?.error ? html`<div class="box"><div class="box-body muted small">${icon('eye', 'sm')} Traffic couldn't be loaded: ${t.error}</div></div>` : t ? trafficBox(t) : ''}
     <div class="insights-cols">
       <div class="box"><div class="box-head">${icon('users', 'sm')}<b>Contributors</b></div>
         ${people.length ? html`<ol class="contrib-list">${people.map((p, i) => html`<li>

@@ -6,6 +6,7 @@ Fast, simple git hosting. One Rust binary serves the web app, the API and git ov
 - **Insights:** Commits → Graph draws every branch with its merges, lane by lane. A file's History button steps through each version of it, following renames, with a slider and the diff of each. The Insights tab shows contributors, weekly commit activity and languages, and to the repository's admins its traffic: views and clones (fetches count too) per day for two weeks, unique visitors, referring sites and popular pages.
 - **Releases:** publish a version from a tag (or a new tag at a branch), with markdown notes, files to download (with download counts) and the source code as zip and tar.gz. Drafts stay with the maintainers, pre-releases are marked, and the repository page shows the latest release.
 - **Collaboration:** issues, labels, pull requests with server-side merge (merge commit, squash or fast-forward), comments in markdown, stars and forks.
+- **Code review:** click a line number in a pull request's Files changed (shift-click for a range) to comment there. Comments form threads with replies that can be resolved; ones whose lines changed since are marked outdated. Gather comments into a review and submit it as Approve, Request changes or Comment (not on your own pull request); the latest decision of each reviewer shows on the pull request and in the list. A ```` ```suggestion ```` block proposes replacement lines, and anyone who can push applies it as a commit with one click (refused if those lines changed meanwhile).
 - **Teams:** add collaborators to a repository as Read (see and clone), Write (push, manage issues and pull requests) or Admin (settings, access, deploy tokens, CI secrets), and see in plain words who can do what in Settings → Who has access. Organizations own repositories for a group: owners manage everything, and members get the organization's base permission (none, read or write) on all of its repositories. An organization shares its creator's repository limit and storage quota, and who belongs to it is visible to its members only. Write access includes running CI: pushes run the repository's pipelines with its secrets, so give Write to people you'd trust with those.
 - **Wikis, discussions, snippets:** every repository has a markdown wiki with page history (its own git repository, private when the repo is) and a discussions forum with General, Q&A, Ideas and Announcements categories, marked answers and upvotes. Snippets share a few files, public or secret (only the link finds it), with every edit kept as a revision.
 - **Editing:** edit, create, rename, delete and upload files in the browser, committing straight to a branch or to a new branch for a pull request.
@@ -148,6 +149,24 @@ Jobs are leased with a heartbeat. A job whose runner dies goes back to the queue
 Turning CI off stops new runs, re-runs and queued jobs.
 
 **Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts are deleted 30 days after their job, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
+
+**Run it locally.** `gitter ci run` runs `.gitter/ci.yml` on your machine with the same parser and step runner, no server needed. Jobs run one at a time in `needs` order, and a job whose needs failed is skipped. Each job gets a fresh copy of the work tree as it is now: tracked files and untracked ones that aren't ignored, without `.git`. Use `--here` to run in the folder itself, for example when steps need git history. `HOME` is a fresh folder, and no secrets are set. Triggers, `paths` and `runs-on` don't apply, and jobs with an `image` need docker. It exits 1 when a job fails.
+
+## Command-line client
+
+The same `gitter` binary is a client for any Gitter server, like `gh`:
+
+```sh
+gitter login https://git.example.com       # asks for an access token (or --token, or GITTER_TOKEN)
+gitter repo create notes --private && gitter repo clone alice/notes && cd notes
+gitter issue create --title "Crash on start" --body "…"
+git switch -c fix && git commit -am "Fix the crash"
+gitter pr create                           # pushes the branch first, then opens the pull request
+gitter pr list; gitter pr checkout 7; gitter pr merge 7 --method squash
+gitter ci status; gitter ci logs 12        # follows a running job; gitter ci rerun 12
+```
+
+`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name`. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter <command> --help` lists every command.
 
 ## Webhooks
 

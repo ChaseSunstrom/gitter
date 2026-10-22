@@ -26,7 +26,7 @@ export default async function (ctx) {
   const { rev, path } = splitRev(meta, ctx.params.rest || '');
   if (!path) return { redirect: `/${owner}/${repo}/commits/${encPath(rev)}` };
   state.rev = rev;
-  const page = Number(ctx.query.get('page') || 1);
+  const page = Math.max(1, Math.floor(Number(ctx.query.get('page'))) || 1);
   const api = repoUrl(owner, repo);
   const d = await get(`${api}/history?rev=${enc(rev)}&path=${enc(path)}&page=${page}`);
   const vs = d.versions;

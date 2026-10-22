@@ -30,6 +30,27 @@ pub struct PageQ {
 /// The graph only reaches this far back: laying out page N means walking every row before it.
 const GRAPH_DEPTH: usize = 10_000;
 
+/// Deep walks (the graph, a file's history) run two at a time, so a burst of them
+/// can't take every git slot from pushes and page views, and repeats are free:
+/// the output is cached under what it depends on.
+static DEEP: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+async fn deep_walk(st: &AppState, r: &Repo, key: String, args: &[&str], cap: usize, sep: u8) -> R<String> {
+    if let Some(hit) = st.git.memo.get::<String>(&key) {
+        return Ok(hit);
+    }
+    let _slot = tokio::time::timeout(std::time::Duration::from_secs(10), DEEP.acquire())
+        .await
+        .map_err(|_| AppError::slow_down("The server is busy walking history for others. Try again in a moment.", 5))?
+        .map_err(|_| AppError::internal("history walks stopped"))?;
+    if let Some(hit) = st.git.memo.get::<String>(&key) {
+        return Ok(hit);
+    }
+    let out = String::from_utf8_lossy(&st.git.run_records(&r.path, args, cap, sep).await?).into_owned();
+    st.git.memo.put(key, &out);
+    Ok(out)
+}
+
 /// Where one commit sits in the graph. Lanes are columns; each row's lines run
 /// from the top edge to the bottom edge of the row: `pass` lanes go straight
 /// through, `up` lanes come down into the dot, `down` lanes leave it for the
@@ -114,11 +135,11 @@ pub async fn graph(
     }
     let end = (start + per).min(GRAPH_DEPTH);
     let n = format!("-n{}", end + 1);
-    let out = st
-        .git
-        .run_records(&r.path, &["rev-list", "--parents", "--topo-order", "--branches", &n, "--"], 8 << 20, b'\n')
-        .await?;
-    let mut rows: Vec<(String, Vec<String>)> = String::from_utf8_lossy(&out)
+    // Cached under the branch heads it walked from.
+    let heads = st.git.run(&r.path, &["for-each-ref", "--format=%(objectname)", "refs/heads"], None, &[]).await?.stdout;
+    let key = format!("graph:{}:{}:{end}", r.id, hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(&heads)[..8]));
+    let out = deep_walk(&st, &r, key, &["rev-list", "--parents", "--topo-order", "--branches", &n, "--"], 8 << 20, b'\n').await?;
+    let mut rows: Vec<(String, Vec<String>)> = out
         .lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace().map(String::from);
@@ -243,11 +264,9 @@ pub async fn history(
     }
     let end = (start + per).min(GRAPH_DEPTH);
     let (fmt, lim) = (format!("--format={COMMIT_FMT}"), format!("-n{}", end + 1));
-    let out = st
-        .git
-        .run_records(&r.path, &["log", "--follow", "-M", "-z", "--name-status", &fmt, &lim, &sha, "--", path], 16 << 20, 0)
-        .await?;
-    let mut versions = parse_history(&String::from_utf8_lossy(&out), path);
+    let key = format!("history:{}:{sha}:{end}:{path}", r.id);
+    let out = deep_walk(&st, &r, key, &["log", "--follow", "-M", "-z", "--name-status", &fmt, &lim, &sha, "--", path], 16 << 20, 0).await?;
+    let mut versions = parse_history(&out, path);
     // A record cut off at the output cap has no name; drop it.
     versions.retain(|v| !v.path.is_empty());
     let has_more = versions.len() > end && end < GRAPH_DEPTH;
@@ -360,8 +379,17 @@ fn write_traffic(c: &mut rusqlite::Connection, counts: &HashMap<Key, i64>, visit
                     OR (SELECT count(*) FROM traffic WHERE repo_id = ?1 AND day = ?2 AND kind = ?3) < ?6)
              ON CONFLICT(repo_id, day, kind, name) DO UPDATE SET count = count + excluded.count",
         )?;
+        // A full list doesn't lock out later names: the least-counted one gives way and the
+        // newcomer inherits its count (space-saving), so junk posted early can't hold the list.
+        let mut swap = tx.prepare(
+            "UPDATE traffic SET name = ?4, count = count + ?5 WHERE repo_id = ?1 AND day = ?2 AND kind = ?3 AND name = (
+                 SELECT name FROM traffic WHERE repo_id = ?1 AND day = ?2 AND kind = ?3 AND name != '' ORDER BY count, name LIMIT 1)
+             AND EXISTS (SELECT 1 FROM repos WHERE id = ?1)",
+        )?;
         for ((repo, day, kind, name), n) in counts {
-            add.execute(params![repo, day, kind, name, n, MAX_NAMES])?;
+            if add.execute(params![repo, day, kind, name, n, MAX_NAMES])? == 0 && !name.is_empty() {
+                swap.execute(params![repo, day, kind, name, n])?;
+            }
         }
         let mut groups: HashMap<(i64, i64, &str), Vec<&str>> = HashMap::new();
         for (repo, day, kind, h) in visitors {

@@ -493,7 +493,42 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX signing_keys_fingerprint ON signing_keys(fingerprint);
     CREATE INDEX signing_keys_user ON signing_keys(user_id);
     "#,
-    // v15: traffic, per repository and UTC day (unix time / 86400). Kind 'view' or
+    // v15: code review. A comment with no review_id was posted on its own (public at once);
+    // others belong to a review, hidden from everyone but its author while it's pending.
+    // original is the text of the lines commented on, so a later change marks it outdated.
+    r#"
+    CREATE TABLE reviews (
+        id INTEGER PRIMARY KEY,
+        issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+        author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        state TEXT NOT NULL DEFAULT 'pending',
+        body TEXT NOT NULL DEFAULT '',
+        commit_sha TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        submitted_at INTEGER
+    );
+    CREATE INDEX reviews_issue ON reviews(issue_id);
+    CREATE TABLE review_comments (
+        id INTEGER PRIMARY KEY,
+        issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+        review_id INTEGER REFERENCES reviews(id) ON DELETE CASCADE,
+        author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        side TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        start_line INTEGER,
+        commit_sha TEXT NOT NULL,
+        original TEXT NOT NULL,
+        in_reply_to INTEGER REFERENCES review_comments(id) ON DELETE CASCADE,
+        body TEXT NOT NULL,
+        resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        resolved_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX review_comments_issue ON review_comments(issue_id);
+    "#,
+    // v16: traffic, per repository and UTC day (unix time / 86400). Kind 'view' or
     // 'clone' with name '' is the day's count; 'path' (a page) and 'ref' (a referring
     // site) rows are the top lists, capped per day. Visitors are hashes of the address
     // with a random salt held in memory for that day only, so no address is stored.

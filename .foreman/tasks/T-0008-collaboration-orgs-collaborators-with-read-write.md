@@ -67,6 +67,7 @@ README: Teams bullet, security note on access
 - 2026-10-22T00:13:07Z focused
 - 2026-10-22T00:39:05Z review fixes: ADMIN_OWNED trusts orgs an admin created (not ones with an admin owner); org repos/storage count toward the creator; members private to members; limited tokens can't leave; admin can't delete an org's only owner; dashboard lists shared repos; role_level removed; stronger org-login test
 - 2026-10-22T00:43:55Z done
+- 2026-10-22T00:43:55Z committed 70d66fe (55 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuse access(), VISIBLE and visible_params, Sudo/Admin extractors, security::record and validate::username. No new crates.

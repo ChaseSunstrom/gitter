@@ -5,6 +5,7 @@ import { loadRepo, repoUrl, repoPage, mountRepoHeader, placeTabBar } from '../re
 import { renderMarkdown, preloadLangs } from '../md.js';
 import { mdEditor, mountMdEditor, clearDraft } from '../mdeditor.js';
 import { diffView, mountDiff } from '../diffview.js';
+import { diffReview, reviewBar, mountReview, reviewItems, reviewersBlock } from '../review.js';
 import { refresh } from '../main.js';
 import { labelChip } from './issues.js';
 
@@ -35,16 +36,20 @@ export default async function (ctx) {
   const issue = data.issue;
   if (issue.is_pr && kind !== 'pr') return { redirect: `/${owner}/${repo}/pull/${n}` };
   if (!issue.is_pr && kind === 'pr') return { redirect: `/${owner}/${repo}/issues/${n}` };
-  const pd = issue.is_pr ? await get(`${api}/pulls/${n}/diff`) : null;
+  const [pd, rv] = issue.is_pr
+    ? await Promise.all([get(`${api}/pulls/${n}/diff`), tab === 'commits' ? null : get(`${api}/pulls/${n}/reviews`, { fresh: true }).catch((e) => { if (e.status !== 400) toastErr(e); return null; })])
+    : [null, null];
+  const rctx = { api, n, isAuthor: state.me?.username === issue.author };
   const mdCtx = { owner, repo, rev: meta.default_branch, dir: '' };
-  await preloadLangs([issue.body, ...data.comments.map((c) => c.body)].join('\n'));
+  await preloadLangs([issue.body, ...data.comments.map((c) => c.body), ...(rv?.threads || []).flatMap((t) => t.comments.map((c) => c.body))].join('\n'));
+  rctx.mdCtx = { owner, repo, rev: meta.default_branch, dir: '' };
 
   const base = `/${owner}/${repo}`;
   const prBase = `${base}/pull/${n}`;
   let content;
   if (tab === 'commits') content = commitsTab(base, pd);
-  else if (tab === 'files') content = html`<div class="pr-files">${diffView(pd.diff, { owner, repo, sha: pd.head_sha, key: `${owner}/${repo}#${n}:${pd.head_sha}` })}</div>`;
-  else content = conversation(meta, data, pd, mdCtx);
+  else if (tab === 'files') content = html`<div class="pr-files">${reviewBar(rv)}${diffView(pd.diff, { owner, repo, sha: pd.head_sha, key: `${owner}/${repo}#${n}:${pd.head_sha}` })}</div>`;
+  else content = conversation(meta, data, pd, mdCtx, rv);
 
   const body = html`<div class="issue-page">
     ${header(meta, data, pd)}
@@ -63,7 +68,10 @@ export default async function (ctx) {
       mountRepoHeader(el, meta);
       placeTabBar(el.querySelector('.issue-page'));
       mountHeader(el, api, issue);
-      if (tab === 'files') mountDiff(el, pd.diff, { key: `${owner}/${repo}#${n}:${pd.head_sha}`, load: (q) => get(`/repos/${owner}/${repo}/pulls/${n}/diff?${q}`).then((x) => x.diff.files[0]) });
+      if (tab === 'files') {
+        mountDiff(el, pd.diff, { key: `${owner}/${repo}#${n}:${pd.head_sha}`, load: (q) => get(`/repos/${owner}/${repo}/pulls/${n}/diff?${q}`).then((x) => x.diff.files[0]), ...(rv ? diffReview(rv, rctx) : {}) });
+      }
+      if (tab !== 'commits') mountReview(el.querySelector('.issue-page'), rv, rctx);
       if (tab === 'conversation') mountConversation(el, meta, api, data, mdCtx);
     },
   };
@@ -188,9 +196,10 @@ function mergeBox(meta, data, pd) {
   </div>`;
 }
 
-function sidebar(meta, data) {
+function sidebar(meta, data, rv) {
   const { issue, participants, all_labels } = data;
   return html`<aside class="issue-side">
+    ${issue.is_pr ? reviewersBlock(rv) : ''}
     <div class="side-block" id="labels-block">
       <div class="section-title">${icon('label', 'sm')} Labels
         ${data.can_write ? html`<span class="grow"></span><button class="btn ghost sm icon" id="edit-labels" aria-label="Edit labels">${icon('settings', 'sm')}</button>` : ''}</div>
@@ -207,17 +216,21 @@ function sidebar(meta, data) {
   </aside>`;
 }
 
-function conversation(meta, data, pd, mdCtx) {
+function conversation(meta, data, pd, mdCtx, rv) {
   const { issue } = data;
   const base = { isPr: issue.is_pr, base: data.pull?.base };
-  const items = [
-    card({ id: 'issue-body', author: issue.author, time: issue.created_at, tag: 'Author',
-      bodyHtml: issue.body.trim() ? raw(renderMarkdown(issue.body, mdCtx)) : html`<p class="muted"><em>No description provided.</em></p>` }),
-    ...data.comments.map((c) => c.kind === 'comment'
+  const timeline = [
+    ...data.comments.map((c) => ({ time: c.created_at, node: c.kind === 'comment'
       ? card({ id: `comment-${c.id}`, author: c.author, time: c.created_at, edited: c.updated_at > c.created_at + 5, tag: c.author === issue.author ? 'Author' : '',
         bodyHtml: c.hidden && !c.body ? html`<p class="muted"><em>A moderator hid this comment.</em></p>`
           : html`${c.hidden ? html`<p class="mod-note">${icon('eye', 'sm')} A moderator hid this comment; only you and admins can read it.</p>` : ''}${raw(renderMarkdown(c.body, mdCtx))}` })
-      : eventRow(c, meta, base)),
+      : eventRow(c, meta, base) })),
+    ...reviewItems(rv, mdCtx),
+  ].sort((a, b) => a.time - b.time);
+  const items = [
+    card({ id: 'issue-body', author: issue.author, time: issue.created_at, tag: 'Author',
+      bodyHtml: issue.body.trim() ? raw(renderMarkdown(issue.body, mdCtx)) : html`<p class="muted"><em>No description provided.</em></p>` }),
+    ...timeline.map((x) => x.node),
   ];
   const mayToggle = data.can_edit && issue.state !== 'merged';
   const noun = issue.is_pr ? 'pull request' : 'issue';
@@ -240,7 +253,7 @@ function conversation(meta, data, pd, mdCtx) {
       ${issue.is_pr ? html`<div class="tl-item tl-merge">${mergeBox(meta, data, pd)}</div>` : ''}
       ${composer}
     </div>
-    ${sidebar(meta, data)}
+    ${sidebar(meta, data, rv)}
   </div>`;
 }
 
