@@ -253,6 +253,9 @@ fn deliver(
     )?;
     let key = thread.key();
     let t = now();
+    // ponytail: one upsert per recipient inside the request, holding the connection; a repository
+    // with thousands of watchers makes each comment that slow. Move to a background queue (like
+    // webhook deliveries) if that ever shows up.
     for u in &readers {
         tx.prepare_cached(&format!(
             "INSERT INTO notifications(user_id, repo_id, thread, issue_id, discussion_id, run_id, reason, actor_id, updated_at)

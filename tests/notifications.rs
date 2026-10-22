@@ -198,6 +198,28 @@ async fn private_repositories_never_notify_people_who_cannot_read_them() {
 }
 
 #[tokio::test]
+async fn a_failed_ci_run_tells_whoever_pushed() {
+    let app = App::new();
+    let root = app.signup("root1").await;
+    ok(&app, &root, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    ok(&app, &root, "PUT", "/api/repos/root1/r/subscription", Some(json!({ "level": "participating" }))).await;
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    let config = "jobs:\n  test:\n    steps: [\"exit 3\"]\n";
+    ok(&app, &root, "POST", "/api/repos/root1/r/contents", Some(json!({ "branch": "main", "message": "CI", "changes": [{ "path": ".gitter/ci.yml", "content": config }] }))).await;
+    let mut items = vec![];
+    for _ in 0..200 {
+        items = inbox(&app, &root, "").await;
+        if !items.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(items.len(), 1, "the run should fail and notify");
+    assert_eq!((items[0]["kind"].as_str(), items[0]["reason"].as_str(), items[0]["state"].as_str()), (Some("ci"), Some("ci"), Some("failure")));
+    assert_eq!(items[0]["url"], "/root1/r/ci/1");
+}
+
+#[tokio::test]
 async fn discussions_and_reviews_notify_and_merges_tell_participants() {
     let app = App::new();
     let alice = app.signup("alice").await;

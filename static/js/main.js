@@ -12,6 +12,7 @@ const ROUTES = [
   ['/snippets/:id', 'snippets', { view: 'show' }], ['/snippets/:id/edit', 'snippets', { view: 'edit' }],
   ['/snippets/:id/revisions', 'snippets', { view: 'revisions' }],
   ['/orgs/new', 'orgs', { view: 'new' }], ['/orgs/:org/settings', 'orgs', { view: 'settings' }],
+  ['/notifications', 'notifications'],
   ['/:user', 'profile'],
   ['/:owner/:repo', 'repo', { view: 'tree' }],
   ['/:owner/:repo/tree/*', 'repo', { view: 'tree' }],
@@ -259,6 +260,7 @@ function topbar() {
       <a class="nav hide-sm" href="/explore" data-nav="explore">Explore</a>
       <a class="nav hide-sm" href="/snippets" data-nav="snippets">Snippets</a>
       ${me ? html`
+        <a class="btn ghost icon notif-btn" href="/notifications" id="notif-btn" data-nav="notifications" aria-label="Notifications">${icon('bell')}<span class="notif-badge" id="notif-badge" hidden></span></a>
         <button class="btn ghost icon" id="new-menu" aria-label="Create new">${icon('plus')}</button>
         <button class="btn ghost" id="user-menu" aria-label="Account menu" style="padding:0 4px">${avatar(me.username, 26)}${icon('chev-down', 'sm')}</button>`
       : html`<a class="btn ghost" href="/login">Sign in</a>${state.signup ? html`<a class="btn primary" href="/signup">Sign up</a>` : ''}`}
@@ -267,7 +269,27 @@ function topbar() {
 
 function paintNav(ctx) {
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === ctx.page));
+  refreshBadge();
 }
+
+// The unread count on the bell: fetched on navigation (at most every 30 s) and each
+// minute while the tab is visible, or set directly by the inbox when it knows it.
+let badgeAt = 0;
+export async function refreshBadge(known, force = false) {
+  const el = $('#notif-badge');
+  if (!el || !state.me) return;
+  let n = known;
+  if (n === undefined) {
+    if (!force && Date.now() - badgeAt < 30_000) return;
+    badgeAt = Date.now();
+    try { n = (await get('/notifications/count', { fresh: true })).unread; } catch { return; }
+  }
+  badgeAt = Date.now();
+  el.hidden = !n;
+  el.textContent = n > 99 ? '99+' : String(n);
+  $('#notif-btn')?.setAttribute('aria-label', n ? `Notifications (${n} unread)` : 'Notifications');
+}
+setInterval(() => { if (document.visibilityState === 'visible') refreshBadge(undefined, true); }, 60_000);
 
 function renderAnnouncement() {
   let el = $('.announce');
