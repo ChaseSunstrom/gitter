@@ -292,6 +292,53 @@ else
   echo "· git-lfs not installed and the download failed: LFS client check skipped"
 fi
 
+# --- container registry: the API with curl, then a real client (docker, podman or skopeo) if installed
+REG="127.0.0.1:$PORT"
+RA=(-u "alice:$TOKEN")  # pragma: allowlist secret
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v2/")" = 401 ] || fail "the registry ping should ask for credentials"
+printf 'e2e config %.0s' $(seq 300) >"$TMP/blob.bin"
+LD="sha256:$(sha256sum "$TMP/blob.bin" | cut -d' ' -f1)"
+curl -sf "${RA[@]}" -X POST --data-binary @"$TMP/blob.bin" "$BASE/v2/alice/hello/blobs/uploads/?digest=$LD" >/dev/null || fail "registry blob push"
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%s},"layers":[]}' \
+  "$LD" "$(wc -c <"$TMP/blob.bin")" >"$TMP/manifest.json"
+curl -sf "${RA[@]}" -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @"$TMP/manifest.json" \
+  "$BASE/v2/alice/hello/manifests/v1" >/dev/null || fail "registry manifest push"
+curl -sf "$BASE/v2/alice/hello/manifests/v1" | cmp -s - "$TMP/manifest.json" || fail "registry manifest pull"
+curl -sf "$BASE/v2/alice/hello/blobs/$LD" | cmp -s - "$TMP/blob.bin" || fail "registry blob pull"
+curl -sf "$BASE/v2/alice/hello/tags/list" | grep -q '"v1"' || fail "registry tags list"
+api GET /repos/alice/hello/packages
+[ "$(jq_ 'd["images"][0]["tags"][0]["tag"]')" = v1 ] || fail "Packages listing: $BODY"
+ok "registry: blob and manifest pushed and pulled with curl, tags listed, Packages tab data"
+CLIENT_LOG="$TMP/registry-client.log"
+if command -v docker >/dev/null && timeout 10 docker info >/dev/null 2>&1; then
+  # A throwaway client config, so the login never touches ~/.docker; an image built offline FROM scratch.
+  export DOCKER_CONFIG="$TMP/docker"
+  IMG="$REG/alice/hello/e2e:1"
+  mkdir -p "$TMP/img" && echo "hello from the registry" >"$TMP/img/hello.txt" && printf 'FROM scratch\nCOPY hello.txt /\n' >"$TMP/img/Dockerfile"
+  { docker build -q -t "$IMG" "$TMP/img" && echo "$TOKEN" | docker login -u alice --password-stdin "$REG" && docker push -q "$IMG" \
+    && docker rmi -f "$IMG" && docker pull -q "$IMG" && docker rmi -f "$IMG" && docker logout "$REG"; } >"$CLIENT_LOG" 2>&1 \
+    || { cat "$CLIENT_LOG"; docker rmi -f "$IMG" >/dev/null 2>&1; fail "docker push and pull"; }
+  unset DOCKER_CONFIG
+  api GET /repos/alice/hello/packages
+  echo "$BODY" | grep -q '"alice/hello/e2e"' || fail "the pushed image should be listed: $BODY"
+  ok "docker $(docker version -f '{{.Client.Version}}' 2>/dev/null) logs in, pushes and pulls an image"
+elif command -v podman >/dev/null; then
+  IMG="$REG/alice/hello/e2e:1"
+  mkdir -p "$TMP/img" && echo "hello from the registry" >"$TMP/img/hello.txt" && printf 'FROM scratch\nCOPY hello.txt /\n' >"$TMP/img/Containerfile"
+  { podman build -q -t "$IMG" "$TMP/img" && podman push --tls-verify=false --creds "alice:$TOKEN" "$IMG" \
+    && podman rmi -f "$IMG" && podman pull -q --tls-verify=false --creds "alice:$TOKEN" "$IMG" && podman rmi -f "$IMG"; } >"$CLIENT_LOG" 2>&1 \
+    || { cat "$CLIENT_LOG"; fail "podman push and pull"; }  # pragma: allowlist secret
+  ok "podman pushes and pulls an image"
+elif command -v skopeo >/dev/null; then
+  { skopeo inspect --raw --tls-verify=false --creds "alice:$TOKEN" "docker://$REG/alice/hello:v1" >"$TMP/sk.json" \
+    && skopeo copy -q --src-tls-verify=false --dest-tls-verify=false --src-creds "alice:$TOKEN" --dest-creds "alice:$TOKEN" \
+      "docker://$REG/alice/hello:v1" "docker://$REG/alice/hello/copy:v1"; } >"$CLIENT_LOG" 2>&1 || { cat "$CLIENT_LOG"; fail "skopeo"; }  # pragma: allowlist secret
+  cmp -s "$TMP/sk.json" "$TMP/manifest.json" || fail "skopeo saw a different manifest"
+  ok "skopeo reads and copies an image"
+else
+  echo "· no docker, podman or skopeo: real registry client check skipped"
+fi
+
 # --- CI: a push runs the pipeline on the built-in runner
 CI_YML='jobs:\n  build:\n    steps:\n      - name: Say hello\n        run: echo hello from ci && ls src\n    artifacts: [\"src/**\"]\n  test:\n    needs: [build]\n    steps:\n      - run: echo testing\n'
 api POST /repos/alice/hello/contents "{\"branch\":\"main\",\"message\":\"Add CI\",\"changes\":[{\"path\":\".gitter/ci.yml\",\"content\":\"$CI_YML\"}]}"

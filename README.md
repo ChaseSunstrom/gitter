@@ -92,6 +92,8 @@ Signed commits: add your public key in Settings → Signing keys (an SSH `.pub` 
 
 Release files upload by streaming, so they can be as big as Git LFS files (the same limit), and they count toward the owner's storage quota too. They're stored under `GITTER_DATA/releases`, always download as attachments, stay as private as their repository, and backups include them. A draft's new tag is made when it's published, and deleting a release deletes its files but keeps its tag. From a script: `curl -H "Authorization: Bearer $TOKEN" --data-binary @app.tar.gz "$URL/api/repos/OWNER/REPO/releases/ID/assets?name=app.tar.gz"`.
 
+Container images: every repository is also an image registry for docker, podman and skopeo (the OCI distribution API at `/v2/`). `docker login HOST` with your username and password or an access token (a token if you use two-factor sign-in; a deploy token works for its repository), then `docker push HOST/owner/repo:tag` or `HOST/owner/repo/name:tag` (names in lowercase). Images follow their repository: whoever can read it pulls, whoever can push to it publishes, and they're gone with it (the trash hides them; purging frees them). Layers are stored once by content under `GITTER_DATA/registry` (one layer in several images or repositories counts once toward the owner's storage quota), each is limited like a Git LFS file, blobs no image names are removed after a day and abandoned uploads after an hour, and backups include them. The repository's Packages tab lists images, tags, sizes and the pull command. Docker accepts plain HTTP only for `localhost`/`127.0.0.1`; anywhere else serve Gitter over HTTPS. Generic packages hold any file under a name and version: `curl -H "Authorization: Bearer $TOKEN" --upload-file tool.tar.gz "$URL/api/repos/OWNER/REPO/packages/generic/tool/1.0.0/tool.tar.gz"`, downloaded from the same URL.
+
 The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`, `gitter bench [--check]` (`-` as the file means stdout/stdin), and `gitter runner` for CI machines.
 
 ## CI
@@ -178,7 +180,7 @@ Everything is optional. The defaults are tuned for a single small server, and th
 |---|---|---|
 | `GITTER_URL` | `http://localhost:3000` | Public address, used in clone URLs. `https://` also turns on secure cookies. |
 | `GITTER_ADDR` | `0.0.0.0:3000` | Address to listen on. |
-| `GITTER_DATA` | `./data` | Where the database and the bare git repositories live (`repos/`, `wikis/`, `snippets/`, deleted repositories in `trash/`, plus Git LFS files in `lfs/` and release files in `releases/`; data exports wait a day in `exports/`). Back this folder up, or use `gitter backup`, which includes all of them. |
+| `GITTER_DATA` | `./data` | Where the database and the bare git repositories live (`repos/`, `wikis/`, `snippets/`, deleted repositories in `trash/`, plus Git LFS files in `lfs/`, release files in `releases/` and container image layers in `registry/`; data exports wait a day in `exports/`). Back this folder up, or use `gitter backup`, which includes all of them. |
 | `GITTER_SIGNUP` | `open` | `invite` needs an invite link from an admin; `closed` stops new sign-ups. The first (admin) account is always created through the setup link. |
 | `GITTER_MAX_PUSH_MB` | `500` | Largest single push. |
 | `GITTER_MAX_REPOS` | `200` | Repositories per user (admins are exempt). |
