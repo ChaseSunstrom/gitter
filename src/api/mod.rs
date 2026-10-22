@@ -1,10 +1,12 @@
 pub mod account;
 pub mod admin;
 pub mod ci;
+pub mod orgs;
 pub mod code;
 pub mod discussions;
 pub mod issues;
 pub mod moderation;
+pub mod releases;
 pub mod repos;
 pub mod security;
 pub mod snippets;
@@ -13,7 +15,7 @@ pub mod wiki;
 
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts};
 use axum::http::request::Parts;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
@@ -62,6 +64,10 @@ pub fn router() -> Router<AppState> {
         .route("/admin/audit", get(security::admin_log))
         .route("/admin/invites", get(admin::invites).post(admin::create_invite))
         .route("/admin/invites/{id}", delete(admin::delete_invite))
+        .route("/orgs", post(orgs::create))
+        .route("/orgs/{org}", get(orgs::show).patch(orgs::update).delete(orgs::delete))
+        .route("/orgs/{org}/members/{user}", put(orgs::set_member).delete(orgs::remove_member))
+        .route("/me/orgs", get(orgs::mine))
         .route("/admin/runners", get(ci::runners).post(ci::create_runner))
         .route("/admin/runners/{id}", delete(ci::delete_runner))
         .route("/admin/reports", get(moderation::queue))
@@ -139,6 +145,8 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/pulls/{{n}}/merge"),
             post(issues::merge_pull),
         )
+        .route(&format!("{repo}/collaborators"), get(orgs::collaborators))
+        .route(&format!("{repo}/collaborators/{{user}}"), put(orgs::set_collaborator).delete(orgs::remove_collaborator))
         .route(&format!("{repo}/ci/runs"), get(ci::runs).post(ci::start))
         .route(&format!("{repo}/ci/runs/{{n}}"), get(ci::run))
         .route(&format!("{repo}/ci/runs/{{n}}/cancel"), post(ci::cancel))
@@ -157,6 +165,18 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/hooks/{{id}}/ping"), post(webhooks::ping))
         .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}"), get(webhooks::delivery))
         .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}/redeliver"), post(webhooks::redeliver))
+        .route(&format!("{repo}/releases"), get(releases::list).post(releases::create))
+        .route(&format!("{repo}/releases/latest"), get(releases::latest))
+        .route(
+            &format!("{repo}/releases/{{id}}"),
+            get(releases::show).patch(releases::update).delete(releases::delete),
+        )
+        // Release files stream in (up to the Git LFS file limit), past the API's 40 MB cap.
+        .route(&format!("{repo}/releases/{{id}}/assets"), post(releases::upload).layer(DefaultBodyLimit::disable()))
+        .route(
+            &format!("{repo}/releases/{{id}}/assets/{{asset}}"),
+            get(releases::download).delete(releases::delete_asset),
+        )
         .route(&format!("{repo}/wiki"), get(wiki::pages).post(wiki::create))
         .route(
             &format!("{repo}/wiki/{{page}}"),
@@ -343,14 +363,17 @@ pub const CARD_SELECT: &str = "SELECT u.username, r.name, r.description, r.is_pr
     (SELECT pu.username || '/' || p.name FROM repos p JOIN users pu ON pu.id = p.owner_id WHERE p.id = r.forked_from AND p.is_private = 0 AND p.hidden = 0)
     FROM repos r JOIN users u ON u.id = r.owner_id";
 
-/// SQL condition: repo `r` is visible to the viewer. Binds one parameter (viewer id, or -1).
-pub const VISIBLE: &str = "((r.is_private = 0 AND r.hidden = 0) OR r.owner_id = ? OR EXISTS (SELECT 1 FROM users a WHERE a.id = ? AND a.is_admin = 1))";
+/// Repositories `r` the viewer can see (the same rule as `repo::access`); takes `visible_params`.
+pub const VISIBLE: &str = "((r.is_private = 0 AND r.hidden = 0) OR r.owner_id = ? OR EXISTS (SELECT 1 FROM users a WHERE a.id = ? AND a.is_admin = 1)
+    OR EXISTS (SELECT 1 FROM repo_collaborators rc WHERE rc.repo_id = r.id AND rc.user_id = ? AND (r.hidden = 0 OR rc.role = 'admin'))
+    OR EXISTS (SELECT 1 FROM org_members om JOIN orgs o ON o.id = om.org_id WHERE om.org_id = r.owner_id AND om.user_id = ?
+        AND (om.role = 'owner' OR (r.hidden = 0 AND o.base_role IN ('read', 'write')))))";
 
-pub fn visible_params(viewer: Option<&crate::auth::User>) -> [Value; 2] {
+pub fn visible_params(viewer: Option<&crate::auth::User>) -> [Value; 4] {
     // A deploy token lists repositories as if signed out (it's for one repo only).
     let viewer = viewer.filter(|u| u.limits.as_ref().is_none_or(|l| l.repo_id.is_none()));
-    let id = viewer.map(|u| u.id).unwrap_or(-1);
-    [Value::Integer(id), Value::Integer(id)]
+    let id = Value::Integer(viewer.map(|u| u.id).unwrap_or(-1));
+    [id.clone(), id.clone(), id.clone(), id]
 }
 
 pub fn repo_cards(

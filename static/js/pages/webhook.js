@@ -12,6 +12,7 @@ export function deliveryState(d) {
   const code = d.response_code != null ? ` (${d.response_code})` : '';
   if (d.status === 'ok') return [ciIcon('success'), `Delivered${code}`];
   if (d.status === 'failed') return [ciIcon('failure'), `Failed${code}, gave up`];
+  if (d.status === 'sending') return [ciIcon('running'), 'Sending'];
   if (!d.attempts && !d.at) return [ciIcon('queued'), 'Waiting to send'];
   if (!d.tried_at && !d.at) return [ciIcon('running'), 'Sending'];
   return [ciIcon('failure'), `Failed${code}${d.next_at ? `, trying again ${ago(d.next_at)}` : ', trying again'}`];
@@ -40,7 +41,7 @@ function detail(d) {
 
 export default async function (ctx) {
   const meta = await loadRepo(ctx.params.owner, ctx.params.repo);
-  if (!meta.can_write) throw Object.assign(new Error('Only people who can write to this repository can change its webhooks'), { status: 403 });
+  if (!meta.can_admin) throw Object.assign(new Error('Only admins of this repository can change its webhooks'), { status: 403 });
   const api = repoUrl(meta.owner, meta.name);
   const full = `${meta.owner}/${meta.name}`;
   const isNew = !!ctx.params.create;

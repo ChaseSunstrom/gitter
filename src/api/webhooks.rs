@@ -94,7 +94,7 @@ async fn load(st: &AppState, r: &Repo, id: i64) -> R<Value> {
 }
 
 pub async fn list(State(st): State<AppState>, Authed(u): Authed, Path((o, n)): Path<(String, String)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let rid = r.id;
     let hooks: Vec<Value> = st
         .db
@@ -113,7 +113,7 @@ pub async fn create(
     Path((o, n)): Path<(String, String)>,
     Json(req): Json<HookReq>,
 ) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let url = check_url(req.url.as_deref().unwrap_or_default())?;
     let secret = req.secret.unwrap_or_default();
     if secret.is_empty() {
@@ -155,7 +155,7 @@ pub async fn update(
     Path((o, n, id)): Path<(String, String, i64)>,
     Json(req): Json<HookReq>,
 ) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let cur = load(&st, &r, id).await?;
     let url = req.url.as_deref().map(check_url).transpose()?;
     let moved = url.as_deref().is_some_and(|x| Some(x) != cur["url"].as_str());
@@ -189,7 +189,7 @@ pub async fn update(
 }
 
 pub async fn remove(State(st): State<AppState>, Sudo(u): Sudo, ip: ClientIp, Path((o, n, id)): Path<(String, String, i64)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let cur = load(&st, &r, id).await?;
     let rid = r.id;
     st.db.call(move |c| Ok(c.execute("DELETE FROM webhooks WHERE id = ?1 AND repo_id = ?2", [id, rid])?)).await?;
@@ -199,7 +199,7 @@ pub async fn remove(State(st): State<AppState>, Sudo(u): Sudo, ip: ClientIp, Pat
 }
 
 pub async fn ping(State(st): State<AppState>, Authed(u): Authed, Path((o, n, id)): Path<(String, String, i64)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     if load(&st, &r, id).await?["active"] != true {
         return Err(AppError::conflict("Turn the webhook on first"));
     }
@@ -223,7 +223,7 @@ fn delivery_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
 
 /// A hook and its newest deliveries.
 pub async fn show(State(st): State<AppState>, Authed(u): Authed, Path((o, n, id)): Path<(String, String, i64)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let hook = load(&st, &r, id).await?;
     let deliveries: Vec<Value> = st
         .db
@@ -237,7 +237,7 @@ pub async fn show(State(st): State<AppState>, Authed(u): Authed, Path((o, n, id)
 
 /// One delivery with what was sent and what came back.
 pub async fn delivery(State(st): State<AppState>, Authed(u): Authed, Path((o, n, id, did)): Path<(String, String, i64, i64)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let rid = r.id;
     st.db
         .call(move |c| {
@@ -264,7 +264,7 @@ pub async fn delivery(State(st): State<AppState>, Authed(u): Authed, Path((o, n,
 
 /// Send a delivery's payload again (same event and delivery id, signed with the current secret).
 pub async fn redeliver(State(st): State<AppState>, Authed(u): Authed, Path((o, n, id, did)): Path<(String, String, i64, i64)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     load(&st, &r, id).await?;
     let new_id = st
         .db

@@ -83,10 +83,20 @@ git push -u origin main</pre><button class="btn sm" data-copy="echo &quot;# ${me
     </div></div>`;
 }
 
+/** The latest release (never a draft or pre-release), or a nudge to make one. */
+function releasesSide(meta) {
+  const base = `/${meta.owner}/${meta.name}/releases`, l = meta.latest_release;
+  if (!meta.releases && !meta.can_write) return '';
+  return html`<div><div class="section-title"><a href="${base}">Releases</a>${meta.releases ? html`<span class="counter">${num(meta.releases)}</span>` : ''}</div>
+    ${l ? html`<a class="row" href="${base}/${l.id}">${icon('tag', 'c-green')}<span class="grow" style="min-width:0"><b class="ellipsis" style="display:block">${l.title}</b>
+        <span class="muted small">${l.tag} · ${timeEl(l.published_at)}</span></span><span class="pill open">Latest</span></a>`
+      : meta.releases ? '' : html`<p class="muted small">No releases yet — <a class="c-accent" href="${base}/new">create one</a>.</p>`}</div>`;
+}
+
 function aboutSide(meta, langs) {
   return html`<aside class="repo-side stack">
     <div><div class="section-title">About</div>
-      ${meta.description ? html`<p class="about-desc">${meta.description}</p>` : html`<p class="muted small">No description${meta.can_write ? html` — <a class="c-accent" href="/${meta.owner}/${meta.name}/settings">add one</a>` : ''}.</p>`}
+      ${meta.description ? html`<p class="about-desc">${meta.description}</p>` : html`<p class="muted small">No description${meta.can_admin ? html` — <a class="c-accent" href="/${meta.owner}/${meta.name}/settings">add one</a>` : ''}.</p>`}
       ${meta.website ? html`<a class="row c-accent small" href="${safeUrl(meta.website)}" rel="noopener nofollow ugc" target="_blank" style="margin-top:8px">${icon('link', 'sm')}<span class="ellipsis">${meta.website.replace(/^https?:\/\//, '')}</span></a>` : ''}
       <div class="side-stats">
         <a href="/${meta.owner}/${meta.name}/insights">${icon('star', 'sm')} <b>${num(meta.stars)}</b> ${meta.stars === 1 ? 'star' : 'stars'}</a>
@@ -95,6 +105,7 @@ function aboutSide(meta, langs) {
         <a href="/${meta.owner}/${meta.name}/tags">${icon('tag', 'sm')} <b>${num(meta.tags.length)}</b> ${meta.tags.length === 1 ? 'tag' : 'tags'}</a>
       </div>
     </div>
+    ${releasesSide(meta)}
     ${langs.length ? html`<div><div class="section-title">Languages</div>
       <div class="lang-bar">${langs.map((l) => html`<span style="width:${Math.max(l.percent, 0.6)}%;background:${l.color}" title="${l.name} ${l.percent.toFixed(1)}%"></span>`)}</div>
       <ul class="lang-list">${langs.slice(0, 8).map((l) => html`<li><span class="dot" style="background:${l.color}"></span><b>${l.name}</b><span class="muted">${l.percent.toFixed(1)}%</span></li>`)}</ul></div>` : ''}

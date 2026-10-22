@@ -11,6 +11,7 @@ const ROUTES = [
   ['/snippets', 'snippets', { view: 'list' }], ['/snippets/mine', 'snippets', { view: 'mine' }], ['/snippets/new', 'snippets', { view: 'edit' }],
   ['/snippets/:id', 'snippets', { view: 'show' }], ['/snippets/:id/edit', 'snippets', { view: 'edit' }],
   ['/snippets/:id/revisions', 'snippets', { view: 'revisions' }],
+  ['/orgs/new', 'orgs', { view: 'new' }], ['/orgs/:org/settings', 'orgs', { view: 'settings' }],
   ['/:user', 'profile'],
   ['/:owner/:repo', 'repo', { view: 'tree' }],
   ['/:owner/:repo/tree/*', 'repo', { view: 'tree' }],
@@ -36,6 +37,8 @@ const ROUTES = [
   ['/:owner/:repo/wiki/:page/history', 'wiki', { view: 'history' }],
   ['/:owner/:repo/discussions', 'discussions', { view: 'list' }], ['/:owner/:repo/discussions/new', 'discussions', { view: 'new' }],
   ['/:owner/:repo/discussions/:n', 'discussions', { view: 'show' }],
+  ['/:owner/:repo/releases', 'releases', { view: 'list' }], ['/:owner/:repo/releases/new', 'releases', { view: 'edit' }],
+  ['/:owner/:repo/releases/:id', 'releases', { view: 'show' }], ['/:owner/:repo/releases/:id/edit', 'releases', { view: 'edit' }],
 ];
 
 function compile([pattern, page, extra = {}]) {
@@ -281,6 +284,7 @@ export function renderTopbar() {
     popover(e.currentTarget, html`
       <a class="menu-item" href="/new">${icon('repo')} New repository</a>
       <a class="menu-item" href="/snippets/new">${icon('file-code')} New snippet</a>
+      <a class="menu-item" href="/orgs/new">${icon('users')} New organization</a>
       ${r ? html`<div class="menu-sep"></div><div class="menu-head">${r.owner}/${r.name}</div>
         <a class="menu-item" href="/${r.owner}/${r.name}/issues/new">${icon('issue')} New issue</a>
         <a class="menu-item" href="/${r.owner}/${r.name}/discussions/new">${icon('comment')} New discussion</a>

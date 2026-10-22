@@ -81,10 +81,16 @@ struct PublicOnly;
 
 impl Resolver for PublicOnly {
     fn resolve(&self, uri: &Uri, config: &ureq::config::Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let addrs = DefaultResolver::default().resolve(uri, config, timeout)?;
-        if let Some(a) = addrs.iter().find(|a| !is_public(a.ip())) {
-            let msg = format!("{} is a private or reserved address, so it isn't contacted", a.ip());
-            return Err(ureq::Error::Io(std::io::Error::other(msg)));
+        // One message for "doesn't resolve" and "private", without the address: whoever
+        // sets a hook URL reads it back, and mustn't be able to map internal names.
+        let refuse = || ureq::Error::Io(std::io::Error::other("Not contacted: the host doesn't resolve to a public address (private or reserved addresses aren't allowed)"));
+        let addrs = match DefaultResolver::default().resolve(uri, config, timeout) {
+            Ok(a) => a,
+            Err(ureq::Error::HostNotFound) => return Err(refuse()),
+            Err(e) => return Err(e),
+        };
+        if addrs.iter().any(|a| !is_public(a.ip())) {
+            return Err(refuse());
         }
         Ok(addrs)
     }

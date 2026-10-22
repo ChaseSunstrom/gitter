@@ -2,13 +2,14 @@
 id: T-0010
 type: FEATURE
 tier: M
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
-updated: 2026-10-21T17:01:42Z
+updated: 2026-10-22T00:30:48Z
+group: import, mirroring, and releases
 ---
 # Depth: import by URL + GitHub issues, pull/push mirrors, releases with assets, commit grap
 ## Raw request
@@ -27,4 +28,5 @@ updated: 2026-10-21T17:01:42Z
 ## Verification evidence
 ## Log
 - 2026-10-21T17:01:42Z created
+- 2026-10-22T00:30:48Z dropped: split into T-0044 (releases), T-0052 (import and mirrors), T-0053 (insights), T-0054 (viewers and polish)
 ## Follow-ups captured

@@ -93,7 +93,12 @@ pub fn enqueue(
             params![h, uuid(), event, body, t, MAX_WAITING],
         )?;
         if queued == 0 {
-            eprintln!("webhooks: hook {h} has {MAX_WAITING} deliveries waiting; dropped a {event} event");
+            // Logged where the hook's admins look, without the payload (it's what would pile up).
+            c.execute(
+                "INSERT INTO webhook_deliveries(hook_id, guid, event, payload, status, error, next_at, created_at)
+                 VALUES (?1, ?2, ?3, '', 'failed', ?4, NULL, ?5)",
+                params![h, uuid(), event, format!("Dropped: {MAX_WAITING} deliveries were already waiting for this receiver"), t],
+            )?;
         }
         n += queued;
     }
@@ -145,7 +150,7 @@ fn issue_json(c: &Connection, repo: &Value, repo_id: i64, number: i64) -> rusqli
                 let (is_pr, state): (bool, String) = (r.get(4)?, r.get(3)?);
                 let url = format!("{}/{}/{number}", repo["url"].as_str().unwrap_or_default(), if is_pr { "pull" } else { "issues" });
                 let mut v = json!({
-                    "number": number, "title": r.get::<_, String>(1)?, "body": r.get::<_, String>(2)?, "state": state,
+                    "number": number, "title": r.get::<_, String>(1)?, "body": clip(r.get::<_, String>(2)?), "state": state,
                     "user": { "username": r.get::<_, String>(5)? }, "labels": [],
                     "created_at": r.get::<_, i64>(6)?, "updated_at": r.get::<_, i64>(7)?, "closed_at": r.get::<_, Option<i64>>(8)?, "url": url,
                 });
@@ -191,7 +196,7 @@ pub fn comment_now(c: &Connection, base: &str, repo_id: i64, sender: i64, id: i6
                  JOIN users u ON u.id = c.author_id WHERE c.id = ?1 AND i.repo_id = ?2",
                 [id, repo_id],
                 |r| {
-                    let comment = json!({ "id": id, "body": r.get::<_, String>(1)?, "user": { "username": r.get::<_, String>(2)? },
+                    let comment = json!({ "id": id, "body": clip(r.get::<_, String>(1)?), "user": { "username": r.get::<_, String>(2)? },
                         "created_at": r.get::<_, i64>(3)?, "updated_at": r.get::<_, i64>(4)? });
                     Ok((r.get::<_, i64>(0)?, comment))
                 },
@@ -222,6 +227,12 @@ pub async fn ping(st: &AppState, repo_id: i64, hook: i64, sender: i64) -> bool {
 
 /// Characters of a commit message a payload carries (git allows any length).
 const MAX_MESSAGE: usize = 8192;
+/// Issue, PR and comment bodies in payloads are cut here (each payload is stored once per hook).
+const MAX_BODY: usize = 16384;
+
+fn clip(s: String) -> String {
+    if s.len() <= MAX_BODY { s } else { s.chars().take(MAX_BODY).collect() }
+}
 
 fn commit_json(repo_url: &str, c: &Commit) -> Value {
     let full = if c.body.is_empty() { c.subject.clone() } else { format!("{}\n\n{}", c.subject, c.body) };
@@ -321,10 +332,22 @@ fn claim(c: &mut Connection, limit: usize) -> rusqlite::Result<Vec<Due>> {
          WHERE next_at <= ?1 AND hook_id IN (SELECT id FROM webhooks WHERE active = 0)",
         [t],
     )?;
+    // A suspended owner's or a moderator-hidden repository's hooks don't send.
+    tx.execute(
+        "UPDATE webhook_deliveries SET next_at = NULL, status = 'failed', error = 'Not sent: the repository is suspended or hidden by a moderator'
+         WHERE next_at <= ?1 AND hook_id IN (SELECT h.id FROM webhooks h JOIN repos r ON r.id = h.repo_id JOIN users u ON u.id = r.owner_id
+             WHERE u.suspended = 1 OR r.hidden = 1)",
+        [t],
+    )?;
     let due: Vec<Due> = {
         let mut q = tx.prepare_cached(
+            // The oldest due delivery of each hook, and none of a hook that's sending one now,
+            // so one slow receiver only ever holds one worker.
             "SELECT d.id, d.guid, d.event, d.payload, h.url, h.secret, h.allow_private FROM webhook_deliveries d
-             JOIN webhooks h ON h.id = d.hook_id WHERE d.next_at <= ?1 ORDER BY d.next_at, d.id LIMIT ?2",
+             JOIN webhooks h ON h.id = d.hook_id
+             WHERE d.id IN (SELECT min(id) FROM webhook_deliveries WHERE next_at <= ?1 GROUP BY hook_id)
+               AND NOT EXISTS (SELECT 1 FROM webhook_deliveries x WHERE x.hook_id = d.hook_id AND x.status = 'sending' AND x.next_at > ?1)
+             ORDER BY d.next_at, d.id LIMIT ?2",
         )?;
         q.query_map(params![t, limit as i64], |r| {
             Ok(Due { id: r.get(0)?, guid: r.get(1)?, event: r.get(2)?, payload: r.get(3)?, url: r.get(4)?, secret: r.get(5)?, allow_private: r.get(6)? })
@@ -332,7 +355,7 @@ fn claim(c: &mut Connection, limit: usize) -> rusqlite::Result<Vec<Due>> {
         .collect::<Result<_, _>>()?
     };
     for d in &due {
-        tx.execute("UPDATE webhook_deliveries SET next_at = ?2, attempts = attempts + 1 WHERE id = ?1", params![d.id, t + LEASE])?;
+        tx.execute("UPDATE webhook_deliveries SET next_at = ?2, attempts = attempts + 1, status = 'sending' WHERE id = ?1", params![d.id, t + LEASE])?;
     }
     tx.commit()?;
     Ok(due)
@@ -393,30 +416,57 @@ fn finish(c: &Connection, id: i64, sent: &str, result: Result<crate::net::Reply,
     Ok(())
 }
 
-/// Announce finished CI runs, then send up to PARALLEL due deliveries at once
-/// and wait for them. Returns how many were sent.
+/// Announce finished CI runs, then send every due delivery, PARALLEL at a
+/// time and each receiver's in order, waiting for them (tests and tools; the
+/// server uses `run`). Returns how many were sent.
 pub async fn tick(st: &AppState) -> usize {
     let base = st.cfg.url.clone();
     if let Err(e) = st.db.call(move |c| Ok(ci_runs(c, &base)?)).await {
         eprintln!("webhooks: ci runs: {}", e.msg);
     }
-    let due = match st.db.call(|c| Ok(claim(c, PARALLEL)?)).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("webhooks: {}", e.msg);
-            return 0;
+    // Rounds until nothing is due: a round takes one delivery per receiver.
+    let mut n = 0;
+    loop {
+        let due = match st.db.call(|c| Ok(claim(c, PARALLEL)?)).await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("webhooks: {}", e.msg);
+                return n;
+            }
+        };
+        if due.is_empty() {
+            return n;
         }
-    };
-    let n = due.len();
-    futures_util::future::join_all(due.into_iter().map(|d| attempt(st, d))).await;
-    n
+        n += due.len();
+        futures_util::future::join_all(due.into_iter().map(|d| attempt(st, d))).await;
+    }
 }
 
-/// The delivery loop, for as long as the server runs.
-// ponytail: a batch waits for its slowest delivery (10 s at most); a worker pool if busy sites need more throughput.
+/// The delivery loop, for as long as the server runs: up to PARALLEL
+/// deliveries in flight, each started as soon as a worker is free.
 pub async fn run(st: AppState) {
+    let workers = std::sync::Arc::new(tokio::sync::Semaphore::new(PARALLEL));
     loop {
-        if tick(&st).await < PARALLEL {
+        let base = st.cfg.url.clone();
+        if let Err(e) = st.db.call(move |c| Ok(ci_runs(c, &base)?)).await {
+            eprintln!("webhooks: ci runs: {}", e.msg);
+        }
+        let room = workers.available_permits();
+        let due = if room == 0 { vec![] } else { st.db.call(move |c| Ok(claim(c, room)?)).await.unwrap_or_else(|e| {
+            eprintln!("webhooks: {}", e.msg);
+            vec![]
+        }) };
+        let started = due.len();
+        for d in due {
+            let Ok(permit) = workers.clone().try_acquire_owned() else { break };
+            let st = st.clone();
+            tokio::spawn(async move {
+                attempt(&st, d).await;
+                drop(permit);
+                st.hook_wake.notify_one();
+            });
+        }
+        if started == 0 || started == room {
             tokio::select! {
                 _ = st.hook_wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {}

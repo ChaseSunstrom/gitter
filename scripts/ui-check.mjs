@@ -50,7 +50,11 @@ const pages = [
   ['/', ['Your repositories']],
   ['/alice', ['alice']],
   ['/alice?tab=stars', ['alice']],
-  ['/alice/hello', ['README.md', 'src']],
+  ['/alice/hello', ['README.md', 'src', 'Releases', 'Version one', 'Latest']],
+  ['/alice/hello/releases', ['Draft a new release', 'Next up', 'Draft', 'Version one', 'Latest', 'First stable release', 'hello.txt', '1 download', 'Source code (zip)', 'Source code (tar.gz)']],
+  ['/alice/hello/releases/1', ['All releases', 'Version one', 'v1.0', 'hello.txt', 'Source code (zip)']],
+  ['/alice/hello/releases/new', ['New release', 'New tag at', 'Release notes', 'This is a pre-release', 'Save draft', 'Publish release']],
+  ['/alice/hello/releases/1/edit', ['Edit Version one', 'hello.txt', 'Delete release', 'Update release']],
   ['/alice/hello/tree/main/src', ['main.rs']],
   ['/alice/hello/blob/main/src/main.rs', ['println']],
   ['/alice/hello/blob/main/README.md', ['hello']],
@@ -70,9 +74,13 @@ const pages = [
   ['/alice/hello/issues/new', []],
   ['/alice/hello/insights', ['Alice']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
-  ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues']],
+  ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues', 'Who has access', 'Site admins']],
   [`/alice/hello/settings/hooks/${hook.id}`, ['Payload URL', 'Recent deliveries', 'ping', 'issues', 'Delivered', 'Send a ping']],
   ['/alice/hello/settings/hooks/new', ['Add webhook', 'Payload URL', 'Allow private addresses']],
+  ['/alice/secret/settings', ['Who has access', 'bob']],
+  ['/acme', ['Acme Inc', 'Organization', 'People', 'tools']],
+  ['/orgs/acme/settings', ['What members can do', 'Members', 'bob']],
+  ['/orgs/new', ['Create an organization']],
   ['/alice/hello/ci', ['CI runs', 'Add CI', '#1']],
   ['/alice/hello/ci/1', ['Add CI', 'build', 'test', 'Say hello', 'Set up job', 'Passed']],
   ['/admin/runners', ['Runners', 'built-in', 'Add a runner']],
@@ -340,7 +348,7 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
   await page.close(); await apage.close();
 }
 
-// Wiki, discussion and snippet forms work end to end.
+// Wiki, discussion, snippet and release forms work end to end.
 {
   const page = await ctx.newPage();
   const errors = [];
@@ -373,8 +381,20 @@ await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
     await page.waitForFunction(() => document.querySelector('#page').innerText.includes('browser snippet'));
     if (!(await text()).includes('Secret')) throw new Error('snippet not secret');
     steps.push('secret snippet');
+    await page.goto(BASE + '/alice/hello/releases/new', { waitUntil: 'networkidle' });
+    await page.fill('#rel-tag', 'v2.0-beta');
+    await page.fill('#rel-title', 'Beta from the browser');
+    await page.check('#rel-pre');
+    await page.setInputFiles('#rel-files', { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('uploaded from chromium') });
+    await page.click('#rel-form button[data-draft=""]');
+    await page.waitForURL(/\/releases\/\d+$/);
+    await page.waitForFunction(() => document.querySelector('#page').innerText.includes('notes.txt'));
+    if (!(await text()).includes('Pre-release')) throw new Error('release not marked as a pre-release');
+    const href = await page.getAttribute('a[download][href*="/assets/"]', 'href');
+    if ((await (await ctx.request.get(BASE + href)).text()) !== 'uploaded from chromium') throw new Error('release file differs');
+    steps.push('pre-release with a file');
   } catch (e) { errors.push(String(e)); }
-  if (errors.length) { failed++; console.log('✗ wiki/discussion/snippet forms', steps, errors); }
+  if (errors.length) { failed++; console.log('✗ wiki/discussion/snippet/release forms', steps, errors); }
   else console.log(`  ok ${steps.join(', ')} made in the browser`);
   await page.close();
 }

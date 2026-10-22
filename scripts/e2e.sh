@@ -164,6 +164,21 @@ SNIP=$(jq_ 'd["id"]')
 curl -sf "$BASE/raw/snippets/$SNIP/latest/hello.py" | grep -q 'print' || fail "snippet raw"
 ok "wiki pages with history and conflict check, discussion answer and vote, snippet raw file"
 
+# --- releases
+api POST /repos/alice/hello/releases '{"tag":"v1.0","target":"main","title":"Version one","notes":"First **stable** release"}'
+RID=$(jq_ 'd["id"]')
+printf 'hello release\n' >"$TMP/hello.txt"
+AID=$(curl -sf -b "$JAR" -H "Origin: $BASE" -H 'Content-Type: text/plain' --data-binary @"$TMP/hello.txt" \
+  "$BASE/api/repos/alice/hello/releases/$RID/assets?name=hello.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || fail "release file upload"
+curl -sf -D "$TMP/rel.h" "$BASE/api/repos/alice/hello/releases/$RID/assets/$AID" | cmp -s - "$TMP/hello.txt" || fail "release file download"
+grep -qi '^content-disposition: attachment; filename="hello.txt"' "$TMP/rel.h" || fail "release files should download as attachments"
+git ls-remote "$BASE/alice/hello.git" refs/tags/v1.0 | grep -q . || fail "the release's new tag is missing"
+api POST /repos/alice/hello/releases '{"tag":"v1.1","title":"Next up","draft":true}'
+curl -sf "$BASE/api/repos/alice/hello/releases" | python3 -c 'import json,sys; sys.exit([r["tag"] for r in json.load(sys.stdin)["releases"]] != ["v1.0"])' || fail "drafts must be hidden from readers"
+api GET /repos/alice/hello/releases/latest
+[ "$(jq_ 'd["tag"]')" = v1.0 ] && [ "$(jq_ 'd["assets"][0]["downloads"]')" = 1 ] || fail "latest release and its download count: $BODY"
+ok "releases: a new tag at a branch, a file uploaded and downloaded (as an attachment, counted), latest, drafts hidden"
+
 # --- second user, privacy, stars, forks
 JAR_A="$JAR"; JAR="$TMP/jar2"
 api POST /auth/signup '{"username":"bob","email":"bob@example.com","password":"another horse"}'
@@ -187,6 +202,33 @@ ok "private repos hidden from others (API, git, raw, explore)"
 JAR="$JAR_A"
 git clone -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/secret.git" "$TMP/secret" || fail "owner clones private"  # pragma: allowlist secret
 ok "owner clones private repo with token"
+
+# --- collaborators and organizations
+api PUT /repos/alice/secret/collaborators/bob '{"role":"write"}'
+BOB_AUTH="Authorization: Basic $(printf '%s' 'bob:another horse' | base64)" # pragma: allowlist secret
+git clone -q -c http.extraHeader="$BOB_AUTH" "http://127.0.0.1:$PORT/alice/secret.git" "$TMP/bob-secret" || fail "collaborator clones private repo"
+(cd "$TMP/bob-secret" && echo hi >bob.txt && git add bob.txt && git -c user.name=bob -c user.email=bob@example.com commit -qm "From bob" \
+  && git -c http.extraHeader="$BOB_AUTH" push -q origin HEAD) || fail "collaborator with write pushes"
+JAR="$TMP/jar2"
+api GET /repos/alice/secret
+[ "$(jq_ 'd["can_write"], d["can_admin"]')" = "True False" ] || fail "collaborator role: $BODY"
+EXPECT=403 api PATCH /repos/alice/secret '{"description":"x"}'
+JAR="$JAR_A"
+api GET /repos/alice/secret/collaborators
+jq_ 'd["access"]' | grep -q bob || fail "access list names the collaborator"
+api POST /orgs '{"name":"acme","display_name":"Acme Inc"}'
+api POST /repos '{"name":"tools","owner":"acme","private":true,"readme":true}'
+JAR="$TMP/jar2"
+EXPECT=404 api GET /repos/acme/tools
+JAR="$JAR_A"
+api PUT /orgs/acme/members/bob '{"role":"member"}'
+JAR="$TMP/jar2"
+api GET /repos/acme/tools
+[ "$(jq_ 'd["can_write"]')" = False ] || fail "org members get the base role (read)"
+JAR="$JAR_A"
+api GET /users/acme
+[ "$(jq_ 'd["is_org"]')" = True ] || fail "org profile"
+ok "collaborators push with their role; organizations own repos and share them with members"
 
 api GET /admin/overview
 [ "$(jq_ 'd["users"]')" = 2 ] || fail "admin overview"

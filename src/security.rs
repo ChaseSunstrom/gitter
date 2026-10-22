@@ -163,17 +163,55 @@ impl Challenges {
     }
 }
 
+/// A value sealed with the server key, as stored text: `sealed:<hex>`.
+pub fn seal_text(key: &[u8; 32], plain: &str) -> String {
+    format!("sealed:{}", hex::encode(seal(key, plain.as_bytes())))
+}
+
+/// The plain value of `seal_text` output. Older plaintext values (before
+/// sealing) pass through; None when the key can't open it.
+pub fn open_text(key: &[u8; 32], stored: &str) -> Option<String> {
+    match stored.strip_prefix("sealed:") {
+        Some(h) => String::from_utf8(open(key, &hex::decode(h).ok()?)?).ok(),
+        None => Some(stored.to_string()),
+    }
+}
+
+/// At boot: seal two-factor secrets stored before they were encrypted.
+pub async fn seal_totp_secrets(db: &Db, key: std::sync::Arc<[u8; 32]>) -> R<usize> {
+    db.call(move |c| {
+        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut q = c.prepare(
+                "SELECT id, totp_secret, totp_pending FROM users
+                 WHERE (totp_secret IS NOT NULL AND totp_secret NOT LIKE 'sealed:%') OR (totp_pending IS NOT NULL AND totp_pending NOT LIKE 'sealed:%')",
+            )?;
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?
+        };
+        let seal = |v: Option<String>| v.map(|v| if v.starts_with("sealed:") { v } else { seal_text(&key, &v) });
+        for (id, s, p) in &rows {
+            c.execute("UPDATE users SET totp_secret = ?2, totp_pending = ?3 WHERE id = ?1", rusqlite::params![id, seal(s.clone()), seal(p.clone())])?;
+        }
+        Ok(rows.len())
+    })
+    .await
+}
+
 /// Check a 2FA code (authenticator or recovery code) for `user_id` and use it up.
 /// Returns how it was verified, or None.
-pub async fn use_code(db: &Db, user_id: i64, code: &str) -> R<Option<String>> {
+pub async fn use_code(db: &Db, key: std::sync::Arc<[u8; 32]>, user_id: i64, code: &str) -> R<Option<String>> {
     let code = code.to_string();
     db.call(move |c| {
         let tx = c.transaction()?;
         let row: Option<(Option<String>, i64)> = tx
             .query_row("SELECT totp_secret, totp_last_step FROM users WHERE id = ?1", [user_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some((Some(secret), last)) = row else { return Ok(None) };
-        if let Some(step) = check_totp(&secret, &code, last) {
+        let Some((Some(stored), last)) = row else { return Ok(None) };
+        let secret = open_text(&key, &stored).unwrap_or_else(|| {
+            // Recovery codes still work; an admin can reset two-factor for the account.
+            eprintln!("2fa: user {user_id}'s secret can't be decrypted (was GITTER_DATA/secret.key replaced?)");
+            String::new()
+        });
+        if let Some(step) = check_totp(&secret, &code, last).filter(|_| !secret.is_empty()) {
             tx.execute("UPDATE users SET totp_last_step = ?1 WHERE id = ?2", rusqlite::params![step, user_id])?;
             tx.commit()?;
             return Ok(Some("authenticator app".to_string()));

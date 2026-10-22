@@ -9,8 +9,9 @@ depends_on: []
 source: user
 created: 2026-10-21T18:05:05Z
 updated: 2026-10-21T18:05:05Z
-inferred_deps: [T-0010]
-inferred_why: T-0010: sync reuses pull/push mirror and import machinery
+inferred_deps: [T-0010, T-0008]
+inferred_why: T-0010: bulk import reuses import-by-URL machinery; T-0008: imported labels and PRs need the collaboration model
+group: import, mirroring, and releases
 ---
 # Sync with GitHub/GitLab (and any git host): sign in with GitHub/GitLab (OAuth), bulk-impor
 ## Raw request

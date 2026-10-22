@@ -26,6 +26,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get, post};
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 
 /// Settings read once at startup.
 #[derive(Clone, Debug)]
@@ -137,7 +138,9 @@ pub fn router(st: AppState) -> Router {
         .route("/robots.txt", get(web::robots))
         .route("/healthz", get(api::admin::healthz))
         .fallback(get(web::index))
-        .layer(CompressionLayer::new());
+        // Binary downloads (release files, raw binaries) gain little from gzip and
+        // would lose their Content-Length, so browsers couldn't show progress.
+        .layer(CompressionLayer::new().compress_when(DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream"))));
 
     Router::new()
         .route(

@@ -47,6 +47,9 @@ const STORES: &[Store] = &[
     Store { dir: "snippets", table: "snippets", what: "snippets", required: true },
 ];
 
+/// Folders of plain files the database lists one by one: Git LFS objects and release files.
+const DATA_DIRS: [&str; 2] = ["lfs", "releases"];
+
 /// Folder names (`<id>.git`) the database knows for a store. A table that
 /// doesn't exist yet (a database from before it was added) knows none.
 fn folders(db: &Connection, s: &Store) -> Result<Vec<String>> {
@@ -81,6 +84,20 @@ fn lfs_oids(db: &Connection) -> Result<Vec<String>> {
     Ok(oids.into_iter().filter(|o| crate::lfs::valid_oid(o)).collect())
 }
 
+/// Release files the database refers to, as (`releases/<release id>/<asset id>`, sha256);
+/// none before the table exists.
+fn release_files(db: &Connection) -> Result<Vec<(String, String)>> {
+    let table = db
+        .query_row("SELECT 1 FROM sqlite_master WHERE name = 'release_assets'", [], |_| Ok(()))
+        .optional()?;
+    if table.is_none() {
+        return Ok(vec![]);
+    }
+    let mut s = db.prepare("SELECT release_id, id, sha256 FROM release_assets ORDER BY id")?;
+    let files = s.query_map([], |r| Ok((format!("releases/{}/{}", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?), r.get(2)?)))?;
+    Ok(files.collect::<Result<_, _>>()?)
+}
+
 fn sha256_file(p: &Path) -> Result<String> {
     let mut h = sha2::Sha256::new();
     std::io::copy(&mut std::fs::File::open(p)?, &mut h)?;
@@ -107,7 +124,7 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
     };
     // The snapshot holds password and session hashes: keep it next to the data, owner-only.
     let tmp = tempdir_in(&cfg.data_dir)?;
-    let res = (|| -> Result<(usize, i64, usize)> {
+    let res = (|| -> Result<(usize, i64, usize, usize)> {
         let snap = tmp.join("gitter.db");
         let conn = Connection::open(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
@@ -116,12 +133,14 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
         let snap_conn = Connection::open(&snap)?;
         let stores: Vec<Vec<String>> = STORES.iter().map(|s| folders(&snap_conn, s)).collect::<Result<_>>()?;
         let oids = lfs_oids(&snap_conn)?;
+        let assets = release_files(&snap_conn)?;
         drop(snap_conn);
         let users: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
         drop(conn);
         let manifest = serde_json::json!({
             "format": FORMAT, "gitter": env!("CARGO_PKG_VERSION"), "created_at": crate::db::now(),
             "repos": stores[0].len(), "snippets": stores[2].len(), "users": users, "lfs_objects": oids.len(),
+            "release_files": assets.len(),
         });
         std::fs::write(tmp.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
@@ -159,19 +178,30 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
             let name = crate::lfs::object_path(Path::new(""), oid);
             tar.append_path_with_name(&src, name)?;
         }
+        // Like LFS files: a release file is in place before its row commits, and never rewritten.
+        tar.append_dir("releases", &cfg.data_dir)?;
+        for (name, _) in &assets {
+            let src = cfg.data_dir.join(name);
+            if !src.is_file() {
+                eprintln!("warning: release file {name} is missing (deleted during the backup?)");
+                continue;
+            }
+            // Tolerates the file vanishing between the check and the copy.
+            append_tree(&mut tar, &src, name)?;
+        }
         tar.into_inner()?.finish()?.flush()?;
-        Ok((stores[0].len(), users, oids.len()))
+        Ok((stores[0].len(), users, oids.len(), assets.len()))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     if res.is_err() && !to_stdout {
         let _ = std::fs::remove_file(&out);
     }
-    let (repos, users, lfs) = res?;
+    let (repos, users, lfs, files) = res?;
     let size = if to_stdout { String::new() } else {
         format!(" ({:.1} MB)", std::fs::metadata(&out)?.len() as f64 / 1e6)
     };
     eprintln!(
-        "Backed up {users} accounts, {repos} repositories and {lfs} Git LFS files to {}{size}.",
+        "Backed up {users} accounts, {repos} repositories, {lfs} Git LFS files and {files} release files to {}{size}.",
         if to_stdout { "stdout".into() } else { out.display().to_string() },
     );
     Ok(())
@@ -239,6 +269,8 @@ fn inspect_archive(archive: &Path) -> Result<serde_json::Value> {
             || name == "secret.key"
             || name == "lfs"
             || name.starts_with("lfs/")
+            || name == "releases"
+            || name.starts_with("releases/")
             || STORES.iter().any(|s| name == s.dir || name.starts_with(&format!("{}/", s.dir)));
         // Only plain relative paths, no `..`, no absolute paths, no links that could point outside.
         let safe = path
@@ -280,8 +312,8 @@ fn unpack(archive: &Path, stage: &Path) -> Result<serde_json::Value> {
     for e in ar.entries()? {
         e?.unpack_in(stage)?;
     }
-    // Backups from before wikis, snippets and LFS have no such folders.
-    for d in STORES.iter().map(|s| s.dir).chain(["lfs"]) {
+    // Backups from before wikis, snippets, LFS and releases have no such folders.
+    for d in STORES.iter().map(|s| s.dir).chain(DATA_DIRS) {
         std::fs::create_dir_all(stage.join(d))?;
     }
     let conn = Connection::open(stage.join("gitter.db"))?;
@@ -335,7 +367,7 @@ pub fn restore(cfg: &Config, archive: &Path, force: bool) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let data = cfg.data_dir.canonicalize()?;
     let has = |d: &str| std::fs::read_dir(data.join(d)).is_ok_and(|mut rd| rd.next().is_some());
-    let occupied = data.join("gitter.db").exists() || has("lfs") || STORES.iter().any(|s| has(s.dir));
+    let occupied = data.join("gitter.db").exists() || DATA_DIRS.iter().any(|d| has(d)) || STORES.iter().any(|s| has(s.dir));
     if occupied && !force {
         bail!(
             "{} already has data. Restore into an empty directory, or pass --force to move the current data aside first.",
@@ -379,7 +411,7 @@ fn restore_from(cfg: &Config, data: &Path, archive: &Path, occupied: bool) -> Re
         }
         eprintln!("Moved the existing data to {}.", aside.display());
     }
-    for name in ["gitter.db", "lfs"].into_iter().chain(STORES.iter().map(|s| s.dir)) {
+    for name in ["gitter.db"].into_iter().chain(DATA_DIRS).chain(STORES.iter().map(|s| s.dir)) {
         std::fs::rename(stage.join(name), data.join(name))
             .with_context(|| format!("couldn't move the restored {name} into place"))?;
     }
@@ -524,6 +556,22 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
             report(damaged == 0, format!("{damaged} Git LFS files don't match their hash"));
         }
     }
+    let assets = release_files(&conn)?;
+    if !assets.is_empty() {
+        let (mut missing, mut damaged) = (0, 0);
+        for (name, sha) in &assets {
+            let p = data.join(name);
+            if !p.is_file() {
+                missing += 1;
+            } else if fsck && sha256_file(&p).ok().as_ref() != Some(sha) {
+                damaged += 1;
+            }
+        }
+        report(missing == 0, format!("{} of {} release files on disk", assets.len() - missing, assets.len()));
+        if fsck {
+            report(damaged == 0, format!("{damaged} release files don't match their hash"));
+        }
+    }
     Ok(problems)
 }
 
@@ -531,8 +579,10 @@ pub fn check(cfg: &Config, fsck: bool) -> Result<usize> {
 /// know about into `orphans/` (so a new one can never reuse stale data) and
 /// warn about missing ones.
 pub fn reconcile(cfg: &Config) -> Result<()> {
-    // Git LFS uploads cut off by the restart.
-    let _ = std::fs::remove_dir_all(cfg.data_dir.join("lfs/tmp"));
+    // Git LFS and release uploads cut off by the restart.
+    for d in DATA_DIRS {
+        let _ = std::fs::remove_dir_all(cfg.data_dir.join(d).join("tmp"));
+    }
     let db_path = cfg.data_dir.join("gitter.db");
     if !db_path.exists() {
         return Ok(());
@@ -800,6 +850,48 @@ mod tests {
         assert!(verify(&cfg_for(&data), &bad).is_err(), "a damaged LFS file fails verify");
         std::fs::remove_file(&obj).unwrap();
         assert_eq!(check(&cfg_for(&data), false).unwrap(), 1, "a missing LFS file is a problem");
+    }
+
+    #[test]
+    fn backups_carry_release_assets_and_verify_checks_them() {
+        use sha2::Digest;
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(data.join("repos")).unwrap();
+        crate::db::Db::open(&data.join("gitter.db")).unwrap();
+        run(git(&["init", "-q", "--bare", &data.join("repos/1.git").to_string_lossy()]), "git init").unwrap();
+        let body = b"a release binary".to_vec();
+        Connection::open(data.join("gitter.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO users(id, username, pass_hash, created_at) VALUES (1, 'a', 'x', 0);
+                 INSERT INTO repos(id, owner_id, name, created_at, updated_at) VALUES (1, 1, 'r', 0, 0);
+                 INSERT INTO releases(id, repo_id, tag, created_at) VALUES (5, 1, 'v1', 0);
+                 INSERT INTO release_assets(id, release_id, name, size, sha256, created_at) VALUES (9, 5, 'tool', {}, '{}', 0);",
+                body.len(),
+                hex::encode(sha2::Sha256::digest(&body))
+            ))
+            .unwrap();
+        let file = data.join("releases/5/9");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, &body).unwrap();
+        std::fs::create_dir_all(data.join("releases/tmp")).unwrap();
+        std::fs::write(data.join("releases/tmp/half-upload"), b"x").unwrap();
+
+        let good = root.path().join("good.tar.gz");
+        backup(&cfg_for(&data), &good).unwrap();
+        verify(&cfg_for(&data), &good).unwrap();
+        let fresh = root.path().join("fresh");
+        restore(&cfg_for(&fresh), &good, false).unwrap();
+        assert_eq!(std::fs::read(fresh.join("releases/5/9")).unwrap(), body);
+        assert!(!fresh.join("releases/tmp").exists(), "unfinished uploads aren't backed up");
+
+        std::fs::write(&file, b"bit rot").unwrap();
+        let bad = root.path().join("bad.tar.gz");
+        backup(&cfg_for(&data), &bad).unwrap();
+        assert!(verify(&cfg_for(&data), &bad).is_err(), "a damaged release file fails verify");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(check(&cfg_for(&data), false).unwrap(), 1, "a missing release file is a problem");
     }
 
     #[test]

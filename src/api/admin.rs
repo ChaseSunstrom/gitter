@@ -106,12 +106,13 @@ pub async fn overview(State(st): State<AppState>, _a: Admin) -> J<serde_json::Va
         .call(|c| {
             let n = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
             let day = crate::db::now() - 86400;
-            let mut s = c.prepare("SELECT username, created_at FROM users ORDER BY id DESC LIMIT 6")?;
+            let mut s = c.prepare("SELECT username, created_at FROM users WHERE is_org = 0 ORDER BY id DESC LIMIT 6")?;
             let recent: Vec<serde_json::Value> = s
                 .query_map([], |r| Ok(json!({ "username": r.get::<_, String>(0)?, "created_at": r.get::<_, i64>(1)? })))?
                 .collect::<Result<_, _>>()?;
             Ok(json!({
-                "users": n("SELECT count(*) FROM users")?,
+                "users": n("SELECT count(*) FROM users WHERE is_org = 0")?,
+                "orgs": n("SELECT count(*) FROM users WHERE is_org = 1")?,
                 "suspended": n("SELECT count(*) FROM users WHERE suspended = 1")?,
                 "repos": n("SELECT count(*) FROM repos")?,
                 "private_repos": n("SELECT count(*) FROM repos WHERE is_private = 1")?,
@@ -164,7 +165,7 @@ pub async fn users(
     let out = st
         .db
         .call(move |c| {
-            let mut cond = String::from("1=1");
+            let mut cond = String::from("u.is_org = 0");
             let mut params: Vec<Value> = vec![];
             if let Some(s) = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 cond.push_str(" AND (u.username LIKE ?1 ESCAPE '\\' OR u.email LIKE ?1 ESCAPE '\\' OR u.display_name LIKE ?1 ESCAPE '\\')");
@@ -248,6 +249,10 @@ pub async fn update_user(
                     "UPDATE users SET is_admin = ?1 WHERE id = ?2",
                     rusqlite::params![a as i64, id],
                 )?;
+                // Only admins may point hooks at private addresses: a former admin's own repos lose that.
+                if !a {
+                    tx.execute("UPDATE webhooks SET allow_private = 0 WHERE repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)", [id])?;
+                }
             }
             if let Some(s) = p.suspended {
                 tx.execute(
@@ -284,7 +289,7 @@ pub async fn delete_user(
     if !d.confirm.eq_ignore_ascii_case(&name) {
         return Err(AppError::bad(format!("Type {name} to confirm")));
     }
-    let (repo_ids, snippet_ids, lfs): (Vec<i64>, Vec<String>, Vec<String>) = st
+    let (repo_ids, snippet_ids, lfs, releases): (Vec<i64>, Vec<String>, Vec<String>, Vec<i64>) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -293,21 +298,32 @@ pub async fn delete_user(
                     r.get(0)
                 })?;
             ensure_another_admin(&tx, id)?;
+            let sole: Option<String> = rusqlite::OptionalExtension::optional(tx.query_row(
+                "SELECT o.username FROM org_members m JOIN users o ON o.id = m.org_id WHERE m.user_id = ?1 AND m.role = 'owner'
+                 AND NOT EXISTS (SELECT 1 FROM org_members x WHERE x.org_id = m.org_id AND x.role = 'owner' AND x.user_id != ?1) LIMIT 1",
+                [id],
+                |r| r.get(0),
+            ))?;
+            if let Some(org) = sole {
+                return Err(AppError::bad(format!("{name} is the only owner of {org}: make someone else an owner first, or delete it")));
+            }
             let ids: Vec<i64> = {
                 let mut s = tx.prepare("SELECT id FROM repos WHERE owner_id = ?1")?;
                 s.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?
             };
             let snippets = super::snippets::ids_of(&tx, id)?;
             let lfs = crate::lfs::held_by(&tx, true, id)?;
+            let releases = super::releases::ids_of(&tx, true, id)?;
             tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
             crate::security::forget_user(&tx, id)?;
             let e = Event { actor: Some(&me), subject: None, action: "user_deleted", detail: format!("{name} and {} repositories", ids.len()), ip: &ip.0 };
             crate::security::append(&tx, &e)?;
             tx.commit()?;
-            Ok((ids, snippets, lfs))
+            Ok((ids, snippets, lfs, releases))
         })
         .await?;
     crate::lfs::collect(&st, lfs).await;
+    super::releases::remove_files(&st, releases).await;
     for id in repo_ids {
         let _ = tokio::fs::remove_dir_all(st.git.repo_path(id)).await;
         let _ = tokio::fs::remove_dir_all(super::wiki::path(&st, id)).await;
