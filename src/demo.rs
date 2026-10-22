@@ -73,7 +73,7 @@ async fn fill(cfg: &Config) -> anyhow::Result<Seeded> {
     cfg.signup = SignupMode::Open;
     let st = AppState::new(cfg.clone(), Db::open(&cfg.data_dir.join("gitter.db"))?);
     let api = Api { app: crate::router(st.clone()), host: "demo.local".into() };
-    let password = format!("demo-{}", hex::encode(rand::random::<[u8; 4]>()));
+    let password = format!("demo-{}", hex::encode(rand::random::<[u8; 12]>()));
 
     let mut cookies = Vec::new();
     let users = ["alice", "bob", "carol"];

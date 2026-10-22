@@ -99,22 +99,44 @@ pub struct Lease {
     /// The repository's CI secrets, decrypted (filled in by `jobs::claim`).
     #[serde(default)]
     pub secrets: Vec<(String, String)>,
+    /// The site's limits for job containers (filled in by `jobs::claim`).
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+/// What a job's container may use (0: no limit).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Limits {
+    pub cpus: u32,
+    pub memory_mb: u32,
+    /// Off: no job gets a network, whatever it asks for.
+    pub network: bool,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { cpus: 0, memory_mb: 0, network: true }
+    }
 }
 
 /// Claim the oldest queued job this runner's labels can run. With
 /// `admins_only`, only jobs of repositories owned by admins.
-/// `no_agents`: skip runs an agent's changes started (the built-in runner is the
-/// server itself, so it never runs code an agent wrote).
-pub fn claim(c: &mut Connection, runner_id: i64, labels: &[String], admins_only: bool, no_agents: bool) -> rusqlite::Result<Option<Lease>> {
+/// Runs waiting for approval are never handed out. `builtin`: the runner built
+/// into the server is the server itself, so it takes only runs a site admin
+/// started (pushed, merged, pressed Run, or last pushed the branch a schedule
+/// runs), never one an agent's changes started.
+pub fn claim(c: &mut Connection, runner_id: i64, labels: &[String], admins_only: bool, builtin: bool) -> rusqlite::Result<Option<Lease>> {
     let tx = c.transaction()?;
     let picked = {
         // ponytail: parses each queued job's labels; a runs_on column if queues get long.
         let mut q = tx.prepare_cached(&format!(
             "SELECT j.id, j.spec FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
              JOIN users u ON u.id = p.owner_id WHERE j.status = 'queued' AND p.deleted_at IS NULL AND (?1 = 0 OR {ADMIN_OWNED})
-             AND (?2 = 0 OR r.agent IS NULL) ORDER BY j.id LIMIT 10000"
+             AND (r.approval IS NULL OR r.approval = 'approved')
+             AND (?2 = 0 OR (r.agent IS NULL AND EXISTS (SELECT 1 FROM users a WHERE a.id = r.actor_id AND a.is_admin = 1)))
+             ORDER BY j.id LIMIT 10000"
         ))?;
-        let rows = q.query_map([admins_only, no_agents], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = q.query_map([admins_only, builtin], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut found = None;
         for row in rows {
             let (id, spec) = row?;
@@ -154,6 +176,7 @@ pub fn claim(c: &mut Connection, runner_id: i64, labels: &[String], admins_only:
                 run_number: r.get(7)?,
                 job: job.clone(),
                 secrets: vec![],
+                limits: Limits::default(),
             })
         },
     )?;

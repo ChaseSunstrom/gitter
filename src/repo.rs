@@ -232,6 +232,24 @@ pub struct Access {
 /// public repos. A moderator-hidden repo is for its admins only. A limited
 /// token narrows that: read-only tokens never write, only full-access tokens
 /// administer, and a deploy token sees other repositories as if signed out.
+/// Whether account `uid` (signed in, no token limits) may push to `repo`: its
+/// owner, a site admin, or a write role through collaborators or the org.
+pub fn writes(c: &rusqlite::Connection, repo: &Repo, uid: i64) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    if uid == repo.owner_id {
+        return Ok(true);
+    }
+    let row: Option<(bool, bool)> = c.query_row("SELECT is_admin = 1, suspended = 1 FROM users WHERE id = ?1", [uid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    match row {
+        None | Some((_, true)) => Ok(false),
+        Some((true, _)) => Ok(true),
+        Some((false, _)) => {
+            let level: Option<i64> = c.query_row(ROLE_SQL, rusqlite::params![repo.id, uid, repo.owner_id], |x| x.get(0))?;
+            Ok(!repo.hidden && level.unwrap_or(0) >= ROLE_WRITE as i64)
+        }
+    }
+}
+
 pub fn access(repo: &Repo, viewer: Option<&User>) -> Access {
     let level = match viewer {
         Some(u) if u.id == repo.owner_id || u.is_admin => ROLE_ADMIN,

@@ -36,6 +36,8 @@ export function mount(kind, el, opts) {
 // ---------------------------------------------------------------- CSV
 
 const MAX_ROWS = 1000;
+/** A file with a huge first line mustn't build a billion cells. */
+const MAX_COLS = 200;
 
 /** RFC 4180-style fields (quotes, doubled quotes, CRLF); stops after `max` rows. */
 export function parseCsv(text, delim, max = Infinity) {
@@ -71,12 +73,13 @@ function csvView({ path, content }) {
   const delim = /\.tsv$/i.test(path) ? '\t' : ',';
   const { rows, more } = parseCsv(content, delim, MAX_ROWS + 1);
   const [head = [], ...body] = rows.filter((r) => !(r.length === 1 && r[0] === ''));
-  const width = Math.max(head.length, ...body.map((r) => r.length));
+  const wide = Math.max(head.length, ...body.map((r) => r.length));
+  const width = Math.min(wide, MAX_COLS);
   if (!width) throw new Error('empty');
   return html`<div class="csv-view">
     <div class="csv-scroll"><table class="csv-table"><thead><tr>${Array.from({ length: width }, (_, j) => html`<th><button data-col="${j}" title="Sort by this column">${head[j] ?? ''}</button></th>`)}</tr></thead>
     <tbody>${raw(csvRows(body, width))}</tbody></table></div>
-    ${more ? html`<p class="csv-more muted small">Showing the first ${num(MAX_ROWS)} rows. Download the file or view the code for the rest.</p>` : ''}
+    ${more || wide > width ? html`<p class="csv-more muted small">Showing the first ${more ? `${num(MAX_ROWS)} rows` : ''}${more && wide > width ? ' and ' : ''}${wide > width ? `${num(MAX_COLS)} columns` : ''}. Download the file or view the code for the rest.</p>` : ''}
   </div>`;
 }
 

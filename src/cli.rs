@@ -904,6 +904,7 @@ fn ci_run(cx: &Ctx) -> Result<()> {
             run_number: 0,
             job: job.clone(),
             secrets: vec![],
+            limits: Default::default(),
         };
         let (ok, code) = rt.block_on(crate::ci::runner::run_here(&lease, &ws, &home));
         done[i] = Some((if ok { "success" } else { "failure" }, code));

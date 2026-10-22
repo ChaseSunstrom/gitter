@@ -69,6 +69,10 @@ client (like gh; `gitter <command> --help` for each):
 Settings come from environment variables; see the README.";
 
 fn main() -> anyhow::Result<()> {
+    // Git runs this binary as a repository's pre-receive hook (a link named so).
+    if std::env::args_os().next().is_some_and(|a| std::path::Path::new(&a).file_name().is_some_and(|f| f == "pre-receive")) {
+        std::process::exit(gitter::protect::pre_receive());
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("serve");
     if matches!(cmd, "login" | "repo" | "issue" | "pr" | "ci") {
@@ -130,6 +134,11 @@ fn main() -> anyhow::Result<()> {
         "bench" => tokio::runtime::Runtime::new()?
             .block_on(gitter::bench::run(args.iter().any(|a| a == "--check"))),
         "demo" => {
+            let mut cfg = cfg;
+            // A demo has a known admin: only this machine reaches it unless GITTER_ADDR says otherwise.
+            if std::env::var_os("GITTER_ADDR").is_none() {
+                cfg.addr = "127.0.0.1:3000".into();
+            }
             tokio::runtime::Runtime::new()?.block_on(gitter::demo::run(&cfg))?;
             serve(cfg)
         }
@@ -168,6 +177,8 @@ async fn runner(url: String, token: String, extra: Vec<String>, jobs: usize, wor
 
 #[tokio::main]
 async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
+    // The git hook links to this binary: take its path now, while it still names this file.
+    let _ = gitter::protect::HOOK_EXE.set(std::env::current_exe()?);
     for d in ["repos", "home"] {
         std::fs::create_dir_all(cfg.data_dir.join(d))?;
     }

@@ -54,7 +54,7 @@ async fn of_commit(st: &AppState, r: &Repo, sha: &str) -> R<Undo> {
         before: parent,
         after: full.clone(),
         target: r.default_branch.clone(),
-        branch: format!("revert-{}", &full[..7]),
+        branch: format!("revert-{}", &full[..12]),
         title: format!("Revert \"{subject}\""),
         body: format!("Reverts {full}."),
         message: format!("Revert \"{subject}\"\n\nThis reverts commit {full}.\n"),
@@ -141,8 +141,15 @@ pub async fn revert(
     let (an, ae) = u.signature();
     let sha = st.git.commit_tree(&r.path, &tree, &[&tip], &undo.message, (&an, &ae)).await?;
     st.git.update_ref(&r.path, &branch_ref, &sha, None).await?;
-    touch(&st.db, r.id, true).await?;
-    record_event(&st.db, u.id, Some(r.id), "push", &undo.branch, &sha, 1).await?;
+    let noted = async {
+        touch(&st.db, r.id, true).await?;
+        record_event(&st.db, u.id, Some(r.id), "push", &undo.branch, &sha, 1).await
+    };
+    if let Err(e) = noted.await {
+        // Nothing half-done: no branch without its pull request.
+        let _ = st.git.delete_ref(&r.path, &branch_ref).await;
+        return Err(e);
+    }
     let upd = RefUpdate { refname: branch_ref.clone(), old: None, new: Some(sha.clone()) };
     crate::hooks::on_push(&st, &r, &u, &[upd]).await;
     // Opened through the same path as any pull request (checks, events, webhooks, CI).

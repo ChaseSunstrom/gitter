@@ -1,5 +1,5 @@
 // Issue and pull request lists.
-import { html, get, enc, timeEl, num, $, popover, agentBadge } from '../lib.js';
+import { html, get, enc, timeEl, num, $, popover, agentBadge, avatar, state } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
 import { navigate } from '../main.js';
@@ -25,14 +25,18 @@ function query(ctx) {
     q: q.get('q') || '',
     label: q.get('label') || '',
     author: q.get('author') || '',
+    milestone: q.get('milestone') || '',
+    assignee: q.get('assignee') || '',
     page: Math.max(1, +q.get('page') || 1),
   };
 }
 
+const FILTERS = ['q', 'label', 'author', 'milestone', 'assignee'];
+
 function listUrl(ctx) {
   const { owner, repo, kind } = ctx.params;
   const f = query(ctx);
-  return `${repoUrl(owner, repo)}/issues?kind=${kind === 'pr' ? 'pr' : 'issue'}&state=${f.state}&q=${enc(f.q)}&label=${enc(f.label)}&author=${enc(f.author)}&page=${f.page}`;
+  return `${repoUrl(owner, repo)}/issues?kind=${kind === 'pr' ? 'pr' : 'issue'}&state=${f.state}${FILTERS.map((k) => `&${k}=${enc(f[k])}`).join('')}&page=${f.page}`;
 }
 
 export async function prefetch(ctx) {
@@ -55,12 +59,13 @@ export default async function (ctx) {
     const p = new URLSearchParams();
     const m = { ...f, page: 1, ...over };
     if (m.state === 'closed') p.set('state', 'closed');
-    for (const k of ['q', 'label', 'author']) if (m[k]) p.set(k, m[k]);
+    for (const k of FILTERS) if (m[k]) p.set(k, m[k]);
     if (m.page > 1) p.set('page', m.page);
     const s = p.toString();
     return path + (s ? '?' + s : '');
   };
-  const filtered = f.q || f.label || f.author;
+  const filtered = FILTERS.some((k) => f[k]);
+  const none = Object.fromEntries(FILTERS.map((k) => [k, '']));
   const noun = pr ? 'pull request' : 'issue';
 
   const rows = data.items.map((it, i) => {
@@ -74,8 +79,10 @@ export default async function (ctx) {
           ${it.labels.map((l) => labelChip(l, link({ label: l.name })))}
           ${it.review_state === 'approved' ? html`<span class="pill open small" title="Approved by a reviewer">${icon('check', 'sm')} Approved</span>` : it.review_state === 'changes_requested' ? html`<span class="pill closed small" title="A reviewer asked for changes">Changes requested</span>` : ''}</div>
         <div class="muted small">#${it.number} ${verb} ${timeEl(when)} by <a href="${link({ author: it.author })}">${it.author}</a> ${agentBadge(it.agent, it.author)}
-          ${it.is_pr && it.head ? html`<span class="hide-sm"> · ${icon('branch', 'sm inline')} ${it.head} → ${it.base}</span>` : ''}</div>
+          ${it.is_pr && it.head ? html`<span class="hide-sm"> · ${icon('branch', 'sm inline')} ${it.head} → ${it.base}</span>` : ''}
+          ${it.milestone ? html`<a class="hide-sm" href="${link({ milestone: it.milestone.title })}"> · ${icon('flag', 'sm inline')} ${it.milestone.title}</a>` : ''}</div>
       </div>
+      ${it.assignees.length ? html`<span class="assignee-stack">${it.assignees.slice(0, 3).map((a) => html`<a href="${link({ assignee: a })}" title="Assigned to ${a}">${avatar(a, 20)}</a>`)}</span>` : ''}
       ${it.comments ? html`<a class="muted small row nowrap" href="${href}" title="${it.comments} comments">${icon('comment', 'sm')}${it.comments}</a>` : ''}
     </div>`;
   });
@@ -83,7 +90,7 @@ export default async function (ctx) {
   const empty = html`<div class="empty">
     ${icon(pr ? 'pr' : 'issue', 'big')}
     <h3>${filtered ? `No ${noun}s match` : f.state === 'open' ? `No open ${noun}s` : `No closed ${noun}s`}</h3>
-    <p>${filtered ? html`<a class="c-accent" href="${link({ q: '', label: '', author: '' })}">Clear filters</a>`
+    <p>${filtered ? html`<a class="c-accent" href="${link(none)}">Clear filters</a>`
       : pr ? 'Pull requests let you propose and review changes before they land.' : 'Issues track bugs, ideas and tasks for this repository.'}</p>
     ${!filtered && f.state === 'open' ? html`<a class="btn primary" href="${pr ? `${base}/compare` : `${base}/issues/new`}">${icon('plus', 'sm')} New ${noun}</a>` : ''}
   </div>`;
@@ -91,13 +98,15 @@ export default async function (ctx) {
   const body = html`<div class="stack">
     <div class="toolbar issues-toolbar">
       <form class="search-input grow" id="issue-search" role="search">${icon('search')}<input class="input" name="q" value="${f.q}" placeholder="Search ${noun}s" aria-label="Search ${noun}s"></form>
-      ${pr ? '' : html`<a class="btn" href="${base}/labels">${icon('label', 'sm')} Labels</a>`}
+      ${pr ? '' : html`<a class="btn" href="${base}/labels">${icon('label', 'sm')} Labels</a><a class="btn" href="${base}/milestones">${icon('flag', 'sm')} Milestones</a>`}
       <a class="btn primary" href="${pr ? `${base}/compare` : `${base}/issues/new`}">${icon('plus', 'sm')} New ${noun}</a>
     </div>
     ${filtered ? html`<div class="row wrap-ok small filter-chips">
       ${f.q ? html`<a class="pill" href="${link({ q: '' })}">“${f.q}” ${icon('x', 'sm')}</a>` : ''}
       ${f.label ? html`<a class="pill" href="${link({ label: '' })}">label: ${f.label} ${icon('x', 'sm')}</a>` : ''}
       ${f.author ? html`<a class="pill" href="${link({ author: '' })}">author: ${f.author} ${icon('x', 'sm')}</a>` : ''}
+      ${f.milestone ? html`<a class="pill" href="${link({ milestone: '' })}">milestone: ${f.milestone} ${icon('x', 'sm')}</a>` : ''}
+      ${f.assignee ? html`<a class="pill" href="${link({ assignee: '' })}">assignee: ${f.assignee} ${icon('x', 'sm')}</a>` : ''}
     </div>` : ''}
     <div class="box">
       <div class="box-head">
@@ -105,6 +114,8 @@ export default async function (ctx) {
         <a class="state-tab ${f.state === 'closed' ? 'on' : ''}" href="${link({ state: 'closed' })}">${icon('check', 'sm')} ${num(data.closed)} ${pr ? 'Closed or merged' : 'Closed'}</a>
         <span class="grow"></span>
         ${labels.labels.length ? html`<button class="btn ghost sm" id="label-filter">${icon('label', 'sm')} Label ${icon('chev-down', 'sm')}</button>` : ''}
+        <button class="btn ghost sm" id="milestone-filter">${icon('flag', 'sm')} Milestone ${icon('chev-down', 'sm')}</button>
+        <button class="btn ghost sm" id="assignee-filter">${icon('user', 'sm')} Assignee ${icon('chev-down', 'sm')}</button>
       </div>
       ${data.items.length ? html`<div class="list stagger">${rows}</div>` : empty}
     </div>
@@ -128,6 +139,22 @@ export default async function (ctx) {
           ${labels.labels.map((l) => html`<a class="menu-item" href="${link({ label: l.name })}"><span class="dot" style="background:${l.color}"></span><span class="grow">${l.name}</span><span class="faint small">${l.open}</span></a>`)}
           ${f.label ? html`<div class="menu-sep"></div><a class="menu-item" href="${link({ label: '' })}">${icon('x', 'sm')} Clear label filter</a>` : ''}`,
         { align: 'right', width: 240 });
+      });
+      $('#milestone-filter', el).addEventListener('click', async (e) => {
+        const anchor = e.currentTarget;
+        const ms = (await get(`${repoUrl(owner, repo)}/milestones`).catch(() => ({ milestones: [] }))).milestones;
+        popover(anchor, html`<div class="menu-head">Filter by milestone</div>
+          <a class="menu-item" href="${link({ milestone: 'none' })}">${icon('x', 'sm')} No milestone</a>
+          ${ms.map((m) => html`<a class="menu-item" href="${link({ milestone: m.title })}">${icon('flag', 'sm')}<span class="grow">${m.title}</span><span class="faint small">${m.open}</span></a>`)}
+          <div class="menu-sep"></div><a class="menu-item" href="${base}/milestones">${icon('settings', 'sm')} All milestones</a>`,
+        { align: 'right', width: 240 });
+      });
+      $('#assignee-filter', el).addEventListener('click', (e) => {
+        popover(e.currentTarget, html`<div class="menu-head">Filter by assignee</div>
+          ${state.me ? html`<a class="menu-item" href="${link({ assignee: state.me.username })}">${avatar(state.me.username, 18)} Assigned to me</a>` : ''}
+          <a class="menu-item" href="${link({ assignee: 'none' })}">${icon('x', 'sm')} Assigned to nobody</a>
+          ${f.assignee ? html`<div class="menu-sep"></div><a class="menu-item" href="${link({ assignee: '' })}">${icon('x', 'sm')} Clear assignee filter</a>` : ''}`,
+        { align: 'right', width: 220 });
       });
     },
   };

@@ -43,7 +43,7 @@ async fn revert_a_commit_opens_a_pull_request_with_the_inverse_change() {
     let (s, v) = app.req(&alice, "POST", "/api/repos/alice/r/revert", Some(json!({ "sha": sha }))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let (n, branch) = (v["number"].as_i64().unwrap(), v["branch"].as_str().unwrap().to_string());
-    assert_eq!(branch, format!("revert-{}", &sha[..7]));
+    assert_eq!(branch, format!("revert-{}", &sha[..12]));
     // The branch holds the inverse change; main is untouched until the PR is merged.
     assert_eq!(file(&app, &alice, "alice/r", &branch, "a.txt").await.as_deref(), Some("one\n"));
     assert_eq!(file(&app, &alice, "alice/r", &branch, "b.txt").await, None);

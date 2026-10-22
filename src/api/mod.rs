@@ -1,5 +1,6 @@
 pub mod account;
 pub mod admin;
+pub mod checks;
 pub mod ci;
 pub mod orgs;
 pub mod code;
@@ -7,6 +8,7 @@ pub mod discussions;
 pub mod insights;
 pub mod issues;
 pub mod lifecycle;
+pub mod milestones;
 pub mod moderation;
 pub mod releases;
 pub mod repos;
@@ -167,6 +169,13 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/comments/{{id}}"),
             patch(issues::edit_comment).delete(issues::delete_comment),
         )
+        .route(&format!("{repo}/milestones"), get(milestones::list).post(milestones::create))
+        .route(
+            &format!("{repo}/milestones/{{n}}"),
+            get(milestones::show).patch(milestones::update).delete(milestones::delete),
+        )
+        .route(&format!("{repo}/assignees"), get(milestones::assignable))
+        .route(&format!("{repo}/issue-templates"), get(milestones::templates))
         .route(&format!("{repo}/pulls"), post(issues::create_pull))
         .route(&format!("{repo}/pulls/{{n}}/diff"), get(issues::pull_diff))
         .route(&format!("{repo}/pulls/{{n}}/reviews"), get(reviews::list).post(reviews::submit))
@@ -185,6 +194,13 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/runs/{{n}}"), get(ci::run))
         .route(&format!("{repo}/ci/runs/{{n}}/cancel"), post(ci::cancel))
         .route(&format!("{repo}/ci/runs/{{n}}/rerun"), post(ci::rerun))
+        .route(&format!("{repo}/ci/runs/{{n}}/approve"), post(ci::approve))
+        .route(&format!("{repo}/ci/badge.svg"), get(checks::badge))
+        .route(&format!("{repo}/branch-rules"), get(checks::rules).post(checks::create_rule))
+        .route(&format!("{repo}/branch-rules/{{id}}"), put(checks::update_rule).delete(checks::delete_rule))
+        .route(&format!("{repo}/statuses/{{sha}}"), post(checks::post_status))
+        .route(&format!("{repo}/checks/{{sha}}"), get(checks::checks))
+        .route(&format!("{repo}/pulls/{{n}}/auto-merge"), put(checks::set_auto_merge).delete(checks::clear_auto_merge))
         .route(&format!("{repo}/ci/jobs/{{id}}/log"), get(ci::log))
         .route(&format!("{repo}/ci/jobs/{{id}}/log/stream"), get(ci::log_stream))
         .route(&format!("{repo}/ci/jobs/{{id}}/artifacts"), get(ci::artifacts))
@@ -542,6 +558,10 @@ mod tests {
             (Method::POST, "/repos/a/b/fork"),
             (Method::POST, "/repos/a/b/releases"),
             (Method::GET, "/repos/a/b/wiki"),
+            (Method::GET, "/repos/a/b/milestones"),
+            (Method::POST, "/repos/a/b/milestones"),
+            (Method::PATCH, "/repos/a/b/milestones/1"),
+            (Method::GET, "/repos/a/b/assignees"),
         ] {
             assert!(!token_may(&l, &m, p), "{m} {p}");
         }

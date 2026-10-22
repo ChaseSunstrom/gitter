@@ -230,6 +230,80 @@ async fn jobs_with_an_image_run_in_docker() {
 }
 
 #[tokio::test]
+async fn trust_job_containers_are_sandboxed() {
+    let have = std::process::Command::new("docker").args(["image", "inspect", "alpine:3.22"]).output().is_ok_and(|o| o.status.success());
+    if !have {
+        eprintln!("skipped: needs docker with the alpine:3.22 image");
+        return;
+    }
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    let probe = "grep NoNewPrivs /proc/self/status; echo pids=$(cat /sys/fs/cgroup/pids.max) mem=$(cat /sys/fs/cgroup/memory.max) cpu=$(cat /sys/fs/cgroup/cpu.max); echo nets=$(ls /sys/class/net); ls /var/run/docker.sock 2>/dev/null || echo no-socket";
+    let config = format!("jobs:\n  box:\n    image: alpine:3.22\n    network: false\n    steps:\n      - run: {probe}\n");
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", &config).await;
+    assert_eq!(settle(&app).await, "success");
+    let id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM ci_jobs", [], |r| r.get(0))?)).await.unwrap();
+    let log = std::fs::read_to_string(gitter::ci::jobs::log_path(&app.state.cfg.data_dir, id)).unwrap();
+    assert!(log.contains("NoNewPrivs:\t1"), "no new privileges: {log}");
+    assert!(log.contains("pids=4096") && log.contains(&format!("mem={}", 4096u64 << 20)) && log.contains("cpu=200000 100000"), "the site's limits: {log}");
+    assert!(log.contains("nets=lo\n") && log.contains("no-socket"), "no network, no docker socket: {log}");
+}
+
+#[tokio::test]
+async fn trust_the_builtin_runner_takes_only_runs_admins_started() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    let bob = app.signup("bob").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    assert_eq!(app.req(&admin, "PUT", "/api/repos/root1/r/collaborators/bob", Some(json!({ "role": "write" }))).await.0, StatusCode::OK);
+    set_ci(&app, "admins", 0).await;
+    let config = "on:\n  push: {}\n  pull_request: {}\n  schedule: [\"*/5 * * * *\"]\njobs:\n  a:\n    steps: [echo]\n";
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", config).await;
+    commit(&app, &bob, "root1/r", "main", None, "bob.txt", "b").await;
+    let runner = |builtin: bool| {
+        let st = app.state.clone();
+        async move {
+            st.db
+                .call(move |c| {
+                    c.execute("INSERT INTO ci_runners (name, builtin, created_at) VALUES ('r', ?1, 0)", [builtin])?;
+                    Ok(c.last_insert_rowid())
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let (builtin, other) = (runner(true).await, runner(false).await);
+    let claim = |id: i64, b: bool| {
+        let st = app.state.clone();
+        async move { gitter::ci::jobs::claim(&st, id, vec![], b).await.unwrap().map(|l| l.run_number) }
+    };
+    // A write collaborator's push runs the code they pushed: never on the server itself.
+    assert_eq!(claim(builtin, true).await, Some(1), "the admin's push");
+    assert_eq!(claim(builtin, true).await, None, "not bob's");
+    assert_eq!(claim(other, false).await, Some(2), "a separate runner takes bob's");
+    // A scheduled run is on behalf of whoever last moved the branch (bob).
+    let five = 1_800_000_000 - 1_800_000_000 % 300;
+    gitter::ci::trigger::tick(&app.state, five).await.unwrap();
+    let r = runs(&app).await;
+    assert_eq!(r.last().map(|r| r.0.as_str()), Some("schedule"), "{r:?}");
+    assert_eq!(claim(builtin, true).await, None, "bob last pushed main");
+    assert_eq!(claim(other, false).await, Some(3));
+    // An admin opening a pull request from bob's branch doesn't vouch for bob's code.
+    commit(&app, &bob, "root1/r", "main", Some("feat"), "f.txt", "f").await;
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Bob's", "head": "feat", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let actor: Option<String> = app
+        .state
+        .db
+        .call(|c| Ok(c.query_row("SELECT u.username FROM ci_runs r JOIN users u ON u.id = r.actor_id WHERE r.event = 'pull_request' ORDER BY r.id DESC LIMIT 1", [], |r| r.get(0))?))
+        .await
+        .ok();
+    assert_eq!(actor.as_deref(), Some("bob"), "the run is on behalf of the branch's last pusher");
+}
+
+#[tokio::test]
 async fn a_job_over_its_time_limit_is_killed() {
     let app = App::new();
     let admin = app.signup("root1").await;

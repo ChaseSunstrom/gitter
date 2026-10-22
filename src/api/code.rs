@@ -386,20 +386,23 @@ pub async fn raw(
     };
     // A pointer whose object isn't uploaded yet will serve the file once it is.
     let pending = pointer.is_some() && lfs.is_none();
+    // Only bytes that really are a PDF get the PDF viewer (not LFS objects, unread here).
+    let real_pdf = lfs.is_none() && data.starts_with(b"%PDF-");
     let (body, ctype, len) = match lfs {
         // ponytail: no text sniffing for LFS files; text ones download instead of showing.
         Some((len, body)) => (body, viewable(&path).unwrap_or("application/octet-stream"), Some(len)),
         None => (Body::from(data), ctype, None),
     };
     let mut resp = inert(body, ctype, len, immutable, r.private || r.hidden || pending);
-    if ctype == "application/pdf" {
+    if ctype == "application/pdf" && real_pdf {
         // Browsers refuse to show a PDF under a sandbox (Chrome blocks its viewer in sandboxed
-        // frames), so PDFs go without one: the viewer runs a PDF's scripts apart from this
-        // origin. Still no scripts, styles or plugins of its own, and only our pages may frame it.
+        // frames), so real PDFs go without one; the browser's viewer keeps a PDF's own scripts
+        // apart from this origin. Still no scripts, styles, forms or plugins of its own, and
+        // only our pages may frame it.
         let h = resp.headers_mut();
         h.insert(
             header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; frame-ancestors 'self'"),
+            HeaderValue::from_static("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'"),
         );
         h.insert("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
     }
@@ -1003,6 +1006,9 @@ pub async fn write_contents(
             axum::http::StatusCode::FORBIDDEN,
             "Agents can't commit to the default branch: commit to a new branch and open a pull request",
         ));
+    }
+    if req.new_branch.is_none() && has_branches {
+        crate::protect::direct(&st, &r, &target, false).await?;
     }
     // Agents work only on branches agents created, so a person's branch (or one
     // that deploys) is never theirs to rewrite.
