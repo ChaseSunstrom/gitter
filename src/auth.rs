@@ -63,13 +63,46 @@ impl Scope {
 pub struct Limits {
     pub scope: Scope,
     pub repo_id: Option<i64>,
+    /// Set for agent tokens: they work only through /mcp (see `api::mcp`).
+    pub agent: Option<std::sync::Arc<Agent>>,
+}
+
+/// An agent token: the repositories and MCP tools it was given.
+#[derive(Debug)]
+pub struct Agent {
+    pub token_id: i64,
+    pub name: String,
+    pub repos: Vec<i64>,
+    pub tools: Vec<String>,
 }
 
 impl Limits {
     pub fn unlimited(&self) -> bool {
-        self.scope == Scope::All && self.repo_id.is_none()
+        self.scope == Scope::All && self.repo_id.is_none() && self.agent.is_none()
+    }
+    /// Whether this token may act in repository `id` at all.
+    pub fn covers(&self, id: i64) -> bool {
+        self.repo_id.is_none_or(|r| r == id) && self.agent.as_ref().is_none_or(|a| a.repos.contains(&id))
     }
 }
+
+tokio::task_local! {
+    /// The agent token's name while `api::mcp` runs one of its tool calls.
+    pub static ACTING_AGENT: String;
+}
+
+/// The agent acting right now, if any (for records made without the `User` at hand).
+pub fn acting_agent() -> Option<String> {
+    ACTING_AGENT.try_with(|a| a.clone()).ok()
+}
+
+/// Run the next extractions of a request as `u`, as if it had signed in (for
+/// requests the server makes on a user's behalf, like MCP tool calls).
+pub fn act_as(ext: &mut axum::http::Extensions, u: User) {
+    ext.insert(CachedViewer(Some(u)));
+}
+
+pub const AGENT_ONLY_MCP: &str = "Agent tokens work only through /mcp";
 
 impl User {
     pub fn from_row(r: &rusqlite::Row) -> rusqlite::Result<User> {
@@ -94,6 +127,10 @@ impl User {
             name,
             format!("{}+{}@users.noreply.gitter", self.id, self.username),
         )
+    }
+    /// The agent token this request came with, if any.
+    pub fn agent(&self) -> Option<&Agent> {
+        self.limits.as_ref()?.agent.as_deref()
     }
 }
 
@@ -247,21 +284,39 @@ pub async fn user_by_token(db: &Db, raw: &str) -> R<Option<User>> {
     }
     let hash = sha256_hex(raw);
     db.call(move |c| {
-        let u = c
+        let row = c
             .query_row(
-                "SELECT u.id, u.username, u.display_name, u.email, u.is_admin, t.scope, t.repo_id FROM users u
+                "SELECT u.id, u.username, u.display_name, u.email, u.is_admin, t.scope, t.repo_id, t.id AS tid, t.kind, t.name AS tname, t.tools FROM users u
                  JOIN tokens t ON t.user_id = u.id
                  WHERE t.token_hash = ?1 AND u.suspended = 0 AND (t.expires_at IS NULL OR t.expires_at > ?2)",
                 rusqlite::params![hash, now()],
                 |r| {
                     let mut u = User::from_row(r)?;
                     let scope = Scope::parse(&r.get::<_, String>("scope")?).unwrap_or(Scope::Read);
-                    let l = Limits { scope, repo_id: r.get("repo_id")? };
-                    u.limits = (!l.unlimited()).then_some(l);
-                    Ok(u)
+                    u.limits = Some(Limits { scope, repo_id: r.get("repo_id")?, agent: None });
+                    let agent = (r.get::<_, String>("kind")? == "agent").then(|| -> rusqlite::Result<_> {
+                        Ok((r.get::<_, i64>("tid")?, r.get::<_, String>("tname")?, r.get::<_, String>("tools")?))
+                    });
+                    Ok((u, agent.transpose()?))
                 },
             )
             .optional()?;
+        let u = match row {
+            Some((mut u, Some((token_id, name, tools)))) => {
+                let mut q = c.prepare("SELECT repo_id FROM token_repos WHERE token_id = ?1")?;
+                let repos = q.query_map([token_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                let tools = tools.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+                // Agents never administer, whatever the row says, and a site admin's agent is no admin.
+                u.is_admin = false;
+                u.limits = Some(Limits { scope: Scope::Write, repo_id: None, agent: Some(std::sync::Arc::new(Agent { token_id, name, repos, tools })) });
+                Some(u)
+            }
+            Some((mut u, None)) => {
+                u.limits = u.limits.filter(|l| !l.unlimited());
+                Some(u)
+            }
+            None => None,
+        };
         if u.is_some() {
             c.execute(
                 "UPDATE tokens SET last_used = ?1 WHERE token_hash = ?2",
@@ -285,7 +340,7 @@ async fn job_user(db: &Db, raw: &str) -> R<Option<User>> {
             [hash],
             |r| {
                 let mut u = User::from_row(r)?;
-                u.limits = Some(Limits { scope: Scope::Read, repo_id: Some(r.get("repo_id")?) });
+                u.limits = Some(Limits { scope: Scope::Read, repo_id: Some(r.get("repo_id")?), agent: None });
                 Ok(u)
             },
         )
@@ -302,8 +357,10 @@ pub fn basic_secret(headers: &HeaderMap) -> Option<String> {
     dec.split_once(':').map(|(_, s)| s.to_string())
 }
 
-/// Username + password, or username + access token (used by git over HTTP).
-pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>> {
+/// Username + password, or username + access token (used by git over HTTP, Git
+/// LFS and the registry). Failed passwords are limited per name and per address
+/// (`ip`), so rotating names can't turn each request into a password hash.
+pub async fn user_by_basic(st: &AppState, headers: &HeaderMap, ip: &str) -> R<Option<User>> {
     let Some(v) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -326,6 +383,9 @@ pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>
         return Ok(None);
     };
     if let Some(u) = user_by_token(&st.db, secret).await? {
+        if u.agent().is_some() {
+            return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, AGENT_ONLY_MCP));
+        }
         // Token works with any username (like GitHub), but if a name was given it must match.
         if name.is_empty()
             || name.eq_ignore_ascii_case(&u.username)
@@ -337,7 +397,8 @@ pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>
         return Ok(None);
     }
     let key = format!("basic:{}", name.to_lowercase());
-    if st.limiter.blocked(&key, 10) {
+    let by_ip = format!("basic-ip:{}", ip_bucket(ip));
+    if st.limiter.blocked(&key, 10) || st.limiter.blocked(&by_ip, 30) {
         return Err(AppError::new(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "Too many failed attempts. Wait a minute.",
@@ -346,6 +407,7 @@ pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>
     let u = password_login(&st.db, name, secret).await?;
     if u.is_none() {
         st.limiter.fail(&key, 60);
+        st.limiter.fail(&by_ip, 60);
     }
     if let Some(u) = &u
         && has_2fa(&st.db, u.id).await?
@@ -408,6 +470,10 @@ impl FromRequestParts<AppState> for Viewer {
             user = user_by_token(&st.db, t.trim()).await?;
             if user.is_none() {
                 return Err(AppError::unauthorized());
+            }
+            // MCP tool calls come in through `act_as`, never with the token itself.
+            if user.as_ref().is_some_and(|u| u.agent().is_some()) {
+                return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, AGENT_ONLY_MCP));
             }
         }
         if user.is_none()

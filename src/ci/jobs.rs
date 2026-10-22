@@ -29,28 +29,41 @@ pub fn artifact_path(data: &Path, job: i64) -> PathBuf {
 /// Claim a job for a runner: the attempt starts with an empty log and no
 /// artifacts, and carries the repository's secrets. Nothing is handed out
 /// while CI is off; the built-in runner (the server itself) and the "admins"
-/// setting only take jobs of repositories owned by admins.
+/// setting only take jobs of repositories owned by admins, and the built-in
+/// runner never takes a run started by an agent's changes.
 pub async fn claim(st: &AppState, runner_id: i64, labels: Vec<String>, builtin: bool) -> R<Option<Lease>> {
     let mode = st.settings.get().ci;
     if mode == "off" {
         return Ok(None);
     }
     let admins_only = builtin || mode != "everyone";
-    let Some(mut lease) = st.db.call(move |c| Ok(queue::claim(c, runner_id, &labels, admins_only)?)).await? else {
+    let Some(mut lease) = st.db.call(move |c| Ok(queue::claim(c, runner_id, &labels, admins_only, builtin)?)).await? else {
         return Ok(None);
     };
     let data = &st.cfg.data_dir;
     let _ = tokio::fs::remove_file(log_path(data, lease.job_id)).await;
     let _ = tokio::fs::remove_file(artifact_path(data, lease.job_id)).await;
     let (job, repo) = (lease.job_id, lease.repo_id);
-    let sealed: Vec<(String, Vec<u8>)> = st
+    let (sealed, by_agent): (Vec<(String, Vec<u8>)>, bool) = st
         .db
         .call(move |c| {
             c.execute("DELETE FROM ci_artifacts WHERE job_id = ?1", [job])?;
+            // A run an agent started gets no secrets: its workflow could print them.
+            let by_agent: bool = c.query_row(
+                "SELECT r.agent IS NOT NULL FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE j.id = ?1",
+                [job],
+                |r| r.get(0),
+            )?;
+            if by_agent {
+                return Ok((vec![], true));
+            }
             let mut q = c.prepare("SELECT name, value FROM ci_secrets WHERE repo_id = ?1 ORDER BY name")?;
-            Ok(q.query_map([repo], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
+            Ok((q.query_map([repo], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?, false))
         })
         .await?;
+    if by_agent {
+        append_log(st, lease.job_id, b"\x1b[33mAn agent started this run, so it gets no CI secrets.\x1b[0m\n").await?;
+    }
     let total = sealed.len();
     lease.secrets = sealed
         .into_iter()

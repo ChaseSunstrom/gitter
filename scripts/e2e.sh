@@ -98,6 +98,11 @@ jq_ 'd["content"]' | grep -q println || fail "blob"
 api GET "/repos/alice/hello/commits?rev=main"
 [ "$(jq_ 'len(d["commits"])')" = 3 ] || fail "commit log"
 SHA=$(jq_ '[c["sha"] for c in d["commits"] if c["subject"]=="Add main"][0]')
+api GET "/repos/alice/hello/graph"
+[ "$(jq_ '"Add lib" in [c["subject"] for c in d["commits"]] and all("lane" in c for c in d["commits"])')" = True ] || fail "commit graph: $BODY"
+api GET "/repos/alice/hello/history?rev=main&path=README.md"
+[ "$(jq_ '[v["commit"]["subject"] for v in d["versions"]][0]')" = "More docs" ] || fail "file history: $BODY"
+ok "commit graph spans branches; file history lists a file's commits"
 api GET "/repos/alice/hello/commit/$SHA"
 [ "$(jq_ 'd["diff"]["files"][0]["new_path"]')" = src/main.rs ] || fail "commit diff"
 api GET "/repos/alice/hello/compare?base=main&head=feature"
@@ -189,6 +194,11 @@ api GET /repos/bob/hello
 [ "$(jq_ 'd["fork_of"]["name"]')" = hello ] || fail "fork"
 EXPECT=403 api PATCH /repos/alice/hello '{"description":"pwned"}'
 ok "second user: star, fork, can't edit others' repos"
+api POST /repos/alice/hello/pulls/2/comments '{"path":"src/lib.rs","side":"new","line":1,"body":"Looks good here","pending":true}'
+api POST /repos/alice/hello/pulls/2/reviews '{"event":"approve","body":"Ship it"}'
+api GET /repos/alice/hello/pulls/2/reviews
+[ "$(jq_ 'd["summary"]["approved"]')" = "['bob']" ] || fail "review: $BODY"
+ok "code review: a line comment in a review, submitted as an approval"
 JAR="$JAR_A"
 api POST /repos '{"name":"secret","private":true,"readme":true}'
 JAR="$TMP/jar2"
@@ -439,6 +449,37 @@ for _ in $(seq 50); do
 done
 [ "$(jq_ '[x["status"] for x in d["deliveries"]]')" = "['ok', 'ok']" ] || fail "webhook delivery log: $BODY"
 ok "webhooks: a local receiver gets a signed ping and issue event, and the delivery log shows both"
+
+# --- MCP server and agent tokens
+api POST /me/tokens '{"name":"e2e agent","kind":"agent","repos":["alice/hello"],"tools":["read_file","create_issue"],"expires_days":1}'
+AGENT=$(jq_ 'd["token"]')
+mcp() { curl -s -X POST -H "Authorization: Bearer $AGENT" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' --data "$1" "$BASE/mcp"; }
+out=$(mcp '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}')
+grep -q '"protocolVersion":"2025-06-18"' <<<"$out" || fail "mcp initialize: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+python3 -c 'import json,sys; t=sorted(x["name"] for x in json.loads(sys.argv[1])["result"]["tools"]); assert t == ["create_issue","list_repos","read_file"], t' "$out" || fail "mcp tools/list: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"alice/hello","path":"src/main.rs"}}}')
+grep -q 'println' <<<"$out" || fail "mcp read_file: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_issue","arguments":{"repo":"alice/hello","title":"Filed by an agent"}}}')
+N=$(python3 -c 'import json,sys; r=json.loads(sys.argv[1])["result"]; assert not r["isError"], r; print(json.loads(r["content"][0]["text"])["number"])' "$out") || fail "mcp create_issue: $out"
+out=$(mcp '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"comment","arguments":{"repo":"alice/hello","number":1,"body":"x"}}}')
+grep -q '"code":-32602' <<<"$out" || fail "a tool the agent wasn't given should be refused: $out"
+api GET "/repos/alice/hello/issues/$N"
+[ "$(jq_ 'd["issue"]["agent"]')" = "e2e agent" ] || fail "the issue should be marked as the agent's: $BODY"
+api GET /me/audit
+grep -q "e2e agent: create_issue alice/hello #$N" <<<"$BODY" || fail "the audit log should name the agent token: $BODY"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $AGENT" "$BASE/api/me")
+[ "$code" = 403 ] || fail "agent token on the REST API should be refused, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -u "x:$AGENT" "$BASE/alice/hello.git/info/refs?service=git-receive-pack")
+[ "$code" = 403 ] || fail "agent token should not work for git pushes, got $code"
+ok "MCP: initialize, tools/list and tool calls with an agent token; its issue is marked and audited; no REST or git"
+# --- traffic: the clones above counted; a page view with an outside referrer
+api POST /repos/alice/hello/traffic/view '{"path":"/","referrer":"https://example.org/post"}'
+api GET /repos/alice/hello/traffic
+[ "$(jq_ 'd["clones"] >= 3 and d["views"] >= 1 and d["referrers"][0]["name"] == "example.org"')" = True ] || fail "traffic: $BODY"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/repos/alice/hello/traffic")
+[ "$code" = 401 ] || fail "traffic should be for admins only, anonymous got $code"
+ok "traffic: clones and views per day for the repository's admins only"
 
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")

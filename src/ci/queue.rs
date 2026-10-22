@@ -103,15 +103,18 @@ pub struct Lease {
 
 /// Claim the oldest queued job this runner's labels can run. With
 /// `admins_only`, only jobs of repositories owned by admins.
-pub fn claim(c: &mut Connection, runner_id: i64, labels: &[String], admins_only: bool) -> rusqlite::Result<Option<Lease>> {
+/// `no_agents`: skip runs an agent's changes started (the built-in runner is the
+/// server itself, so it never runs code an agent wrote).
+pub fn claim(c: &mut Connection, runner_id: i64, labels: &[String], admins_only: bool, no_agents: bool) -> rusqlite::Result<Option<Lease>> {
     let tx = c.transaction()?;
     let picked = {
         // ponytail: parses each queued job's labels; a runs_on column if queues get long.
         let mut q = tx.prepare_cached(&format!(
             "SELECT j.id, j.spec FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
-             JOIN users u ON u.id = p.owner_id WHERE j.status = 'queued' AND p.deleted_at IS NULL AND (?1 = 0 OR {ADMIN_OWNED}) ORDER BY j.id LIMIT 10000"
+             JOIN users u ON u.id = p.owner_id WHERE j.status = 'queued' AND p.deleted_at IS NULL AND (?1 = 0 OR {ADMIN_OWNED})
+             AND (?2 = 0 OR r.agent IS NULL) ORDER BY j.id LIMIT 10000"
         ))?;
-        let rows = q.query_map([admins_only], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = q.query_map([admins_only, no_agents], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut found = None;
         for row in rows {
             let (id, spec) = row?;
@@ -362,11 +365,11 @@ mod tests {
             let (r1, _) = setup(c);
             let run_id = run(c, CHAIN);
             assert_eq!(jobs(c).iter().map(|j| j.1.as_str()).collect::<Vec<_>>(), ["queued", "waiting", "waiting"]);
-            let a = claim(c, r1, &[], false).unwrap().unwrap();
+            let a = claim(c, r1, &[], false, false).unwrap().unwrap();
             assert_eq!((a.job.key.as_str(), a.attempt, a.repo.as_str()), ("a", 1, "ann/r"));
-            assert!(claim(c, r1, &[], false).unwrap().is_none(), "b waits for a");
+            assert!(claim(c, r1, &[], false, false).unwrap().is_none(), "b waits for a");
             assert!(finish(c, a.job_id, &a.token, true, Some(0)).unwrap());
-            let b = claim(c, r1, &[], false).unwrap().unwrap();
+            let b = claim(c, r1, &[], false, false).unwrap().unwrap();
             assert_eq!(b.job.key, "b");
             assert!(finish(c, b.job_id, &b.token, false, Some(1)).unwrap());
             assert_eq!(jobs(c)[2].1, "skipped");
@@ -389,13 +392,13 @@ mod tests {
             let p = parse("jobs:\n  a:\n    steps: [x]\n  docs:\n    paths: [docs/]\n    steps: [y]\n  b:\n    needs: [a]\n    steps: [z]\n").unwrap();
             let r = NewRun { repo_id: 1, event: "push".into(), refname: "refs/heads/main".into(), sha: "a".repeat(40), pr_number: None, actor_id: None, title: "t".into() };
             let (run_id, _) = create_run(c, &r, &p.jobs, &[false, true, false]).unwrap();
-            let a = claim(c, r1, &[], false).unwrap().unwrap();
+            let a = claim(c, r1, &[], false, false).unwrap().unwrap();
             finish(c, a.job_id, &a.token, false, Some(1)).unwrap();
             assert_eq!(jobs(c).iter().map(|j| j.1.as_str()).collect::<Vec<_>>(), ["failure", "skipped", "skipped"]);
             rerun(c, run_id, false).unwrap();
             assert_eq!(jobs(c).iter().map(|j| j.1.as_str()).collect::<Vec<_>>(), ["queued", "skipped", "waiting"], "docs had no matching change");
             // A removed runner's job goes straight back to the queue.
-            let again = claim(c, r1, &[], false).unwrap().unwrap();
+            let again = claim(c, r1, &[], false, false).unwrap().unwrap();
             assert_eq!(release_runner(c, r1).unwrap(), 1);
             assert!(!heartbeat(c, again.job_id, &again.token).unwrap());
             assert_eq!(jobs(c)[0].1, "queued");
@@ -411,11 +414,11 @@ mod tests {
         db.call(|c| {
             let (r1, r2) = setup(c);
             run(c, "jobs:\n  a:\n    steps: [echo a]\n");
-            let first = claim(c, r1, &[], false).unwrap().unwrap();
+            let first = claim(c, r1, &[], false, false).unwrap().unwrap();
             assert!(heartbeat(c, first.job_id, &first.token).unwrap());
             c.execute("UPDATE ci_jobs SET lease_until = 0", []).unwrap();
             assert_eq!(requeue_expired(c).unwrap(), 1);
-            let second = claim(c, r2, &[], false).unwrap().unwrap();
+            let second = claim(c, r2, &[], false, false).unwrap().unwrap();
             assert_eq!(second.attempt, 2);
             assert!(!heartbeat(c, first.job_id, &first.token).unwrap(), "the old attempt must stop");
             assert!(!finish(c, first.job_id, &first.token, false, Some(1)).unwrap(), "and can't report");
@@ -426,7 +429,7 @@ mod tests {
             // A job lost on every attempt fails instead of looping forever.
             run(c, "jobs:\n  z:\n    steps: [echo z]\n");
             for _ in 0..MAX_ATTEMPTS {
-                claim(c, r1, &[], false).unwrap().unwrap();
+                claim(c, r1, &[], false, false).unwrap().unwrap();
                 c.execute("UPDATE ci_jobs SET lease_until = 0 WHERE status = 'running'", []).unwrap();
                 requeue_expired(c).unwrap();
             }
@@ -444,10 +447,10 @@ mod tests {
         db.call(|c| {
             let (r1, r2) = setup(c);
             let run_id = run(c, "jobs:\n  g:\n    runs-on: [gpu]\n    steps: [train]\n  h:\n    steps: [echo]\n");
-            let plain = claim(c, r1, &[], false).unwrap().unwrap();
+            let plain = claim(c, r1, &[], false, false).unwrap().unwrap();
             assert_eq!(plain.job.key, "h", "a runner without the label skips g");
-            assert!(claim(c, r1, &[], false).unwrap().is_none());
-            let gpu = claim(c, r2, &["gpu".into()], false).unwrap().unwrap();
+            assert!(claim(c, r1, &[], false, false).unwrap().is_none());
+            let gpu = claim(c, r2, &["gpu".into()], false, false).unwrap().unwrap();
             assert_eq!(gpu.job.key, "g");
             cancel(c, run_id).unwrap();
             assert!(!heartbeat(c, gpu.job_id, &gpu.token).unwrap());

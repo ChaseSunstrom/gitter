@@ -189,3 +189,34 @@
 .disk-bar { height: 10px; border-radius: 99px; background: var(--hover); overflow: hidden; }
 .disk-bar span { display: block; height: 100%; background: var(--grad); border-radius: 99px; transition: width .6s var(--ease); }
 .admin-user { flex-wrap: wrap; }
+
+/* ---------- commit graph, file history, traffic ---------- */
+.graph-cell { position: relative; flex: none; align-self: stretch; margin: -11px 0; overflow: hidden; }
+.graph-cell svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.graph-cell line { stroke-width: 2; stroke-linecap: round; }
+.graph-cell i { position: absolute; top: calc(50% - 4.5px); width: 9px; height: 9px; border-radius: 50%; background: var(--surface); border: 2px solid currentColor; box-sizing: border-box; }
+.graph-cell i.merge { background: currentColor; }
+.graph-cell .g0 { stroke: var(--accent); color: var(--accent); }
+.graph-cell .g1 { stroke: var(--green); color: var(--green); }
+.graph-cell .g2 { stroke: var(--purple); color: var(--purple); }
+.graph-cell .g3 { stroke: var(--amber); color: var(--amber); }
+.graph-cell .g4 { stroke: var(--red); color: var(--red); }
+.graph-cell .g5 { stroke: var(--muted); color: var(--muted); }
+.scrubber .box-body { gap: 10px; }
+.scrubber input[type=range] { accent-color: var(--accent); min-width: 0; }
+.version-list { list-style: none; margin: 0; padding: 4px; max-height: 260px; overflow: auto; border-top: 1px solid var(--line); }
+.version-list button { display: flex; width: 100%; gap: 8px; align-items: center; padding: 6px 10px; border-radius: 7px; text-align: left; }
+.version-list button:hover { background: var(--hover); }
+.version-list button.on { background: var(--accent-soft); color: var(--ink); }
+.st-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); flex: none; }
+.st-dot.added { background: var(--green); }
+.st-dot.deleted { background: var(--red); }
+.st-dot.renamed, .st-dot.copied { background: var(--purple); }
+.version-head { gap: 10px; }
+.version-head .subj { color: var(--ink); }
+.traffic-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; }
+.traffic-chart { min-width: 0; margin-top: 6px; }
+.activity-chart .bar.soft { fill: color-mix(in srgb, var(--accent) 30%, var(--surface)); }
+.top-list { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 6px; }
+.top-list li { display: flex; gap: 10px; font-size: 13px; }
+@media (max-width: 860px) { .traffic-grid { grid-template-columns: minmax(0, 1fr); } }

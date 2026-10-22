@@ -22,14 +22,14 @@ pub struct Label {
 
 #[derive(Serialize)]
 pub struct IssueRow {
-    id: i64,
+    pub(super) id: i64,
     number: i64,
-    title: String,
+    pub(super) title: String,
     body: String,
-    state: String,
-    is_pr: bool,
+    pub(super) state: String,
+    pub(super) is_pr: bool,
     author: String,
-    author_id: i64,
+    pub(super) author_id: i64,
     created_at: i64,
     updated_at: i64,
     closed_at: Option<i64>,
@@ -39,11 +39,21 @@ pub struct IssueRow {
     base: Option<String>,
     /// Hidden by a moderator: shown only to its author and admins.
     hidden: bool,
+    /// The agent token that opened it for `author`, if one did.
+    agent: Option<String>,
+    /// Pull requests: "approved" or "changes_requested" by reviewers' latest decisions.
+    review_state: Option<String>,
 }
 
 const ISSUE_SELECT: &str = "SELECT i.id, i.number, i.title, i.body, i.state, i.is_pr, u.username, i.author_id, i.created_at,
     i.updated_at, i.closed_at, (SELECT count(*) FROM comments c WHERE c.issue_id = i.id AND c.kind = 'comment'),
-    p.head_branch, p.base_branch, i.hidden
+    p.head_branch, p.base_branch, i.hidden,
+    CASE WHEN i.is_pr = 0 THEN NULL
+    WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.issue_id = i.id AND v.state = 'changes_requested' AND NOT EXISTS (
+        SELECT 1 FROM reviews x WHERE x.issue_id = v.issue_id AND x.author_id = v.author_id AND x.state IN ('approved', 'changes_requested')
+        AND (x.submitted_at > v.submitted_at OR (x.submitted_at = v.submitted_at AND x.id > v.id)))) THEN 'changes_requested'
+    WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.issue_id = i.id AND v.state = 'approved') THEN 'approved' END,
+    i.agent
     FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id";
 
 fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
@@ -64,6 +74,8 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
         head: r.get(12)?,
         base: r.get(13)?,
         hidden: r.get::<_, i64>(14)? != 0,
+        review_state: r.get(15)?,
+        agent: r.get(16)?,
     })
 }
 
@@ -203,6 +215,7 @@ fn insert_issue(
     title: &str,
     body: &str,
     is_pr: bool,
+    agent: Option<&str>,
 ) -> R<(i64, i64)> {
     let num: i64 = tx.query_row(
         "SELECT coalesce(max(number), 0) + 1 FROM issues WHERE repo_id = ?1",
@@ -211,8 +224,8 @@ fn insert_issue(
     )?;
     let t = now();
     tx.execute(
-        "INSERT INTO issues(repo_id, number, author_id, title, body, is_pr, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
-        rusqlite::params![repo_id, num, author, title.trim(), body, is_pr as i64, t],
+        "INSERT INTO issues(repo_id, number, author_id, title, body, is_pr, created_at, updated_at, agent) VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8)",
+        rusqlite::params![repo_id, num, author, title.trim(), body, is_pr as i64, t, agent],
     )?;
     Ok((tx.last_insert_rowid(), num))
 }
@@ -232,12 +245,13 @@ pub async fn create(
         ));
     }
     let (rid, uid, can_label) = (r.id, u.id, r.can_write);
+    let agent = u.agent().map(|a| a.name.clone());
     let title = req.title.clone();
     let num = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
-            let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, false)?;
+            let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, false, agent.as_deref())?;
             if can_label {
                 for l in req.labels {
                     tx.execute("INSERT OR IGNORE INTO issue_labels(issue_id, label_id) SELECT ?1, id FROM labels WHERE id = ?2 AND repo_id = ?3", [id, l, rid])?;
@@ -263,7 +277,7 @@ pub async fn create(
 
 /// An issue or PR by number, as `viewer` may see it (moderator-hidden ones only
 /// for their author and admins).
-async fn load_issue(st: &AppState, r: &Repo, number: i64, viewer: Option<&User>) -> R<IssueRow> {
+pub(super) async fn load_issue(st: &AppState, r: &Repo, number: i64, viewer: Option<&User>) -> R<IssueRow> {
     let rid = r.id;
     let (vid, admin) = (viewer.map(|u| u.id).unwrap_or(-1), viewer.is_some_and(|u| u.is_admin));
     let i = st.db
@@ -303,7 +317,7 @@ pub async fn show(
         .db
         .call(move |c| {
             let mut s = c.prepare(
-                "SELECT c.id, u.username, c.author_id, c.kind, c.body, c.created_at, c.updated_at, c.hidden FROM comments c
+                "SELECT c.id, u.username, c.author_id, c.kind, c.body, c.created_at, c.updated_at, c.hidden, c.agent FROM comments c
                  JOIN users u ON u.id = c.author_id WHERE c.issue_id = ?1 ORDER BY c.id",
             )?;
             let comments: Vec<serde_json::Value> = s
@@ -314,7 +328,7 @@ pub async fn show(
                     let body: String = if hidden && !(viewer_admin || author_id == vid) { String::new() } else { r.get(4)? };
                     Ok(json!({ "id": r.get::<_, i64>(0)?, "author": r.get::<_, String>(1)?, "kind": r.get::<_, String>(3)?,
                         "body": body, "created_at": r.get::<_, i64>(5)?, "updated_at": r.get::<_, i64>(6)?,
-                        "can_edit": author_id == vid || can_write, "hidden": hidden }))
+                        "can_edit": author_id == vid || can_write, "hidden": hidden, "agent": r.get::<_, Option<String>>(8)? }))
                 })?
                 .collect::<Result<_, _>>()?;
             let mut ls = c.prepare("SELECT id, name, color FROM labels WHERE repo_id = ?1 ORDER BY name")?;
@@ -344,9 +358,22 @@ type PullRow = (
     Option<i64>,
 );
 
+/// A PR's head branch and the head and base shas its diff shows (the branches
+/// while it's open, the recorded shas after), without merge checks.
+pub(super) async fn pull_shas(st: &AppState, r: &Repo, issue: &IssueRow) -> R<(String, Option<String>, Option<String>)> {
+    let iid = issue.id;
+    let (head_b, base_b, head0, base0): (String, String, Option<String>, Option<String>) = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT head_branch, base_branch, head_sha, base_sha FROM pulls WHERE issue_id = ?1", [iid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
+        .await?;
+    let head = st.git.resolve(&r.path, &format!("refs/heads/{head_b}")).await?;
+    let base = st.git.resolve(&r.path, &format!("refs/heads/{base_b}")).await?;
+    Ok(if issue.state == "open" { (head_b, head.or(head0), base.or(base0)) } else { (head_b, head0.or(head), base0.or(base)) })
+}
+
 /// Head/base state of a PR: mergeable, conflicts, or merged. Marks a PR merged
 /// when its head was merged into the base outside Gitter (e.g. a manual push).
-async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -> R<serde_json::Value> {
+pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -> R<serde_json::Value> {
     let iid = issue.id;
     let (head_b, base_b, head_sha0, base_sha0, merged_sha, merged_by, merged_at): PullRow = st
         .db
@@ -529,6 +556,7 @@ pub async fn comment(
         return Err(AppError::bad("Write a comment"));
     }
     let (iid, uid) = (issue.id, u.id);
+    let agent = u.agent().map(|a| a.name.clone());
     let id = st
         .db
         .call(move |c| {
@@ -537,8 +565,8 @@ pub async fn comment(
             let mut id = 0;
             if !body.is_empty() {
                 tx.execute(
-                    "INSERT INTO comments(issue_id, author_id, body, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-                    rusqlite::params![iid, uid, body, t],
+                    "INSERT INTO comments(issue_id, author_id, body, created_at, updated_at, agent) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                    rusqlite::params![iid, uid, body, t, agent],
                 )?;
                 id = tx.last_insert_rowid();
             }
@@ -547,8 +575,8 @@ pub async fn comment(
                 tx.execute("UPDATE issues SET state = ?1, closed_at = ?2 WHERE id = ?3", rusqlite::params![s, closed, iid])?;
                 let kind = if s == "closed" { "closed" } else { "reopened" };
                 tx.execute(
-                    "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at) VALUES (?1, ?2, ?3, '', ?4, ?4)",
-                    rusqlite::params![iid, uid, kind, t],
+                    "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at, agent) VALUES (?1, ?2, ?3, '', ?4, ?4, ?5)",
+                    rusqlite::params![iid, uid, kind, t, agent],
                 )?;
             }
             tx.execute("UPDATE issues SET updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid])?;
@@ -770,6 +798,7 @@ pub async fn create_pull(
         )));
     }
     let (rid, uid) = (r.id, u.id);
+    let agent = u.agent().map(|a| a.name.clone());
     let title = req.title.clone();
     let (head_branch, base_branch) = (req.head.clone(), req.base.clone());
     let num = st
@@ -786,7 +815,7 @@ pub async fn create_pull(
             if let Some(d) = dup {
                 return Err(AppError::conflict(format!("Pull request #{d} is already open for these branches")));
             }
-            let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, true)?;
+            let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, true, agent.as_deref())?;
             tx.execute("INSERT INTO pulls(issue_id, head_branch, base_branch) VALUES (?1, ?2, ?3)", rusqlite::params![id, req.head, req.base])?;
             tx.commit()?;
             Ok(num)

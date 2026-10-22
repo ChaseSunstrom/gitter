@@ -20,7 +20,7 @@ const ROUTES = [
   ['/:owner/:repo/edit/*', 'editor', { mode: 'edit' }],
   ['/:owner/:repo/new/*', 'editor', { mode: 'new' }],
   ['/:owner/:repo/upload/*', 'editor', { mode: 'upload' }],
-  ['/:owner/:repo/commits', 'commits'], ['/:owner/:repo/commits/*', 'commits'],
+  ['/:owner/:repo/commits', 'commits'], ['/:owner/:repo/commits/*', 'commits'], ['/:owner/:repo/history/*', 'history'],
   ['/:owner/:repo/commit/:sha', 'commit'],
   ['/:owner/:repo/compare', 'compare'], ['/:owner/:repo/compare/*', 'compare'],
   ['/:owner/:repo/branches', 'branches', { view: 'branches' }], ['/:owner/:repo/tags', 'branches', { view: 'tags' }],

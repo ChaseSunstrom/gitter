@@ -1,12 +1,15 @@
 // Packages: the repository's container images (tags, sizes, the pull command)
 // and generic package files, with how to publish them.
-import { html, get, timeEl, bytes, encPath } from '../lib.js';
+import { html, get, send, timeEl, bytes, encPath, enc, $$, action, confirmDialog, toast } from '../lib.js';
+import { refresh } from '../main.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
 
 const copyBtn = (text, label) => html`<button class="btn ghost sm icon" data-copy="${text}" data-copy-label="${label}" aria-label="${label}">${icon('copy', 'sm')}</button>`;
 
-function image(img) {
+const delBtn = (img, ref, what) => html`<button class="btn ghost sm icon" data-del-image="${img.sub}" data-ref="${ref}" data-what="${what}" aria-label="Delete ${what}">${icon('trash', 'sm')}</button>`;
+
+function image(img, canWrite) {
   return html`<article class="box">
     <div class="box-head row wrap-ok"><h2 class="grow mono" style="font-size:15px">${icon('package', 'sm')} ${img.name}</h2></div>
     <div class="box-body stack">
@@ -16,7 +19,13 @@ function image(img) {
           <span class="mono grow">${t.tag}</span>
           <span class="mono muted small hide-sm" title="${t.digest}">${t.digest.slice(7, 19)}</span>
           <span class="muted small nowrap">${bytes(t.size)}</span>
-          <span class="muted small nowrap hide-sm">${timeEl(t.updated_at)}</span></div>`)}
+          <span class="muted small nowrap hide-sm">${timeEl(t.updated_at)}</span>
+          ${canWrite ? delBtn(img, t.tag, `tag ${t.tag}`) : ''}</div>`)}
+        ${img.untagged.map((u) => html`<div class="list-row">${icon('commit', 'sm muted')}
+          <span class="mono grow muted" title="${u.digest}">untagged ${u.digest.slice(7, 19)}</span>
+          <span class="muted small nowrap">${bytes(u.size)}</span>
+          <span class="muted small nowrap hide-sm">${timeEl(u.created_at)}</span>
+          ${canWrite ? delBtn(img, u.digest, `untagged image ${u.digest.slice(7, 19)}`) : ''}</div>`)}
       </div>
     </div></article>`;
 }
@@ -48,10 +57,23 @@ docker push ${d.image}:latest</pre>
     <div class="toolbar"><h1 class="page-h grow">${icon('package')} Packages</h1></div>
     ${empty ? html`<div class="box empty">${icon('package', 'big')}<h3>No packages yet</h3>
       <p>Container images and package files published here live with the repository and follow who can see it.</p></div>` : ''}
-    ${d.images.map(image)}
+    ${d.images.map((i) => image(i, d.can_write))}
     ${d.packages.length ? html`<div><div class="section-title">${icon('download', 'sm')} Generic packages</div>
       <div class="box list">${d.packages.map((p) => pkg(meta, p))}</div></div>` : ''}
     ${d.can_write ? how : ''}
   </div>`;
-  return { title: `Packages · ${meta.owner}/${meta.name}`, html: repoPage(meta, 'packages', body), mount: (el) => mountRepoHeader(el, meta) };
+  const mount = (el) => {
+    mountRepoHeader(el, meta);
+    for (const b of $$('[data-del-image]', el)) {
+      b.addEventListener('click', action(b, async () => {
+        const untagged = b.dataset.ref.startsWith('sha256:');
+        const text = untagged ? 'Its layers are freed once no other image uses them. Anyone pulling it by digest loses it.' : 'The image stays, by digest, until you delete it too.';
+        if (!await confirmDialog({ title: `Delete ${b.dataset.what}?`, text, ok: 'Delete', danger: true })) return;
+        await send('DELETE', `${repoUrl(owner, repo)}/packages/images?image=${enc(b.dataset.delImage)}&reference=${enc(b.dataset.ref)}`);
+        toast('Deleted');
+        refresh();
+      }));
+    }
+  };
+  return { title: `Packages · ${meta.owner}/${meta.name}`, html: repoPage(meta, 'packages', body), mount };
 }

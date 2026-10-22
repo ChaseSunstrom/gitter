@@ -23,6 +23,8 @@ use crate::{AppState, diff, validate};
 
 const BLOB_DISPLAY_CAP: u64 = 1_500_000;
 const README_CAP: u64 = 512 * 1024;
+/// Branches agents may hold in one repository (deleting one frees its place).
+const MAX_AGENT_BRANCHES: i64 = 100;
 
 #[derive(Deserialize)]
 pub struct RevPath {
@@ -962,6 +964,39 @@ pub async fn write_contents(
         }
         None => req.branch.clone(),
     };
+    // The default branch is protected from agents: their changes go through pull requests.
+    if u.agent().is_some() && (target == r.default_branch || !has_branches) {
+        return Err(AppError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "Agents can't commit to the default branch: commit to a new branch and open a pull request",
+        ));
+    }
+    // Agents work only on branches agents created, so a person's branch (or one
+    // that deploys) is never theirs to rewrite.
+    if u.agent().is_some() {
+        let (id, b, fresh) = (r.id, target.clone(), req.new_branch.is_some());
+        let (mine, count): (bool, i64) = st
+            .db
+            .call(move |c| {
+                Ok(c.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM agent_branches WHERE repo_id = ?1 AND branch = ?2), (SELECT COUNT(*) FROM agent_branches WHERE repo_id = ?1)",
+                    rusqlite::params![id, b],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await?;
+        if !fresh && !mine {
+            return Err(AppError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "Agents can only commit to branches an agent created: pass new_branch to start one",
+            ));
+        }
+        if fresh && count >= MAX_AGENT_BRANCHES {
+            return Err(AppError::bad(format!(
+                "Agents have {MAX_AGENT_BRANCHES} branches in this repository already: merge or delete some first"
+            )));
+        }
+    }
     let expect_old = if req.new_branch.is_some() {
         None
     } else {
@@ -1007,6 +1042,17 @@ pub async fn write_contents(
                 Ok(c.execute(
                     "UPDATE repos SET default_branch = ?1 WHERE id = ?2",
                     rusqlite::params![b, id],
+                )?)
+            })
+            .await?;
+    }
+    if let (Some(a), true) = (u.agent(), req.new_branch.is_some()) {
+        let (id, b, name) = (r.id, target.clone(), a.name.clone());
+        st.db
+            .call(move |c| {
+                Ok(c.execute(
+                    "INSERT OR REPLACE INTO agent_branches (repo_id, branch, agent, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![id, b, name, crate::db::now()],
                 )?)
             })
             .await?;

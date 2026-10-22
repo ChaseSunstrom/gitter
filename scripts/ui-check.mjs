@@ -67,13 +67,15 @@ const pages = [
   ['/alice/hello/issues?state=closed', ['Crash on start']],
   ['/alice/hello/issues/1', ['Crash on start', 'Looking into it']],
   ['/alice/hello/pulls?state=closed', ['Add lib']],
-  ['/alice/hello/pull/2', ['Add lib']],
-  ['/alice/hello/pull/2/files', ['src/lib.rs']],
+  ['/alice/hello/pull/2', ['Add lib', 'approved these changes', 'Ship it', 'Looks good here', 'Reviewers']],
+  ['/alice/hello/pull/2/files', ['src/lib.rs', 'Looks good here', 'Review changes']],
   ['/alice/hello/pull/2/commits', ['Add lib']],
   ['/alice/hello/compare/main...pw-branch', []],
   ['/alice/hello/labels', ['bug']],
   ['/alice/hello/issues/new', []],
-  ['/alice/hello/insights', ['Alice']],
+  ['/alice/hello/insights', ['Alice', 'Traffic', 'Referring sites', 'example.org', 'Popular pages']],
+  ['/alice/hello/commits?graph=1', ['Commits', 'on every branch', 'Add lib']],
+  ['/alice/hello/history/main/README.md', ['History for', 'More docs', 'View file']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
   ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues', 'Who has access', 'Site admins', 'Transfer ownership', 'Recently deleted']],
   [`/alice/hello/settings/hooks/${hook.id}`, ['Payload URL', 'Recent deliveries', 'ping', 'issues', 'Delivered', 'Send a ping']],
@@ -144,6 +146,44 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   const why = await page.locator('.sig-pop').innerText().catch(() => '');
   if (errors.length || !badges.list || !badges.commit || !badges.blame || !why.includes("alice's SSH key")) { failed++; console.log('✗ signature badges', { signed, badges, why, errors }); }
   else console.log('  ok signing keys are listed; commits, the commit page and blame show Verified, and the badge says why');
+  await page.close();
+}
+
+// Insights: the graph draws a dot per commit; the history scrubber steps to an older version's diff.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/alice/hello/commits?graph=1', { waitUntil: 'networkidle' });
+  const rows = await page.locator('.commit-graph .commit-row').count();
+  const dots = await page.locator('.commit-graph .graph-cell i').count();
+  await page.goto(BASE + '/alice/hello/history/main/README.md', { waitUntil: 'networkidle' });
+  await page.locator('#v-older').click();
+  await page.locator('#version-view .diff').waitFor({ timeout: 5000 }).catch(() => {});
+  const label = await page.locator('#v-label').innerText().catch(() => '');
+  const diff = await page.locator('#version-view .dfile').count();
+  if (errors.length || !rows || dots !== rows || !/^\d+ of \d+$/.test(label) || label.startsWith(label.split(' of ')[1] + ' ') || !diff) {
+    failed++; console.log('✗ commit graph or history scrubber', { rows, dots, label, diff, errors });
+  } else console.log('  ok the commit graph draws every commit; the history scrubber steps back to an older diff');
+  await page.close();
+}
+
+// Code review: clicking a line number opens the comment composer under that line.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/alice/hello/pull/2/files', { waitUntil: 'networkidle' });
+  await page.locator('td.dn[data-side="new"][data-n="1"]').first().click();
+  const open = await page.locator('.rcomposer textarea').count();
+  if (errors.length || !open) { failed++; console.log('✗ review composer', { open, errors }); }
+  else console.log('  ok a line number opens the review composer');
+  // SHOTS=<dir> saves pictures of the review pages to look at.
+  if (process.env.SHOTS) {
+    await page.screenshot({ path: `${process.env.SHOTS}/review-files.png`, fullPage: true });
+    await page.goto(BASE + '/alice/hello/pull/2', { waitUntil: 'networkidle' });
+    await page.screenshot({ path: `${process.env.SHOTS}/review-conversation.png`, fullPage: true });
+  }
   await page.close();
 }
 
@@ -442,6 +482,40 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   const scratch = (await ctx.request.get(BASE + '/api/repos/alice/scratch')).status();
   if (errors.length || present !== 200 || scratch !== 200) { failed++; console.log('✗ settings → repositories', { present, scratch, errors }); }
   else console.log('  ok a transfer accepted and a deleted repository restored from settings');
+  await page.close();
+}
+
+// Agent tokens: made in Settings → Tokens with repositories and tools; what the agent does
+// through /mcp shows an Agent badge, and the security log names the token.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  let num = null, badge = 0, logged = false;
+  try {
+    await page.goto(BASE + '/settings/tokens', { waitUntil: 'networkidle' });
+    await page.fill('#token-form input[name=name]', 'ui agent');
+    await page.selectOption('#tk-scope', 'agent');
+    await page.fill('#tk-repos', 'alice/hello');
+    await page.uncheck('#token-form input[name=tool][value=commit_files]');
+    await page.click('#token-form button[type=submit]');
+    await page.waitForSelector('#new-token .token-reveal', { timeout: 5000 });
+    const token = await page.locator('#token-value').inputValue();
+    if (!(await page.locator('#new-token pre').innerText()).includes('/mcp')) throw new Error('no MCP config example');
+    const call = async (name, args) => (await (await fetch(BASE + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) })).json()).result;
+    const made = await call('create_issue', { repo: 'alice/hello', title: 'Opened by an agent' });
+    if (!made || made.isError) throw new Error('create_issue: ' + JSON.stringify(made));
+    num = JSON.parse(made.content[0].text).number;
+    const denied = await call('commit_files', { repo: 'alice/hello', branch: 'main', new_branch: 'x', message: 'x', files: [{ path: 'x', content: 'x' }] });
+    if (denied) throw new Error('a tool left unticked still works');
+    await page.goto(`${BASE}/alice/hello/issues/${num}`, { waitUntil: 'networkidle' });
+    badge = await page.locator('.comment-head .agent-badge').count();
+    await page.goto(BASE + '/settings/security', { waitUntil: 'networkidle' });
+    logged = (await page.locator('#page').innerText()).includes('ui agent: create_issue alice/hello');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !badge || !logged) { failed++; console.log('✗ agent token', { num, badge, logged, errors }); }
+  else console.log('  ok agent token made in settings; its issue has an Agent badge and the security log names it');
   await page.close();
 }
 

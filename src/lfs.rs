@@ -119,8 +119,8 @@ fn reply(r: R<Response>) -> Response {
 
 /// The repository behind an LFS URL if the caller may read it, and whether the
 /// caller is anonymous. Repositories they can't see are a challenge (anonymous) or a 404.
-async fn open(st: &AppState, headers: &HeaderMap, owner: &str, name: &str) -> R<(Repo, bool)> {
-    let user = user_by_basic(st, headers).await?;
+async fn open(st: &AppState, headers: &HeaderMap, ip: &str, owner: &str, name: &str) -> R<(Repo, bool)> {
+    let user = user_by_basic(st, headers, ip).await?;
     let hidden = || {
         if user.is_none() {
             AppError::unauthorized()
@@ -177,7 +177,7 @@ async fn batch_inner(st: AppState, owner: String, name: String, req: Request) ->
         r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait.max(1)));
         return Ok(r);
     }
-    let (repo, anonymous) = open(&st, &headers, &owner, &name).await?;
+    let (repo, anonymous) = open(&st, &headers, &ip, &owner, &name).await?;
     let Ok(body) = axum::body::to_bytes(req.into_body(), BATCH_CAP).await else {
         return Ok(error(StatusCode::PAYLOAD_TOO_LARGE, "The batch request is too large"));
     };
@@ -247,11 +247,12 @@ pub async fn download(
         Ok(s) => s,
         Err(r) => return r,
     };
-    reply(download_inner(st, owner, name, oid, req.headers(), slot).await)
+    let ip = crate::api::client_ip(&st, req.headers(), req.extensions());
+    reply(download_inner(st, owner, name, oid, req.headers(), &ip, slot).await)
 }
 
-async fn download_inner(st: AppState, owner: String, name: String, oid: String, headers: &HeaderMap, slot: Slot) -> R<Response> {
-    let (repo, _) = open(&st, headers, &owner, &name).await?;
+async fn download_inner(st: AppState, owner: String, name: String, oid: String, headers: &HeaderMap, ip: &str, slot: Slot) -> R<Response> {
+    let (repo, _) = open(&st, headers, ip, &owner, &name).await?;
     if !valid_oid(&oid) || !held(&st, repo.id, vec![oid.clone()]).await?[0] {
         return Ok(error(StatusCode::NOT_FOUND, "Object does not exist"));
     }
@@ -302,7 +303,8 @@ pub async fn upload(
 }
 
 async fn upload_inner(st: AppState, owner: String, name: String, oid: String, req: Request) -> R<Response> {
-    let (repo, anonymous) = open(&st, req.headers(), &owner, &name).await?;
+    let ip = crate::api::client_ip(&st, req.headers(), req.extensions());
+    let (repo, anonymous) = open(&st, req.headers(), &ip, &owner, &name).await?;
     need_write(&repo, anonymous)?;
     if !valid_oid(&oid) {
         return Ok(error(StatusCode::UNPROCESSABLE_ENTITY, "Invalid object id"));

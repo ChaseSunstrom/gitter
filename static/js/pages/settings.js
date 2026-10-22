@@ -88,26 +88,35 @@ function reposTab(tr, trash) {
 
 const SCOPES = { read: 'Read only', write: 'Read and write', all: 'Full access' };
 
-function tokensTab(tokens) {
+function tokensTab({ tokens, agent_tools: tools = [] }) {
+  const toolName = Object.fromEntries(tools.map((t) => [t.name, t.title]));
   return html`<div class="stack settings-form">
     <h2>Personal access tokens</h2>
-    <p class="muted">Tokens work like passwords for git over HTTPS and for the API. Give each one a name so you know where it's used, and delete any you no longer need.</p>
+    <p class="muted">Tokens work like passwords for git over HTTPS and for the API. Give each one a name so you know where it's used, and delete any you no longer need.
+      An <b>agent token</b> lets an AI agent work through Gitter's MCP server at <code>/mcp</code>, only in the repositories and with the tools you pick. It can't change settings, see secrets or tokens, commit outside the branches agents start, or merge; its CI runs get no secrets and never run on this server, and what it does is marked as an agent's.</p>
     <form id="token-form" class="box"><div class="box-body stack">
       <div class="field"><label for="tk-name">Name</label><input class="input" id="tk-name" name="name" placeholder="What's this token for? e.g. laptop" maxlength="80" required></div>
       <div class="grid-2">
         <div class="field"><label for="tk-scope">Access</label><select class="select" id="tk-scope" name="scope">
           <option value="write" selected>Read and write: clone, push, issues, pull requests</option>
           <option value="read">Read only: clone and view</option>
-          <option value="all">Full access: everything your account can do</option></select></div>
+          <option value="all">Full access: everything your account can do</option>
+          <option value="agent">Agent (MCP): chosen repositories and tools</option></select></div>
         <div class="field"><label for="tk-exp">Expires</label><select class="select" id="tk-exp" name="expires_days">
           <option value="30">In 30 days</option><option value="90" selected>In 90 days</option><option value="365">In a year</option><option value="">Never</option></select></div>
       </div>
-      <div class="field"><label for="tk-repo">Only for one repository <span class="muted">(optional)</span></label><input class="input" id="tk-repo" name="repo" placeholder="owner/name, or leave empty for all your repositories" autocapitalize="off" spellcheck="false"></div>
+      <div class="field" id="tk-one"><label for="tk-repo">Only for one repository <span class="muted">(optional)</span></label><input class="input" id="tk-repo" name="repo" placeholder="owner/name, or leave empty for all your repositories" autocapitalize="off" spellcheck="false"></div>
+      <div class="stack" id="tk-agent" hidden>
+        <div class="field"><label for="tk-repos">Repositories</label><input class="input" id="tk-repos" name="repos" placeholder="owner/name owner/other (up to 20)" autocapitalize="off" spellcheck="false"></div>
+        <div class="field" role="group" aria-labelledby="tk-tools-l"><label id="tk-tools-l">Tools</label>
+          <div class="row wrap-ok">${tools.map((t) => html`<label class="check small"><input type="checkbox" name="tool" value="${t.name}" checked> ${t.title}</label>`)}</div></div>
+      </div>
       <div class="row"><button class="btn primary" type="submit">${icon('plus', 'sm')} Generate token</button></div>
     </div></form>
     <div id="new-token"></div>
     ${tokens.length ? html`<div class="box list">${tokens.map((t) => html`<div class="list-row token-row">
-        ${icon('key', 'muted')}<div class="grow"><b>${t.name}</b> <span class="pill">${SCOPES[t.scope] || t.scope}</span>${t.repo ? html` <span class="pill">${t.repo}</span>` : ''}${t.expired ? html` <span class="pill closed">Expired</span>` : ''}
+        ${icon('key', 'muted')}<div class="grow"><b>${t.name}</b> ${t.kind === 'agent' ? html`<span class="pill agent-badge">Agent</span>${t.repos.map((r) => html` <span class="pill">${r}</span>`)}` : html`<span class="pill">${SCOPES[t.scope] || t.scope}</span>`}${t.repo ? html` <span class="pill">${t.repo}</span>` : ''}${t.expired ? html` <span class="pill closed">Expired</span>` : ''}
+          ${t.kind === 'agent' ? html`<div class="small muted">Tools: ${t.tools.map((x) => toolName[x] || x).join(', ')}</div>` : ''}
           <div class="small muted">Created ${timeEl(t.created_at)} · ${t.last_used ? html`Last used ${timeEl(t.last_used)}` : 'Never used'}${t.expires_at && !t.expired ? html` · expires ${timeEl(t.expires_at)}` : ''}</div></div>
         <button class="btn sm danger" data-del="${t.id}" data-name="${t.name}">${icon('trash', 'sm')} Delete</button></div>`)}</div>`
       : html`<div class="box empty small">${icon('key', 'big')}<h3>No tokens yet</h3><p>Generate one to push from scripts or other machines.</p></div>`}
@@ -198,7 +207,7 @@ export default async function (ctx) {
   const tab = TABS.some(([k]) => k === ctx.params.tab) ? ctx.params.tab : 'profile';
   let inner, exp = null, timer;
   if (tab === 'profile') { const m = await get('/me', { fresh: true }); inner = profileTab(m.profile, m.storage); }
-  else if (tab === 'tokens') inner = tokensTab((await get('/me/tokens', { fresh: true })).tokens);
+  else if (tab === 'tokens') inner = tokensTab(await get('/me/tokens', { fresh: true }));
   else if (tab === 'signing') inner = signingTab((await get('/me/signing-keys', { fresh: true })).keys);
   else if (tab === 'account') { exp = (await get('/me/export', { fresh: true })).export; inner = accountTab(exp); }
   else if (tab === 'repositories') {
@@ -250,19 +259,29 @@ export default async function (ctx) {
       const tf = $('#token-form', el);
       if (tf) {
         const btn = tf.querySelector('[type=submit]');
+        const scopeSel = $('#tk-scope', tf);
+        const showKind = () => { const ag = scopeSel.value === 'agent'; $('#tk-agent', tf).hidden = !ag; $('#tk-one', tf).hidden = ag; };
+        scopeSel.addEventListener('change', showKind);
         tf.addEventListener('submit', action(btn, async () => {
-          const f = Object.fromEntries(new FormData(tf));
+          const fd = new FormData(tf);
+          const f = Object.fromEntries(fd);
           const name = f.name.trim();
           if (!name) return;
-          const r = await send('POST', '/me/tokens', { name, scope: f.scope, repo: f.repo.trim(), expires_days: f.expires_days ? +f.expires_days : null });
+          const agent = f.scope === 'agent';
+          const expires_days = f.expires_days ? +f.expires_days : null;
+          const r = agent
+            ? await send('POST', '/me/tokens', { name, kind: 'agent', repos: f.repos.split(/[\s,]+/).filter(Boolean), tools: fd.getAll('tool'), expires_days })
+            : await send('POST', '/me/tokens', { name, scope: f.scope, repo: f.repo.trim(), expires_days });
           await refresh();
           const box = $('#new-token');
-          const example = `git clone ${location.protocol}//${state.me.username}:${r.token}@${location.host}/${state.me.username}/<repo>.git`;
+          const example = agent
+            ? JSON.stringify({ mcpServers: { gitter: { type: 'http', url: `${location.origin}/mcp`, headers: { Authorization: `Bearer ${r.token}` } } } }, null, 2)
+            : `git clone ${location.protocol}//${state.me.username}:${r.token}@${location.host}/${state.me.username}/<repo>.git`;
           box.innerHTML = html`<div class="token-reveal fade">
             <div class="row">${icon('check', 'c-green')}<b>Token “${name}” created</b></div>
             <p class="small">Copy it now. For your security it won't be shown again.</p>
             <div class="row"><input class="input mono" readonly value="${r.token}" aria-label="New token" id="token-value"><button class="btn primary" data-copy="${r.token}" data-copy-label="Token copied">${icon('copy', 'sm')} Copy</button></div>
-            <p class="small muted">Use it as your password when git asks, or in a URL:</p>
+            <p class="small muted">${agent ? 'Add Gitter to your agent\'s MCP servers, for example:' : 'Use it as your password when git asks, or in a URL:'}</p>
             <pre class="setup-cmd">${example}</pre></div>`.s;
           $('#token-value', box).select();
         }));

@@ -308,8 +308,12 @@ const AUDIT = {
   wiki_page_deleted: 'Deleted a wiki page', discussion_deleted: 'Deleted a discussion', discussion_reply_deleted: 'Removed a reply in a discussion', snippet_deleted: 'Deleted a snippet', release_deleted: 'Deleted a release',
   ci_secret_set: 'Set a CI secret', ci_secret_deleted: 'Deleted a CI secret', ci_runner_created: 'Added a CI runner', ci_runner_deleted: 'Removed a CI runner',
   webhook_created: 'Added a webhook', webhook_changed: 'Changed a webhook', webhook_deleted: 'Deleted a webhook',
+  agent_action: 'An agent made a change',
 };
 export const auditLabel = (a) => AUDIT[a] || String(a).replace(/_/g, ' ');
+/** Marks something an agent token did on someone's behalf. */
+export const agentBadge = (agent, who) => agent
+  ? html`<span class="pill agent-badge" title="Done by the agent token “${agent}” on behalf of ${who}">Agent</span>` : '';
 /** "Firefox on Linux" from a user agent string. */
 export function deviceName(ua) {
   const b = [['Firefox', 'Firefox'], ['Edg', 'Edge'], ['Chrome', 'Chrome'], ['Safari', 'Safari'], ['git', 'git'], ['curl', 'curl']].find(([k]) => ua.includes(k));

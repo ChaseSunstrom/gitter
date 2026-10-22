@@ -1,6 +1,6 @@
 // Home: a landing page for visitors, a dashboard for signed-in people.
 // Also exports the activity row used by profile pages.
-import { html, state, get, timeEl, avatar, short, plural, $, $$ } from '../lib.js';
+import { html, state, get, timeEl, avatar, short, plural, $, $$, agentBadge } from '../lib.js';
 import { icon, logo } from '../icons.js';
 import { repoCard, langColor } from './explore.js';
 
@@ -8,7 +8,7 @@ import { repoCard, langColor } from './explore.js';
 
 function eventText(e) {
   const repo = e.repo ? html`<a class="ev-repo" href="/${e.repo}">${e.repo}</a>` : html`<span class="muted">a deleted repository</span>`;
-  const user = html`<a class="ev-user" href="/${e.user}">${e.user}</a>`;
+  const user = html`<a class="ev-user" href="/${e.user}">${e.user}</a>${e.agent ? html` ${agentBadge(e.agent, e.user)}` : ''}`;
   const n = e.target;
   switch (e.kind) {
     case 'create': return [icon('repo'), html`${user} created ${repo}`];
@@ -28,7 +28,7 @@ function groupPushes(events) {
   const out = [];
   for (const e of events) {
     const prev = out[out.length - 1];
-    if (prev && e.kind === 'push' && prev.kind === 'push' && prev.user === e.user && prev.repo === e.repo && prev.title === e.title) {
+    if (prev && e.kind === 'push' && prev.kind === 'push' && prev.user === e.user && prev.agent === e.agent && prev.repo === e.repo && prev.title === e.title) {
       prev.count += e.count;
       continue;
     }

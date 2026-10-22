@@ -3,8 +3,10 @@
 Fast, simple git hosting. One Rust binary serves the web app, the API and git over HTTPS, and keeps its state in SQLite plus plain bare repositories.
 
 - **Code:** browse repositories, view files with syntax colors and linkable line ranges, blame, history, search, download archives.
+- **Insights:** Commits → Graph draws every branch with its merges, lane by lane. A file's History button steps through each version of it, following renames, with a slider and the diff of each. The Insights tab shows contributors, weekly commit activity and languages, and to the repository's admins its traffic: views and clones (fetches count too) per day for two weeks, unique visitors, referring sites and popular pages.
 - **Releases:** publish a version from a tag (or a new tag at a branch), with markdown notes, files to download (with download counts) and the source code as zip and tar.gz. Drafts stay with the maintainers, pre-releases are marked, and the repository page shows the latest release.
 - **Collaboration:** issues, labels, pull requests with server-side merge (merge commit, squash or fast-forward), comments in markdown, stars and forks.
+- **Code review:** click a line number in a pull request's Files changed (shift-click for a range) to comment there. Comments form threads with replies that can be resolved; ones whose lines changed since are marked outdated. Gather comments into a review and submit it as Approve, Request changes or Comment (not on your own pull request); the latest decision of each reviewer shows on the pull request and in the list. A ```` ```suggestion ```` block proposes replacement lines, and anyone who can push applies it as a commit with one click (refused if those lines changed meanwhile).
 - **Teams:** add collaborators to a repository as Read (see and clone), Write (push, manage issues and pull requests) or Admin (settings, access, deploy tokens, CI secrets), and see in plain words who can do what in Settings → Who has access. Organizations own repositories for a group: owners manage everything, and members get the organization's base permission (none, read or write) on all of its repositories. An organization shares its creator's repository limit and storage quota, and who belongs to it is visible to its members only. Write access includes running CI: pushes run the repository's pipelines with its secrets, so give Write to people you'd trust with those.
 - **Wikis, discussions, snippets:** every repository has a markdown wiki with page history (its own git repository, private when the repo is) and a discussions forum with General, Q&A, Ideas and Announcements categories, marked answers and upvotes. Snippets share a few files, public or secret (only the link finds it), with every edit kept as a revision.
 - **Editing:** edit, create, rename, delete and upload files in the browser, committing straight to a branch or to a new branch for a pull request.
@@ -92,7 +94,7 @@ Signed commits: add your public key in Settings → Signing keys (an SSH `.pub` 
 
 Release files upload by streaming, so they can be as big as Git LFS files (the same limit), and they count toward the owner's storage quota too. They're stored under `GITTER_DATA/releases`, always download as attachments, stay as private as their repository, and backups include them. A draft's new tag is made when it's published, and deleting a release deletes its files but keeps its tag. From a script: `curl -H "Authorization: Bearer $TOKEN" --data-binary @app.tar.gz "$URL/api/repos/OWNER/REPO/releases/ID/assets?name=app.tar.gz"`.
 
-Container images: every repository is also an image registry for docker, podman and skopeo (the OCI distribution API at `/v2/`). `docker login HOST` with your username and password or an access token (a token if you use two-factor sign-in; a deploy token works for its repository), then `docker push HOST/owner/repo:tag` or `HOST/owner/repo/name:tag` (names in lowercase). Images follow their repository: whoever can read it pulls, whoever can push to it publishes, and they're gone with it (the trash hides them; purging frees them). Layers are stored once by content under `GITTER_DATA/registry` (one layer in several images or repositories counts once toward the owner's storage quota), each is limited like a Git LFS file, blobs no image names are removed after a day and abandoned uploads after an hour, and backups include them. The repository's Packages tab lists images, tags, sizes and the pull command. Docker accepts plain HTTP only for `localhost`/`127.0.0.1`; anywhere else serve Gitter over HTTPS. Generic packages hold any file under a name and version: `curl -H "Authorization: Bearer $TOKEN" --upload-file tool.tar.gz "$URL/api/repos/OWNER/REPO/packages/generic/tool/1.0.0/tool.tar.gz"`, downloaded from the same URL.
+Container images: every repository is also an image registry for docker, podman and skopeo (the OCI distribution API at `/v2/`). `docker login HOST` with your username and password or an access token (a token if you use two-factor sign-in; a deploy token works for its repository), then `docker push HOST/owner/repo:tag` or `HOST/owner/repo/name:tag` (names in lowercase). Images follow their repository: whoever can read it pulls, whoever can push to it publishes, and they're gone with it (the trash hides them; purging frees them). Layers are stored once by content under `GITTER_DATA/registry` (one layer in several images or repositories counts once toward the owner's storage quota), each is limited like a Git LFS file, blobs no image names are removed after a day and abandoned uploads after an hour, and backups include them. The repository's Packages tab lists images, tags, sizes and the pull command, plus untagged images (left behind when a tag moves on; still pullable by digest and still using storage), and writers can delete tags and images there. A repository holds up to 100 image names and 1,000 tags. Sign-in is HTTP Basic only (no token service): docker, podman and skopeo pull public images anonymously, but containerd and Kubernetes nodes may need credentials configured even for public ones. Docker accepts plain HTTP only for `localhost`/`127.0.0.1`; anywhere else serve Gitter over HTTPS. Generic packages hold any file under a name and version: `curl -H "Authorization: Bearer $TOKEN" --upload-file tool.tar.gz "$URL/api/repos/OWNER/REPO/packages/generic/tool/1.0.0/tool.tar.gz"`, downloaded from the same URL.
 
 The same binary has the operator commands: `gitter backup <file>`, `gitter verify <file>`, `gitter restore <file> [--force]`, `gitter doctor [--fsck]`, `gitter bench [--check]` (`-` as the file means stdout/stdin), and `gitter runner` for CI machines.
 
@@ -150,6 +152,24 @@ Turning CI off stops new runs, re-runs and queued jobs.
 
 **Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts are deleted 30 days after their job, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
 
+**Run it locally.** `gitter ci run` runs `.gitter/ci.yml` on your machine with the same parser and step runner, no server needed. Jobs run one at a time in `needs` order, and a job whose needs failed is skipped. Each job gets a fresh copy of the work tree as it is now: tracked files and untracked ones that aren't ignored, without `.git`. Use `--here` to run in the folder itself, for example when steps need git history. `HOME` is a fresh folder, and no secrets are set. Triggers, `paths` and `runs-on` don't apply, and jobs with an `image` need docker. It exits 1 when a job fails.
+
+## Command-line client
+
+The same `gitter` binary is a client for any Gitter server, like `gh`:
+
+```sh
+gitter login https://git.example.com       # asks for an access token (or --token, or GITTER_TOKEN)
+gitter repo create notes --private && gitter repo clone alice/notes && cd notes
+gitter issue create --title "Crash on start" --body "…"
+git switch -c fix && git commit -am "Fix the crash"
+gitter pr create                           # pushes the branch first, then opens the pull request
+gitter pr list; gitter pr checkout 7; gitter pr merge 7 --method squash
+gitter ci status; gitter ci logs 12        # follows a running job; gitter ci rerun 12
+```
+
+`gitter login` saves the server and token to `~/.config/gitter/config.json`, readable only by you. Inside a clone, commands act on the repository the git remote points at. Elsewhere, pass `-R owner/name`. `--json` prints the server's answer as JSON. Git operations get the token through the environment, only for that server's URLs, so it is never written to `.git/config`. `gitter <command> --help` lists every command.
+
 ## Webhooks
 
 A repository's admins add webhooks under **Settings → Webhooks** (signed in on the web, with a recent password confirmation). Each event is a `POST` of JSON to the payload URL with these headers:
@@ -171,6 +191,33 @@ Every payload has `repository` (`id`, `full_name`, `owner`, `name`, `description
 Times are Unix seconds. Any 2xx answer counts as delivered. Anything else, no answer within 10 seconds, or a refused address is tried again after 1 minute, 5 minutes, 30 minutes, 2 hours and 6 hours, then given up. Redirects aren't followed, and only the first 64 KB of an answer is read. The queue is in the database, so retries survive restarts (a restored backup sends what was still waiting). Each webhook's page lists its last 50 deliveries with the request, the response code and the first 2 KB of the answer, and can send any of them again.
 
 Deliveries only go to public internet addresses: the host name is looked up once and the connection goes to the checked address, so loopback, private, link-local, shared (100.64/10), multicast and reserved addresses are refused, DNS rebinding included. A site admin can tick **Allow private addresses** on a webhook to reach the server's own network; it switches off again if someone who isn't an admin changes the URL, or when its repository's owner stops being an admin. Hooks of a suspended account or a moderator-hidden repository don't send. Each receiver gets one delivery at a time, so a slow one doesn't hold up the others; issue, pull request and comment bodies are cut at 16 KB, and when 100 deliveries are already waiting for a receiver, new events are dropped and the drop is logged on the webhook's page. The secret is encrypted at rest with `GITTER_DATA/secret.key`.
+
+## AI agents (MCP)
+
+Gitter is an [MCP](https://modelcontextprotocol.io) server at `/mcp` (JSON-RPC 2.0 over the streamable HTTP transport, plain JSON replies). In **Settings → Access tokens**, pick **Agent (MCP)**, the repositories (up to 20) and the tools the agent may use, then add the server to your agent. For Claude Code, `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "gitter": {
+      "type": "http",
+      "url": "https://git.example.com/mcp",
+      "headers": { "Authorization": "Bearer gtr_your_agent_token" }
+    }
+  }
+}
+```
+
+or `claude mcp add --transport http gitter https://git.example.com/mcp --header "Authorization: Bearer gtr_…"`.
+
+Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_issues`, `get_issue`, `create_issue`, `comment`, `open_pull_request`, `list_ci_runs`, `get_ci_run`, `get_ci_log` and `commit_files`. Each call is an ordinary API request made as you, so the agent can never do more than you can, and less:
+
+- It reaches only the repositories you picked (not even other public ones) and only the tools you ticked.
+- It can't change settings, collaborators or webhooks, see CI secrets, tokens or your account, or merge pull requests. `commit_files` starts a new branch (`new_branch`) or adds to one an agent started, never the default branch or a person's branch; then `open_pull_request`. Agents hold at most 100 branches per repository (deleting one frees its place).
+- Any CI run of an agent's branch, whoever pushed, gets no CI secrets, since the agent wrote the workflow and reads the log, and the built-in runner (the server itself) never takes it: it waits for a runner you registered. Once a person merges the work, it runs like anyone's.
+- The token works only at `/mcp`: not for git, the REST API or the web.
+- It has its own rate limit (120 calls a minute) and its changes count apart from yours.
+- Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".
 
 ## Configuration
 
@@ -204,11 +251,12 @@ Behind nginx or Caddy, set `GITTER_URL` to the public address. Requests whose `O
 
 - Repository and user names are checked against a strict pattern, and repositories, wikis and snippets live on disk under their numeric or random id, so no user input ever becomes a path. Secret snippets have 128-bit random ids.
 - Private repositories answer "not found" to everyone without access: through the web, the API, raw files, archives, search and git.
-- Access is one rule for every route: owners and site admins can do everything; collaborators and organization members get their role; a token can only narrow it (read-only tokens never write, only full-access tokens administer, and a deploy token sees other repositories as if signed out). Organizations can't sign in.
+- Access is one rule for every route: owners and site admins can do everything; collaborators and organization members get their role; a token can only narrow it (read-only tokens never write, only full-access tokens administer, a deploy token sees other repositories as if signed out, and an agent token sees only its own). Organizations can't sign in.
 - Sessions are random 256-bit tokens, stored hashed and sent as `HttpOnly; SameSite=Lax` cookies. Writes made with a session cookie must come from this site's own pages, which blocks cross-site request forgery.
 - Passwords use Argon2id. Login and sign-up are rate limited.
 - User markdown is sanitized with DOMPurify, and the app ships a strict Content Security Policy.
 - Raw files are served as inert text or images inside a sandboxing CSP.
+- Traffic stores no addresses: a visitor is a hash of the address with a random salt that changes every day and is never written down, so it can't be traced back or followed across days. Only the referring site's host is kept, and traffic older than 14 days is deleted.
 
 ## Development
 

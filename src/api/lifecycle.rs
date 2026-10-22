@@ -775,6 +775,18 @@ fn export_json(c: &Connection, uid: i64) -> R<ExportData> {
         ),
         [uid],
     )?;
+    let reviews = json!({
+        "reviews": rows(c, &format!(
+            "SELECT {repo_name} AS repo, i.number, v.state, v.body, v.commit_sha, v.submitted_at
+             FROM reviews v JOIN issues i ON i.id = v.issue_id JOIN repos r ON r.id = i.repo_id JOIN users ou ON ou.id = r.owner_id
+             WHERE v.author_id = ?1 AND v.state != 'pending' ORDER BY v.id"
+        ), [uid])?,
+        "line_comments": rows(c, &format!(
+            "SELECT {repo_name} AS repo, i.number, rc.path, rc.side, rc.line, rc.start_line, rc.commit_sha, rc.body, rc.created_at, rc.updated_at
+             FROM review_comments rc JOIN issues i ON i.id = rc.issue_id JOIN repos r ON r.id = i.repo_id JOIN users ou ON ou.id = r.owner_id
+             WHERE rc.author_id = ?1 ORDER BY rc.id"
+        ), [uid])?,
+    });
     let discussions = json!({
         "discussions": rows(c, &format!(
             "SELECT {repo_name} AS repo, d.number, d.category, d.title, d.body, d.created_at, d.updated_at
@@ -808,6 +820,7 @@ fn export_json(c: &Connection, uid: i64) -> R<ExportData> {
         ("issues.json", pretty(&json!(issues))),
         ("comments.json", pretty(&json!(comments))),
         ("discussions.json", pretty(&discussions)),
+        ("reviews.json", pretty(&reviews)),
         ("snippets.json", pretty(&json!(snippets))),
         ("security-log.json", pretty(&json!(log))),
     ];

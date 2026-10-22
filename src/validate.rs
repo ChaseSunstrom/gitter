@@ -15,6 +15,7 @@ const RESERVED: &[&str] = &[
     "help",
     "login",
     "logout",
+    "mcp",
     "new",
     "notifications",
     "org",

@@ -30,6 +30,9 @@ use crate::repo::Repo;
 use crate::smart_http::Slot;
 
 const MAX_MANIFEST: usize = 4 << 20;
+/// Image names (`owner/repo/sub`) and tags one repository may hold.
+const MAX_IMAGES: i64 = 100;
+const MAX_TAGS: i64 = 1000;
 /// Registry requests per minute from one address (a push is a few per layer).
 const REQUESTS_PER_MIN: u32 = 1200;
 /// Uploads one account may have open at once.
@@ -190,8 +193,8 @@ fn parse(path: &str) -> Option<(String, Op)> {
 /// don't work are refused rather than treated as anonymous, so `docker login`
 /// fails on a wrong password; repositories the caller can't see are a challenge
 /// (anonymous) or unknown.
-async fn open(st: &AppState, headers: &HeaderMap, owner: &str, name: &str) -> O<(Repo, Option<User>)> {
-    let user = user_by_basic(st, headers).await?;
+async fn open(st: &AppState, headers: &HeaderMap, ip: &str, owner: &str, name: &str) -> O<(Repo, Option<User>)> {
+    let user = user_by_basic(st, headers, ip).await?;
     if user.is_none() && headers.contains_key(header::AUTHORIZATION) {
         return Err(challenge());
     }
@@ -360,7 +363,7 @@ pub async fn ping(State(st): State<AppState>, req: Request) -> Response {
 
 async fn ping_inner(st: &AppState, ip: &str, headers: HeaderMap) -> O<Response> {
     limited(st, ip)?;
-    match user_by_basic(st, &headers).await? {
+    match user_by_basic(st, &headers, ip).await? {
         Some(_) => Ok(Json(json!({})).into_response()),
         None => Err(challenge()),
     }
@@ -381,7 +384,7 @@ async fn route(st: AppState, req: Request) -> O<Response> {
         return Err(oci(StatusCode::NOT_FOUND, "UNSUPPORTED", "There's no such registry endpoint"));
     };
     let img = image(&name).ok_or_else(|| oci(StatusCode::BAD_REQUEST, "NAME_INVALID", "Image names are owner/repository[/name], in lowercase"))?;
-    let (repo, user) = open(&st, &headers, &img.owner, &img.repo).await?;
+    let (repo, user) = open(&st, &headers, &ip, &img.owner, &img.repo).await?;
     match (method, op) {
         (m @ (Method::GET | Method::HEAD), Op::Blob(d)) => get_blob(&st, &repo, &d, m == Method::HEAD, &ip).await,
         (Method::POST, Op::StartUpload) => start_upload(&st, &repo, &user, &img, &q, body, &ip).await,
@@ -426,7 +429,6 @@ const MANIFEST_TYPES: &[&str] = &[
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
-    "application/vnd.oci.artifact.manifest.v1+json",
 ];
 
 /// Stored bytes are pushers' content served from this origin: never sniffed,
@@ -702,8 +704,10 @@ fn references(v: &Value) -> Option<(Vec<String>, Vec<String>)> {
 async fn put_manifest(st: &AppState, repo: &Repo, user: &Option<User>, img: &Image, reference: &str, headers: &HeaderMap, body: Body) -> O<Response> {
     need_write(repo, user)?;
     let invalid = |m: &str| oci(StatusCode::BAD_REQUEST, "MANIFEST_INVALID", m);
-    let bytes = axum::body::to_bytes(body, MAX_MANIFEST)
+    // A client that stalls mid-manifest doesn't hold the request open for good.
+    let bytes = tokio::time::timeout(Duration::from_secs(60), axum::body::to_bytes(body, MAX_MANIFEST))
         .await
+        .map_err(|_| oci(StatusCode::REQUEST_TIMEOUT, "MANIFEST_INVALID", "The manifest took too long to arrive"))?
         .map_err(|_| oci(StatusCode::PAYLOAD_TOO_LARGE, "MANIFEST_INVALID", "Manifests are limited to 4 MB"))?;
     let v: Value = serde_json::from_slice(&bytes).ok().filter(Value::is_object).ok_or_else(|| invalid("That isn't a valid manifest"))?;
     if v["schemaVersion"].as_i64() != Some(2) {
@@ -730,21 +734,17 @@ async fn put_manifest(st: &AppState, repo: &Repo, user: &Option<User>, img: &Ima
     } else {
         return Err(oci(StatusCode::BAD_REQUEST, "TAG_INVALID", "Tags are up to 128 letters, digits, '_', '.' and '-'"));
     };
-    let (limit, too_big) = upload_limit(st, repo, 0).await?;
-    if bytes.len() as u64 > limit {
-        return Err(oci(StatusCode::PAYLOAD_TOO_LARGE, "DENIED", too_big));
-    }
-    // The manifest's bytes are a blob, in place before the rows that name it.
+    // The manifest's bytes are a blob, in place before the rows that name it:
+    // always written afresh (a rename), so a sweep removing an old copy meanwhile
+    // can't leave the rows without their file. Storage is checked with the rows.
     let dest = blob_path(&st.cfg.data_dir, &d);
-    if !tokio::fs::try_exists(&dest).await.unwrap_or(false) {
-        let mut rnd = [0u8; 8];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
-        tokio::fs::create_dir_all(tmp_dir(st)).await?;
-        let tmp = crate::lfs::Tmp(tmp_dir(st).join(hex::encode(rnd)));
-        tokio::fs::write(&tmp.0, &bytes).await?;
-        tokio::fs::create_dir_all(dest.parent().unwrap_or(&dest)).await?;
-        tokio::fs::rename(&tmp.0, &dest).await?;
-    }
+    let mut rnd = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
+    tokio::fs::create_dir_all(tmp_dir(st)).await?;
+    let tmp = crate::lfs::Tmp(tmp_dir(st).join(hex::encode(rnd)));
+    tokio::fs::write(&tmp.0, &bytes).await?;
+    tokio::fs::create_dir_all(dest.parent().unwrap_or(&dest)).await?;
+    tokio::fs::rename(&tmp.0, &dest).await?;
     let (rid, owner, sub, dg, len) = (repo.id, repo.owner_id, img.sub.clone(), d.clone(), bytes.len() as i64);
     let quota = st.settings.get().max_storage_mb * 1024 * 1024;
     let res: O<()> = st
@@ -768,6 +768,18 @@ async fn put_manifest(st: &AppState, repo: &Repo, user: &Option<User>, img: &Ima
                     Some(s) => size += s,
                     None => return Ok(Err(oci(StatusCode::BAD_REQUEST, "MANIFEST_UNKNOWN", format!("Push manifest {m} before the index that names it")))),
                 }
+            }
+            let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.query_row(sql, p, |r| r.get::<_, i64>(0));
+            if one("SELECT EXISTS (SELECT 1 FROM registry_manifests WHERE repo_id = ?1 AND name = ?2)", &[&rid, &sub])? == 0
+                && one("SELECT COUNT(DISTINCT name) FROM registry_manifests WHERE repo_id = ?1", &[&rid])? >= MAX_IMAGES
+            {
+                return Ok(Err(oci(StatusCode::FORBIDDEN, "DENIED", format!("A repository holds at most {MAX_IMAGES} images: delete one first"))));
+            }
+            if let Some(t) = &tag
+                && one("SELECT EXISTS (SELECT 1 FROM registry_tags WHERE repo_id = ?1 AND name = ?2 AND tag = ?3)", &[&rid, &sub, t])? == 0
+                && one("SELECT COUNT(*) FROM registry_tags WHERE repo_id = ?1", &[&rid])? >= MAX_TAGS
+            {
+                return Ok(Err(oci(StatusCode::FORBIDDEN, "DENIED", format!("A repository holds at most {MAX_TAGS} tags: delete some first"))));
             }
             let added = tx.execute("INSERT OR IGNORE INTO registry_blobs(repo_id, digest, size, created_at) VALUES (?1, ?2, ?3, ?4)", params![rid, dg, len, now()])? == 1;
             tx.execute(
@@ -795,6 +807,10 @@ async fn put_manifest(st: &AppState, repo: &Repo, user: &Option<User>, img: &Ima
         collect(st, vec![d]).await;
         return Err(e);
     }
+    // A sweep that found the old copy unheld may have removed it just before the rows committed.
+    if !tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        tokio::fs::write(&dest, &bytes).await?;
+    }
     Ok(created(img, "manifests", &d))
 }
 
@@ -809,6 +825,14 @@ async fn delete_manifest(st: &AppState, repo: &Repo, user: &Option<User>, img: &
         .db
         .call(move |c| {
             let tx = c.transaction()?;
+            let named: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM registry_refs f JOIN registry_manifests m ON m.id = f.manifest_id WHERE m.repo_id = ?1 AND m.name = ?3 AND f.digest = ?2)",
+                params![rid, r, sub],
+                |x| x.get(0),
+            )?;
+            if named {
+                return Ok(Err(oci(StatusCode::CONFLICT, "DENIED", "An index names this manifest: delete the index first")));
+            }
             let n = if r.starts_with("sha256:") {
                 tx.execute("DELETE FROM registry_tags WHERE repo_id = ?1 AND name = ?2 AND digest = ?3", params![rid, sub, r])?;
                 tx.execute("DELETE FROM registry_manifests WHERE repo_id = ?1 AND name = ?2 AND digest = ?3", params![rid, sub, r])?
@@ -816,9 +840,9 @@ async fn delete_manifest(st: &AppState, repo: &Repo, user: &Option<User>, img: &
                 tx.execute("DELETE FROM registry_tags WHERE repo_id = ?1 AND name = ?2 AND tag = ?3", params![rid, sub, r])?
             };
             tx.commit()?;
-            Ok(n > 0)
+            Ok(Ok(n > 0))
         })
-        .await?;
+        .await??;
     if !gone {
         return Err(oci(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", "This image has no such manifest"));
     }
@@ -861,7 +885,7 @@ pub async fn list(State(st): State<AppState>, Viewer(v): Viewer, UrlPath((o, n))
     let host = registry_host(&st);
     let base = format!("{}/{}", r.owner.to_ascii_lowercase(), r.name.to_ascii_lowercase());
     let rid = r.id;
-    let (tags, files) = st
+    let (tags, untagged, files) = st
         .db
         .call(move |c| {
             let mut s = c.prepare(
@@ -874,6 +898,17 @@ pub async fn list(State(st): State<AppState>, Viewer(v): Viewer, UrlPath((o, n))
                     Ok((x.get(0)?, json!({ "tag": x.get::<_, String>(1)?, "digest": x.get::<_, String>(2)?, "size": x.get::<_, i64>(3)?, "updated_at": x.get::<_, i64>(4)? })))
                 })?
                 .collect::<Result<_, _>>()?;
+            // Manifests no tag or index names (a tag moved on): still pullable by digest,
+            // still using storage, so listed to be deleted.
+            let mut s = c.prepare(
+                "SELECT m.name, m.digest, m.size, m.created_at FROM registry_manifests m WHERE m.repo_id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM registry_tags t WHERE t.repo_id = m.repo_id AND t.name = m.name AND t.digest = m.digest)
+                 AND NOT EXISTS (SELECT 1 FROM registry_refs f JOIN registry_manifests p ON p.id = f.manifest_id WHERE p.repo_id = m.repo_id AND f.digest = m.digest)
+                 ORDER BY m.name, m.created_at DESC LIMIT 2000",
+            )?;
+            let untagged: Vec<(String, Value)> = s
+                .query_map([rid], |x| Ok((x.get(0)?, json!({ "digest": x.get::<_, String>(1)?, "size": x.get::<_, i64>(2)?, "created_at": x.get::<_, i64>(3)? }))))?
+                .collect::<Result<_, _>>()?;
             let mut s = c.prepare("SELECT name, version, file, size, digest, created_at FROM packages WHERE repo_id = ?1 ORDER BY name, created_at DESC, version, file LIMIT 2000")?;
             let files: Vec<(String, String, Value)> = s
                 .query_map([rid], |x| {
@@ -881,19 +916,22 @@ pub async fn list(State(st): State<AppState>, Viewer(v): Viewer, UrlPath((o, n))
                     Ok((x.get(0)?, x.get(1)?, json!({ "file": x.get::<_, String>(2)?, "size": x.get::<_, i64>(3)?, "sha256": d.get(7..).unwrap_or(""), "created_at": x.get::<_, i64>(5)? })))
                 })?
                 .collect::<Result<_, _>>()?;
-            Ok((tags, files))
+            Ok((tags, untagged, files))
         })
         .await?;
-    let mut images: Vec<Value> = Vec::new();
-    for (sub, t) in tags {
+    let mut images: std::collections::BTreeMap<String, Value> = Default::default();
+    for (key, (sub, t)) in tags.into_iter().map(|x| ("tags", x)).chain(untagged.into_iter().map(|x| ("untagged", x))) {
         let name = if sub.is_empty() { base.clone() } else { format!("{base}/{sub}") };
-        if images.last().is_none_or(|i| i["name"] != name.as_str()) {
-            images.push(json!({ "name": name, "pull": format!("{host}/{name}:{}", t["tag"].as_str().unwrap_or("latest")), "tags": [] }));
-        }
-        if let Some(Value::Array(a)) = images.last_mut().map(|i| &mut i["tags"]) {
+        let pull = match t["tag"].as_str() {
+            Some(tag) => format!("{host}/{name}:{tag}"),
+            None => format!("{host}/{name}@{}", t["digest"].as_str().unwrap_or("")),
+        };
+        let img = images.entry(sub.clone()).or_insert_with(|| json!({ "name": name, "sub": sub, "pull": pull, "tags": [], "untagged": [] }));
+        if let Some(Value::Array(a)) = img.get_mut(key) {
             a.push(t);
         }
     }
+    let images: Vec<Value> = images.into_values().collect();
     let mut packages: Vec<Value> = Vec::new();
     for (name, version, f) in files {
         if packages.last().is_none_or(|p| p["name"] != name.as_str() || p["version"] != version.as_str()) {
@@ -904,6 +942,21 @@ pub async fn list(State(st): State<AppState>, Viewer(v): Viewer, UrlPath((o, n))
         }
     }
     Ok(Json(json!({ "registry": host, "image": format!("{host}/{base}"), "can_write": r.can_write, "images": images, "packages": packages })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ImageRef {
+    #[serde(default)]
+    image: String,
+    reference: String,
+}
+
+/// From the Packages tab: delete a tag, or a manifest by digest (its tags too).
+pub async fn image_delete(State(st): State<AppState>, Authed(u): Authed, UrlPath((o, n)): UrlPath<(String, String)>, Query(q): Query<ImageRef>) -> J<Value> {
+    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let img = Image { full: String::new(), owner: r.owner.clone(), repo: r.name.clone(), sub: q.image };
+    delete_manifest(&st, &r, &Some(u), &img, &q.reference).await.map_err(|e| AppError::new(e.status, e.msg))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// A package name, version or file name: letters, digits, `.`, `-`, `_`, `+`.

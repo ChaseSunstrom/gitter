@@ -610,6 +610,7 @@ pub async fn delete_branch(
     st.git
         .delete_ref(&r.path, &format!("refs/heads/{}", q.name))
         .await?;
+    crate::hooks::forget_agent_branches(&st, r.id, vec![q.name.clone()]).await;
     touch(&st.db, r.id, false).await?;
     ok()
 }

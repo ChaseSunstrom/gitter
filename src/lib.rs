@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod bench;
 pub mod ci;
+pub mod cli;
 pub mod db;
 pub mod diff;
 pub mod error;
@@ -75,6 +76,8 @@ pub struct AppState {
     pub signing: Arc<signing::Signing>,
     /// Wakes the webhook sender when a delivery is queued.
     pub hook_wake: Arc<tokio::sync::Notify>,
+    /// Page views and clones counted in memory until the next flush.
+    pub traffic: Arc<api::insights::Traffic>,
 }
 
 impl AppState {
@@ -96,6 +99,7 @@ impl AppState {
             ci_wake: Arc::default(),
             signing: Arc::new(signing::Signing::new(cfg_dir.join("gpg"))),
             hook_wake: Arc::default(),
+            traffic: Arc::default(),
         }
     }
 }
@@ -124,14 +128,8 @@ pub fn router(st: AppState) -> Router {
         .layer(DefaultBodyLimit::disable());
 
     let app = Router::new()
-        .nest(
-            "/api",
-            api::router()
-                .layer(DefaultBodyLimit::max(40 * 1024 * 1024))
-                .layer(axum::middleware::from_fn_with_state(st.clone(), api::scope_guard))
-                .layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit))
-                .layer(axum::middleware::from_fn_with_state(st.clone(), web::csrf)),
-        )
+        .nest("/api", api::guarded(&st))
+        .route("/mcp", post(api::mcp::handle).get(api::mcp::no_stream).delete(api::mcp::no_stream))
         .route(
             "/raw/{owner}/{repo}/{*rest}",
             get(api::code::raw).route_layer(axum::middleware::from_fn_with_state(st.clone(), api::rate_limit)),
