@@ -14,8 +14,25 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     }
     st.git.maintain_soon(repo.path.clone());
     refresh_size(st, repo.id).await;
+    let gone: Vec<String> = updates.iter().filter(|u| u.new.is_none()).filter_map(|u| u.refname.strip_prefix("refs/heads/").map(String::from)).collect();
+    if !gone.is_empty() {
+        forget_agent_branches(st, repo.id, gone).await;
+    }
     crate::ci::trigger::on_push(st, repo, user.id, updates).await;
     crate::webhooks::push(st, repo, user.id, updates).await;
+}
+
+/// A deleted branch stops being an agent's: one made later under its name is a new branch.
+pub async fn forget_agent_branches(st: &AppState, repo_id: i64, branches: Vec<String>) {
+    let _ = st
+        .db
+        .call(move |c| {
+            for b in &branches {
+                c.execute("DELETE FROM agent_branches WHERE repo_id = ?1 AND branch = ?2", rusqlite::params![repo_id, b])?;
+            }
+            Ok(())
+        })
+        .await;
 }
 
 /// Record how much disk a repository uses (for storage quotas and the admin page).

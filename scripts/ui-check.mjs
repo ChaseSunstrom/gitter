@@ -484,5 +484,39 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Agent tokens: made in Settings → Tokens with repositories and tools; what the agent does
+// through /mcp shows an Agent badge, and the security log names the token.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  let num = null, badge = 0, logged = false;
+  try {
+    await page.goto(BASE + '/settings/tokens', { waitUntil: 'networkidle' });
+    await page.fill('#token-form input[name=name]', 'ui agent');
+    await page.selectOption('#tk-scope', 'agent');
+    await page.fill('#tk-repos', 'alice/hello');
+    await page.uncheck('#token-form input[name=tool][value=commit_files]');
+    await page.click('#token-form button[type=submit]');
+    await page.waitForSelector('#new-token .token-reveal', { timeout: 5000 });
+    const token = await page.locator('#token-value').inputValue();
+    if (!(await page.locator('#new-token pre').innerText()).includes('/mcp')) throw new Error('no MCP config example');
+    const call = async (name, args) => (await (await fetch(BASE + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) })).json()).result;
+    const made = await call('create_issue', { repo: 'alice/hello', title: 'Opened by an agent' });
+    if (!made || made.isError) throw new Error('create_issue: ' + JSON.stringify(made));
+    num = JSON.parse(made.content[0].text).number;
+    const denied = await call('commit_files', { repo: 'alice/hello', branch: 'main', new_branch: 'x', message: 'x', files: [{ path: 'x', content: 'x' }] });
+    if (denied) throw new Error('a tool left unticked still works');
+    await page.goto(`${BASE}/alice/hello/issues/${num}`, { waitUntil: 'networkidle' });
+    badge = await page.locator('.comment-head .agent-badge').count();
+    await page.goto(BASE + '/settings/security', { waitUntil: 'networkidle' });
+    logged = (await page.locator('#page').innerText()).includes('ui agent: create_issue alice/hello');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !badge || !logged) { failed++; console.log('✗ agent token', { num, badge, logged, errors }); }
+  else console.log('  ok agent token made in settings; its issue has an Agent badge and the security log names it');
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

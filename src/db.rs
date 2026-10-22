@@ -549,6 +549,32 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY(repo_id, day, kind, hash)
     ) WITHOUT ROWID;
     "#,
+    // v17: agent tokens (kind 'agent': only through /mcp, to the repositories in
+    // token_repos and the comma-separated MCP tools in `tools`), and what agents did
+    // (`agent` names the token, kept when the token is deleted). A CI run an agent
+    // started gets no secrets.
+    r#"
+    ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'user';
+    ALTER TABLE tokens ADD COLUMN tools TEXT NOT NULL DEFAULT '';
+    CREATE TABLE token_repos (
+        token_id INTEGER NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        PRIMARY KEY(token_id, repo_id)
+    );
+    ALTER TABLE events ADD COLUMN agent TEXT;
+    ALTER TABLE issues ADD COLUMN agent TEXT;
+    ALTER TABLE comments ADD COLUMN agent TEXT;
+    ALTER TABLE ci_runs ADD COLUMN agent TEXT;
+    -- Branches an agent created: the only existing branches agents may commit to, and a
+    -- run on one is an agent run (no secrets, never the built-in runner) whoever pushed.
+    CREATE TABLE agent_branches (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(repo_id, branch)
+    );
+    "#,
 ];
 
 impl Db {

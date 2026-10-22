@@ -15,6 +15,7 @@ pub mod security;
 pub mod snippets;
 pub mod webhooks;
 pub mod wiki;
+pub mod mcp;
 
 use std::net::SocketAddr;
 
@@ -238,6 +239,16 @@ pub fn router() -> Router<AppState> {
         .fallback(|| async { AppError::not_found() })
 }
 
+/// The API with its guards (body cap, token limits, rate limits, cross-site
+/// check), as mounted at /api and as MCP tool calls go through it.
+pub fn guarded(st: &AppState) -> Router<AppState> {
+    router()
+        .layer(DefaultBodyLimit::max(40 * 1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(st.clone(), scope_guard))
+        .layer(axum::middleware::from_fn_with_state(st.clone(), rate_limit))
+        .layer(axum::middleware::from_fn_with_state(st.clone(), crate::web::csrf))
+}
+
 /// Limited tokens only reach what their scope allows: reads everywhere, and for
 /// `write` tokens also changes inside a repository (issues, PRs, files,
 /// branches). Account, token, security and admin routes, and creating, forking,
@@ -257,11 +268,11 @@ pub async fn scope_guard(
         && (!token_may(l, &parts.method, parts.uri.path()) || !in_its_repo(&st, l, &parts).await)
     {
         let one = if l.repo_id.is_some() { " to one repository" } else { "" };
-        return AppError::new(
-            axum::http::StatusCode::FORBIDDEN,
-            format!("This token can't do that (it has {} access{one})", l.scope.as_str()),
-        )
-        .into_response();
+        let msg = match l.agent {
+            Some(_) => "Agent tokens can't do that".to_string(),
+            None => format!("This token can't do that (it has {} access{one})", l.scope.as_str()),
+        };
+        return AppError::new(axum::http::StatusCode::FORBIDDEN, msg).into_response();
     }
     next.run(axum::extract::Request::from_parts(parts, body)).await
 }
@@ -269,7 +280,9 @@ pub async fn scope_guard(
 /// A deploy token's writes must target its own repository: issues, comments
 /// and stars elsewhere would be made as its owner.
 async fn in_its_repo(st: &AppState, l: &crate::auth::Limits, parts: &Parts) -> bool {
-    let Some(want) = l.repo_id else { return true };
+    if l.repo_id.is_none() && l.agent.is_none() {
+        return true;
+    }
     if matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD) {
         return true;
     }
@@ -277,7 +290,7 @@ async fn in_its_repo(st: &AppState, l: &crate::auth::Limits, parts: &Parts) -> b
     let (Some(o), Some(n)) = (segs.get(1).cloned(), segs.get(2).cloned()) else { return false };
     // Through the same lookup as `Repo::load`, so a write to a renamed repo's old path gets its redirect.
     let found = st.db.call(move |c| Ok(crate::repo::lookup(c, &o, &n)?)).await.unwrap_or(None);
-    found.is_some_and(|(r, _)| r.id == want)
+    found.is_some_and(|(r, _)| l.covers(r.id))
 }
 
 /// Account-level routes no limited token may touch, even to read.
@@ -288,6 +301,9 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
         return false;
     }
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if l.agent.is_some() {
+        return agent_may(method, &segs);
+    }
     // Webhooks are the repository's configuration, and their URLs can hold credentials.
     if segs.len() >= 4 && segs[0] == "repos" && segs[3] == "hooks" {
         return false;
@@ -309,6 +325,28 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
 fn is_view_count(method: &axum::http::Method, path: &str) -> bool {
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
     *method == axum::http::Method::POST && segs.len() == 5 && segs[0] == "repos" && segs[3] == "traffic" && segs[4] == "view"
+}
+
+/// What an agent token's MCP tool calls may reach: inside a repository only,
+/// reading code, issues, pull requests and CI, and writing issues, comments,
+/// pull requests and commits. Never settings, collaborators, hooks, secrets,
+/// tokens or merges (an allow-list, so new areas stay closed to agents).
+fn agent_may(method: &axum::http::Method, segs: &[&str]) -> bool {
+    if segs.len() < 3 || segs[0] != "repos" {
+        return false;
+    }
+    let area = segs.get(3).copied().unwrap_or("");
+    if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
+        // Exactly what the tools read (`mcp::request`): not drafts, artifacts or settings.
+        return matches!(area, "tree" | "blob" | "grep" | "issues")
+            || (area == "ci" && (segs.get(4) == Some(&"runs") || (segs.get(4) == Some(&"jobs") && segs.len() == 7 && segs[6] == "log")));
+    }
+    *method == axum::http::Method::POST
+        && match area {
+            "issues" | "contents" => true,
+            "pulls" => segs.len() == 4,
+            _ => false,
+        }
 }
 
 /// Per-address limits on all API requests, and per-account limits on changes
@@ -333,6 +371,8 @@ pub async fn rate_limit(
     if mutating && s.write_rate_per_min > 0 {
         let v = crate::auth::Viewer::from_request_parts(&mut parts, &st).await.ok().and_then(|v| v.0);
         let key = match &v {
+            // An agent's changes count apart from its owner's (and admins' agents are limited too).
+            Some(u) if u.agent().is_some() => u.agent().map(|a| format!("write-agent:{}", a.token_id)),
             Some(u) if u.is_admin => None,
             Some(u) => Some(format!("write:{}", u.id)),
             None => Some(format!("write-ip:{ip}")),
@@ -404,7 +444,7 @@ pub const VISIBLE: &str = "(r.deleted_at IS NULL AND ((r.is_private = 0 AND r.hi
 
 pub fn visible_params(viewer: Option<&crate::auth::User>) -> [Value; 4] {
     // A deploy token lists repositories as if signed out (it's for one repo only).
-    let viewer = viewer.filter(|u| u.limits.as_ref().is_none_or(|l| l.repo_id.is_none()));
+    let viewer = viewer.filter(|u| u.limits.as_ref().is_none_or(|l| l.repo_id.is_none() && l.agent.is_none()));
     let id = Value::Integer(viewer.map(|u| u.id).unwrap_or(-1));
     [id.clone(), id.clone(), id.clone(), id]
 }
@@ -446,4 +486,53 @@ pub fn like(s: &str) -> String {
 
 pub fn page(p: Option<usize>) -> usize {
     p.unwrap_or(1).clamp(1, 10_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Method;
+
+    #[test]
+    fn agent_tokens_never_reach_settings_secrets_tokens_or_merges() {
+        let a = crate::auth::Agent { token_id: 1, name: "bot".into(), repos: vec![1], tools: vec![] };
+        let l = crate::auth::Limits { scope: crate::auth::Scope::Write, repo_id: None, agent: Some(std::sync::Arc::new(a)) };
+        for (m, p) in [
+            (Method::GET, "/repos/a/b/blob"),
+            (Method::GET, "/repos/a/b/issues/3"),
+            (Method::GET, "/repos/a/b/ci/runs/1"),
+            (Method::GET, "/repos/a/b/ci/jobs/9/log"),
+            (Method::POST, "/repos/a/b/issues"),
+            (Method::POST, "/repos/a/b/issues/3/comments"),
+            (Method::POST, "/repos/a/b/pulls"),
+            (Method::POST, "/repos/a/b/contents"),
+        ] {
+            assert!(token_may(&l, &m, p), "{m} {p}");
+        }
+        for (m, p) in [
+            (Method::GET, "/me"),
+            (Method::GET, "/me/tokens"),
+            (Method::POST, "/me/tokens"),
+            (Method::GET, "/search"),
+            (Method::GET, "/repos/a/b"),
+            (Method::PATCH, "/repos/a/b"),
+            (Method::DELETE, "/repos/a/b"),
+            (Method::GET, "/repos/a/b/ci/secrets"),
+            (Method::PUT, "/repos/a/b/ci/secrets/X"),
+            (Method::POST, "/repos/a/b/ci/runs"),
+            (Method::GET, "/repos/a/b/collaborators"),
+            (Method::GET, "/repos/a/b/hooks"),
+            (Method::GET, "/repos/a/b/deploy-tokens"),
+            (Method::GET, "/repos/a/b/transfer"),
+            (Method::POST, "/repos/a/b/pulls/1/merge"),
+            (Method::PATCH, "/repos/a/b/issues/1"),
+            (Method::DELETE, "/repos/a/b/branches"),
+            (Method::POST, "/repos/a/b/branches"),
+            (Method::POST, "/repos/a/b/fork"),
+            (Method::POST, "/repos/a/b/releases"),
+            (Method::GET, "/repos/a/b/wiki"),
+        ] {
+            assert!(!token_may(&l, &m, p), "{m} {p}");
+        }
+    }
 }

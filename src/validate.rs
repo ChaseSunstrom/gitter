@@ -15,6 +15,7 @@ const RESERVED: &[&str] = &[
     "help",
     "login",
     "logout",
+    "mcp",
     "new",
     "notifications",
     "org",
@@ -29,6 +30,7 @@ const RESERVED: &[&str] = &[
     "static",
     "user",
     "users",
+    "v2",
 ];
 
 /// User and repository names: start alphanumeric, then alphanumerics, `-`, `_`, `.`.
