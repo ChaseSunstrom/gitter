@@ -3,6 +3,7 @@
 Fast, simple git hosting. One Rust binary serves the web app, the API and git over HTTPS, and keeps its state in SQLite plus plain bare repositories.
 
 - **Code:** browse repositories, view files with syntax colors and linkable line ranges, blame, history, search, download archives.
+- **Insights:** Commits → Graph draws every branch with its merges, lane by lane. A file's History button steps through each version of it, following renames, with a slider and the diff of each. The Insights tab shows contributors, weekly commit activity and languages, and to the repository's admins its traffic: views and clones (fetches count too) per day for two weeks, unique visitors, referring sites and popular pages.
 - **Releases:** publish a version from a tag (or a new tag at a branch), with markdown notes, files to download (with download counts) and the source code as zip and tar.gz. Drafts stay with the maintainers, pre-releases are marked, and the repository page shows the latest release.
 - **Collaboration:** issues, labels, pull requests with server-side merge (merge commit, squash or fast-forward), comments in markdown, stars and forks.
 - **Teams:** add collaborators to a repository as Read (see and clone), Write (push, manage issues and pull requests) or Admin (settings, access, deploy tokens, CI secrets), and see in plain words who can do what in Settings → Who has access. Organizations own repositories for a group: owners manage everything, and members get the organization's base permission (none, read or write) on all of its repositories. An organization shares its creator's repository limit and storage quota, and who belongs to it is visible to its members only. Write access includes running CI: pushes run the repository's pipelines with its secrets, so give Write to people you'd trust with those.
@@ -207,6 +208,7 @@ Behind nginx or Caddy, set `GITTER_URL` to the public address. Requests whose `O
 - Passwords use Argon2id. Login and sign-up are rate limited.
 - User markdown is sanitized with DOMPurify, and the app ships a strict Content Security Policy.
 - Raw files are served as inert text or images inside a sandboxing CSP.
+- Traffic stores no addresses: a visitor is a hash of the address with a random salt that changes every day and is never written down, so it can't be traced back or followed across days. Only the referring site's host is kept, and traffic older than 14 days is deleted.
 
 ## Development
 

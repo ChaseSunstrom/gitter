@@ -72,7 +72,9 @@ const pages = [
   ['/alice/hello/compare/main...pw-branch', []],
   ['/alice/hello/labels', ['bug']],
   ['/alice/hello/issues/new', []],
-  ['/alice/hello/insights', ['Alice']],
+  ['/alice/hello/insights', ['Alice', 'Traffic', 'Referring sites', 'example.org', 'Popular pages']],
+  ['/alice/hello/commits?graph=1', ['Commits', 'on every branch', 'Add lib']],
+  ['/alice/hello/history/main/README.md', ['History for', 'More docs', 'View file']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
   ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues', 'Who has access', 'Site admins', 'Transfer ownership', 'Recently deleted']],
   [`/alice/hello/settings/hooks/${hook.id}`, ['Payload URL', 'Recent deliveries', 'ping', 'issues', 'Delivered', 'Send a ping']],
@@ -143,6 +145,25 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   const why = await page.locator('.sig-pop').innerText().catch(() => '');
   if (errors.length || !badges.list || !badges.commit || !badges.blame || !why.includes("alice's SSH key")) { failed++; console.log('✗ signature badges', { signed, badges, why, errors }); }
   else console.log('  ok signing keys are listed; commits, the commit page and blame show Verified, and the badge says why');
+  await page.close();
+}
+
+// Insights: the graph draws a dot per commit; the history scrubber steps to an older version's diff.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/alice/hello/commits?graph=1', { waitUntil: 'networkidle' });
+  const rows = await page.locator('.commit-graph .commit-row').count();
+  const dots = await page.locator('.commit-graph .graph-cell i').count();
+  await page.goto(BASE + '/alice/hello/history/main/README.md', { waitUntil: 'networkidle' });
+  await page.locator('#v-older').click();
+  await page.locator('#version-view .diff').waitFor({ timeout: 5000 }).catch(() => {});
+  const label = await page.locator('#v-label').innerText().catch(() => '');
+  const diff = await page.locator('#version-view .dfile').count();
+  if (errors.length || !rows || dots !== rows || !/^\d+ of \d+$/.test(label) || label.startsWith(label.split(' of ')[1] + ' ') || !diff) {
+    failed++; console.log('✗ commit graph or history scrubber', { rows, dots, label, diff, errors });
+  } else console.log('  ok the commit graph draws every commit; the history scrubber steps back to an older diff');
   await page.close();
 }
 

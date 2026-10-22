@@ -4,6 +4,7 @@ pub mod ci;
 pub mod orgs;
 pub mod code;
 pub mod discussions;
+pub mod insights;
 pub mod issues;
 pub mod lifecycle;
 pub mod moderation;
@@ -134,6 +135,10 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/blame"), get(code::blame))
         .route(&format!("{repo}/contents"), post(code::write_contents))
         .route(&format!("{repo}/contributors"), get(code::contributors))
+        .route(&format!("{repo}/graph"), get(insights::graph))
+        .route(&format!("{repo}/history"), get(insights::history))
+        .route(&format!("{repo}/traffic"), get(insights::traffic))
+        .route(&format!("{repo}/traffic/view"), post(insights::view))
         .route(
             &format!("{repo}/labels"),
             get(issues::labels).post(issues::create_label),
@@ -306,7 +311,9 @@ pub async fn rate_limit(
     {
         return AppError::slow_down("Too many requests from your network. Slow down a little.", wait).into_response();
     }
-    let mutating = !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+    // A page-view count isn't a change: browsing mustn't use up the write allowance.
+    let mutating = !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS)
+        && !parts.uri.path().ends_with("/traffic/view");
     if mutating && s.write_rate_per_min > 0 {
         let v = crate::auth::Viewer::from_request_parts(&mut parts, &st).await.ok().and_then(|v| v.0);
         let key = match &v {

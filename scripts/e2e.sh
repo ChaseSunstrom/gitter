@@ -98,6 +98,11 @@ jq_ 'd["content"]' | grep -q println || fail "blob"
 api GET "/repos/alice/hello/commits?rev=main"
 [ "$(jq_ 'len(d["commits"])')" = 3 ] || fail "commit log"
 SHA=$(jq_ '[c["sha"] for c in d["commits"] if c["subject"]=="Add main"][0]')
+api GET "/repos/alice/hello/graph"
+[ "$(jq_ '"Add lib" in [c["subject"] for c in d["commits"]] and all("lane" in c for c in d["commits"])')" = True ] || fail "commit graph: $BODY"
+api GET "/repos/alice/hello/history?rev=main&path=README.md"
+[ "$(jq_ '[v["commit"]["subject"] for v in d["versions"]][0]')" = "More docs" ] || fail "file history: $BODY"
+ok "commit graph spans branches; file history lists a file's commits"
 api GET "/repos/alice/hello/commit/$SHA"
 [ "$(jq_ 'd["diff"]["files"][0]["new_path"]')" = src/main.rs ] || fail "commit diff"
 api GET "/repos/alice/hello/compare?base=main&head=feature"
@@ -392,6 +397,14 @@ for _ in $(seq 50); do
 done
 [ "$(jq_ '[x["status"] for x in d["deliveries"]]')" = "['ok', 'ok']" ] || fail "webhook delivery log: $BODY"
 ok "webhooks: a local receiver gets a signed ping and issue event, and the delivery log shows both"
+
+# --- traffic: the clones above counted; a page view with an outside referrer
+api POST /repos/alice/hello/traffic/view '{"path":"/","referrer":"https://example.org/post"}'
+api GET /repos/alice/hello/traffic
+[ "$(jq_ 'd["clones"] >= 3 and d["views"] >= 1 and d["referrers"][0]["name"] == "example.org"')" = True ] || fail "traffic: $BODY"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/repos/alice/hello/traffic")
+[ "$code" = 401 ] || fail "traffic should be for admins only, anonymous got $code"
+ok "traffic: clones and views per day for the repository's admins only"
 
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")

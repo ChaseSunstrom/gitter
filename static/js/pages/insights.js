@@ -39,12 +39,47 @@ function activityChart(weeks) {
   return raw(`<svg class="activity-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Commits per week over the last year">${grid}${bars}${ticks}</svg>`);
 }
 
+/** 14 daily bars: all of `key`, with the unique part drawn over it. */
+function dailyChart(days, key, label) {
+  const W = 560, H = 150, left = 30, bottom = 22, top = 8;
+  const max = Math.max(1, ...days.map((d) => d[key]));
+  const plotW = W - left - 4, plotH = H - top - bottom, bw = plotW / days.length;
+  const h = (v) => (v / max) * plotH;
+  let out = `<line x1="${left}" x2="${W - 4}" y1="${top}" y2="${top}" class="grid"/><text x="${left - 6}" y="${top + 3.5}" text-anchor="end">${max}</text>`;
+  days.forEach((d, i) => {
+    const x = left + i * bw + 2, w = Math.max(1, bw - 4), all = d[key], uniq = d['unique_' + key];
+    const date = new Date(d.time * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    out += `<g><title>${date}: ${plural(all, label)}, ${uniq} unique</title>
+      <rect x="${x}" y="${top + plotH - h(all)}" width="${w}" height="${h(all)}" rx="1.5" class="bar soft"/>
+      <rect x="${x}" y="${top + plotH - h(uniq)}" width="${w}" height="${h(uniq)}" rx="1.5" class="bar${all ? '' : ' zero'}"/></g>`;
+    if (i % 3 === 0) out += `<text x="${x}" y="${H - 6}">${date}</text>`;
+  });
+  return raw(`<svg class="activity-chart traffic-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label}s per day over the last two weeks">${out}</svg>`);
+}
+
+function topList(rows, empty) {
+  return rows.length ? html`<ol class="top-list">${rows.map((r) => html`<li><span class="ellipsis grow">${r.name}</span><b class="small">${num(r.count)}</b></li>`)}</ol>`
+    : html`<p class="muted small">${empty}</p>`;
+}
+
+function trafficBox(t) {
+  const sum = (k) => t.days.reduce((a, d) => a + d[k], 0);
+  return html`<div class="box traffic"><div class="box-head">${icon('eye', 'sm')}<b>Traffic</b><span class="grow"></span><span class="muted small">Last 14 days (UTC) · only admins see this</span></div>
+    <div class="box-body traffic-grid">
+      <div><div class="spread"><b>${plural(sum('views'), 'view')}</b><span class="muted small">${num(sum('unique_views'))} unique a day, summed</span></div>${dailyChart(t.days, 'views', 'view')}</div>
+      <div><div class="spread"><b>${plural(sum('clones'), 'clone')}</b><span class="muted small">${num(sum('unique_clones'))} unique a day, summed</span></div>${dailyChart(t.days, 'clones', 'clone')}</div>
+      <div><b class="small">Referring sites</b>${topList(t.referrers, 'No visits from other sites yet.')}</div>
+      <div><b class="small">Popular pages</b>${topList(t.paths, 'No page views yet.')}</div>
+    </div></div>`;
+}
+
 export default async function (ctx) {
   const { owner, repo } = ctx.params;
   const meta = await loadRepo(owner, repo);
-  const [c, l] = await Promise.all([
+  const [c, l, t] = await Promise.all([
     get(`${repoUrl(owner, repo)}/contributors`),
     get(`${repoUrl(owner, repo)}/languages`).catch(() => ({ languages: [] })),
+    meta.can_admin ? get(`${repoUrl(owner, repo)}/traffic`, { fresh: true }).catch(() => null) : null,
   ]);
   const people = c.contributors;
   const top = Math.max(1, ...people.map((p) => p.commits));
@@ -61,6 +96,7 @@ export default async function (ctx) {
     </div>
     <div class="box"><div class="box-head">${icon('pulse', 'sm')}<b>Commit activity</b><span class="grow"></span><span class="muted small">${plural(yearCommits, 'commit')} in the last year</span></div>
       <div class="box-body chart-wrap">${meta.empty ? html`<p class="muted">No commits yet.</p>` : activityChart(c.weeks)}</div></div>
+    ${t ? trafficBox(t) : ''}
     <div class="insights-cols">
       <div class="box"><div class="box-head">${icon('users', 'sm')}<b>Contributors</b></div>
         ${people.length ? html`<ol class="contrib-list">${people.map((p, i) => html`<li>

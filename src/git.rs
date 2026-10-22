@@ -784,7 +784,7 @@ pub struct LogQuery<'a> {
 
 /// Fields separated by 0x1f; the free-text message comes last and records end
 /// with NUL (`-z`), which git never allows inside a commit message.
-const COMMIT_FMT: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%B";
+pub const COMMIT_FMT: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%B";
 
 #[derive(Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Commit {

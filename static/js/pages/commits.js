@@ -1,10 +1,13 @@
 // Commit history for a branch (optionally one path), with message/author search.
-import { html, state, get, avatar, timeEl, short, encPath, day, debounce, $, sigBadge } from '../lib.js';
+import { html, raw, state, get, avatar, timeEl, short, encPath, day, debounce, $, sigBadge } from '../lib.js';
 import { icon } from '../icons.js';
 import { loadRepo, repoUrl, splitRev, repoPage, mountRepoHeader, refPicker, mountRefPicker, crumbs } from '../repohead.js';
 import { navigate } from '../main.js';
 
+const isGraph = (q, path) => q.get('graph') === '1' && !path;
+
 function apiUrl(meta, rev, path, q) {
+  if (isGraph(q, path)) return `${repoUrl(meta.owner, meta.name)}/graph?page=${encodeURIComponent(q.get('page') || '1')}`;
   const p = new URLSearchParams({ rev, path, page: q.get('page') || '1' });
   if (q.get('q')) p.set('q', q.get('q'));
   if (q.get('author')) p.set('author', q.get('author'));
@@ -17,10 +20,25 @@ export async function prefetch(ctx) {
   get(apiUrl(meta, rev, path, ctx.query));
 }
 
-export function commitRow(meta, c, i = 0) {
+/** The commit's graph cell: lanes as lines through the row, the commit as a dot. */
+const LANE_W = 14, MAX_LANES = 12;
+function graphCell(c, width) {
+  const w = Math.min(Math.max(width, 1), MAX_LANES) * LANE_W;
+  const x = (j) => j * LANE_W + LANE_W / 2;
+  const line = (j, x1, y1, x2, y2) => `<line class="g${j % 6}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" vector-effect="non-scaling-stroke"/>`;
+  const lines = [
+    ...c.pass.map((j) => line(j, x(j), 0, x(j), 100)),
+    ...c.up.map((j) => line(j, x(j), 0, x(c.lane), 50)),
+    ...c.down.map((j) => line(j, x(c.lane), 50, x(j), 100)),
+  ].join('');
+  const merge = c.parents.length > 1 ? ' merge' : '';
+  return raw(`<span class="graph-cell" style="width:${w}px" aria-hidden="true"><svg viewBox="0 0 ${w} 100" preserveAspectRatio="none">${lines}</svg>${c.lane < MAX_LANES ? `<i class="g${c.lane % 6}${merge}" style="left:${x(c.lane) - 4.5}px"></i>` : ''}</span>`);
+}
+
+export function commitRow(meta, c, i = 0, lead = '') {
   const base = `/${meta.owner}/${meta.name}`;
   return html`<div class="commit-row" style="--i:${Math.min(i, 20)}">
-    ${avatar(c.author_email || c.author_name, 32)}
+    ${lead}${avatar(c.author_email || c.author_name, 32)}
     <div class="grow">
       <div class="row" style="align-items:flex-start"><a class="subj" href="${base}/commit/${c.sha}">${c.subject}</a>
         ${c.body ? html`<button class="more" data-more aria-label="Show full message">…</button>` : ''}</div>
@@ -70,17 +88,27 @@ export default async function (ctx) {
   const base = `/${owner}/${repo}`;
   const page = d.page;
   const pageHref = (n) => { const p = new URLSearchParams(q); p.set('page', n); return `${base}/commits/${encPath(rev)}${path ? '/' + encPath(path) : ''}?${p}`; };
+  const graph = isGraph(q, path);
+  const toggle = path ? '' : html`<div class="seg" role="group" aria-label="Commit view">
+    <a href="${base}/commits/${encPath(rev)}" class="${graph ? '' : 'on'}">${icon('history', 'sm')} List</a>
+    <a href="${base}/commits?graph=1" class="${graph ? 'on' : ''}" title="Every branch, with merges drawn">${icon('branch', 'sm')} Graph</a></div>`;
+  const list = !d.commits.length
+    ? html`<div class="box empty">${icon('history', 'big')}<h3>No commits found</h3><p>${graph ? 'No branch has commits yet.' : 'Try a different search.'}</p></div>`
+    : graph ? html`<div class="box list commit-graph">${d.commits.map((c, i) => commitRow(meta, c, i, graphCell(c, d.width)))}</div>`
+      : groupByDay(meta, d.commits);
   const body = html`<div class="stack">
     <div class="toolbar">
-      ${refPicker(meta, rev)}
+      ${graph ? '' : refPicker(meta, rev)}
       ${path ? html`<span class="muted small">History for</span>${crumbs(meta, rev, path, { last: false })}` : html`<h2 style="font-size:17px">Commits</h2>`}
+      ${graph ? html`<span class="muted small">on every branch</span>` : ''}
       <span class="grow"></span>
-      <div class="filters">
+      ${toggle}
+      ${graph ? '' : html`<div class="filters">
         <div class="search-input">${icon('search')}<input class="input sm" id="cq" placeholder="Search messages" value="${q.get('q') || ''}" aria-label="Search commit messages"></div>
         <input class="input sm" id="ca" placeholder="Author" style="width:140px" value="${q.get('author') || ''}" aria-label="Filter by author">
-      </div>
+      </div>`}
     </div>
-    ${d.commits.length ? groupByDay(meta, d.commits) : html`<div class="box empty">${icon('history', 'big')}<h3>No commits found</h3><p>Try a different search.</p></div>`}
+    ${list}
     ${page > 1 || d.has_more ? html`<div class="pager">
       ${page > 1 ? html`<a class="btn" href="${pageHref(page - 1)}">${icon('chev-left', 'sm')} Newer</a>` : ''}
       ${d.has_more ? html`<a class="btn" href="${pageHref(page + 1)}">Older ${icon('chev-right', 'sm')}</a>` : ''}</div>` : ''}
@@ -92,6 +120,7 @@ export default async function (ctx) {
       mountRepoHeader(el, meta);
       mountRefPicker(el, meta, rev, (r) => `${base}/commits/${encPath(r)}${path ? '/' + encPath(path) : ''}`);
       mountCommitRows(el);
+      if (graph) return;
       const apply = debounce(() => {
         const p = new URLSearchParams();
         const qv = $('#cq', el).value.trim();

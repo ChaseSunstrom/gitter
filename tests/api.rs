@@ -2989,3 +2989,213 @@ async fn transfers_and_trash_follow_org_ownership() {
     assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
     assert!(!app.state.cfg.data_dir.join(format!("trash/{id}.git")).exists());
 }
+
+// ---------- insights: commit graph, file history, traffic (T-0053)
+
+/// Run git against a bare repository as a push would, returning trimmed stdout.
+fn insights_git(repo: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg(format!("--git-dir={}", repo.display()))
+        .args(["-c", "user.name=a", "-c", "user.email=a@b.c"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+async fn insights_write(app: &App, c: &Client, repo: &str, branch: &str, msg: &str, changes: Value) {
+    let (s, e) = app
+        .req(c, "POST", &format!("/api/repos/{repo}/contents"), Some(json!({ "branch": branch, "message": msg, "changes": changes })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{msg}: {e}");
+}
+
+/// Every row's lines join up with the rows around it: what leaves the bottom of
+/// one row (pass + down) is what enters the top of the next (pass + up).
+fn insights_check_lanes(rows: &[Value], mut active: Vec<i64>) -> Vec<i64> {
+    let lanes = |v: &Value| -> Vec<i64> { v.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect() };
+    for r in rows {
+        let (lane, pass, up, down) = (r["lane"].as_i64().unwrap(), lanes(&r["pass"]), lanes(&r["up"]), lanes(&r["down"]));
+        let mut top: Vec<i64> = pass.iter().chain(&up).copied().collect();
+        top.sort();
+        top.dedup();
+        active.sort();
+        assert_eq!(top, active, "row {} starts where the last ended: {r}", r["sha"]);
+        assert!(up.is_empty() || up.contains(&lane), "lines from above meet at the dot: {r}");
+        assert!(!pass.contains(&lane), "nothing passes through the dot: {r}");
+        active = pass.iter().chain(&down).copied().collect();
+        active.sort();
+        active.dedup();
+    }
+    active
+}
+
+#[tokio::test]
+async fn insights_graph_lanes_cover_branches_and_merges() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "g", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos/alice/g/branches", Some(json!({ "name": "side", "from": "main" }))).await;
+    insights_write(&app, &alice, "alice/g", "side", "Side work", json!([{ "path": "side.txt", "content": "s\n" }])).await;
+    insights_write(&app, &alice, "alice/g", "main", "Main work", json!([{ "path": "main.txt", "content": "m\n" }])).await;
+    let repo = app.state.git.repo_path(1);
+    let (m, s) = (insights_git(&repo, &["rev-parse", "main"]), insights_git(&repo, &["rev-parse", "side"]));
+    let merge = insights_git(&repo, &["commit-tree", &format!("{m}^{{tree}}"), "-p", &m, "-p", &s, "-m", "Merge side"]);
+    insights_git(&repo, &["update-ref", "refs/heads/main", &merge]);
+    // An unmerged branch shows up too: the graph spans every branch.
+    app.req(&alice, "POST", "/api/repos/alice/g/branches", Some(json!({ "name": "wip", "from": "side" }))).await;
+    insights_write(&app, &alice, "alice/g", "wip", "Unfinished", json!([{ "path": "wip.txt", "content": "w\n" }])).await;
+
+    let (st, d) = app.req(&alice, "GET", "/api/repos/alice/g/graph", None).await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let rows = d["commits"].as_array().unwrap();
+    let subjects: Vec<&str> = rows.iter().map(|r| r["subject"].as_str().unwrap()).collect();
+    assert_eq!(rows.len(), 5, "{subjects:?}");
+    for want in ["Merge side", "Side work", "Main work", "Unfinished", "Initial commit"] {
+        assert!(subjects.contains(&want), "{want} in {subjects:?}");
+    }
+    let merge_row = rows.iter().find(|r| r["subject"] == "Merge side").unwrap();
+    let down = merge_row["down"].as_array().unwrap();
+    assert_eq!(down.len(), 2, "a merge leaves on two lines: {merge_row}");
+    assert_ne!(down[0], down[1]);
+    assert_eq!(merge_row["parents"].as_array().unwrap().len(), 2);
+    let end = insights_check_lanes(rows, vec![]);
+    assert!(end.is_empty(), "every line ends at the root commit: {end:?}");
+    assert!(rows.last().unwrap()["down"].as_array().unwrap().is_empty(), "the root has no parent line");
+    assert!(d["width"].as_i64().unwrap() >= 2);
+    assert_eq!(d["has_more"], false);
+
+    // Pages carry the lanes over: page 2 starts with the lines page 1 left open.
+    let (_, p1) = app.req(&alice, "GET", "/api/repos/alice/g/graph?per=2", None).await;
+    let (_, p2) = app.req(&alice, "GET", "/api/repos/alice/g/graph?per=2&page=2", None).await;
+    assert_eq!(p1["has_more"], true);
+    let open = insights_check_lanes(p1["commits"].as_array().unwrap(), vec![]);
+    assert!(!open.is_empty());
+    insights_check_lanes(p2["commits"].as_array().unwrap(), open);
+    assert_eq!(p2["commits"][0]["sha"], rows[2]["sha"]);
+
+    // Private repositories stay private; filters don't apply to the all-branches graph.
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "hid", "private": true, "readme": true }))).await;
+    let bob = app.signup("bob").await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/hid/graph", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&Client::default(), "GET", "/api/repos/alice/hid/graph", None).await.0, StatusCode::NOT_FOUND);
+    let (s, e) = app.req(&alice, "GET", "/api/repos/alice/g/graph?page=500", None).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(e["commits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn insights_file_history_follows_renames() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "h", "readme": true }))).await;
+    let text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+    insights_write(&app, &alice, "alice/h", "main", "Add notes", json!([{ "path": "docs/a.txt", "content": text }])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Edit notes", json!([{ "path": "docs/a.txt", "content": format!("{text}eight\n") }])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Unrelated", json!([{ "path": "other.txt", "content": "x\n" }])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Rename notes", json!([
+        { "path": "docs/a.txt", "delete": true }, { "path": "b.txt", "content": format!("{text}eight\n") }
+    ])).await;
+    insights_write(&app, &alice, "alice/h", "main", "Edit renamed", json!([{ "path": "b.txt", "content": format!("{text}eight\nnine\n") }])).await;
+
+    let (s, d) = app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=b.txt", None).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    let v = d["versions"].as_array().unwrap();
+    let got: Vec<(&str, &str, &str)> = v
+        .iter()
+        .map(|x| (x["commit"]["subject"].as_str().unwrap(), x["status"].as_str().unwrap(), x["path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("Edit renamed", "modified", "b.txt"),
+            ("Rename notes", "renamed", "b.txt"),
+            ("Edit notes", "modified", "docs/a.txt"),
+            ("Add notes", "added", "docs/a.txt"),
+        ]
+    );
+    assert_eq!(v[1]["old_path"], "docs/a.txt");
+    assert_eq!(d["has_more"], false);
+    // Each version's diff loads through the commit view, renames paired up.
+    let sha = v[1]["commit"]["sha"].as_str().unwrap();
+    let (_, c) = app.req(&alice, "GET", &format!("/api/repos/alice/h/commit/{sha}?path=b.txt&old=docs/a.txt"), None).await;
+    assert_eq!(c["diff"]["files"].as_array().unwrap().len(), 1, "{c}");
+    let (_, p) = app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=b.txt&per=3&page=2", None).await;
+    assert_eq!(p["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(p["versions"][0]["commit"]["subject"], "Add notes");
+
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=", None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=../x", None).await.0, StatusCode::BAD_REQUEST);
+    let (_, none) = app.req(&alice, "GET", "/api/repos/alice/h/history?rev=main&path=nope.txt", None).await;
+    assert_eq!(none["versions"].as_array().unwrap().len(), 0);
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "hid", "private": true, "readme": true }))).await;
+    let bob = app.signup("bob").await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/hid/history?path=README.md", None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn insights_traffic_counts_for_admins_only() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "pub", "readme": true }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "priv", "private": true, "readme": true }))).await;
+    let view = |path: &str, referrer: &str| json!({ "path": path, "referrer": referrer });
+    for (c, p, r) in [
+        (&anon, "/", "https://news.example.com/item?id=1"),
+        (&bob, "/blob/main/README.md", "https://news.example.com/other"),
+        (&alice, "/blob/main/README.md", "http://test.local/alice"),
+    ] {
+        let (s, e) = app.req(c, "POST", "/api/repos/alice/pub/traffic/view", Some(view(p, r))).await;
+        assert_eq!(s, StatusCode::OK, "{e}");
+    }
+    // Junk is dropped, not stored: a path off the repository, an over-long one.
+    app.req(&anon, "POST", "/api/repos/alice/pub/traffic/view", Some(view(&"/x".repeat(400), "javascript:alert(1)"))).await;
+    // A clone (or fetch) starts with the upload-pack ref advertisement.
+    let refs = Request::get("/alice/pub.git/info/refs?service=git-upload-pack").body(Body::empty()).unwrap();
+    assert_eq!(app.router.clone().oneshot(refs).await.unwrap().status(), StatusCode::OK);
+
+    let (s, t) = app.req(&alice, "GET", "/api/repos/alice/pub/traffic", None).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let days = t["days"].as_array().unwrap();
+    assert_eq!(days.len(), 14);
+    let today = days.last().unwrap();
+    assert_eq!((today["views"].as_i64(), today["clones"].as_i64()), (Some(4), Some(1)), "{t}");
+    assert_eq!(today["unique_views"], 1, "the same address is one visitor: {t}");
+    assert_eq!(today["unique_clones"], 1);
+    assert_eq!(t["views"], 4);
+    assert_eq!(t["referrers"], json!([{ "name": "news.example.com", "count": 2 }]), "own-site and junk referrers are skipped");
+    assert_eq!(t["paths"][0], json!({ "name": "/blob/main/README.md", "count": 2 }), "{t}");
+    assert!(t["paths"].as_array().unwrap().iter().all(|p| p["name"].as_str().unwrap().len() <= 200));
+    // Stored by repository id, with no address in it.
+    let leaked: i64 = app
+        .state
+        .db
+        .call(|c| Ok(c.query_row("SELECT count(*) FROM traffic_visitors WHERE hash LIKE '%unknown%' OR hash LIKE '%127.0.0.1%'", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(leaked, 0);
+
+    // Readers and strangers get nothing; private repositories don't count outsiders.
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/pub/traffic", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&anon, "GET", "/api/repos/alice/pub/traffic", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(app.req(&bob, "POST", "/api/repos/alice/priv/traffic/view", Some(view("/", ""))).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/priv/traffic", None).await.0, StatusCode::NOT_FOUND);
+    let (_, p) = app.req(&alice, "GET", "/api/repos/alice/priv/traffic", None).await;
+    assert_eq!(p["views"], 0);
+    // An admin collaborator sees it, and it follows a rename.
+    app.req(&alice, "PUT", "/api/repos/alice/pub/collaborators/bob", Some(json!({ "role": "admin" }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/pub/traffic", None).await.0, StatusCode::OK);
+    let (s, e) = app.req(&alice, "PATCH", "/api/repos/alice/pub", Some(json!({ "name": "renamed" }))).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/renamed/traffic", None).await.1["views"], 4);
+    // A trashed repository is gone: no counting, no report.
+    app.req(&alice, "DELETE", "/api/repos/alice/renamed", Some(json!({ "confirm": "alice/renamed" }))).await;
+    assert_eq!(app.req(&alice, "GET", "/api/repos/alice/renamed/traffic", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&anon, "POST", "/api/repos/alice/renamed/traffic/view", Some(view("/", ""))).await.0, StatusCode::NOT_FOUND);
+}
