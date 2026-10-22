@@ -116,6 +116,13 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         "runner" => {
+            if args[1..].iter().any(|a| a == "--help" || a == "-h") {
+                // Its lines of HELP, up to the next command.
+                let from = HELP.find("  gitter runner").unwrap_or(0);
+                let to = HELP[from + 1..].find("\n  gitter ").map_or(HELP.len(), |i| from + 1 + i);
+                println!("{}", &HELP[from..to]);
+                return Ok(());
+            }
             let known = ["--url", "--token", "--labels", "--jobs", "--work"];
             for pair in args[1..].chunks(2) {
                 if !known.contains(&pair[0].as_str()) || pair.len() < 2 {

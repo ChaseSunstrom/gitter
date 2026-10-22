@@ -536,9 +536,13 @@ fn login(mut cx: Ctx) -> Result<()> {
     cx.cfg.default = url.clone();
     save(&cx.cfg)?;
     // setup-git was run for other servers, not this one.
+    // A hint only: an unreadable git config gives none.
     let ours: Vec<String> = global_config(&["--get-regexp", r"^credential\..*\.helper$"])
+        .unwrap_or_default()
         .iter()
-        .filter_map(|e| e.split_once('\n').filter(|(_, v)| v.contains("auth git-credential")).map(|(k, _)| k.to_string()))
+        .filter_map(|e| e.split_once('\n'))
+        .filter(|(k, v)| k.strip_prefix("credential.").and_then(|k| k.strip_suffix(".helper")).is_some_and(|s| gitters_helper(v, s)))
+        .map(|(k, _)| k.to_string())
         .collect();
     if !ours.is_empty() && !ours.contains(&format!("credential.{url}.helper")) {
         eprintln!("To let plain git use this login too, run `gitter auth setup-git` again.");
@@ -546,13 +550,23 @@ fn login(mut cx: Ctx) -> Result<()> {
     Ok(())
 }
 
-/// `git config --global --null ARGS…`: its entries (empty when there are none or git fails).
-fn global_config(args: &[&str]) -> Vec<String> {
+/// Whether `v` is a credential helper setup-git wrote for `server`: `!'EXE' auth git-credential 'SERVER'`, or
+/// the older form without SERVER when EXE is named gitter (gh's helper, quoted, looks the same otherwise).
+fn gitters_helper(v: &str, server: &str) -> bool {
+    let Some(rest) = v.strip_prefix("!'") else { return false };
+    rest.ends_with(&format!("' auth git-credential {}", quote(server)))
+        || rest.strip_suffix("' auth git-credential").is_some_and(|exe| exe == "gitter" || exe.ends_with("/gitter"))
+}
+
+/// `git config --global --null ARGS…`: its entries (empty when there are none; an error when git fails).
+fn global_config(args: &[&str]) -> Result<Vec<String>> {
     let mut a = vec!["config", "--global", "--null"];
     a.extend(args);
-    match git_cmd(&a, None).stdin(Stdio::null()).stderr(Stdio::null()).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).split_terminator('\0').map(String::from).collect(),
-        _ => vec![],
+    let o = git_cmd(&a, None).stdin(Stdio::null()).output().context("can't run git")?;
+    match o.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&o.stdout).split_terminator('\0').map(String::from).collect()),
+        Some(1) => Ok(vec![]), // no such key
+        _ => bail!("{}", clean(String::from_utf8_lossy(&o.stderr).trim(), false)),
     }
 }
 
@@ -664,9 +678,9 @@ fn quote(s: &str) -> String {
 }
 
 /// Makes `key` exactly `vals` in the global git config (none: unset). If a step fails, the old values are put
-/// back, never a part of the new ones (just a reset would leave git with no helper).
+/// back, never a part of the new ones (just a reset would leave git with no helper). Unreadable: nothing written.
 fn set_all(key: &str, vals: &[&str]) -> Result<()> {
-    let old = global_config(&["--get-all", key]);
+    let old = global_config(&["--get-all", key])?;
     let set = || -> Result<()> {
         let Some((first, rest)) = vals.split_first() else {
             return git(&["config", "--global", "--unset-all", key], None).map(drop);
@@ -705,8 +719,15 @@ fn logout(mut cx: Ctx) -> Result<()> {
         println!("Logged out of {shown}");
     }
     let key = format!("credential.{server}.helper");
-    let old = global_config(&["--get-all", &key]);
-    let ours = |v: &str| v.starts_with("!'") && (v.ends_with(&format!(" auth git-credential {}", quote(&server))) || v.ends_with("' auth git-credential"));
+    let old = match global_config(&["--get-all", &key]) {
+        Ok(v) => v,
+        Err(e) if had => {
+            eprintln!("Warning: can't read git's config, so a credential helper for {shown} may be left there: {e:#}");
+            return Ok(());
+        }
+        Err(e) => return Err(e.context(format!("not logged in to {shown}, and can't read git's config"))),
+    };
+    let ours = |v: &str| gitters_helper(v, &server);
     let keep: Vec<&str> = old.iter().enumerate().filter(|(i, v)| !(ours(v) || (v.is_empty() && old.get(i + 1).is_some_and(|n| ours(n))))).map(|(_, v)| v.as_str()).collect();
     if keep.len() < old.len() {
         set_all(&key, &keep).with_context(|| format!("can't remove git's credential helper for {shown}"))?;
