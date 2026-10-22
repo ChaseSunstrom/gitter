@@ -1166,5 +1166,34 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   else console.log(`  ok pull request from a fork: ${steps.join(', ')}`);
 }
 
+// Deployments (seeded by e2e's alice/site): the environment with its latest deployment and rule,
+// the pull request's preview on its page and in the list, and a new environment made from the form.
+{
+  const page = await ctx.newPage();
+  const errors = [], steps = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  try {
+    await page.goto(BASE + '/alice/site/deployments', { waitUntil: 'networkidle' });
+    const text = await page.locator('#repo-body').innerText();
+    for (const want of ['production', 'main', 'Pull request previews', 'Open preview']) if (!text.includes(want)) throw new Error(`no ${want} on the deployments page`);
+    steps.push('listed production and the preview');
+    await page.goto(BASE + '/alice/site/pull/1', { waitUntil: 'networkidle' });
+    await page.locator('#pr-deploys').waitFor({ state: 'visible', timeout: 5000 });
+    const box = await page.locator('#pr-deploys').innerText();
+    if (!box.includes('preview/pr-1') || !box.includes('Open preview')) throw new Error(`pull request deployments: ${box}`);
+    steps.push('the pull request shows its preview');
+    await page.goto(BASE + '/alice/site/deployments', { waitUntil: 'networkidle' });
+    await page.click('#env-new-btn');
+    await page.fill('#env-name', 'staging');
+    await Promise.all([page.waitForResponse((r) => r.url().endsWith('/environments') && r.request().method() === 'PUT'), page.click('#env-new button[type=submit]')]);
+    await page.locator('[data-env] b', { hasText: 'staging' }).waitFor({ timeout: 5000 });
+    steps.push('made staging');
+  } catch (e) { errors.push(String(e)); }
+  await page.close();
+  if (errors.length || steps.length < 3) { failed++; console.log('✗ deployments', { steps, errors }); }
+  else console.log(`  ok deployments: ${steps.join(', ')}`);
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

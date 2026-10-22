@@ -39,50 +39,68 @@ pub async fn claim(st: &AppState, runner_id: i64, labels: Vec<String>, builtin: 
         return Ok(None);
     }
     let admins_only = builtin || mode != "everyone";
-    let Some(mut lease) = st.db.call(move |c| Ok(queue::claim(c, runner_id, &labels, admins_only, builtin)?)).await? else {
-        return Ok(None);
-    };
-    lease.limits = queue::Limits { cpus: s.ci_cpus, memory_mb: s.ci_memory_mb, network: s.ci_network };
-    let data = &st.cfg.data_dir;
-    let _ = tokio::fs::remove_file(log_path(data, lease.job_id)).await;
-    let _ = tokio::fs::remove_file(artifact_path(data, lease.job_id)).await;
-    let (job, repo) = (lease.job_id, lease.repo_id);
-    let (sealed, by_agent): (Vec<(String, Vec<u8>)>, bool) = st
-        .db
-        .call(move |c| {
-            c.execute("DELETE FROM ci_artifacts WHERE job_id = ?1", [job])?;
-            // Earlier attempts' test results stop showing (they stay for spotting flaky tests).
-            c.execute("UPDATE ci_test_results SET current = 0 WHERE job_id = ?1", [job])?;
-            c.execute("DELETE FROM ci_job_reports WHERE job_id = ?1", [job])?;
-            // A run an agent started gets no secrets: its workflow could print them.
-            let by_agent: bool = c.query_row(
-                "SELECT r.agent IS NOT NULL FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE j.id = ?1",
-                [job],
-                |r| r.get(0),
-            )?;
-            if by_agent {
-                return Ok((vec![], true));
+    // A job its environment refuses ends at once, and the next one is claimed instead.
+    loop {
+        let labels = labels.clone();
+        let Some(mut lease) = st.db.call(move |c| Ok(queue::claim(c, runner_id, &labels, admins_only, builtin)?)).await? else {
+            return Ok(None);
+        };
+        lease.limits = queue::Limits { cpus: s.ci_cpus, memory_mb: s.ci_memory_mb, network: s.ci_network };
+        let data = &st.cfg.data_dir;
+        let _ = tokio::fs::remove_file(log_path(data, lease.job_id)).await;
+        let _ = tokio::fs::remove_file(artifact_path(data, lease.job_id)).await;
+        let (job, repo) = (lease.job_id, lease.repo_id);
+        let (sealed, by_agent): (Vec<(String, Vec<u8>)>, bool) = st
+            .db
+            .call(move |c| {
+                c.execute("DELETE FROM ci_artifacts WHERE job_id = ?1", [job])?;
+                // Earlier attempts' test results stop showing (they stay for spotting flaky tests).
+                c.execute("UPDATE ci_test_results SET current = 0 WHERE job_id = ?1", [job])?;
+                c.execute("DELETE FROM ci_job_reports WHERE job_id = ?1", [job])?;
+                // A run an agent started gets no secrets: its workflow could print them.
+                let by_agent: bool = c.query_row(
+                    "SELECT r.agent IS NOT NULL FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE j.id = ?1",
+                    [job],
+                    |r| r.get(0),
+                )?;
+                if by_agent {
+                    return Ok((vec![], true));
+                }
+                let mut q = c.prepare("SELECT name, value FROM ci_secrets WHERE repo_id = ?1 ORDER BY name")?;
+                Ok((q.query_map([repo], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?, false))
+            })
+            .await?;
+        if by_agent {
+            append_log(st, lease.job_id, b"\x1b[33mAn agent started this run, so it gets no CI secrets.\x1b[0m\n").await?;
+        }
+        let total = sealed.len();
+        lease.secrets = sealed
+            .into_iter()
+            .filter_map(|(n, v)| Some((n, String::from_utf8(crate::security::open(&st.key, &v)?).ok()?)))
+            .collect();
+        if lease.secrets.len() < total {
+            let note = format!(
+                "\x1b[33mwarning: {} of this repository's secrets can't be decrypted (was GITTER_DATA/secret.key replaced?); set them again in Settings → CI secrets\x1b[0m\n",
+                total - lease.secrets.len()
+            );
+            append_log(st, lease.job_id, note.as_bytes()).await?;
+        }
+        if lease.job.environment.is_some() || lease.job.preview.is_some() {
+            match crate::api::deploy::job_started(st, &lease, by_agent).await? {
+                Ok(theirs) => {
+                    // The environment's own secrets win over the repository's of the same name.
+                    lease.secrets.retain(|(n, _)| !theirs.iter().any(|(m, _)| m == n));
+                    lease.secrets.extend(theirs);
+                }
+                Err(why) => {
+                    append_log(st, lease.job_id, format!("\x1b[31m{why}\x1b[0m\n").as_bytes()).await?;
+                    finish(st, lease.job_id, &lease.token, false, None).await?;
+                    continue;
+                }
             }
-            let mut q = c.prepare("SELECT name, value FROM ci_secrets WHERE repo_id = ?1 ORDER BY name")?;
-            Ok((q.query_map([repo], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?, false))
-        })
-        .await?;
-    if by_agent {
-        append_log(st, lease.job_id, b"\x1b[33mAn agent started this run, so it gets no CI secrets.\x1b[0m\n").await?;
+        }
+        return Ok(Some(lease));
     }
-    let total = sealed.len();
-    lease.secrets = sealed
-        .into_iter()
-        .filter_map(|(n, v)| Some((n, String::from_utf8(crate::security::open(&st.key, &v)?).ok()?)))
-        .collect();
-    if lease.secrets.len() < total {
-        let note = format!(
-            "\x1b[33mwarning: {} of this repository's secrets can't be decrypted (was GITTER_DATA/secret.key replaced?); set them again in Settings → CI secrets\x1b[0m\n",
-            total - lease.secrets.len()
-        );
-        append_log(st, lease.job_id, note.as_bytes()).await?;
-    }
-    Ok(Some(lease))
 }
 
 /// Does `token` still hold job `job` (this attempt is the current one)?
@@ -103,6 +121,7 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
     let done = st.db.call(move |c| Ok(queue::finish(c, job, &t, success, code)?)).await?;
     st.ci_wake.notify_waiters();
     if done {
+        crate::api::deploy::job_finished(st, job, success).await;
         crate::api::notifications::ci_finished(st, job).await;
     }
     // A finished run may be the last check a pull request waited on to merge itself.
@@ -131,6 +150,7 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
 /// deleted), artifacts past ARTIFACT_DAYS, and artifact rows whose file is missing
 /// (backups don't carry CI files).
 pub async fn sweep(st: &AppState) -> R<usize> {
+    crate::api::preview::sweep(st).await;
     let data = st.cfg.data_dir.clone();
     let cutoff = now() - ARTIFACT_DAYS * 86400;
     let old: Vec<i64> = st

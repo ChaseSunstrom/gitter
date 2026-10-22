@@ -511,6 +511,21 @@ pub struct Job {
     /// pipeline's own triggers are what any of its jobs wants). Server-side only.
     #[serde(skip)]
     pub when: Option<Triggers>,
+    /// `environment:` the job deploys there: a deployment follows the job, and it gets
+    /// that environment's secrets (if its branch rule lets the job's ref in).
+    #[serde(default)]
+    pub environment: Option<Environment>,
+    /// `preview: DIR` (pull request runs): DIR is published at a preview URL after a success.
+    #[serde(default)]
+    pub preview: Option<String>,
+}
+
+/// Where a job deploys: an environment's name, and the URL to show for it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Environment {
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
 }
 
 /// `cache:` on a job: workspace folders or files under a key (see `ci::cache`).
@@ -592,8 +607,43 @@ pub fn script_pipeline() -> Pipeline {
             reports: vec![],
             coverage: vec![],
             when: None,
+            environment: None,
+            preview: None,
         }],
     }
+}
+
+/// `environment: production`, or `environment: { name: production, url: https://… }`.
+fn environment(v: Option<&Value>, job: &str) -> Result<Option<Environment>, String> {
+    let what = format!("jobs.{job}.environment");
+    let (name, url) = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => (s.clone(), String::new()),
+        Some(Value::Object(m)) => {
+            if let Some(k) = m.keys().find(|k| !matches!(k.as_str(), "name" | "url")) {
+                return Err(format!("{what}: unknown setting '{k}' (use name and url)"));
+            }
+            let text = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            (text("name"), text("url"))
+        }
+        Some(_) => return Err(format!("{what}: a name, or name and url")),
+    };
+    let url = url.trim().to_string();
+    if !(url.is_empty() || crate::validate::web_link(&url)) {
+        return Err(format!("{what}.url: a link starting with https://"));
+    }
+    Ok(Some(Environment { name: name.trim().to_string(), url }))
+}
+
+/// `preview: DIR`: a folder of the work tree, inside it.
+fn preview(v: Option<&Value>, job: &str) -> Result<Option<String>, String> {
+    let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(None) };
+    let d = v.as_str().ok_or(format!("jobs.{job}.preview: a folder, like dist"))?;
+    let d = d.trim().trim_start_matches("./").trim_end_matches('/');
+    if d.is_empty() || d.len() > 200 || d.starts_with('/') || d.split('/').any(|p| p.is_empty() || p == "." || p == "..") || d.contains(['*', '?', '[', '\\']) {
+        return Err(format!("jobs.{job}.preview: a folder inside the work tree, like dist or site/public"));
+    }
+    Ok(Some(d.to_string()))
 }
 
 fn strings(v: &Value, what: &str) -> Result<Vec<String>, String> {
@@ -768,7 +818,22 @@ pub fn parse_value(v: Value) -> Result<Pipeline, String> {
         for k in m.keys() {
             if !matches!(
                 k.as_str(),
-                "steps" | "image" | "needs" | "env" | "matrix" | "paths" | "timeout" | "artifacts" | "runs-on" | "name" | "network" | "cache" | "reports" | "coverage"
+                "steps"
+                    | "image"
+                    | "needs"
+                    | "env"
+                    | "matrix"
+                    | "paths"
+                    | "timeout"
+                    | "artifacts"
+                    | "runs-on"
+                    | "name"
+                    | "network"
+                    | "cache"
+                    | "reports"
+                    | "coverage"
+                    | "environment"
+                    | "preview"
             ) {
                 return Err(format!("jobs.{key}: unknown setting '{k}'"));
             }
@@ -796,7 +861,19 @@ pub fn parse_value(v: Value) -> Result<Pipeline, String> {
         let reports = strings(m.get("reports").unwrap_or(&Value::Null), &format!("jobs.{key}.reports"))?;
         let coverage = strings(m.get("coverage").unwrap_or(&Value::Null), &format!("jobs.{key}.coverage"))?;
         let title = m.get("name").and_then(Value::as_str).unwrap_or(key).to_string();
+        let environment = environment(m.get("environment"), key)?;
+        let preview = preview(m.get("preview"), key)?;
+        let mut artifacts = strings(m.get("artifacts").unwrap_or(&Value::Null), &format!("jobs.{key}.artifacts"))?;
+        if let Some(p) = &preview {
+            artifacts.push(format!("{p}/**"));
+        }
         for combo in &matrix {
+            let environment = environment.as_ref().map(|e| Environment { name: interpolate(&e.name, combo), url: interpolate(&e.url, combo) });
+            if let Some(e) = &environment
+                && !crate::api::deploy::env_name(&e.name)
+            {
+                return Err(format!("jobs.{key}.environment: '{}' isn't an environment name (letters, numbers, '.', '-', '_', '/')", e.name));
+            }
             let image = image.as_deref().map(|i| interpolate(i, combo));
             if let Some(i) = &image
                 && (i.starts_with('-') || i.is_empty() || !i.chars().all(|c| c.is_ascii_alphanumeric() || "._-/:@".contains(c)))
@@ -818,13 +895,15 @@ pub fn parse_value(v: Value) -> Result<Pipeline, String> {
                 paths: strings(m.get("paths").unwrap_or(&Value::Null), &format!("jobs.{key}.paths"))?,
                 timeout_secs: duration(m.get("timeout").unwrap_or(&Value::Null)).map_err(|e| format!("jobs.{key}.{e}"))?,
                 steps: steps.iter().map(|s| Step { name: interpolate(&s.name, combo), run: interpolate(&s.run, combo) }).collect(),
-                artifacts: strings(m.get("artifacts").unwrap_or(&Value::Null), &format!("jobs.{key}.artifacts"))?,
+                artifacts: artifacts.clone(),
                 runs_on: strings(m.get("runs-on").unwrap_or(&Value::Null), &format!("jobs.{key}.runs-on"))?,
                 network,
                 cache: cache.as_ref().map(|c| Cache { key: interpolate(&c.key, combo), restore_keys: c.restore_keys.iter().map(|r| interpolate(r, combo)).collect(), ..c.clone() }),
                 reports: reports.clone(),
                 coverage: coverage.clone(),
                 when: None,
+                environment,
+                preview: preview.clone(),
             });
             if out.len() > MAX_JOBS {
                 return Err(format!("a pipeline can have at most {MAX_JOBS} jobs (after matrix expansion)"));
@@ -1096,6 +1175,13 @@ jobs:
         assert!(parse("jobs:\n  a:\n    needs: [b]\n    steps: [x]\n  b:\n    needs: [a]\n    steps: [y]\n").unwrap_err().contains("loop"));
         assert!(parse("jobs:\n  a:\n    needs: [nope]\n    steps: [x]\n").unwrap_err().contains("no other job"));
         assert!(parse("jobs:\n  a:\n    stepz: [x]\n").unwrap_err().contains("unknown setting"));
+        // Where a job deploys, and the folder it previews (which its artifacts then include).
+        let p = parse("jobs:\n  a:\n    environment: { name: prod-${{ matrix.r }}, url: https://x.example }\n    matrix: { r: [eu] }\n    preview: ./site/public/\n    steps: [x]\n").unwrap();
+        assert_eq!(p.jobs[0].environment, Some(Environment { name: "prod-eu".into(), url: "https://x.example".into() }));
+        assert_eq!((p.jobs[0].preview.as_deref(), p.jobs[0].artifacts.as_slice()), (Some("site/public"), &["site/public/**".to_string()][..]));
+        for bad in ["environment: ../up", "environment: { name: x, region: y }", "environment: { name: x, url: 'javascript:alert(1)' }", "preview: ../out", "preview: /etc", "preview: 'dist/*'"] {
+            assert!(parse(&format!("jobs:\n  a:\n    {bad}\n    steps: [x]\n")).is_err(), "{bad}");
+        }
         assert!(parse("on: deploy\njobs:\n  a:\n    steps: [x]\n").is_err());
         assert!(parse("jobs:\n  a:\n    image: --privileged\n    steps: [x]\n").unwrap_err().contains("image name"));
         assert!(parse("jobs:\n  a:\n    timeout: 99999999999999999999h\n    steps: [x]\n").is_err());
