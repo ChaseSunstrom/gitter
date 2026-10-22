@@ -228,6 +228,7 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));
     tokio::spawn(gitter::webhooks::run(st.clone()));
     tokio::spawn(gitter::mirrors::run(st.clone()));
+    tokio::spawn(gitter::imports::run(st.clone()));
     tokio::spawn(gitter::api::insights::flush_loop(st.clone()));
     let (traffic, db) = (st.traffic.clone(), st.db.clone());
     let st2 = st.clone();
@@ -237,6 +238,7 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         loop {
             gitter::lfs::sweep(&st2).await;
             gitter::api::releases::sweep(&st2).await;
+            gitter::imports::sweep(&st2).await;
             gitter::registry::sweep(&st2).await;
             if let Err(e) = gitter::api::notifications::sweep(&st2).await {
                 eprintln!("notifications sweep: {}", e.msg);

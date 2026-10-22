@@ -109,7 +109,7 @@ fn auth_header(remote: &Remote) -> Option<String> {
 
 /// git's complaint as kept and shown: the credentials blanked out (git
 /// shouldn't print them, but a remote could echo them back), the end of it only.
-fn clean(err: &str, remote: &Remote) -> String {
+pub fn clean(err: &str, remote: &Remote) -> String {
     let mut e = err.replace('\r', "\n");
     for s in [remote.password.clone(), basic(remote)] {
         if !s.is_empty() {
@@ -259,7 +259,7 @@ async fn sync(st: &AppState, j: Job) {
         None => Err("The password can't be decrypted (was GITTER_DATA/secret.key replaced?). Set it again in this mirror's settings.".to_string()),
         Some(password) => {
             let remote = Remote { url: j.url.clone(), username: j.username.clone(), password, allow_private: j.allow_private };
-            let r = if j.pull { pull(st, j.repo_id, &remote).await } else { push(st, j.repo_id, &remote).await };
+            let r = if j.pull { pull(st, j.repo_id, &remote, &[]).await } else { push(st, j.repo_id, &remote).await };
             r.map_err(|e| clean(&e, &remote))
         }
     };
@@ -275,8 +275,9 @@ async fn load_repo(st: &AppState, id: i64) -> Result<Repo, String> {
     Ok(Repo::with_access(st, repo.ok_or("The repository is gone")?, None))
 }
 
-/// Fetch the remote's branches and tags over ours (those gone there go here too).
-async fn pull(st: &AppState, repo_id: i64, remote: &Remote) -> Result<(), String> {
+/// Fetch the remote's branches and tags over ours (those gone there go here too),
+/// and the `extra` refspecs (an import's pull request heads).
+pub async fn pull(st: &AppState, repo_id: i64, remote: &Remote, extra: &[&str]) -> Result<(), String> {
     let repo = load_repo(st, repo_id).await?;
     // git has no fetch-size limit to pass, so exec watches what the fetch writes.
     let left = crate::repo::storage_left(st, repo.owner_id).await.map_err(|e| e.msg)?;
@@ -287,6 +288,7 @@ async fn pull(st: &AppState, repo_id: i64, remote: &Remote) -> Result<(), String
     let mut cmd = git(st, &repo.path, remote).await?;
     // Objects from elsewhere are checked like pushed ones.
     cmd.args(["-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--prune", "--force", "--no-write-fetch-head", "--no-auto-gc", &remote.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+    cmd.args(extra);
     exec(st, cmd, left.map(|l| (repo.path.as_path(), l))).await?;
     let after = crate::smart_http::ref_map(st, &repo).await.map_err(|e| e.msg)?;
     if after == before {

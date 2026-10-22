@@ -51,6 +51,7 @@ none: no behaviour beyond the two lanes, which have their own docs notes
 - 2026-10-22T20:12:15Z re-based: what other work changed while it was paused isn't its own change
 - 2026-10-22T20:12:15Z focused
 - 2026-10-22T20:19:34Z done
+- 2026-10-22T20:19:34Z committed 438268c (6 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

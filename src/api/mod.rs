@@ -54,6 +54,9 @@ pub fn router() -> Router<AppState> {
         .route("/auth/providers", get(oauth::public_list))
         .route("/auth/oauth/callback", get(oauth::callback))
         .route("/auth/oauth/{slug}/start", post(oauth::start))
+        .route("/imports", get(crate::imports::mine).post(crate::imports::start))
+        .route("/imports/preview", post(crate::imports::preview))
+        .route("/imports/{id}/cancel", post(crate::imports::cancel))
         .route("/me/identities", get(oauth::identities))
         .route("/me/identities/{id}", delete(oauth::unlink))
         .route("/admin/oauth-providers", get(oauth::list).post(oauth::create))
@@ -365,7 +368,7 @@ async fn in_its_repo(st: &AppState, l: &crate::auth::Limits, parts: &Parts) -> b
 }
 
 /// Account-level routes no limited token may touch, even to read.
-const ACCOUNT_ROUTES: &[&str] = &["/admin", "/me/tokens", "/me/security", "/me/audit", "/me/2fa", "/me/sessions", "/me/password", "/me/identities", "/me/export", "/me/trash", "/me/transfers", "/auth"];
+const ACCOUNT_ROUTES: &[&str] = &["/admin", "/me/tokens", "/me/security", "/me/audit", "/me/2fa", "/me/sessions", "/me/password", "/me/identities", "/imports", "/me/export", "/me/trash", "/me/transfers", "/auth"];
 
 fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -> bool {
     if ACCOUNT_ROUTES.iter().any(|p| path == *p || path.starts_with(&format!("{p}/"))) {

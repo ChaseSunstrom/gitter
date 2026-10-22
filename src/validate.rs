@@ -13,6 +13,7 @@ const RESERVED: &[&str] = &[
     "favicon.ico",
     "favicon.svg",
     "help",
+    "import",
     "login",
     "logout",
     "mcp",

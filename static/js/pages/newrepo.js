@@ -25,7 +25,8 @@ export default async function (ctx) {
     title: 'New repository',
     html: html`<div class="wrap narrow new-repo">
       <h1>Create a new repository</h1>
-      <p class="muted">A repository holds your project's files and their full history.</p>
+      <p class="muted">A repository holds your project's files and their full history.
+        Moving from GitHub or GitLab? <a class="c-accent" href="/import">Import repositories with their issues and pull requests</a>.</p>
       <form id="new-repo" class="stack" novalidate>
         <div class="owner-name">
           ${orgs.length ? html`<div class="field"><label for="repo-owner">Owner</label><select class="select" id="repo-owner">

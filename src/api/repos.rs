@@ -46,11 +46,24 @@ async fn insert_repo(
     private: bool,
     forked_from: Option<i64>,
 ) -> R<i64> {
+    insert_repo_limited(st, owner, name, description, private, forked_from, true).await
+}
+
+async fn insert_repo_limited(
+    st: &AppState,
+    owner: &User,
+    name: &str,
+    description: &str,
+    private: bool,
+    forked_from: Option<i64>,
+    limited: bool,
+) -> R<i64> {
     let max = st.settings.get().max_repos_per_user;
     // An organization's repositories count toward its creator's limits.
     let oid = owner.id;
     let (payer, admin) = st.db.call(move |c| Ok(crate::repo::payer(c, oid)?)).await?;
     if !admin
+        && limited
         && let Err(wait) = st.limiter.check(&format!("create:{payer}"), 30, 3600)
     {
         return Err(AppError::slow_down("You've created a lot of repositories in the last hour. Try again later.", wait));
@@ -89,23 +102,10 @@ async fn drop_row(st: &AppState, id: i64) {
         .await;
 }
 
-pub async fn create(
-    State(st): State<AppState>,
-    Authed(u): Authed,
-    Json(req): Json<CreateReq>,
-) -> J<serde_json::Value> {
-    let name = req.name.trim().to_string();
-    if !validate::repo_name(&name) {
-        return Err(AppError::bad(
-            "Repository names use letters, numbers, '-', '_' or '.', and can't end in .git",
-        ));
-    }
-    let description = req.description.trim().to_string();
-    if description.chars().count() > 350 {
-        return Err(AppError::bad("Keep the description under 350 characters"));
-    }
+/// Who a new repository belongs to: `u`, or the organization `owner` when `u` may create in it.
+pub async fn owner_for(st: &AppState, u: &User, owner: Option<&str>) -> R<User> {
     // In an organization, the org owns it: its quota, its name.
-    let owner = match req.owner.as_deref().filter(|o| !o.eq_ignore_ascii_case(&u.username)) {
+    Ok(match owner.filter(|o| !o.eq_ignore_ascii_case(&u.username)) {
         None => u.clone(),
         Some(org) => {
             let o = org.to_string();
@@ -126,7 +126,37 @@ pub async fn create(
             }
             org
         }
-    };
+    })
+}
+
+/// An empty repository for an import: no README, no create-rate limit (the import has its own limits).
+pub async fn create_empty(st: &AppState, u: &User, owner: &User, name: &str, description: &str, private: bool) -> R<i64> {
+    let id = insert_repo_limited(st, owner, name, description, private, None, false).await?;
+    if let Err(e) = init_repo(st, u, id, name, description, false).await {
+        drop_row(st, id).await;
+        let _ = tokio::fs::remove_dir_all(st.git.repo_path(id)).await;
+        return Err(e);
+    }
+    record_event(&st.db, u.id, Some(id), "create", name, "", 1).await?;
+    Ok(id)
+}
+
+pub async fn create(
+    State(st): State<AppState>,
+    Authed(u): Authed,
+    Json(req): Json<CreateReq>,
+) -> J<serde_json::Value> {
+    let name = req.name.trim().to_string();
+    if !validate::repo_name(&name) {
+        return Err(AppError::bad(
+            "Repository names use letters, numbers, '-', '_' or '.', and can't end in .git",
+        ));
+    }
+    let description = req.description.trim().to_string();
+    if description.chars().count() > 350 {
+        return Err(AppError::bad("Keep the description under 350 characters"));
+    }
+    let owner = owner_for(&st, &u, req.owner.as_deref()).await?;
     let id = insert_repo(&st, &owner, &name, &description, req.private, None).await?;
     let path = st.git.repo_path(id);
     if let Err(e) = init_repo(&st, &u, id, &name, &description, req.readme).await {

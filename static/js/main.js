@@ -5,7 +5,7 @@ import { initPalette, openPalette } from './palette.js';
 
 // ---------- routes ----------
 const ROUTES = [
-  ['/', 'home'], ['/login', 'auth', { mode: 'login' }], ['/signup', 'auth', { mode: 'signup' }], ['/new', 'newrepo'],
+  ['/', 'home'], ['/login', 'auth', { mode: 'login' }], ['/signup', 'auth', { mode: 'signup' }], ['/new', 'newrepo'], ['/import', 'import'],
   ['/explore', 'explore'], ['/settings', 'settings'], ['/settings/:tab', 'settings'],
   ['/admin', 'admin'], ['/admin/:tab', 'admin'],
   ['/snippets', 'snippets', { view: 'list' }], ['/snippets/mine', 'snippets', { view: 'mine' }], ['/snippets/new', 'snippets', { view: 'edit' }],

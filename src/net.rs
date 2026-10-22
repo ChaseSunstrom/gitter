@@ -20,8 +20,16 @@ pub const USER_AGENT: &str = concat!("Gitter/", env!("CARGO_PKG_VERSION"));
 
 pub struct Reply {
     pub status: u16,
-    /// At most MAX_REPLY bytes.
+    /// At most MAX_REPLY bytes (or the cap the caller asked for).
     pub body: Vec<u8>,
+    /// Response headers, names in lowercase.
+    pub headers: Vec<(String, String)>,
+}
+
+impl Reply {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
 }
 
 /// Percent-encode everything but the unreserved characters (RFC 3986).
@@ -154,10 +162,11 @@ pub fn fetch(url: &str, headers: &[(&str, String)], body: Option<&[u8]>, allow_p
         None => headers.iter().fold(agent.get(url), |r, (k, v)| r.header(*k, v)).call(),
     };
     let mut resp = sent.map_err(describe)?;
+    let headers = resp.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_ascii_lowercase(), v.to_str().ok()?.to_string()))).collect();
     let mut out = Vec::new();
     // A reply cut short (a stall past the time limit) still counts by its status.
     let _ = resp.body_mut().as_reader().take(cap).read_to_end(&mut out);
-    Ok(Reply { status: resp.status().as_u16(), body: out })
+    Ok(Reply { status: resp.status().as_u16(), body: out, headers })
 }
 
 fn describe(e: ureq::Error) -> String {

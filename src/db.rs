@@ -959,6 +959,53 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX identities_user ON identities(user_id);
     "#,
+    // v30: bulk imports from GitHub and GitLab. A job's token is sealed and set to NULL
+    // when the job ends. Each item is one repository working through its stages; import_map
+    // ties what was imported to the remote's ids, so doing a page twice adds nothing twice.
+    r#"
+    CREATE TABLE import_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        token TEXT,
+        allow_private INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'running',
+        error TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX import_jobs_user ON import_jobs(user_id, state);
+    CREATE UNIQUE INDEX import_jobs_one_running ON import_jobs(user_id) WHERE state = 'running';
+    CREATE TABLE import_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE CASCADE,
+        source TEXT NOT NULL,
+        remote_id TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL,
+        private INTEGER NOT NULL DEFAULT 0,
+        description TEXT NOT NULL DEFAULT '',
+        repo_id INTEGER REFERENCES repos(id) ON DELETE SET NULL,
+        stage TEXT NOT NULL DEFAULT 'create',
+        cursor TEXT NOT NULL DEFAULT '',
+        number_offset INTEGER NOT NULL DEFAULT -1,
+        pages INTEGER NOT NULL DEFAULT 0,
+        tries INTEGER NOT NULL DEFAULT 0,
+        skipped INTEGER NOT NULL DEFAULT 0,
+        error TEXT NOT NULL DEFAULT '',
+        next_at INTEGER NOT NULL DEFAULT 0,
+        running_until INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX import_items_due ON import_items(stage, next_at);
+    CREATE TABLE import_map (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        remote_id TEXT NOT NULL,
+        local_id INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, kind, remote_id)
+    );
+    "#,
 ];
 
 impl Db {

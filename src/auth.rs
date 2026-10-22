@@ -396,6 +396,7 @@ pub async fn user_by_basic(st: &AppState, headers: &HeaderMap, ip: &str) -> R<Op
             || name.eq_ignore_ascii_case(&u.username)
             || name == "x-access-token"
             || name == "token"
+            || name == "oauth2"
         {
             return Ok(Some(u));
         }

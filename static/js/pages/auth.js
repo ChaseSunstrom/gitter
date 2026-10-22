@@ -4,7 +4,7 @@ import { logo } from '../icons.js';
 import { navigate, renderTopbar } from '../main.js';
 
 // Keep in sync with RESERVED in src/validate.rs (the server has the final say).
-const RESERVED = ['about', 'admin', 'api', 'archive', 'assets', 'ci', 'dashboard', 'explore', 'favicon.ico', 'favicon.svg', 'help', 'login', 'logout', 'new', 'notifications', 'org', 'orgs', 'raw', 'robots.txt', 'runners', 'search', 'settings', 'signup', 'static', 'user', 'users'];
+const RESERVED = ['about', 'admin', 'api', 'archive', 'assets', 'ci', 'dashboard', 'explore', 'favicon.ico', 'favicon.svg', 'help', 'import', 'login', 'logout', 'new', 'notifications', 'org', 'orgs', 'raw', 'robots.txt', 'runners', 'search', 'settings', 'signup', 'static', 'user', 'users'];
 
 export function usernameError(u) {
   if (!u) return 'Pick a username';

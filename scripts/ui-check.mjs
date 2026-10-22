@@ -1083,5 +1083,52 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Import: a mock GitHub API lists a repository; importing it shows its progress (the mock has no
+// git behind it, so the copy fails and says why), and New repository links here.
+{
+  const http = await import('node:http');
+  const api = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const reply = (code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (u.pathname === '/api/v3/user') return reply(200, { login: 'octo' });
+    if (u.pathname === '/api/v3/user/repos') return reply(200, [{ full_name: 'octo/imported-demo', name: 'imported-demo', private: false, description: 'From the mock' }]);
+    reply(404, { message: 'Not Found' });
+  });
+  await new Promise((r) => api.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${api.address().port}`;
+  const page = await ctx.newPage();
+  const errors = [], steps = [];
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('pageerror', (e) => errors.push(String(e)));
+  try {
+    await page.goto(BASE + '/new', { waitUntil: 'networkidle' });
+    await Promise.all([page.waitForURL(BASE + '/import'), page.click('a[href="/import"]')]);
+    await page.waitForSelector('#imp-form');
+    await page.fill('#imp-base', base);
+    await page.fill('#imp-token', 'e2e-import-token');
+    await page.fill('#imp-source', 'octo');
+    await page.check('#imp-form input[name=allow_private]');
+    await page.click('#imp-list');
+    await page.locator('#imp-repos', { hasText: 'octo/imported-demo' }).waitFor({ timeout: 5000 });
+    steps.push('listed the source');
+    await page.click('#imp-go');
+    await page.locator('.import-job', { hasText: 'imported-demo' }).waitFor({ timeout: 5000 });
+    steps.push('started');
+    // The worker makes the repository, then the copy from the mock fails and waits to try again.
+    await page.locator('.import-job .list-row', { hasText: 'Trying again' }).waitFor({ timeout: 20000 });
+    const job = await page.locator('.import-job').first().innerText();
+    if (!job.includes('alice/imported-demo')) throw new Error(`no repository link: ${job}`);
+    if (job.includes('e2e-import-token')) throw new Error('the token is on the page');
+    steps.push('showed the copy waiting to try again');
+    await page.click('.import-job [data-cancel]');
+    await page.locator('.import-job .box-head .pill', { hasText: 'Cancelled' }).first().waitFor({ timeout: 5000 });
+    steps.push('cancelled');
+  } catch (e) { errors.push(String(e)); }
+  api.close();
+  if (errors.length || steps.length < 4) { failed++; console.log('✗ import page', { steps, errors }); }
+  else console.log(`  ok import page ${steps.join(', ')}`);
+  await page.close();
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod langs;
 pub mod lfs;
 pub mod mergequeue;
+pub mod imports;
 pub mod mirrors;
 pub mod net;
 pub mod protect;
