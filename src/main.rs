@@ -237,6 +237,9 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         loop {
             gitter::lfs::sweep(&st2).await;
             gitter::registry::sweep(&st2).await;
+            if let Err(e) = gitter::api::notifications::sweep(&st2).await {
+                eprintln!("notifications sweep: {}", e.msg);
+            }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     });

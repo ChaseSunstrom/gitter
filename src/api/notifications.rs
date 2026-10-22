@@ -81,9 +81,13 @@ fn reader_sql(u: &str) -> String {
 /// The usernames @mentioned in markdown `text`, outside code blocks and code
 /// spans, each once (case-insensitively), at most MAX_MENTIONS.
 pub fn mentions(text: &str) -> Vec<String> {
-    // Drop fenced and indented code blocks, keep the rest.
+    // Drop fenced and indented code blocks, keep the rest. An indented line is code
+    // only where a code block can start or go on: not right after paragraph text
+    // (it continues the paragraph), and not in a list (it's the item's content).
+    // ponytail: no list-item content offsets, so code indented inside a list item counts as prose.
     let mut prose = String::new();
     let mut fence: Option<(char, usize)> = None;
+    let (mut para, mut code, mut list, mut blank) = (false, false, false, true);
     for line in text.lines() {
         let t = line.trim_start();
         let c = t.chars().next().unwrap_or(' ');
@@ -94,13 +98,36 @@ pub fn mentions(text: &str) -> Vec<String> {
             }
             continue;
         }
+        if t.is_empty() {
+            (para, blank) = (false, true);
+            continue;
+        }
+        let was_blank = std::mem::replace(&mut blank, false);
         if (c == '`' || c == '~') && run >= 3 {
             fence = Some((c, run));
+            (para, code) = (false, false);
             continue;
         }
         if line.starts_with("    ") || line.starts_with('\t') {
-            continue;
+            code = code || (!para && !list);
+            if code {
+                continue;
+            }
+        } else {
+            // A list item starts with "-", "*", "+", "1." or "1)" and a space (or nothing).
+            let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+            let marker = if matches!(c, '-' | '*' | '+') {
+                1
+            } else if (1..10).contains(&digits) && matches!(t.as_bytes().get(digits), Some(b'.' | b')')) {
+                digits + 1
+            } else {
+                0
+            };
+            let item = marker > 0 && matches!(t.as_bytes().get(marker), None | Some(b' ' | b'\t'));
+            code = false;
+            list = item || (list && !was_blank);
         }
+        para = true;
         prose.push_str(line);
         prose.push('\n');
     }
@@ -305,18 +332,29 @@ pub async fn tell(st: &AppState, repo_id: i64, thread: Thread, actor: Option<i64
 
 /// A submitted review: its summary and its line comments may mention people.
 pub async fn review(st: &AppState, repo_id: i64, issue_id: i64, review_id: i64, actor: i64, body: &str) {
-    let found = st
+    let summary = body.to_string();
+    let text = st
         .db
-        .call(move |c| Ok(review_text(c, review_id)?))
+        .call(move |c| Ok(review_mentions(c, issue_id, review_id, &summary)?))
         .await
-        .unwrap_or_default();
-    notify(st, repo_id, Thread::Issue(issue_id), actor, &format!("{body}\n\n{found}")).await;
+        .unwrap_or_else(|_| body.to_string());
+    notify(st, repo_id, Thread::Issue(issue_id), actor, &text).await;
 }
 
-fn review_text(c: &rusqlite::Connection, review_id: i64) -> rusqlite::Result<String> {
-    let mut q = c.prepare("SELECT body FROM review_comments WHERE review_id = ?1 ORDER BY id LIMIT 200")?;
-    let bodies: Vec<String> = q.query_map([review_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
-    Ok(bodies.join("\n\n"))
+/// The people a review's summary and line comments mention (up to MAX_MENTIONS), as
+/// "@a @b". Each comment is read on its own, so one's unclosed fence can't hide the next's.
+fn review_mentions(c: &rusqlite::Connection, issue_id: i64, review_id: i64, summary: &str) -> rusqlite::Result<String> {
+    let mut names = mentions(summary);
+    let mut seen: HashSet<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    let mut q = c.prepare("SELECT body FROM review_comments WHERE issue_id = ?1 AND review_id = ?2 AND instr(body, '@') > 0 ORDER BY id")?;
+    let mut rows = q.query([issue_id, review_id])?;
+    while names.len() < MAX_MENTIONS
+        && let Some(r) = rows.next()?
+    {
+        names.extend(mentions(&r.get::<_, String>(0)?).into_iter().filter(|n| seen.insert(n.to_ascii_lowercase())));
+    }
+    names.truncate(MAX_MENTIONS);
+    Ok(names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(" "))
 }
 
 /// A CI job finished: if that made its run fail, tell whoever started the run.
@@ -336,6 +374,30 @@ pub async fn ci_finished(st: &AppState, job: i64) {
     if let Some((run, repo, Some(actor))) = run {
         tell(st, repo, Thread::Run(run), None, vec![actor], "ci").await;
     }
+}
+
+/// Forget done notifications 90 days after their thread's last news and read ones
+/// after 180 (news makes a new one). Hourly; 10,000 ids at a time, so requests get
+/// the connection in between. Returns how many went.
+pub async fn sweep(st: &AppState) -> R<usize> {
+    let (low, high): (i64, i64) = st
+        .db
+        .call(|c| Ok(c.query_row("SELECT coalesce(min(id), 1) - 1, coalesce(max(id), 0) FROM notifications", [], |r| Ok((r.get(0)?, r.get(1)?)))?))
+        .await?;
+    let (t, mut total) = (now(), 0);
+    for from in (low..high).step_by(10_000) {
+        total += st
+            .db
+            .call(move |c| {
+                Ok(c.execute(
+                    "DELETE FROM notifications WHERE id > ?1 AND id <= ?1 + 10000
+                     AND unread = 0 AND updated_at < ?2 - (CASE WHEN done = 1 THEN 90 ELSE 180 END) * 86400",
+                    [from, t],
+                )?)
+            })
+            .await?;
+    }
+    Ok(total)
 }
 
 // ------------------------------------------------------------------ the inbox
@@ -415,8 +477,11 @@ pub async fn list(State(st): State<AppState>, Authed(u): Authed, Query(q): Query
                         "kind": kind, "number": number, "title": title, "state": state, "url": url }))
                 })?
                 .collect::<Result<_, _>>()?;
+            // The repository facet counts the newest 1000 open ones (as the badge does), so a
+            // huge inbox doesn't visibility-check every row on each load.
             let mut s = c.prepare(&format!(
-                "SELECT ru.username || '/' || r.name, count(*), sum(n.unread) {FROM} WHERE n.user_id = ?1 AND n.done = 0 AND {readable}
+                "SELECT ru.username || '/' || r.name, count(*), sum(n.unread) {FROM}
+                 WHERE n.id IN (SELECT id FROM notifications WHERE user_id = ?1 AND done = 0 ORDER BY updated_at DESC LIMIT 1000) AND {readable}
                  GROUP BY r.id ORDER BY 1 LIMIT 100"
             ))?;
             let repos: Vec<Value> = s
@@ -633,6 +698,12 @@ mod tests {
         assert_eq!(m("`@a` ``x ` @b `` @c"), ["c"]);
         assert_eq!(m("```\n@a\n```\n~~~~\n@b\n~~~\n@c\n~~~~\n@d"), ["d"]);
         assert_eq!(m("text\n\n    @indented\n\t@tab\n@e"), ["e"]);
+        assert_eq!(m("    @first\n\n    @blank-inside"), Vec::<String>::new(), "code from the start, past a blank line");
+        assert_eq!(m("text\n    @lazy"), ["lazy"], "an indented line can't interrupt a paragraph");
+        assert_eq!(m("- a\n    - cc @bob\n1. b\n\n    @carol\n\t@tab"), ["bob", "carol", "tab"], "list items' nested lists and paragraphs");
+        assert_eq!(m("- a\n\nout of the list\n\n    @code"), Vec::<String>::new(), "a paragraph after a blank line ends the list");
+        assert_eq!(m("```\nx\n```\n    @after-fence"), Vec::<String>::new());
+        assert_eq!(m("1 apple\n\n    @code\n2) b\n    @item"), ["item"], "a number alone isn't a list item");
         assert_eq!(m("@org/team @admin @x..y @-no"), Vec::<String>::new(), "teams, reserved and invalid names");
         assert_eq!(m("unclosed ` @f"), ["f"]);
         assert_eq!(m("é@g @h"), ["h"]);
