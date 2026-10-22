@@ -6,7 +6,7 @@ import { renderMarkdown, preloadLangs } from '../md.js';
 import { mdEditor, mountMdEditor, clearDraft } from '../mdeditor.js';
 import { diffView, mountDiff } from '../diffview.js';
 import { diffReview, reviewBar, mountReview, reviewItems, reviewersBlock } from '../review.js';
-import { refresh } from '../main.js';
+import { refresh, navigate } from '../main.js';
 import { labelChip } from './issues.js';
 
 const STATE_TEXT = { open: 'Open', closed: 'Closed', merged: 'Merged' };
@@ -48,7 +48,7 @@ export default async function (ctx) {
   const prBase = `${base}/pull/${n}`;
   let content;
   if (tab === 'commits') content = commitsTab(base, pd);
-  else if (tab === 'files') content = html`<div class="pr-files">${reviewBar(rv)}${diffView(pd.diff, { owner, repo, sha: pd.head_sha, key: `${owner}/${repo}#${n}:${pd.head_sha}` })}</div>`;
+  else if (tab === 'files') content = html`<div class="pr-files">${reviewBar(rv)}${diffView(pd.diff, { owner, repo, sha: pd.head_sha, base: pd.merge_base || pd.base_sha, key: `${owner}/${repo}#${n}:${pd.head_sha}` })}</div>`;
   else content = conversation(meta, data, pd, mdCtx, rv);
 
   const body = html`<div class="issue-page">
@@ -162,6 +162,7 @@ function mergeBox(meta, data, pd) {
     return html`<div class="merge-box merged-box">
       <span class="merge-icon">${icon('merged')}</span>
       <div class="grow"><b>Pull request merged</b><div class="muted small">${pull.merged_by ? html`${pull.merged_by} merged ` : 'Merged '}${pull.merged_sha ? html`commit <a class="sha" href="${base}/commit/${pull.merged_sha}">${short(pull.merged_sha)}</a> ` : ''}into ${pull.base}${pull.merged_at ? html` ${timeEl(pull.merged_at)}` : ''}.</div></div>
+      ${meta.can_write ? html`<button class="btn sm" id="revert-pr" title="Open a pull request that undoes this one">${icon('history', 'sm')} Revert</button>` : ''}
       ${pull.head_exists && meta.can_write && pull.head !== meta.default_branch ? html`<button class="btn sm" id="delete-head">${icon('trash', 'sm')} Delete branch</button>` : ''}
     </div>`;
   }
@@ -367,6 +368,12 @@ function mountConversation(el, meta, api, data, mdCtx) {
       document.querySelector('.merged-box')?.classList.add('celebrate');
     }));
   }
+  const rv = $('#revert-pr', el);
+  rv?.addEventListener('click', action(rv, async () => {
+    const r = await send('POST', `${api}/revert`, { pull: issue.number });
+    toast(`Opened pull request #${r.number} on ${r.branch}`);
+    navigate(`/${meta.owner}/${meta.name}/pull/${r.number}`);
+  }));
   const del = $('#delete-head', el);
   del?.addEventListener('click', action(del, async () => {
     await send('DELETE', `${api}/branches?name=${encodeURIComponent(data.pull.head)}`);

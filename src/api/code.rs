@@ -263,6 +263,27 @@ fn is_image(path: &str) -> Option<&'static str> {
     })
 }
 
+/// Types the browser shows without running anything: images, audio, video, PDF.
+fn viewable(path: &str) -> Option<&'static str> {
+    is_image(path).or_else(|| {
+        let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "pdf" => "application/pdf",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "ogg" | "oga" | "opus" => "audio/ogg",
+            "flac" => "audio/flac",
+            "m4a" => "audio/mp4",
+            "aac" => "audio/aac",
+            "mp4" | "m4v" => "video/mp4",
+            "webm" => "video/webm",
+            "ogv" => "video/ogg",
+            "mov" => "video/quicktime",
+            _ => return None,
+        })
+    })
+}
+
 pub async fn blob(
     State(st): State<AppState>,
     Viewer(v): Viewer,
@@ -347,7 +368,7 @@ pub async fn raw(
         return Err(AppError::not_found());
     }
     let data = st.git.blob(&r.path, &oid).await?;
-    let ctype = match is_image(&path) {
+    let ctype = match viewable(&path) {
         Some(t) => t,
         None if data.iter().take(8000).any(|b| *b == 0) => "application/octet-stream",
         None => "text/plain; charset=utf-8",
@@ -367,10 +388,22 @@ pub async fn raw(
     let pending = pointer.is_some() && lfs.is_none();
     let (body, ctype, len) = match lfs {
         // ponytail: no text sniffing for LFS files; text ones download instead of showing.
-        Some((len, body)) => (body, is_image(&path).unwrap_or("application/octet-stream"), Some(len)),
+        Some((len, body)) => (body, viewable(&path).unwrap_or("application/octet-stream"), Some(len)),
         None => (Body::from(data), ctype, None),
     };
-    Ok(inert(body, ctype, len, immutable, r.private || r.hidden || pending))
+    let mut resp = inert(body, ctype, len, immutable, r.private || r.hidden || pending);
+    if ctype == "application/pdf" {
+        // Browsers refuse to show a PDF under a sandbox (Chrome blocks its viewer in sandboxed
+        // frames), so PDFs go without one: the viewer runs a PDF's scripts apart from this
+        // origin. Still no scripts, styles or plugins of its own, and only our pages may frame it.
+        let h = resp.headers_mut();
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; frame-ancestors 'self'"),
+        );
+        h.insert("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
+    }
+    Ok(resp)
 }
 
 /// User file bytes served so they can never run script on this origin. `no_store`

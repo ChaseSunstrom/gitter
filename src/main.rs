@@ -51,6 +51,8 @@ usage:
                                restore a backup into GITTER_DATA (- for stdin; --force moves existing data aside)
   gitter doctor [--fsck]       check git, storage, database and repositories
   gitter bench [--check]       time the main pages on a seeded throwaway instance (--check enforces budgets)
+  gitter demo                  seed an empty GITTER_DATA with sample people, repositories, issues, pull requests,
+                               CI runs and a wiki, then start the server
   gitter runner --url URL --token TOKEN [--labels a,b] [--jobs N] [--work DIR]
                                run CI jobs for a Gitter server on this machine (token from Site administration → Runners;
                                or set GITTER_RUNNER_TOKEN)
@@ -127,6 +129,10 @@ fn main() -> anyhow::Result<()> {
         }
         "bench" => tokio::runtime::Runtime::new()?
             .block_on(gitter::bench::run(args.iter().any(|a| a == "--check"))),
+        "demo" => {
+            tokio::runtime::Runtime::new()?.block_on(gitter::demo::run(&cfg))?;
+            serve(cfg)
+        }
         "--version" | "-V" | "version" => {
             println!("gitter {}", env!("CARGO_PKG_VERSION"));
             Ok(())

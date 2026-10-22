@@ -143,8 +143,33 @@ function fileNote(f, i, canLoad) {
   return null;
 }
 
+const IMAGE = /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i;
+
+/** Raw URLs of a changed image's two sides ('' for a side it doesn't have), or null if it isn't an image diff. */
+function imageSides(f, opts) {
+  const path = f.status === 'deleted' ? f.old_path : f.new_path;
+  if (!f.binary || !IMAGE.test(path) || !opts.owner || !opts.sha) return null;
+  const at = (rev, p) => `/raw/${opts.owner}/${opts.repo}/${rev}/${encPath(p)}`;
+  return {
+    old: f.status !== 'added' && opts.base ? at(opts.base, f.old_path || path) : '',
+    new: f.status !== 'deleted' ? at(opts.sha, f.new_path) : '',
+  };
+}
+
+/** A changed image side by side, as a swipe, or as onion skin (the last two need both sides). */
+function imageDiff(oldUrl, newUrl) {
+  const fig = (url, cls, label) => url ? `<figure class="${cls}"><img src="${esc(url)}" alt="${label}"><figcaption>${label}</figcaption></figure>` : '';
+  const both = oldUrl && newUrl;
+  return `<div class="imgdiff" data-imode="2up">
+    ${both ? `<div class="seg" role="group" aria-label="Image comparison"><button class="on" data-imode="2up">2-up</button><button data-imode="swipe">Swipe</button><button data-imode="onion">Onion skin</button></div>` : ''}
+    <div class="imgdiff-2up">${fig(oldUrl, 'del', 'Before')}${fig(newUrl, 'add', 'After')}</div>
+    ${both ? `<div class="imgdiff-stack" hidden><div class="imgdiff-layers" style="--pos:50%;--op:.5"><img src="${esc(oldUrl)}" alt="Before"><img class="top" src="${esc(newUrl)}" alt="After"></div>
+      <input type="range" min="0" max="100" value="50" aria-label="Before ↔ after"></div>` : ''}
+  </div>`;
+}
+
 /**
- * Render a diff. opts: { owner, repo, sha (commit to link "view file" to), key (for viewed state), title }
+ * Render a diff. opts: { owner, repo, sha (commit to link "view file" to), base (the old side, for image diffs), key (for viewed state), title }
  */
 export function diffView(diff, opts = {}) {
   const files = diff.files || [];
@@ -160,7 +185,8 @@ export function diffView(diff, opts = {}) {
     const [letter, cls, word] = STATUS[f.status] || STATUS.modified;
     const viewed = opts.key && isViewed(opts.key, path);
     const view = opts.sha && f.status !== 'deleted' ? `/${opts.owner}/${opts.repo}/blob/${opts.sha}/${encPath(path)}` : null;
-    return html`<section class="dfile ${viewed ? 'collapsed viewed' : ''}" id="diff-${i}" data-i="${i}">
+    const img = imageSides(f, opts);
+    return html`<section class="dfile ${viewed ? 'collapsed viewed' : ''}" id="diff-${i}" data-i="${i}" ${img ? html`data-img-old="${img.old}" data-img-new="${img.new}"` : ''}>
       <header class="dhead">
         <button class="btn ghost sm icon dtoggle" aria-label="Collapse file">${icon('chev-down', 'sm')}</button>
         <span class="st ${cls}" title="${word}">${letter}</span>
@@ -208,6 +234,8 @@ export async function mountDiff(root, diff, opts = {}) {
     if (!body) return;
     rendered.add(i);
     body._more?.disconnect();
+    const sec = body.closest('.dfile');
+    if (sec.dataset.imgNew != null) { body.innerHTML = imageDiff(sec.dataset.imgOld, sec.dataset.imgNew); return; }
     const note = fileNote(files[i], i, !!opts.load);
     if (note) { body.innerHTML = note; return; }
     // Rows go in a chunk at a time as the reader scrolls, so a 40,000-line file stays smooth.
@@ -264,6 +292,15 @@ export async function mountDiff(root, diff, opts = {}) {
       renderBody(i);
       return;
     }
+    const im = t.closest('button[data-imode]');
+    if (im) {
+      const box = im.closest('.imgdiff'), m = im.dataset.imode;
+      box.dataset.imode = m;
+      box.querySelectorAll('button[data-imode]').forEach((b) => b.classList.toggle('on', b === im));
+      box.querySelector('.imgdiff-2up').hidden = m !== '2up';
+      box.querySelector('.imgdiff-stack').hidden = m === '2up';
+      return;
+    }
     const tog = t.closest('.dtoggle');
     if (tog) {
       const sec = tog.closest('.dfile');
@@ -299,6 +336,13 @@ export async function mountDiff(root, diff, opts = {}) {
       el.querySelectorAll('.dtree-item.on').forEach((x) => x.classList.remove('on'));
       jump.classList.add('on');
     }
+  });
+  el.addEventListener('input', (e) => {
+    const r = e.target.closest('.imgdiff-stack input[type=range]');
+    if (!r) return;
+    const layers = r.previousElementSibling;
+    layers.style.setProperty('--pos', `${r.value}%`);
+    layers.style.setProperty('--op', String(r.value / 100));
   });
   el.addEventListener('change', (e) => {
     const cb = e.target.closest('[data-viewed]');
