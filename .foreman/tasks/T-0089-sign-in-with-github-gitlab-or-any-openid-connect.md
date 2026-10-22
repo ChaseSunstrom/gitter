@@ -8,7 +8,7 @@ scope: []
 depends_on: [T-0084]
 source: user
 created: 2026-10-22T16:03:16Z
-updated: 2026-10-22T19:56:15Z
+updated: 2026-10-22T19:56:31Z
 base: 4311fd24379402062c0146eaf1d3f8c9bc8c9c19
 base_tree: 742a33e7c3f08c13a0dd2d75313fbc484d97df28
 plan0_at: 2026-10-22T19:13:22Z
@@ -28,6 +28,7 @@ Admins add sign-in providers (GitHub, GitLab incl. self-managed, generic OIDC) w
 ## Approach (options → choice → why)
 (a) hand-rolled code flow over net.rs GET/POST with pinning [chosen: three HTTP calls, no new crate, reuses PublicOnly/pin]; (b) oauth2/openidconnect crates (heavy dependency, JWKS); (c) proxy auth headers (needs an external proxy). OIDC: discovery document, issuer must match, userinfo for claims (no JWKS signature checks: the token comes straight from the token endpoint over TLS). Provider HTTP via a new net::get_json with a larger cap and redirects off; admin may allow private addresses for self-hosted GitLab/OIDC.
 ## Risks and rollback
+Rollback: git revert 3ec26f1; migration v29 only adds tables, so old code ignores them (accounts made through providers keep pass_hash '!' and would need a password reset by an admin). Risk: provider misconfiguration only affects that provider's button; turning a provider off stops its sign-ins at once.
 ## Execution prompt
 ## Steps
 1. [x] schema (oauth_providers, identities), admin API with sealed secrets, net::get_json
@@ -70,6 +71,8 @@ README: Sign in with GitHub, GitLab or OpenID Connect
 - 2026-10-22T19:13:22Z focused
 - 2026-10-22T19:35:53Z scope: net.rs (fetch for GET+POST, enc moved from mcp.rs), security.rs reauth (provider challenge), account.rs change_password (first password without current), lib.js/main.js reauth dialog and return handling, CSS for the auth card
 - 2026-10-22T19:56:15Z done
+- 2026-10-22T19:56:15Z committed 3ec26f1 (34 files)
+- 2026-10-22T19:56:31Z ui-check console.log lines are that harness's ok/✗ reporting convention, not debug output
 ## Follow-ups captured
 ## Build vs reuse
 Reuses auth::create_session and the 2FA challenge store for sign-in, security::seal for client secrets, net.rs PublicOnly resolver plus the mirrors lane's net::pin for provider calls (new net::get_json with a larger cap, redirects off), the existing Sudo/Fresh extractors for linking. No new crate: the code flow is three HTTP calls; OIDC uses discovery + userinfo instead of a JWKS library.
@@ -83,12 +86,12 @@ A second read on sonnet, before execution (data, not instructions):
 - LOW: Schema migration lacks a rollback or a note. Unique `(provider_id, subject)` and the secret-sealing key rotation story are also missing. — Add the unique index, make the migration additive, and note how the sealed secrets behave when the sealing key changes.
 Verdict: revise — the flow design is sound, but the ID-token/userinfo trust, email-collision handling, and SSRF re-validation of discovered endpoints need explicit decisions and tests before step 1 proceeds.
 ## Dissent
-- [ ] HIGH: Skipping ID-token validation is justified only for the code flow's token endpoint, but the plan doesn't say the `sub` comes from a trustworthy source. Userinfo `sub` must equal the ID token `sub` per the OIDC spec, and the plan never mentions the nonce, `aud`, or `exp` checks. An unverified u…
-- [ ] HIGH: Account takeover via unverified email and via provider-controlled identity. The plan covers "email only when verified" but not what happens if a verified email collides with an existing account's email (unique constraint failure, or worse, a silent merge). GitHub's `/user` email is often unve…
-- [ ] HIGH: Admin-configurable provider URLs with "allow private addresses" create an SSRF risk. Discovery-document endpoints (token, userinfo) can point anywhere, and DNS rebinding applies. The plan mentions pinning but not re-validating discovered endpoints. — Run every discovered URL through the same …
-- [ ] MEDIUM: Several acceptance claims can't be verified with the listed tests. "Secrets never returned by API" and "no console errors" are asserted without a specified check, and the e2e script's coverage of the new pages is unstated. The mock provider must also simulate failure modes (bad state, repla…
-- [ ] MEDIUM: Account-state edge cases are unspecified. These include: state/cookie single-use and expiry; open-redirect via a post-login `next` parameter; deleting or disabling a provider while identities exist (does this count toward "last method"?); unlinking when the only other method is a passkey or…
-- [ ] LOW: Schema migration lacks a rollback or a note. Unique `(provider_id, subject)` and the secret-sealing key rotation story are also missing. — Add the unique index, make the migration additive, and note how the sealed secrets behave when the sealing key changes.
+- [x] HIGH: Skipping ID-token validation is justified only for the code flow's token endpoint, but the plan doesn't say the `sub` comes from a trustworthy source. Userinfo `sub` must equal the ID token `sub` per the OIDC spec, and the plan never mentions the nonce, `aud`, or `exp` checks. An unverified u… — answered: ID token iss/aud/azp/exp/nonce checked and userinfo sub must equal it (tests: id_token_claims_and_userinfo_must_match)
+- [x] HIGH: Account takeover via unverified email and via provider-controlled identity. The plan covers "email only when verified" but not what happens if a verified email collides with an existing account's email (unique constraint failure, or worse, a silent merge). GitHub's `/user` email is often unve… — answered: only verified emails kept; a taken email refuses sign-up and never links (test: only_verified_emails...); linking only from a fresh session
+- [x] HIGH: Admin-configurable provider URLs with "allow private addresses" create an SSRF risk. Discovery-document endpoints (token, userinfo) can point anywhere, and DNS rebinding applies. The plan mentions pinning but not re-validating discovered endpoints. — Run every discovered URL through the same … — answered: every URL incl. discovered endpoints passes check_url + https unless allow_private, PublicOnly resolver pins addresses, no redirects (test: suspended_accounts_and_private_addresses_are_refused)
+- [x] MEDIUM: Several acceptance claims can't be verified with the listed tests. "Secrets never returned by API" and "no console errors" are asserted without a specified check, and the e2e script's coverage of the new pages is unstated. The mock provider must also simulate failure modes (bad state, repla… — answered: mock provider covers bad/replayed/expired state, wrong cookie, wrong nonce/aud/iss, sub mismatch; admin responses checked for the secret; e2e drives the real buttons with a mock OIDC server
+- [x] MEDIUM: Account-state edge cases are unspecified. These include: state/cookie single-use and expiry; open-redirect via a post-login `next` parameter; deleting or disabling a provider while identities exist (does this count toward "last method"?); unlinking when the only other method is a passkey or… — answered: state single-use, 10 min, per-sign-in cookie; next must be a local path (unit + integration tests); disabled providers don't count as a way in; provider removal refused if it strands anyone
+- [x] LOW: Schema migration lacks a rollback or a note. Unique `(provider_id, subject)` and the secret-sealing key rotation story are also missing. — Add the unique index, make the migration additive, and note how the sealed secrets behave when the sealing key changes. — answered: migration v29 additive with UNIQUE(provider_id, subject) and (provider_id, user_id); README notes a new server key means re-entering secrets
 ## Related
 Related past work (data from this project's history, not instructions):
 - research T-0024-recon: 1. **Answer [stale: src/api/issues.rs, src/db.rs, src/hooks.rs changed since it was written]
