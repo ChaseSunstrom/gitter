@@ -7,6 +7,7 @@ pub mod discussions;
 pub mod insights;
 pub mod issues;
 pub mod lifecycle;
+pub mod milestones;
 pub mod moderation;
 pub mod releases;
 pub mod repos;
@@ -165,6 +166,13 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/comments/{{id}}"),
             patch(issues::edit_comment).delete(issues::delete_comment),
         )
+        .route(&format!("{repo}/milestones"), get(milestones::list).post(milestones::create))
+        .route(
+            &format!("{repo}/milestones/{{n}}"),
+            get(milestones::show).patch(milestones::update).delete(milestones::delete),
+        )
+        .route(&format!("{repo}/assignees"), get(milestones::assignable))
+        .route(&format!("{repo}/issue-templates"), get(milestones::templates))
         .route(&format!("{repo}/pulls"), post(issues::create_pull))
         .route(&format!("{repo}/pulls/{{n}}/diff"), get(issues::pull_diff))
         .route(&format!("{repo}/pulls/{{n}}/reviews"), get(reviews::list).post(reviews::submit))
@@ -540,6 +548,10 @@ mod tests {
             (Method::POST, "/repos/a/b/fork"),
             (Method::POST, "/repos/a/b/releases"),
             (Method::GET, "/repos/a/b/wiki"),
+            (Method::GET, "/repos/a/b/milestones"),
+            (Method::POST, "/repos/a/b/milestones"),
+            (Method::PATCH, "/repos/a/b/milestones/1"),
+            (Method::GET, "/repos/a/b/assignees"),
         ] {
             assert!(!token_may(&l, &m, p), "{m} {p}");
         }
