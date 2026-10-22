@@ -2491,6 +2491,76 @@ async fn webhook_ci_runs_are_announced_once_when_they_finish() {
     assert_eq!(rx.last().1["run"]["status"], "cancelled");
 }
 
+#[tokio::test]
+async fn web_branch_create_and_delete_run_the_push_hooks() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let ci = json!({ "branch": "main", "message": "CI", "changes": [{ "path": ".gitter/ci.yml", "content": "jobs:\n  a:\n    steps: [echo]\n" }] });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(ci)).await.0, StatusCode::OK);
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["push"], "allow_private": true });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await.0, StatusCode::OK);
+    gitter::webhooks::tick(&app.state).await;
+    let pushers = || async {
+        let q = "SELECT count(*) FROM branch_pushers WHERE branch = 'feature'";
+        app.state.db.call(move |c| Ok(c.query_row(q, [], |r| r.get::<_, i64>(0))?)).await.unwrap()
+    };
+
+    // Made on the web: a push run, a push webhook, a recorded pusher.
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/branches", Some(json!({ "name": "feature", "from": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let sha = v["sha"].as_str().unwrap().to_string();
+    let runs: Vec<(String, String)> = app
+        .state
+        .db
+        .call(|c| Ok(c.prepare("SELECT event, ref FROM ci_runs ORDER BY number")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?))
+        .await
+        .unwrap();
+    assert_eq!(runs, [("push".into(), "refs/heads/main".into()), ("push".into(), "refs/heads/feature".into())]);
+    assert_eq!(pushers().await, 1);
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping", "push"]);
+    let (_, p) = rx.last();
+    assert_eq!((p["ref"].as_str(), p["created"].as_bool(), p["after"].as_str()), (Some("refs/heads/feature"), Some(true), Some(sha.as_str())));
+
+    // Deleted on the web: a deletion webhook, the pusher forgotten.
+    assert_eq!(app.req(&admin, "DELETE", "/api/repos/root1/r/branches?name=feature", None).await.0, StatusCode::OK);
+    assert_eq!(pushers().await, 0);
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping", "push", "push"]);
+    let (_, p) = rx.last();
+    assert_eq!((p["ref"].as_str(), p["deleted"].as_bool(), p["before"].as_str()), (Some("refs/heads/feature"), Some(true), Some(sha.as_str())));
+    assert!(p["after"].is_null(), "{p}");
+
+    // Deleting it again changes nothing and announces nothing.
+    assert_eq!(app.req(&admin, "DELETE", "/api/repos/root1/r/branches?name=feature", None).await.0, StatusCode::OK);
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events().len(), 3);
+}
+
+#[tokio::test]
+async fn web_branch_tags_conflict_only_when_the_tag_exists() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "t", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    // A tag pushed between the release's check and making it (the API checks first, so call it directly).
+    let sha = insights_git(&repo, &["rev-parse", "main"]);
+    insights_git(&repo, &["tag", "v2", "main"]);
+    let u = gitter::auth::user_by_id(&app.state.db, 1).await.unwrap().unwrap();
+    let r = gitter::repo::Repo::writable(&app.state, Some(&u), "alice", "t").await.unwrap();
+    let e = gitter::api::releases::make_tag(&app.state, &r, &u, "v2", &sha, "v2").await.unwrap_err();
+    assert_eq!(e.status, StatusCode::CONFLICT, "{}", e.msg);
+    assert!(e.msg.contains("created by someone else"), "{}", e.msg);
+    assert_eq!(insights_git(&repo, &["rev-parse", "v2"]), sha, "the pushed tag stays");
+    // A tag that can't be made for another reason (`v3` is in the way of `v3/rc`) isn't blamed on anyone.
+    insights_git(&repo, &["tag", "v3", "main"]);
+    let (s, e) = app.req(&alice, "POST", "/api/repos/alice/t/releases", Some(json!({ "tag": "v3/rc" }))).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{e}");
+    assert!(!e["error"].as_str().unwrap().contains("someone else"), "{e}");
+}
+
 /// A raw-body request as `c` (release asset uploads and downloads): status, headers, body.
 async fn raw_as(app: &App, c: &Client, method: &str, path: &str, ctype: &str, body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
     let mut b = Request::builder().method(method).uri(path).header("host", "test.local").header("origin", ORIGIN);
