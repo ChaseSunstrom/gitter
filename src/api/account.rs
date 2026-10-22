@@ -209,7 +209,7 @@ pub async fn login_2fa(
         .db
         .call(move |c| Ok(c.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1 AND suspended = 0"), [uid], User::from_row)?))
         .await?;
-    match crate::security::use_code(&st.db, uid, &req.code).await? {
+    match crate::security::use_code(&st.db, st.key.clone(), uid, &req.code).await? {
         Some(how) => {
             st.challenges.finish(&req.challenge);
             st.limiter.reset(&key);

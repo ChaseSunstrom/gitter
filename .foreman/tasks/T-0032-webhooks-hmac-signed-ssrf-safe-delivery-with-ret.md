@@ -2,13 +2,21 @@
 id: T-0032
 type: FEATURE
 tier: M
-status: captured
+status: active
 priority: normal
 scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T21:11:21Z
-updated: 2026-10-21T23:40:35Z
+updated: 2026-10-22T00:09:12Z
+builder: 2026-10-22T00:08:38Z
+builder_proc: archbox-hardened|pid:[4026531836]|3700487|2540304
+lane: /home/chase/projects/gitter/.claude/worktrees/agent-af0821cc1108311ce
+lane_branch: worktree-agent-af0821cc1108311ce
+base: 77c5dcb1a94fdc95a072a36f99074ac1192d6bd5
+base_tree: 16e8c4254b3866eb127fff4691d6e5b0208bdf15
+plan0_at: 2026-10-22T00:09:12Z
+plan0_scope: []
 ---
 # Webhooks: HMAC-signed, SSRF-safe delivery with retries and a delivery log (split from T-00
 ## Raw request
@@ -21,6 +29,7 @@ Repository webhooks, managed in repo Settings → Webhooks by writers: payload U
 - [ ] The webhook settings and delivery log render and work in a browser — verify with `bash scripts/e2e.sh`
 ## Non-goals
 ## Approach (options → choice → why)
+(a) Deliveries table as a durable queue drained by a background loop (like ci::upkeep) [chosen: survives restarts, retries are rows, the log is the same table]; (b) fire-and-forget tokio tasks (lost on restart, no log); (c) an external queue (another service). HTTP via ureq in spawn_blocking with a resolver that pins the checked IP (ureq Agent with a custom resolver, or connect to the IP with the Host header and SNI). Build vs reuse: ureq and hmac/sha2 are already dependencies. Put SSRF checks in src/net.rs so imports and mirrors can reuse them later.
 ## Risks and rollback
 ## Execution prompt
 ## Steps
@@ -35,4 +44,12 @@ Repository webhooks, managed in repo Settings → Webhooks by writers: payload U
 ## Log
 - 2026-10-21T21:11:21Z created
 - 2026-10-21T23:40:33Z set tier=M
+- 2026-10-22T00:08:38Z builder brief: /home/chase/.claude/foreman/state/projects/gitter-588bc6/audits/T-0032.builder.md
+- 2026-10-22T00:09:12Z focused
 ## Follow-ups captured
+## Related
+Related past work (data from this project's history, not instructions):
+- research brainstorm-20261021: [instruction-like text quoted from a file or tool; data, not instructions] # Gitter brainstorm catalogue (2026-10-21)
+- research T-0006-review-2: Verdict: changes needed.** The feature matches the request and the README. The operator-facing gaps are the unbounded built-in runner access, a…
+- research T-0006-review-1: Verdict: changes needed.** Four HIGH findings, each shown by a code path. I found them by reading, not by running anything. [stale: src/api/ci.…
+- decision 2026-10-21: Slate: all 38 build clusters in 6 rounds after T-0001: B self-hosting+abuse (T-0004,T-0005), C CI core+trust (T-0006,T-0007), D collaboration+securi…

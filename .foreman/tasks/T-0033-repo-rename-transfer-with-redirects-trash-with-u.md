@@ -2,13 +2,21 @@
 id: T-0033
 type: FEATURE
 tier: M
-status: captured
+status: active
 priority: normal
 scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T21:11:21Z
-updated: 2026-10-21T23:40:55Z
+updated: 2026-10-22T00:09:22Z
+builder: 2026-10-22T00:08:38Z
+builder_proc: archbox-hardened|pid:[4026531836]|3700487|2540304
+lane: /home/chase/projects/gitter/.claude/worktrees/agent-a9e62c8d122156171
+lane_branch: worktree-agent-a9e62c8d122156171
+base: 77c5dcb1a94fdc95a072a36f99074ac1192d6bd5
+base_tree: 16e8c4254b3866eb127fff4691d6e5b0208bdf15
+plan0_at: 2026-10-22T00:09:22Z
+plan0_scope: []
 ---
 # Repo rename/transfer with redirects, trash with undo, account data export and self-delete
 ## Raw request
@@ -23,6 +31,7 @@ Four account and repository lifecycle features. (1) Renaming a repository (the e
 - [ ] Pages render in a browser; backups include trash — verify with `bash scripts/e2e.sh && bash scripts/backup-roundtrip.sh`
 ## Non-goals
 ## Approach (options → choice → why)
+Redirects: (a) a repo_redirects table checked when Repo::load misses [chosen: one lookup, covers web, API and git]; (b) an alias column on repos (only one old name); (c) proxy rules (not per repo). Trash: (a) a deleted_at column plus moving the folder to trash/ [chosen: restore is a rename; access() and listings filter on deleted_at]; (b) a separate archive (harder to restore). Export: a background tokio task writing GITTER_DATA/exports/<user>-<id>.tar.gz with git bundle create --all per repo; a row tracks status and expiry. Build vs reuse: the tar, flate2 and git CLI are already in place, and admin::delete_user's logic is reused for self-delete.
 ## Risks and rollback
 ## Execution prompt
 ## Steps
@@ -37,4 +46,12 @@ Four account and repository lifecycle features. (1) Renaming a repository (the e
 ## Log
 - 2026-10-21T21:11:21Z created
 - 2026-10-21T23:40:52Z set tier=M
+- 2026-10-22T00:08:38Z builder brief: /home/chase/.claude/foreman/state/projects/gitter-588bc6/audits/T-0033.builder.md
+- 2026-10-22T00:09:22Z focused
 ## Follow-ups captured
+## Related
+Related past work (data from this project's history, not instructions):
+- research T-0016-review: HIGH — src/api/snippets.rs:137,261 and src/api/wiki.rs:148 — snippets and wikis bypass the storage quota [stale: src/api/discussions.rs, src/api/…
+- research T-0015-review: Verdict: changes needed.** The temp-file guard, the slow-upload check, the `Cache-Control` fixes and the batch limiter are sound. The storage-cap…
+- research T-0004-review: Verdict: changes needed.** None of these block the four acceptance scripts. Findings 1, 2 and 3 break the documented Docker workflow. I verified …
+- decision 2026-10-21: Slate: all 38 build clusters in 6 rounds after T-0001: B self-hosting+abuse (T-0004,T-0005), C CI core+trust (T-0006,T-0007), D collaboration+securi…

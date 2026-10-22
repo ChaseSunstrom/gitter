@@ -179,6 +179,11 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         );
         *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
     }
+    match gitter::security::seal_totp_secrets(&st.db, st.key.clone()).await {
+        Ok(0) => {}
+        Ok(n) => println!("sealed {n} two-factor secret(s) with the server key"),
+        Err(e) => eprintln!("sealing two-factor secrets: {}", e.msg),
+    }
     tokio::spawn(gitter::ci::upkeep(st.clone()));
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));
     let st2 = st.clone();

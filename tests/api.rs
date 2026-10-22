@@ -1663,3 +1663,37 @@ async fn snippets_and_wikis_count_toward_storage() {
     let (s, e) = app.req(&bob, "POST", "/api/repos/bob/r/wiki", Some(json!({ "name": "Home", "content": "z".repeat(100_000) }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "out of storage: {e}");
 }
+
+#[tokio::test]
+async fn totp_secrets_are_sealed_at_rest() {
+    use gitter::security::{seal_totp_secrets, step_now, totp_code, use_code};
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let (_, setup) = app.req(&alice, "POST", "/api/me/2fa/setup", None).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    let (s, _) = app.req(&alice, "POST", "/api/me/2fa/enable", Some(json!({ "code": totp_code(&secret, step_now()).unwrap() }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let stored: String = app.state.db.call(|c| Ok(c.query_row("SELECT totp_secret FROM users WHERE username = 'alice'", [], |r| r.get(0))?)).await.unwrap();
+    assert!(stored.starts_with("sealed:") && !stored.contains(&secret), "{stored}");
+    // A secret stored before sealing still works, and the boot pass seals it.
+    let bob = app.signup("bob").await;
+    drop(bob);
+    let legacy = gitter::security::new_totp_secret();
+    let l2 = legacy.clone();
+    let bob_id: i64 = app
+        .state
+        .db
+        .call(move |c| {
+            c.execute("UPDATE users SET totp_secret = ?1 WHERE username = 'bob'", [&l2])?;
+            Ok(c.query_row("SELECT id FROM users WHERE username = 'bob'", [], |r| r.get(0))?)
+        })
+        .await
+        .unwrap();
+    let code = totp_code(&legacy, step_now()).unwrap();
+    assert!(use_code(&app.state.db, app.state.key.clone(), bob_id, &code).await.unwrap().is_some());
+    assert_eq!(seal_totp_secrets(&app.state.db, app.state.key.clone()).await.unwrap(), 1);
+    let sealed: String = app.state.db.call(move |c| Ok(c.query_row("SELECT totp_secret FROM users WHERE id = ?1", [bob_id], |r| r.get(0))?)).await.unwrap();
+    assert!(sealed.starts_with("sealed:"));
+    assert_eq!(gitter::security::open_text(&app.state.key, &sealed).as_deref(), Some(legacy.as_str()));
+    assert_eq!(seal_totp_secrets(&app.state.db, app.state.key.clone()).await.unwrap(), 0, "already sealed");
+}
