@@ -1,5 +1,5 @@
 // Sign in and sign up.
-import { html, state, send, $, action } from '../lib.js';
+import { html, state, send, get, $, action, busy, enc, startOAuth } from '../lib.js';
 import { logo } from '../icons.js';
 import { navigate, renderTopbar } from '../main.js';
 
@@ -38,9 +38,16 @@ function card(inner) {
     <a href="/" class="auth-logo" aria-label="Gitter home">${logo(44)}</a>${inner}</div></div>`;
 }
 
-function loginView(ctx) {
+/** "Sign in with GitHub" and friends, when an admin has added providers. */
+const oauthList = (providers, verb) => providers.length
+  ? html`<div class="oauth-list">${providers.map((p) => html`<button type="button" class="btn lg" data-oauth="${p.slug}">${verb} with ${p.name}</button>`)}</div>
+    <div class="or-sep" role="separator"><span>or</span></div>`
+  : '';
+
+function loginView(ctx, providers) {
   const q = ctx.url.search;
   return card(html`<h1>Sign in to Gitter</h1>
+    ${oauthList(providers, 'Sign in')}
     <form id="auth-form" class="stack" novalidate>
       <div class="field"><label for="login">Username or email</label><input class="input" id="login" name="login" autocomplete="username" autofocus required></div>
       <div class="field"><label for="password">Password</label><input class="input" id="password" name="password" type="password" autocomplete="current-password" required></div>
@@ -50,7 +57,7 @@ function loginView(ctx) {
     ${state.signup ? html`<p class="auth-alt muted small">New here? <a class="c-accent" href="/signup${q}">Create an account</a></p>` : ''}`);
 }
 
-function signupView(ctx) {
+function signupView(ctx, providers) {
   const setup = ctx.query.get('setup') || '';
   if (state.instance?.needs_setup && !setup) {
     return card(html`<h1>Finish setting up Gitter</h1><p class="muted">This server has no accounts yet. To create the admin account, open the setup link printed in the server log
@@ -66,7 +73,7 @@ function signupView(ctx) {
       <a class="btn lg" href="/login${ctx.url.search}">Sign in instead</a>`);
   }
   return card(html`<h1>${setup ? 'Create the admin account' : 'Create your account'}</h1>
-    ${setup ? html`<p class="muted">This first account runs the server: it can manage accounts and settings.</p>` : ''}
+    ${setup ? html`<p class="muted">This first account runs the server: it can manage accounts and settings.</p>` : oauthList(providers, 'Sign up')}
     <form id="auth-form" class="stack" novalidate>
       <div class="field"><label for="username">Username</label><input class="input" id="username" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" autofocus required>
         <span class="hint" id="username-msg">Letters, numbers, '-', '_' or '.'. This is your public URL.</span></div>
@@ -102,7 +109,7 @@ function codeStep(el, challenge, ctx) {
     let res;
     try { res = await send('POST', '/auth/login/2fa', { challenge, code: input.value }); }
     catch (e) {
-      if (e.code === 'restart') return navigate(location.pathname + location.search, { replace: true });
+      if (e.code === 'restart') return navigate(`/login?next=${enc(next(ctx))}`, { replace: true });
       err.textContent = e.message; err.hidden = false; input.select(); return;
     }
     state.me = res.user;
@@ -114,14 +121,35 @@ function codeStep(el, challenge, ctx) {
 export default async function (ctx) {
   if (state.me) return { redirect: next(ctx) };
   const signup = ctx.params.mode === 'signup';
+  const { providers } = await get('/auth/providers').catch(() => ({ providers: [] }));
   return {
     title: signup ? 'Sign up' : 'Sign in',
-    html: signup ? signupView(ctx) : loginView(ctx),
+    html: signup ? signupView(ctx, providers) : loginView(ctx, providers),
     mount(el) {
       const form = $('#auth-form', el);
       if (!form) return;
       const err = $('#form-err', el);
       const showErr = (m) => { err.textContent = m; err.hidden = !m; };
+      // Back from a provider: its error, or the 2FA step for an account that has it.
+      if (ctx.query.get('challenge')) {
+        // Out of the address bar and history once read.
+        history.replaceState(history.state, '', `/login?next=${enc(next(ctx))}`);
+        return codeStep(el, ctx.query.get('challenge'), ctx);
+      }
+      if (ctx.query.get('oauth_error')) {
+        showErr(ctx.query.get('oauth_error'));
+        // Shown once: a reload shouldn't bring it back.
+        const u = new URL(location.href);
+        u.searchParams.delete('oauth_error');
+        history.replaceState(history.state, '', u.pathname + u.search);
+      }
+      el.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-oauth]');
+        if (!b) return;
+        busy(b, true);
+        startOAuth(b.dataset.oauth, 'login', { next: next(ctx), invite: ctx.query.get('invite') || '' })
+          .catch((x) => { busy(b, false); showErr(x.message); });
+      });
       const user = $('#username', el);
       const pw = $('#password', el);
       if (signup) {
