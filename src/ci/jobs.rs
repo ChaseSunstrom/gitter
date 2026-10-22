@@ -51,6 +51,9 @@ pub async fn claim(st: &AppState, runner_id: i64, labels: Vec<String>, builtin: 
         .db
         .call(move |c| {
             c.execute("DELETE FROM ci_artifacts WHERE job_id = ?1", [job])?;
+            // Earlier attempts' test results stop showing (they stay for spotting flaky tests).
+            c.execute("UPDATE ci_test_results SET current = 0 WHERE job_id = ?1", [job])?;
+            c.execute("DELETE FROM ci_job_reports WHERE job_id = ?1", [job])?;
             // A run an agent started gets no secrets: its workflow could print them.
             let by_agent: bool = c.query_row(
                 "SELECT r.agent IS NOT NULL FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE j.id = ?1",

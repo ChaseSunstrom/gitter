@@ -387,6 +387,59 @@ pub struct Job {
     /// `network: false`: the job's container gets no network at all.
     #[serde(default = "yes")]
     pub network: bool,
+    /// Files kept between runs (restored before the steps, saved after a success).
+    #[serde(default)]
+    pub cache: Option<Cache>,
+    /// JUnit XML files the server reads into test results.
+    #[serde(default)]
+    pub reports: Vec<String>,
+    /// Cobertura XML or LCOV files the server reads into a coverage percentage.
+    #[serde(default)]
+    pub coverage: Vec<String>,
+}
+
+/// `cache:` on a job: workspace folders or files under a key (see `ci::cache`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Cache {
+    /// A template: `deps-{{ hash Cargo.lock }}`, `{{ os }}`, `{{ arch }}`.
+    pub key: String,
+    pub paths: Vec<String>,
+    /// Key prefixes to fall back on when no cache has the exact key.
+    #[serde(default)]
+    pub restore_keys: Vec<String>,
+}
+
+fn cache(v: Option<&Value>, job: &str) -> Result<Option<Cache>, String> {
+    let m = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(m)) => m,
+        Some(_) => return Err(format!("jobs.{job}.cache: expected key and paths")),
+    };
+    for k in m.keys() {
+        if !matches!(k.as_str(), "key" | "paths" | "restore-keys") {
+            return Err(format!("jobs.{job}.cache: unknown setting '{k}' (use key, paths and restore-keys)"));
+        }
+    }
+    let key = m.get("key").and_then(Value::as_str).ok_or(format!("jobs.{job}.cache: needs a key"))?.to_string();
+    super::cache::check_key(&key).map_err(|e| format!("jobs.{job}.cache.key: {e}"))?;
+    let paths = strings(m.get("paths").unwrap_or(&Value::Null), &format!("jobs.{job}.cache.paths"))?;
+    if paths.is_empty() || paths.len() > 20 {
+        return Err(format!("jobs.{job}.cache.paths: list 1 to 20 folders or files in the workspace"));
+    }
+    for p in &paths {
+        let bad = p.is_empty() || p.len() > 256 || p.starts_with('/') || p.starts_with('~') || p.split('/').any(|s| s == ".." || s == "." || s == ".git");
+        if bad {
+            return Err(format!("jobs.{job}.cache.paths: '{p}' must be a folder or file inside the workspace"));
+        }
+    }
+    let restore_keys = strings(m.get("restore-keys").unwrap_or(&Value::Null), &format!("jobs.{job}.cache.restore-keys"))?;
+    for r in &restore_keys {
+        super::cache::check_key(r).map_err(|e| format!("jobs.{job}.cache.restore-keys: {e}"))?;
+    }
+    if restore_keys.len() > 10 {
+        return Err(format!("jobs.{job}.cache.restore-keys: at most 10"));
+    }
+    Ok(Some(Cache { key, paths: paths.into_iter().map(|p| p.trim_end_matches('/').to_string()).collect(), restore_keys }))
 }
 
 fn yes() -> bool {
@@ -419,6 +472,9 @@ pub fn script_pipeline() -> Pipeline {
             artifacts: vec![],
             runs_on: vec![],
             network: true,
+            cache: None,
+            reports: vec![],
+            coverage: vec![],
         }],
     }
 }
@@ -585,7 +641,10 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
         }
         let Value::Object(m) = spec else { return Err(format!("jobs.{key}: expected steps and settings")) };
         for k in m.keys() {
-            if !matches!(k.as_str(), "steps" | "image" | "needs" | "env" | "matrix" | "paths" | "timeout" | "artifacts" | "runs-on" | "name" | "network") {
+            if !matches!(
+                k.as_str(),
+                "steps" | "image" | "needs" | "env" | "matrix" | "paths" | "timeout" | "artifacts" | "runs-on" | "name" | "network" | "cache" | "reports" | "coverage"
+            ) {
                 return Err(format!("jobs.{key}: unknown setting '{k}'"));
             }
         }
@@ -608,6 +667,9 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
             Some(_) => return Err(format!("jobs.{key}.network: true or false")),
         };
         let matrix = matrix(m.get("matrix"), key)?;
+        let cache = cache(m.get("cache"), key)?;
+        let reports = strings(m.get("reports").unwrap_or(&Value::Null), &format!("jobs.{key}.reports"))?;
+        let coverage = strings(m.get("coverage").unwrap_or(&Value::Null), &format!("jobs.{key}.coverage"))?;
         let title = m.get("name").and_then(Value::as_str).unwrap_or(key).to_string();
         for combo in &matrix {
             let image = image.as_deref().map(|i| interpolate(i, combo));
@@ -634,6 +696,9 @@ pub fn parse(src: &str) -> Result<Pipeline, String> {
                 artifacts: strings(m.get("artifacts").unwrap_or(&Value::Null), &format!("jobs.{key}.artifacts"))?,
                 runs_on: strings(m.get("runs-on").unwrap_or(&Value::Null), &format!("jobs.{key}.runs-on"))?,
                 network,
+                cache: cache.as_ref().map(|c| Cache { key: interpolate(&c.key, combo), ..c.clone() }),
+                reports: reports.clone(),
+                coverage: coverage.clone(),
             });
             if out.len() > MAX_JOBS {
                 return Err(format!("a pipeline can have at most {MAX_JOBS} jobs (after matrix expansion)"));

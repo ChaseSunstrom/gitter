@@ -777,6 +777,55 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX osv_affected_pkg ON osv_affected(ecosystem, name);
     CREATE INDEX osv_affected_vuln ON osv_affected(vuln_id);
     "#,
+    // CI caches (trust: 0 an agent's run wrote it, 1 a person's, 2 an admin's), test reports, flaky tests.
+    r#"
+    CREATE TABLE ci_caches (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        ref TEXT NOT NULL,
+        trust INTEGER NOT NULL,
+        key TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        used_at INTEGER NOT NULL,
+        UNIQUE (repo_id, ref, trust, key)
+    );
+    CREATE TABLE ci_job_reports (
+        job_id INTEGER PRIMARY KEY REFERENCES ci_jobs(id) ON DELETE CASCADE,
+        tests INTEGER NOT NULL,
+        failed INTEGER NOT NULL,
+        skipped INTEGER NOT NULL,
+        flaky INTEGER NOT NULL,
+        cov_hit REAL,
+        cov_total REAL
+    );
+    CREATE TABLE ci_test_results (
+        id INTEGER PRIMARY KEY,
+        job_id INTEGER NOT NULL REFERENCES ci_jobs(id) ON DELETE CASCADE,
+        current INTEGER NOT NULL DEFAULT 1,
+        repo_id INTEGER NOT NULL,
+        sha TEXT NOT NULL,
+        job TEXT NOT NULL,
+        suite TEXT NOT NULL,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT '',
+        file TEXT,
+        line INTEGER,
+        flaky INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX ci_test_results_job ON ci_test_results(job_id);
+    CREATE INDEX ci_test_results_sha ON ci_test_results(repo_id, sha, name);
+    CREATE TABLE ci_flaky_tests (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        flips INTEGER NOT NULL,
+        last_sha TEXT NOT NULL,
+        last_run INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, name)
+    );
+    "#,
 ];
 
 impl Db {
