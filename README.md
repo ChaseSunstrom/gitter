@@ -233,6 +233,23 @@ Tools: `list_repos` (always on), `search_code`, `read_file`, `list_tree`, `list_
 - It has its own rate limit (120 calls a minute) and its changes count apart from yours.
 - Issues, pull requests, comments and feed entries it makes show an **Agent** badge next to your name, and each change is in your security log as "*token name*: *tool* *repository* …".
 
+## Security scanning
+
+**Push protection.** Every push (over HTTPS or SSH) and every commit made on the web (editing, uploading, applying a review suggestion, an agent's `commit_files`) is scanned before any branch moves. The lines it adds are checked for AWS access keys, private keys (a PEM header followed by key material), Gitter's own tokens (`gtr_`, `grn_`, `gcj_`), GitHub, GitLab, Slack, Stripe live, Google, npm, PyPI, OpenAI and Anthropic keys, and random-looking values assigned to names like `password`, `secret`, `token` or `api_key`. A push that adds one is refused with each finding's file, line and kind and a masked form (`AKIA…7Q`); the secret itself is never stored, logged or printed (findings are kept masked, with a fingerprint keyed by the server's secret key). Values that are URLs or paths don't count. A one-time allowance is used up only by a push that goes through. The scan reads at most 512 MB or two minutes of a push, and lets the rest through (the server log says so):
+
+```
+remote: Push refused: it adds something that looks like a secret.
+remote:   conf/aws.env:2  AWS access key ID  AKIA…2T  (commit 3f2a1c9)
+remote: If it's a false positive, a test value, or a secret you'll revoke, allow it once here and push again:
+remote:   https://git.example.com/alice/app/security?allow=4be1…
+```
+
+Take the secret out of the commits (removing it in a later commit isn't enough), or open the link, say why, and **Allow once**: the next push or commit by you that has that finding (same kind, file and secret) goes through, within 3 hours, and the allowance is used up. Only the person who pushed can allow their finding, never an agent token, and each allowance is in the audit log. Web commits show the same findings in a dialog. Pushes are scanned up to 512 MB of changes; merge commits' own changes aren't.
+
+**Security tab.** Repository admins can scan every file on the default branch on demand and see the findings. Everyone who can read the repository sees its **dependencies**, read from the default branch's lockfiles (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `go.sum`, `requirements.txt` pins, `poetry.lock`, `Gemfile.lock`; not under `node_modules`, `vendor` or `third_party`), the **vulnerabilities** known for them, and an **SBOM** download as SPDX 2.3 or CycloneDX 1.5 JSON (`GET /api/repos/OWNER/REPO/sbom?format=spdx|cyclonedx`).
+
+**Vulnerability data** comes from an [OSV](https://osv.dev) snapshot the site admin imports, so it works offline: on any Security tab (or `POST /api/admin/osv` with the file as the body, up to 512 MB), upload one OSV JSON record, a JSON array of them, or an ecosystem's zip from `https://osv-vulnerabilities.storage.googleapis.com/<ecosystem>/all.zip` (e.g. `crates.io`, `npm`, `Go`, `PyPI`, `RubyGems`). Importing again updates advisories by id; withdrawn ones are removed. Versions are matched against each advisory's version list and its SEMVER/ECOSYSTEM ranges with a simple dotted-number comparison, so exotic version schemes can be off.
+
 ## Git over SSH
 
 Off by default. Set `GITTER_SSH_ADDR` (for example `0.0.0.0:2222`) and Gitter also serves clone, fetch and push over SSH, from its own built-in SSH server: no system `sshd` to set up. Its host key is made on first start in `GITTER_DATA/ssh_host_ed25519_key` (back it up, or clients will warn that the host changed). Clone URLs use the host name in `GITTER_URL` and the port listened on; when that port is mapped to another one (a container's `2222` published as `22`), set `GITTER_SSH_PORT` to the public port. On port 22 URLs look like `git@git.example.com:alice/hello.git`, otherwise `ssh://git@git.example.com:2222/alice/hello.git`. With Docker Compose, add `- "22:2222"` under `ports` and `GITTER_SSH_ADDR: 0.0.0.0:2222` and `GITTER_SSH_PORT: 22` under `environment`.

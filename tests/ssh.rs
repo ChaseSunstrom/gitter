@@ -163,6 +163,13 @@ async fn git_over_ssh_follows_the_http_access_rules() {
     assert!(run(&work, "git", &["commit", "-qm", "Straight to main"], &ak).await.0);
     let (ok, out) = run(&work, "git", &["push", "origin", "HEAD:main"], &ak).await;
     assert!(!ok && out.contains("main is protected"), "{out}");
+    // Push protection holds over SSH too.
+    std::fs::write(work.join("aws.env"), format!("KEY=AKIA{}\n", "Q3EGRIW5ZKVNOM2T")).unwrap();
+    assert!(run(&work, "git", &["add", "."], &ak).await.0);
+    assert!(run(&work, "git", &["commit", "-qm", "Oops"], &ak).await.0);
+    let (ok, out) = run(&work, "git", &["push", "origin", "HEAD:refs/heads/leak"], &ak).await;
+    assert!(!ok && out.contains("Push refused") && out.contains("aws.env:1"), "{out}");
+    assert!(run(&work, "git", &["reset", "-q", "--hard", "HEAD~1"], &ak).await.0);
     // A second command on the same connection works (ssh connection sharing).
     let (ok, out) = run(&work, "git", &["push", "origin", "HEAD:refs/heads/topic"], &ak).await;
     assert!(ok, "{out}");

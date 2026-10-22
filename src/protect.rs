@@ -288,9 +288,8 @@ fn reviews(c: &Connection, repo: &Repo, issue_id: i64, sha: &str) -> rusqlite::R
 /// The binary git runs as the pre-receive hook (tests point it at the built `gitter`).
 pub static HOOK_EXE: OnceLock<PathBuf> = OnceLock::new();
 
-/// Git config and environment for a push by `repo`'s viewer: the hook folder
-/// and the rules binding them, or None when no rule does (no hook at all).
-pub async fn push_hook(st: &AppState, repo: &Repo) -> R<Option<(PathBuf, String)>> {
+/// The rules binding `repo`'s viewer, for the hook (GITTER_RULES), or None.
+pub async fn rules_env(st: &AppState, repo: &Repo) -> R<Option<String>> {
     let rules = binding(st, repo).await?;
     if rules.is_empty() {
         return Ok(None);
@@ -300,37 +299,55 @@ pub async fn push_hook(st: &AppState, repo: &Repo) -> R<Option<(PathBuf, String)
     if json.len() > 100_000 {
         return Err(AppError::internal("too many branch rules to check this push"));
     }
+    Ok(Some(json))
+}
+
+/// GITTER_DATA/hooks, holding `pre-receive`: a link to this binary, which git
+/// runs before any ref of a push moves (branch rules, then push protection).
+pub fn hook_dir(st: &AppState) -> R<PathBuf> {
     let dir = st.cfg.data_dir.join("hooks");
     // Set at startup (`main`): once the binary is replaced in place, current_exe() names a deleted file.
     let exe = HOOK_EXE.get().cloned().or_else(|| std::env::current_exe().ok()).ok_or_else(|| AppError::internal("can't find the server binary for the git hook"))?;
     // Git skips a hook it can't run, so a missing binary refuses the push instead.
     if !exe.is_file() {
-        return Err(AppError::internal("the server binary moved: restart it so pushes can be checked against branch rules"));
+        return Err(AppError::internal("the server binary moved: restart it so pushes can be checked"));
     }
     let link = dir.join("pre-receive");
-    // A link to this binary, not a script: nothing to quote, and it works on a noexec data volume.
+    // A link, not a script: nothing to quote, and it works on a noexec data volume.
     if std::fs::read_link(&link).ok() != Some(exe.clone()) {
         std::fs::create_dir_all(&dir)?;
         let tmp = dir.join(format!(".pre-receive.{}.{:x}", std::process::id(), rand::random::<u64>()));
         std::os::unix::fs::symlink(&exe, &tmp)?;
         std::fs::rename(&tmp, &link)?;
     }
-    Ok(Some((dir, json)))
+    Ok(dir)
 }
 
-/// Run as git's pre-receive hook: "old new ref" lines on stdin; refuse the
-/// whole push (exit 1, the reasons go to the pusher) when one breaks a rule in
-/// GITTER_RULES. A new branch is always allowed.
+/// Run as git's pre-receive hook: "old new ref" lines on stdin. Refuses the
+/// whole push (exit 1, the reasons go to the pusher) when one breaks a branch
+/// rule in GITTER_RULES, and otherwise runs push protection (`scan::check`),
+/// so a refused push never uses up an allowance.
 pub fn pre_receive() -> i32 {
-    let Ok(raw) = std::env::var("GITTER_RULES") else { return 0 };
-    let Ok(rules) = serde_json::from_str::<Vec<Rule>>(&raw) else {
+    let mut raw = Vec::new();
+    let Ok(input) = std::io::stdin().read_to_end(&mut raw).map_err(drop).and_then(|_| String::from_utf8(raw).map_err(drop)) else {
+        eprintln!("Gitter couldn't read the refs this push updates (names must be UTF-8), so it refuses the push.");
+        return 1;
+    };
+    if let Ok(rules) = std::env::var("GITTER_RULES") {
+        let code = check_rules(&rules, &input);
+        if code != 0 {
+            return code;
+        }
+    }
+    crate::scan::check(&input)
+}
+
+/// The branch-rule half of the hook.
+fn check_rules(raw: &str, input: &str) -> i32 {
+    let Ok(rules) = serde_json::from_str::<Vec<Rule>>(raw) else {
         eprintln!("Gitter couldn't read this repository's branch rules, so it refuses the push.");
         return 1;
     };
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return 1;
-    }
     let hex = |s: &str| (40..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit());
     let zero = |s: &str| s.bytes().all(|b| b == b'0');
     let mut refused = Vec::new();

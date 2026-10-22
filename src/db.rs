@@ -722,6 +722,61 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX ssh_keys_user ON ssh_keys(user_id);
     "#,
+    // v23: security scanning. A push or web commit that adds a secret is refused and the
+    // finding kept for its author (masked, never the secret; a week) in secret_blocks, so
+    // they can allow it once (secret_bypasses, used up by the next push or commit that has
+    // it). secret_scans holds the latest on-demand scan of a default branch (findings as
+    // JSON). osv_* is the vulnerability database the site admin imports (OSV format);
+    // ranges are the OSV SEMVER/ECOSYSTEM ranges as JSON.
+    r#"
+    CREATE TABLE secret_blocks (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        path TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        masked TEXT NOT NULL,
+        commit_sha TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX secret_blocks_who ON secret_blocks(repo_id, user_id, fingerprint);
+    CREATE INDEX secret_blocks_age ON secret_blocks(created_at);
+    CREATE TABLE secret_bypasses (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER,
+        PRIMARY KEY (repo_id, user_id, fingerprint)
+    );
+    CREATE TABLE secret_scans (
+        repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+        commit_sha TEXT NOT NULL,
+        scanned_at INTEGER NOT NULL,
+        truncated INTEGER NOT NULL DEFAULT 0,
+        findings TEXT NOT NULL
+    );
+    CREATE TABLE osv_vulns (
+        id TEXT PRIMARY KEY,
+        summary TEXT NOT NULL DEFAULT '',
+        severity TEXT NOT NULL DEFAULT '',
+        aliases TEXT NOT NULL DEFAULT '[]',
+        modified TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE osv_affected (
+        vuln_id TEXT NOT NULL REFERENCES osv_vulns(id) ON DELETE CASCADE,
+        ecosystem TEXT NOT NULL,
+        name TEXT NOT NULL,
+        versions TEXT NOT NULL DEFAULT '[]',
+        ranges TEXT NOT NULL DEFAULT '[]'
+    );
+    CREATE INDEX osv_affected_pkg ON osv_affected(ecosystem, name);
+    CREATE INDEX osv_affected_vuln ON osv_affected(vuln_id);
+    "#,
 ];
 
 impl Db {

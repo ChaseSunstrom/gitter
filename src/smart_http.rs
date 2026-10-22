@@ -198,17 +198,33 @@ pub async fn push_limit(st: &AppState, repo: &Repo, push: bool) -> Result<u64, A
 /// `git` set up for a transfer over any transport; callers add the service and
 /// its arguments. `receives`: this transfer takes a push, so the pre-receive
 /// hook checks it against the branch rules binding the pusher before any ref moves.
-pub async fn transfer_command(st: &AppState, repo: &Repo, user: Option<&User>, max_push: u64, receives: bool) -> Result<tokio::process::Command, AppError> {
+pub async fn transfer_command(
+    st: &AppState,
+    repo: &Repo,
+    user: Option<&User>,
+    max_push: u64,
+    receives: bool,
+) -> Result<(tokio::process::Command, Option<crate::scan::PushGuard>), AppError> {
     let mut cmd = st.git.command(None);
     // The current push limit overrides whatever was stored when the repo was created.
     cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
-    if receives && let Some((dir, rules)) = crate::protect::push_hook(st, repo).await? {
-        cmd.arg("-c").arg(format!("core.hooksPath={}", dir.display())).env("GITTER_RULES", rules);
+    let mut guard = None;
+    if receives {
+        // The pre-receive hook: branch rules binding the pusher, then push protection.
+        cmd.arg("-c").arg(format!("core.hooksPath={}", crate::protect::hook_dir(st)?.display()));
+        if let Some(rules) = crate::protect::rules_env(st, repo).await? {
+            cmd.env("GITTER_RULES", rules);
+        }
+        if let Some(u) = user {
+            let g = crate::scan::PushGuard::start(st, repo, u).await?;
+            g.apply(&mut cmd);
+            guard = Some(g);
+        }
     }
     if let Some(u) = user {
         cmd.env("REMOTE_USER", &u.username);
     }
-    Ok(cmd)
+    Ok((cmd, guard))
 }
 
 /// A refusal from the shared checks as git over HTTP says it: anonymous
@@ -265,7 +281,7 @@ async fn serve_inner(
         Ok(m) => m,
         Err(e) => return Ok(refuse(e, false)),
     };
-    let mut cmd = transfer_command(&st, &repo, user.as_ref(), max_push, push && is_post).await?;
+    let (mut cmd, guard) = transfer_command(&st, &repo, user.as_ref(), max_push, push && is_post).await?;
     if crate::auth::basic_secret(&headers).is_some_and(|s| s.starts_with(crate::ci::queue::JOB_TOKEN_PREFIX)) {
         // A CI runner fetches the one commit it builds (only commits a ref can reach).
         cmd.arg("-c").arg("uploadpack.allowReachableSHA1InWant=true");
@@ -373,13 +389,17 @@ async fn serve_inner(
             }
         }
         drop(stdout);
-        drop(tx);
         if aborted {
             let _ = child.start_kill();
             feeder.abort();
         }
         let _ = feeder.await;
         let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        // What push protection refused is on record before the client hears the push is over.
+        if let Some(g) = guard {
+            g.finish(&st2).await;
+        }
+        drop(tx);
         if let (Some(before), Some(user)) = (before, user)
             && let Err(e) = after_push(&st2, &repo, &user, before).await
         {

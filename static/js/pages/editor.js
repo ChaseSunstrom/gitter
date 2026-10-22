@@ -6,6 +6,7 @@ import { loadRepo, repoUrl, splitRev, repoPage, mountRepoHeader } from '../repoh
 import { highlightBlock, ensureLang } from '../hl.js';
 import { renderMarkdown, preloadLangs } from '../md.js';
 import { navigate } from '../main.js';
+import { allowDialog } from './security.js';
 
 // ---------- dropped files (handed over from the tree page) ----------
 let stashed = null;
@@ -124,9 +125,16 @@ function readCommit(root, defaultMsg) {
 
 async function doCommit(meta, branch, expected, changes, root, defaultMsg, after) {
   const { message, newBranch } = readCommit(root, defaultMsg);
-  const r = await send('POST', `${repoUrl(meta.owner, meta.name)}/contents`, {
+  const commit = () => send('POST', `${repoUrl(meta.owner, meta.name)}/contents`, {
     branch, expected_sha: expected || undefined, new_branch: newBranch || undefined, message, changes,
   });
+  let r;
+  try { r = await commit(); } catch (e) {
+    // Push protection: the commit adds something that looks like a secret.
+    if (e.code !== 'secret_detected' || !e.details?.findings?.length) throw e;
+    if (!await allowDialog(meta, e.details.findings)) return;
+    r = await commit();
+  }
   const base = `/${meta.owner}/${meta.name}`;
   if (newBranch) {
     toast('Changes committed to ' + newBranch);

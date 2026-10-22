@@ -13,6 +13,7 @@ pub mod moderation;
 pub mod releases;
 pub mod repos;
 pub mod reviews;
+pub mod scanning;
 pub mod security;
 pub mod snippets;
 pub mod webhooks;
@@ -229,6 +230,13 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/releases/{{id}}/assets/{{asset}}"),
             get(releases::download).delete(releases::delete_asset),
         )
+        .route(&format!("{repo}/security"), get(scanning::overview))
+        .route(&format!("{repo}/security/scan"), post(scanning::scan))
+        .route(&format!("{repo}/security/bypasses"), post(scanning::allow))
+        .route(&format!("{repo}/dependencies"), get(scanning::dependencies))
+        .route(&format!("{repo}/sbom"), get(scanning::sbom))
+        // osv.dev's per-ecosystem zips are large.
+        .route("/admin/osv", get(scanning::osv_status).post(scanning::osv_import).layer(DefaultBodyLimit::max(512 << 20)))
         .route(&format!("{repo}/packages"), get(crate::registry::list))
         .route(&format!("{repo}/packages/images"), delete(crate::registry::image_delete))
         .route(

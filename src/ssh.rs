@@ -443,7 +443,7 @@ impl Job {
         let before = if push { Some(http::before_push(&st, &repo, Some(&user)).await?) } else { None };
         let _permit = st.git.permit_stream().await?;
         let max_push = http::push_limit(&st, &repo, push).await?;
-        let mut cmd = http::transfer_command(&st, &repo, Some(&user), max_push, push).await?;
+        let (mut cmd, guard) = http::transfer_command(&st, &repo, Some(&user), max_push, push).await?;
         cmd.arg(service);
         if service == "upload-pack" {
             cmd.arg("--strict");
@@ -495,6 +495,10 @@ impl Job {
             Ok(Ok(s)) => s.code().unwrap_or(1),
             _ => 1,
         };
+        // What push protection refused is on record before the client hears the push is over.
+        if let Some(g) = guard {
+            g.finish(&st).await;
+        }
         let _ = handle.exit_status_request(channel, code as u32).await;
         let _ = handle.eof(channel).await;
         let _ = handle.close(channel).await;

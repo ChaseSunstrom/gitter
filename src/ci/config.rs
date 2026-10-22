@@ -823,7 +823,7 @@ impl Cron {
 }
 
 /// (year, month 1-12, day 1-31, hour, minute, weekday 0=Sunday) of unix time `t`, UTC.
-fn civil(t: i64) -> (i64, usize, usize, usize, usize, usize) {
+pub(crate) fn civil(t: i64) -> (i64, usize, usize, usize, usize, usize) {
     let days = t.div_euclid(86400);
     let secs = t.rem_euclid(86400);
     // Howard Hinnant's days-from-civil, inverted.

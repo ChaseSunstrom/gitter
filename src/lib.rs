@@ -5,6 +5,7 @@ pub mod ci;
 pub mod cli;
 pub mod db;
 pub mod demo;
+pub mod deps;
 pub mod diff;
 pub mod error;
 pub mod git;
@@ -16,6 +17,7 @@ pub mod protect;
 pub mod ops;
 pub mod registry;
 pub mod repo;
+pub mod scan;
 pub mod security;
 pub mod settings;
 pub mod signing;
@@ -90,6 +92,14 @@ impl AppState {
         let git = git::Git::new(cfg.data_dir.join("repos"), cfg.data_dir.join("home"), 64);
         let settings = Arc::new(settings::Live::new(settings::Settings::from_config(&cfg)));
         let cfg_dir = cfg.data_dir.clone();
+        let key = security::server_key(&cfg_dir).unwrap_or_else(|e| panic!("can't read or create {}/secret.key: {e}", cfg_dir.display()));
+        // Push protection's fingerprints are keyed by the server's secret (not the key itself).
+        {
+            use hmac::Mac;
+            let mut m = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).expect("any key length");
+            m.update(b"gitter scan fingerprints");
+            scan::set_key(&m.finalize().into_bytes());
+        }
         AppState {
             db,
             git,
@@ -100,7 +110,7 @@ impl AppState {
             setup_code: Arc::default(),
             challenges: Arc::default(),
             transfers: Arc::default(),
-            key: Arc::new(security::server_key(&cfg_dir).unwrap_or_else(|e| panic!("can't read or create {}/secret.key: {e}", cfg_dir.display()))),
+            key: Arc::new(key),
             ci_wake: Arc::default(),
             signing: Arc::new(signing::Signing::new(cfg_dir.join("gpg"))),
             hook_wake: Arc::default(),

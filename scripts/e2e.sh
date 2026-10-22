@@ -503,6 +503,36 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/repos/alice/hello/traff
 [ "$code" = 401 ] || fail "traffic should be for admins only, anonymous got $code"
 ok "traffic: clones and views per day for the repository's admins only"
 
+# --- push protection, secret scanning, dependencies, OSV and SBOM (in their own repository)
+api POST /repos '{"name":"vault","readme":true}'
+V="$TMP/vault"
+git clone -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/vault.git" "$V" || fail "clone vault"  # pragma: allowlist secret
+AWS_KEY="AKIA$(printf '%s' Q3EGRIW5ZKVNOM2T)"
+(cd "$V" && git config user.name Alice && git config user.email alice@example.com \
+  && printf 'AWS_ACCESS_KEY_ID=%s\n' "$AWS_KEY" >deploy.env \
+  && printf '[[package]]\nname = "smallvec"\nversion = "1.6.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n' >Cargo.lock \
+  && git add -A && git commit -qm "Deploy settings") || fail "vault commit"
+if (cd "$V" && git push -q origin main 2>"$TMP/refused.log"); then fail "a push adding an AWS key should be refused"; fi
+grep -qF 'deploy.env:1  AWS access key ID  AKIA…2T' "$TMP/refused.log" || fail "the refusal should name file, line and kind: $(cat "$TMP/refused.log")"
+if grep -qF "$AWS_KEY" "$TMP/refused.log"; then fail "the refusal printed the secret"; fi
+FP=$(grep -o 'allow=[0-9a-f,]*' "$TMP/refused.log" | head -1 | cut -d= -f2)
+api POST /repos/alice/vault/security/bypasses "{\"fingerprints\":[\"$FP\"],\"reason\":\"test\"}"
+(cd "$V" && git push -q origin main) || fail "a push after allowing the finding once"
+ok "push protection: a secret is refused with file, line and kind, then goes through once allowed"
+api POST /repos/alice/vault/security/scan
+[ "$(jq_ 'd["scan"]["findings"][0]["path"]')" = deploy.env ] || fail "on-demand scan: $BODY"
+printf '%s' '[{"id":"GHSA-e2e-0001","summary":"smallvec overflow","database_specific":{"severity":"HIGH"},"affected":[{"package":{"ecosystem":"crates.io","name":"smallvec"},"ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.0"},{"fixed":"1.6.1"}]}]}]}]' >"$TMP/osv.json"
+code=$(curl -s -o "$TMP/osv.out" -w '%{http_code}' -b "$JAR" -H "Origin: $BASE" -H 'Content-Type: application/octet-stream' --data-binary @"$TMP/osv.json" "$BASE/api/admin/osv")
+[ "$code" = 200 ] || fail "OSV import: $code $(cat "$TMP/osv.out")"
+api GET /repos/alice/vault/dependencies
+[ "$(jq_ 'd["vulnerabilities"][0]["id"] + " " + d["vulnerabilities"][0]["fixed"]')" = "GHSA-e2e-0001 1.6.1" ] || fail "vulnerability match: $BODY"
+curl -sf -b "$JAR" "$BASE/api/repos/alice/vault/sbom?format=spdx" | grep -q '"SPDX-2.3"' || fail "SPDX SBOM"
+curl -sf -b "$JAR" "$BASE/api/repos/alice/vault/sbom?format=cyclonedx" | grep -q '"pkg:cargo/smallvec@1.6.0"' || fail "CycloneDX SBOM"
+ok "secret scan on demand; Cargo.lock's smallvec flagged by an imported OSV advisory; SPDX and CycloneDX SBOMs"
+# A refused push left for the UI check's Security tab.
+(cd "$V" && printf 'export TOKEN=gtr_%s\n' aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9f >ci.sh && git add ci.sh && git commit -qm "CI" \
+  && ! git push -q origin main 2>/dev/null && git reset -q --hard HEAD~1) || fail "a Gitter token should be refused too"
+
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")
 [ "$code" = 200 ] && grep -q '<html' "$TMP/index.html" || fail "SPA route"

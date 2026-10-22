@@ -34,7 +34,7 @@ export const state = { me: null, signup: true, repo: null };
 // ---------- API ----------
 const cache = new Map(); // url -> { t, p }
 const TTL = 20_000;
-export class ApiError extends Error { constructor(status, msg, code) { super(msg); this.status = status; this.code = code; } }
+export class ApiError extends Error { constructor(status, msg, code, details) { super(msg); this.status = status; this.code = code; this.details = details; } }
 
 async function request(method, url, body) {
   const opts = { method, headers: { Accept: 'application/json' }, credentials: 'same-origin' };
@@ -43,7 +43,7 @@ async function request(method, url, body) {
   try { res = await fetch('/api' + url, opts); } catch { throw new ApiError(0, "Can't reach the server. Check your connection."); }
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
-  if (!res.ok) throw new ApiError(res.status, data?.error || `Request failed (${res.status})`, data?.code);
+  if (!res.ok) throw new ApiError(res.status, data?.error || `Request failed (${res.status})`, data?.code, data?.details);
   return data;
 }
 
