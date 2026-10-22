@@ -16,7 +16,7 @@ ok() { pass=$((pass + 1)); echo "✓ $*"; }
 cargo build -q
 GITTER_DATA="$TMP/data" GITTER_ADDR="127.0.0.1:$PORT" GITTER_URL="$BASE" ./target/debug/gitter >"$LOG" 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; rm -rf "$TMP"' EXIT
+trap 'kill $PID ${HOOK_PID:-} 2>/dev/null; rm -rf "$TMP"' EXIT
 for _ in $(seq 50); do curl -sf "$BASE/robots.txt" >/dev/null && break; sleep 0.1; done
 SETUP=$(grep -o 'setup=[A-Za-z0-9_-]*' "$LOG" | head -1 | cut -d= -f2)
 [ -n "$SETUP" ] || fail "first boot should print a setup link"
@@ -164,6 +164,21 @@ SNIP=$(jq_ 'd["id"]')
 curl -sf "$BASE/raw/snippets/$SNIP/latest/hello.py" | grep -q 'print' || fail "snippet raw"
 ok "wiki pages with history and conflict check, discussion answer and vote, snippet raw file"
 
+# --- releases
+api POST /repos/alice/hello/releases '{"tag":"v1.0","target":"main","title":"Version one","notes":"First **stable** release"}'
+RID=$(jq_ 'd["id"]')
+printf 'hello release\n' >"$TMP/hello.txt"
+AID=$(curl -sf -b "$JAR" -H "Origin: $BASE" -H 'Content-Type: text/plain' --data-binary @"$TMP/hello.txt" \
+  "$BASE/api/repos/alice/hello/releases/$RID/assets?name=hello.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || fail "release file upload"
+curl -sf -D "$TMP/rel.h" "$BASE/api/repos/alice/hello/releases/$RID/assets/$AID" | cmp -s - "$TMP/hello.txt" || fail "release file download"
+grep -qi '^content-disposition: attachment; filename="hello.txt"' "$TMP/rel.h" || fail "release files should download as attachments"
+git ls-remote "$BASE/alice/hello.git" refs/tags/v1.0 | grep -q . || fail "the release's new tag is missing"
+api POST /repos/alice/hello/releases '{"tag":"v1.1","title":"Next up","draft":true}'
+curl -sf "$BASE/api/repos/alice/hello/releases" | python3 -c 'import json,sys; sys.exit([r["tag"] for r in json.load(sys.stdin)["releases"]] != ["v1.0"])' || fail "drafts must be hidden from readers"
+api GET /repos/alice/hello/releases/latest
+[ "$(jq_ 'd["tag"]')" = v1.0 ] && [ "$(jq_ 'd["assets"][0]["downloads"]')" = 1 ] || fail "latest release and its download count: $BODY"
+ok "releases: a new tag at a branch, a file uploaded and downloaded (as an attachment, counted), latest, drafts hidden"
+
 # --- second user, privacy, stars, forks
 JAR_A="$JAR"; JAR="$TMP/jar2"
 api POST /auth/signup '{"username":"bob","email":"bob@example.com","password":"another horse"}'
@@ -187,6 +202,33 @@ ok "private repos hidden from others (API, git, raw, explore)"
 JAR="$JAR_A"
 git clone -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/secret.git" "$TMP/secret" || fail "owner clones private"  # pragma: allowlist secret
 ok "owner clones private repo with token"
+
+# --- collaborators and organizations
+api PUT /repos/alice/secret/collaborators/bob '{"role":"write"}'
+BOB_AUTH="Authorization: Basic $(printf '%s' 'bob:another horse' | base64)" # pragma: allowlist secret
+git clone -q -c http.extraHeader="$BOB_AUTH" "http://127.0.0.1:$PORT/alice/secret.git" "$TMP/bob-secret" || fail "collaborator clones private repo"
+(cd "$TMP/bob-secret" && echo hi >bob.txt && git add bob.txt && git -c user.name=bob -c user.email=bob@example.com commit -qm "From bob" \
+  && git -c http.extraHeader="$BOB_AUTH" push -q origin HEAD) || fail "collaborator with write pushes"
+JAR="$TMP/jar2"
+api GET /repos/alice/secret
+[ "$(jq_ 'd["can_write"], d["can_admin"]')" = "True False" ] || fail "collaborator role: $BODY"
+EXPECT=403 api PATCH /repos/alice/secret '{"description":"x"}'
+JAR="$JAR_A"
+api GET /repos/alice/secret/collaborators
+jq_ 'd["access"]' | grep -q bob || fail "access list names the collaborator"
+api POST /orgs '{"name":"acme","display_name":"Acme Inc"}'
+api POST /repos '{"name":"tools","owner":"acme","private":true,"readme":true}'
+JAR="$TMP/jar2"
+EXPECT=404 api GET /repos/acme/tools
+JAR="$JAR_A"
+api PUT /orgs/acme/members/bob '{"role":"member"}'
+JAR="$TMP/jar2"
+api GET /repos/acme/tools
+[ "$(jq_ 'd["can_write"]')" = False ] || fail "org members get the base role (read)"
+JAR="$JAR_A"
+api GET /users/acme
+[ "$(jq_ 'd["is_org"]')" = True ] || fail "org profile"
+ok "collaborators push with their role; organizations own repos and share them with members"
 
 api GET /admin/overview
 [ "$(jq_ 'd["users"]')" = 2 ] || fail "admin overview"
@@ -296,6 +338,45 @@ grep -q 'Crash on start' "$TMP/export/issues.json" || fail "export has the issue
 git clone -q -b main "$TMP/export/repositories/hello.bundle" "$TMP/from-bundle" && [ -f "$TMP/from-bundle/src/main.rs" ] || fail "clone from the exported bundle"
 EXPECT=400 api DELETE /me '{"confirm":"bob"}'
 ok "data export (JSON and git bundles); self-delete needs the typed username"
+# --- webhooks: a local receiver gets a signed ping and an issue event (private addresses need the admin's say-so)
+HOOK_LOG="$TMP/hook.log"
+python3 -c '
+import http.server, json, sys
+log = open(sys.argv[1], "a")
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        log.write(json.dumps({"headers": {k.lower(): v for k, v in self.headers.items()}, "body": body.decode()}) + "\n"); log.flush()
+        self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[2], "w").write(str(s.server_port))
+s.serve_forever()
+' "$HOOK_LOG" "$TMP/hook.port" &
+HOOK_PID=$!
+for _ in $(seq 50); do [ -s "$TMP/hook.port" ] && break; sleep 0.1; done
+HOOK_URL="http://127.0.0.1:$(cat "$TMP/hook.port")/hook"
+api POST /repos/alice/hello/hooks "{\"url\":\"$HOOK_URL\",\"secret\":\"e2e-secret\",\"events\":[\"issues\"],\"allow_private\":true}"
+HOOK_ID=$(jq_ 'd["id"]')
+api POST /repos/alice/hello/issues '{"title":"Hooked","body":"Sent to a webhook"}'
+for _ in $(seq 100); do [ "$(grep -c . "$HOOK_LOG" 2>/dev/null)" -ge 2 ] && break; sleep 0.1; done
+python3 - "$HOOK_LOG" <<'PY' || fail "webhook deliveries: $(cat "$HOOK_LOG")"
+import hashlib, hmac, json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert sorted(r["headers"]["x-gitter-event"] for r in rows) == ["issues", "ping"], rows
+for r in rows:
+    want = "sha256=" + hmac.new(b"e2e-secret", r["body"].encode(), hashlib.sha256).hexdigest()
+    assert r["headers"]["x-gitter-signature-256"] == want, r["headers"]
+issue = next(json.loads(r["body"]) for r in rows if r["headers"]["x-gitter-event"] == "issues")
+assert issue["action"] == "opened" and issue["issue"]["title"] == "Hooked", issue
+PY
+for _ in $(seq 50); do
+  api GET "/repos/alice/hello/hooks/$HOOK_ID"
+  [ "$(jq_ '[x["status"] for x in d["deliveries"]]')" = "['ok', 'ok']" ] && break
+  sleep 0.1
+done
+[ "$(jq_ '[x["status"] for x in d["deliveries"]]')" = "['ok', 'ok']" ] || fail "webhook delivery log: $BODY"
+ok "webhooks: a local receiver gets a signed ping and issue event, and the delivery log shows both"
 
 # --- web pages
 code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/main/src/main.rs")

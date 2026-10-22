@@ -106,12 +106,13 @@ pub async fn overview(State(st): State<AppState>, _a: Admin) -> J<serde_json::Va
         .call(|c| {
             let n = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
             let day = crate::db::now() - 86400;
-            let mut s = c.prepare("SELECT username, created_at FROM users ORDER BY id DESC LIMIT 6")?;
+            let mut s = c.prepare("SELECT username, created_at FROM users WHERE is_org = 0 ORDER BY id DESC LIMIT 6")?;
             let recent: Vec<serde_json::Value> = s
                 .query_map([], |r| Ok(json!({ "username": r.get::<_, String>(0)?, "created_at": r.get::<_, i64>(1)? })))?
                 .collect::<Result<_, _>>()?;
             Ok(json!({
-                "users": n("SELECT count(*) FROM users")?,
+                "users": n("SELECT count(*) FROM users WHERE is_org = 0")?,
+                "orgs": n("SELECT count(*) FROM users WHERE is_org = 1")?,
                 "suspended": n("SELECT count(*) FROM users WHERE suspended = 1")?,
                 "repos": n("SELECT count(*) FROM repos WHERE deleted_at IS NULL")?,
                 "private_repos": n("SELECT count(*) FROM repos WHERE is_private = 1 AND deleted_at IS NULL")?,
@@ -164,7 +165,7 @@ pub async fn users(
     let out = st
         .db
         .call(move |c| {
-            let mut cond = String::from("1=1");
+            let mut cond = String::from("u.is_org = 0");
             let mut params: Vec<Value> = vec![];
             if let Some(s) = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 cond.push_str(" AND (u.username LIKE ?1 ESCAPE '\\' OR u.email LIKE ?1 ESCAPE '\\' OR u.display_name LIKE ?1 ESCAPE '\\')");
@@ -248,6 +249,10 @@ pub async fn update_user(
                     "UPDATE users SET is_admin = ?1 WHERE id = ?2",
                     rusqlite::params![a as i64, id],
                 )?;
+                // Only admins may point hooks at private addresses: a former admin's own repos lose that.
+                if !a {
+                    tx.execute("UPDATE webhooks SET allow_private = 0 WHERE repo_id IN (SELECT id FROM repos WHERE owner_id = ?1)", [id])?;
+                }
             }
             if let Some(s) = p.suspended {
                 tx.execute(

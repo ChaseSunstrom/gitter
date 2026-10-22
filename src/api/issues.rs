@@ -257,6 +257,7 @@ pub async fn create(
         1,
     )
     .await?;
+    crate::webhooks::issue(&st, r.id, u.id, num, false, "opened").await;
     Ok(Json(json!({ "number": num })))
 }
 
@@ -453,6 +454,7 @@ pub async fn update(
         Some(_) => return Err(AppError::bad("Unknown state")),
     };
     let (iid, rid, uid) = (issue.id, r.id, u.id);
+    let edited = req.title.is_some() || req.body.is_some() || req.labels.is_some();
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -483,6 +485,12 @@ pub async fn update(
             Ok(())
         })
         .await?;
+    if edited {
+        crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, "edited").await;
+    }
+    if let Some(s) = new_state {
+        crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
+    }
     ok()
 }
 
@@ -558,6 +566,12 @@ pub async fn comment(
         1,
     )
     .await?;
+    if id > 0 {
+        crate::webhooks::comment(&st, r.id, u.id, id, "created").await;
+    }
+    if let Some(s) = new_state {
+        crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
+    }
     Ok(Json(json!({ "id": id })))
 }
 
@@ -601,6 +615,7 @@ pub async fn edit_comment(
             )?)
         })
         .await?;
+    crate::webhooks::comment(&st, r.id, u.id, id, "edited").await;
     ok()
 }
 
@@ -613,9 +628,24 @@ pub async fn delete_comment(
     if comment_owner(&st, &r, id).await? != u.id && !r.can_write {
         return Err(AppError::forbidden());
     }
-    st.db
-        .call(move |c| Ok(c.execute("DELETE FROM comments WHERE id = ?1", [id])?))
+    let (rid, uid, base) = (r.id, u.id, st.cfg.url.clone());
+    let queued = st
+        .db
+        .call(move |c| {
+            // The event is built from the comment, so before it goes, and only kept if it does.
+            let tx = c.transaction()?;
+            let queued = crate::webhooks::comment_now(&tx, &base, rid, uid, id, "deleted").unwrap_or_else(|e| {
+                eprintln!("webhooks: {e}");
+                0
+            });
+            tx.execute("DELETE FROM comments WHERE id = ?1", [id])?;
+            tx.commit()?;
+            Ok(queued)
+        })
         .await?;
+    if queued > 0 {
+        st.hook_wake.notify_one();
+    }
     ok()
 }
 
@@ -772,6 +802,7 @@ pub async fn create_pull(
         1,
     )
     .await?;
+    crate::webhooks::issue(&st, r.id, u.id, num, true, "opened").await;
     if let Err(e) = crate::ci::trigger::on_pull_opened(&st, &r, u.id, num, &head_branch, &base_branch).await {
         eprintln!("ci: {}#{num}: {}", r.full_name(), e.msg);
     }
@@ -955,6 +986,7 @@ pub async fn merge_pull(
         old: Some(base),
         new: Some(new_sha.clone()),
     };
+    crate::webhooks::issue(&st, r.id, u.id, num, true, "merged").await;
     crate::hooks::on_push(&st, &r, &u, &[upd]).await;
     if req.delete_branch && head_b != r.default_branch {
         let _ = st

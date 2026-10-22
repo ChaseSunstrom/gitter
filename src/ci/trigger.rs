@@ -19,7 +19,7 @@ pub async fn enabled(st: &AppState, owner_id: i64) -> bool {
         "everyone" => true,
         "admins" => st
             .db
-            .call(move |c| Ok(c.query_row("SELECT is_admin FROM users WHERE id = ?1", [owner_id], |r| r.get::<_, bool>(0))?))
+            .call(move |c| Ok(c.query_row(&format!("SELECT {} FROM users u WHERE u.id = ?1", super::queue::ADMIN_OWNED), [owner_id], |r| r.get::<_, bool>(0))?))
             .await
             .unwrap_or(false),
         _ => false,

@@ -9,6 +9,7 @@ pub mod git;
 pub mod hooks;
 pub mod langs;
 pub mod lfs;
+pub mod net;
 pub mod ops;
 pub mod repo;
 pub mod security;
@@ -16,6 +17,7 @@ pub mod settings;
 pub mod smart_http;
 pub mod validate;
 pub mod web;
+pub mod webhooks;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +26,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get, post};
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 
 /// Settings read once at startup.
 #[derive(Clone, Debug)]
@@ -66,6 +69,8 @@ pub struct AppState {
     pub key: Arc<[u8; 32]>,
     /// Wakes the built-in runner when a job is queued.
     pub ci_wake: Arc<tokio::sync::Notify>,
+    /// Wakes the webhook sender when a delivery is queued.
+    pub hook_wake: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -85,6 +90,7 @@ impl AppState {
             transfers: Arc::default(),
             key: Arc::new(security::server_key(&cfg_dir).unwrap_or_else(|e| panic!("can't read or create {}/secret.key: {e}", cfg_dir.display()))),
             ci_wake: Arc::default(),
+            hook_wake: Arc::default(),
         }
     }
 }
@@ -132,7 +138,9 @@ pub fn router(st: AppState) -> Router {
         .route("/robots.txt", get(web::robots))
         .route("/healthz", get(api::admin::healthz))
         .fallback(get(web::index))
-        .layer(CompressionLayer::new());
+        // Binary downloads (release files, raw binaries) gain little from gzip and
+        // would lose their Content-Length, so browsers couldn't show progress.
+        .layer(CompressionLayer::new().compress_when(DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream"))));
 
     Router::new()
         .route(

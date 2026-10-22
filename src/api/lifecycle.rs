@@ -42,9 +42,32 @@ fn export_path(st: &AppState, user_id: i64, id: i64) -> PathBuf {
     st.cfg.data_dir.join("exports").join(format!("{user_id}-{id}.tar.gz"))
 }
 
-/// Repositories an account owns, not counting the trash.
-pub fn live_repos(c: &Connection, owner_id: i64) -> rusqlite::Result<i64> {
-    c.query_row("SELECT count(*) FROM repos WHERE owner_id = ?1 AND deleted_at IS NULL", [owner_id], |r| r.get(0))
+/// Repositories counted against `payer`'s limit (its own and its organizations'), not counting the trash.
+pub fn live_repos(c: &Connection, payer: i64) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT count(*) FROM repos WHERE owner_id IN (SELECT ?1 UNION ALL SELECT id FROM orgs WHERE created_by = ?1) AND deleted_at IS NULL",
+        [payer],
+        |r| r.get(0),
+    )
+}
+
+/// May `u` give away or bring back a repository of `owner_id`: the owner, an
+/// owner of the organization that owns it, or a site admin (not admin collaborators).
+fn owns(c: &Connection, u: &User, owner_id: i64) -> rusqlite::Result<bool> {
+    if u.is_admin || u.id == owner_id {
+        return Ok(true);
+    }
+    let q = "SELECT 1 FROM org_members WHERE org_id = ?1 AND user_id = ?2 AND role = 'owner'";
+    Ok(c.query_row(q, [owner_id, u.id], |_| Ok(())).optional()?.is_some())
+}
+
+async fn must_own(st: &AppState, u: &User, owner_id: i64) -> R<()> {
+    let u2 = u.clone();
+    if st.db.call(move |c| Ok(owns(c, &u2, owner_id)?)).await? {
+        Ok(())
+    } else {
+        Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "Only the repository's owner can do that"))
+    }
 }
 
 fn name_taken(c: &Connection, owner_id: i64, name: &str) -> rusqlite::Result<bool> {
@@ -67,7 +90,7 @@ async fn move_dir(from: &FsPath, to: &FsPath) -> std::io::Result<()> {
 // ---------- transfers ----------
 
 pub async fn offer(State(st): State<AppState>, Viewer(v): Viewer, Path((owner, name)): Path<(String, String)>) -> J<Value> {
-    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    let r = Repo::administrable(&st, v.as_ref(), &owner, &name).await?;
     let id = r.id;
     let offer = st
         .db
@@ -97,7 +120,8 @@ pub async fn offer_transfer(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<OfferReq>,
 ) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
+    must_own(&st, &u, r.owner_id).await?;
     if !req.confirm.trim().eq_ignore_ascii_case(&r.full_name()) {
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
@@ -127,7 +151,8 @@ pub async fn offer_transfer(
 }
 
 pub async fn cancel_transfer(State(st): State<AppState>, Authed(u): Authed, Path((owner, name)): Path<(String, String)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
+    must_own(&st, &u, r.owner_id).await?;
     let id = r.id;
     st.db.call(move |c| Ok(c.execute("DELETE FROM repo_transfers WHERE repo_id = ?1", [id])?)).await?;
     ok()
@@ -145,14 +170,16 @@ pub async fn my_transfers(State(st): State<AppState>, Authed(u): Authed) -> J<Va
                 "SELECT t.repo_id AS id, fu.username || '/' || r.name AS repo, fu.username AS \"from\", r.description, r.is_private AS private,
                     t.created_at, t.expires_at
                  FROM repo_transfers t JOIN repos r ON r.id = t.repo_id JOIN users fu ON fu.id = r.owner_id
-                 WHERE t.to_id = ?1 AND t.expires_at > ?2 AND r.deleted_at IS NULL AND r.owner_id = t.from_id ORDER BY t.created_at DESC",
+                 WHERE t.to_id IN (SELECT ?1 UNION ALL SELECT org_id FROM org_members WHERE user_id = ?1 AND role = 'owner')
+                   AND t.expires_at > ?2 AND r.deleted_at IS NULL AND r.owner_id = t.from_id ORDER BY t.created_at DESC",
                 params![uid, t],
             )?;
             let outgoing = rows(
                 c,
                 "SELECT t.repo_id AS id, ou.username || '/' || r.name AS repo, tu.username AS \"to\", t.created_at, t.expires_at
                  FROM repo_transfers t JOIN repos r ON r.id = t.repo_id JOIN users ou ON ou.id = r.owner_id JOIN users tu ON tu.id = t.to_id
-                 WHERE r.owner_id = ?1 AND t.expires_at > ?2 AND r.deleted_at IS NULL ORDER BY t.created_at DESC",
+                 WHERE r.owner_id IN (SELECT ?1 UNION ALL SELECT org_id FROM org_members WHERE user_id = ?1 AND role = 'owner')
+                   AND t.expires_at > ?2 AND r.deleted_at IS NULL ORDER BY t.created_at DESC",
                 params![uid, t],
             )?;
             Ok(json!({ "incoming": incoming, "outgoing": outgoing }))
@@ -166,48 +193,56 @@ pub async fn my_transfers(State(st): State<AppState>, Authed(u): Authed) -> J<Va
 pub async fn accept(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp, Path(id): Path<i64>) -> J<Value> {
     let s = st.settings.get();
     let (max, quota) = (s.max_repos_per_user, (s.max_storage_mb * 1024 * 1024) as i64);
-    let (me, admin) = (u.id, u.is_admin);
-    let (from_id, from, name) = st
+    let me = u.id;
+    let (from_id, from, to, name) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
-            // Its size here: the folder, the wiki and the LFS files this account doesn't hold yet.
-            let row: Option<(i64, String, String, i64)> = tx
+            // Offered to you, or to an organization you own. Its size there: the folder,
+            // the wiki, release files and the LFS files that account doesn't hold yet.
+            let row: Option<(i64, String, i64, String, String, i64)> = tx
                 .query_row(
-                    "SELECT r.owner_id, fu.username, r.name, r.size_bytes + r.wiki_bytes + COALESCE((SELECT sum(size) FROM lfs_objects
-                        WHERE repo_id = r.id AND oid NOT IN (SELECT l.oid FROM lfs_objects l JOIN repos x ON x.id = l.repo_id WHERE x.owner_id = ?2)), 0)
-                     FROM repo_transfers t JOIN repos r ON r.id = t.repo_id JOIN users fu ON fu.id = r.owner_id
-                     WHERE t.repo_id = ?1 AND t.to_id = ?2 AND t.expires_at > ?3 AND r.deleted_at IS NULL AND r.owner_id = t.from_id",
+                    "SELECT r.owner_id, fu.username, t.to_id, tu.username, r.name, r.size_bytes + r.wiki_bytes
+                        + COALESCE((SELECT sum(size) FROM lfs_objects
+                            WHERE repo_id = r.id AND oid NOT IN (SELECT l.oid FROM lfs_objects l JOIN repos x ON x.id = l.repo_id WHERE x.owner_id = t.to_id)), 0)
+                        + COALESCE((SELECT sum(a.size) FROM release_assets a JOIN releases rl ON rl.id = a.release_id WHERE rl.repo_id = r.id), 0)
+                     FROM repo_transfers t JOIN repos r ON r.id = t.repo_id JOIN users fu ON fu.id = r.owner_id JOIN users tu ON tu.id = t.to_id
+                     WHERE t.repo_id = ?1 AND t.expires_at > ?3 AND r.deleted_at IS NULL AND r.owner_id = t.from_id
+                       AND (t.to_id = ?2 OR t.to_id IN (SELECT org_id FROM org_members WHERE user_id = ?2 AND role = 'owner'))",
                     params![id, me, now()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )
                 .optional()?;
-            let (from_id, from, name, size) = row.ok_or_else(AppError::not_found)?;
-            if name_taken(&tx, me, &name)? {
-                return Err(AppError::conflict(format!("You already have a repository named {name}. Rename yours first.")));
+            let (from_id, from, to_id, to, name, size) = row.ok_or_else(AppError::not_found)?;
+            if name_taken(&tx, to_id, &name)? {
+                return Err(AppError::conflict(format!("{to} already has a repository named {name}. Rename that one first.")));
             }
-            if !admin && live_repos(&tx, me)? >= max {
-                return Err(AppError::bad(format!("You've reached the limit of {max} repositories")));
+            let (payer, admin) = crate::repo::payer(&tx, to_id)?;
+            if !admin && live_repos(&tx, payer)? >= max {
+                return Err(AppError::bad(format!("That would go over the limit of {max} repositories")));
             }
             if !admin && quota > 0 {
-                let used: i64 = tx.query_row(&format!("SELECT {}", crate::repo::STORAGE_USED), [me], |r| r.get(0))?;
+                let (used, _) = crate::repo::usage(&tx, to_id)?;
                 if used + size > quota {
-                    return Err(AppError::bad("You don't have enough storage left to take this repository"));
+                    return Err(AppError::bad("There isn't enough storage left to take this repository"));
                 }
             }
             add_redirect(&tx, from_id, &name, id)?;
-            claim_name(&tx, me, &name)?;
-            tx.execute("UPDATE repos SET owner_id = ?2, updated_at = ?3 WHERE id = ?1", params![id, me, now()])?;
-            // Deploy tokens were the old owner's keys to it.
+            claim_name(&tx, to_id, &name)?;
+            tx.execute("UPDATE repos SET owner_id = ?2, updated_at = ?3 WHERE id = ?1", params![id, to_id, now()])?;
+            // The old owner's keys to it and credentials in it: deploy tokens, CI secrets,
+            // and webhooks (their URLs and secrets) don't move with the code.
             tx.execute("DELETE FROM tokens WHERE repo_id = ?1", [id])?;
+            tx.execute("DELETE FROM ci_secrets WHERE repo_id = ?1", [id])?;
+            tx.execute("DELETE FROM webhooks WHERE repo_id = ?1", [id])?;
             tx.execute("DELETE FROM repo_transfers WHERE repo_id = ?1", [id])?;
             tx.commit()?;
-            Ok((from_id, from, name))
+            Ok((from_id, from, to, name))
         })
         .await?;
-    let detail = format!("{from}/{name} to {}", u.username);
+    let detail = format!("{from}/{name} to {to}");
     record(&st.db, Event { actor: Some(&u), subject: Some(from_id), action: "repo_transferred", detail, ip: &ip.0 }).await;
-    Ok(Json(json!({ "owner": u.username, "name": name })))
+    Ok(Json(json!({ "owner": to, "name": name })))
 }
 
 pub async fn decline(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp, Path(id): Path<i64>) -> J<Value> {
@@ -218,12 +253,15 @@ pub async fn decline(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp
             let row = c
                 .query_row(
                     "SELECT t.from_id, fu.username || '/' || r.name FROM repo_transfers t JOIN repos r ON r.id = t.repo_id
-                     JOIN users fu ON fu.id = r.owner_id WHERE t.repo_id = ?1 AND t.to_id = ?2",
+                     JOIN users fu ON fu.id = r.owner_id WHERE t.repo_id = ?1
+                       AND t.to_id IN (SELECT ?2 UNION ALL SELECT org_id FROM org_members WHERE user_id = ?2 AND role = 'owner')",
                     [id, uid],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            c.execute("DELETE FROM repo_transfers WHERE repo_id = ?1 AND to_id = ?2", [id, uid])?;
+            if row.is_some() {
+                c.execute("DELETE FROM repo_transfers WHERE repo_id = ?1", [id])?;
+            }
             Ok(row)
         })
         .await?;
@@ -248,12 +286,16 @@ pub async fn trash(st: &AppState, r: &Repo) -> R<()> {
             tx.execute("DELETE FROM repo_transfers WHERE repo_id = ?1", [id])?;
             tx.commit()?;
             // Its CI stops: queued jobs never start, running ones stop at their next heartbeat.
+            // Best effort: the claim query skips trashed repositories anyway, and a failure
+            // here mustn't leave the row trashed with the folder still in place.
             let runs: Vec<(i64, String)> = {
                 let mut q = c.prepare("SELECT id, status FROM ci_runs WHERE repo_id = ?1")?;
                 q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
             };
             for (run, _) in runs.iter().filter(|(_, s)| !crate::ci::queue::terminal(s)) {
-                crate::ci::queue::cancel(c, *run)?;
+                if let Err(e) = crate::ci::queue::cancel(c, *run) {
+                    eprintln!("trash: cancelling CI run {run}: {e}");
+                }
             }
             Ok(())
         })
@@ -286,14 +328,17 @@ pub async fn purge(st: &AppState, id: i64, actor: Option<&User>, ip: &str) -> R<
                 .optional()?;
             let Some(row) = row else { return Ok(None) };
             let oids = crate::lfs::held_by(&tx, false, id)?;
+            let releases = super::releases::ids_of(&tx, false, id)?;
             tx.execute("DELETE FROM repos WHERE id = ?1", [id])?;
             tx.commit()?;
-            Ok(Some((row, oids)))
+            Ok(Some((row, oids, releases)))
         })
         .await?;
-    let Some(((owner_id, owner, name), oids)) = found else { return Ok(false) };
+    let Some(((owner_id, owner, name), oids, releases)) = found else { return Ok(false) };
     crate::lfs::collect(st, oids).await;
-    for dir in [trash_path(st, id), super::wiki::path(st, id)] {
+    super::releases::remove_files(st, releases).await;
+    // The live path too, in case moving it into the trash failed halfway.
+    for dir in [trash_path(st, id), st.git.repo_path(id), super::wiki::path(st, id)] {
         if let Err(e) = tokio::fs::remove_dir_all(&dir).await
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -321,7 +366,8 @@ fn trashed(c: &Connection, cond: &str, p: impl rusqlite::Params) -> rusqlite::Re
 /// Your recently deleted repositories.
 pub async fn my_trash(State(st): State<AppState>, Authed(u): Authed) -> J<Value> {
     let uid = u.id;
-    let repos = st.db.call(move |c| Ok(trashed(c, "r.owner_id = ?1", [uid])?)).await?;
+    let cond = "(r.owner_id = ?1 OR r.owner_id IN (SELECT org_id FROM org_members WHERE user_id = ?1 AND role = 'owner'))";
+    let repos = st.db.call(move |c| Ok(trashed(c, cond, [uid])?)).await?;
     Ok(Json(json!({ "repos": repos })))
 }
 
@@ -334,25 +380,36 @@ pub async fn all_trash(State(st): State<AppState>, _a: Admin) -> J<Value> {
 /// Bring a repository back from the trash, under its old name (which must be free).
 pub async fn restore(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp, Path(id): Path<i64>) -> J<Value> {
     let max = st.settings.get().max_repos_per_user;
-    let (uid, admin) = (u.id, u.is_admin);
-    let name = st
+    if !tokio::fs::try_exists(trash_path(&st, id)).await.unwrap_or(false) {
+        return Err(AppError::internal(format!("repository {id}'s files are missing from the trash")));
+    }
+    let u2 = u.clone();
+    let (owner, name) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
-            let name: String = tx
-                .query_row("SELECT deleted_name FROM repos WHERE id = ?1 AND owner_id = ?2 AND deleted_at IS NOT NULL", [id, uid], |r| r.get(0))
+            let (owner_id, owner, name): (i64, String, String) = tx
+                .query_row(
+                    "SELECT r.owner_id, u.username, r.deleted_name FROM repos r JOIN users u ON u.id = r.owner_id WHERE r.id = ?1 AND r.deleted_at IS NOT NULL",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
                 .optional()?
                 .ok_or_else(AppError::not_found)?;
-            if name_taken(&tx, uid, &name)? {
-                return Err(AppError::conflict(format!("You already have a repository named {name}. Rename or delete it, then restore this one.")));
+            if !owns(&tx, &u2, owner_id)? {
+                return Err(AppError::not_found());
             }
-            if !admin && live_repos(&tx, uid)? >= max {
-                return Err(AppError::bad(format!("You've reached the limit of {max} repositories")));
+            if name_taken(&tx, owner_id, &name)? {
+                return Err(AppError::conflict(format!("{owner} already has a repository named {name}. Rename or delete it, then restore this one.")));
+            }
+            let (payer, admin) = crate::repo::payer(&tx, owner_id)?;
+            if !admin && live_repos(&tx, payer)? >= max {
+                return Err(AppError::bad(format!("That would go over the limit of {max} repositories")));
             }
             tx.execute("UPDATE repos SET name = deleted_name, deleted_name = NULL, deleted_at = NULL WHERE id = ?1", [id])?;
-            claim_name(&tx, uid, &name)?;
+            claim_name(&tx, owner_id, &name)?;
             tx.commit()?;
-            Ok(name)
+            Ok((owner, name))
         })
         .await?;
     if let Err(e) = move_dir(&trash_path(&st, id), &st.git.repo_path(id)).await {
@@ -361,8 +418,8 @@ pub async fn restore(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp
             .await?;
         return Err(AppError::internal(format!("restoring repository {id}: {e}")));
     }
-    record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "repo_restored", detail: format!("{}/{name}", u.username), ip: &ip.0 }).await;
-    Ok(Json(json!({ "owner": u.username, "name": name })))
+    record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "repo_restored", detail: format!("{owner}/{name}"), ip: &ip.0 }).await;
+    Ok(Json(json!({ "owner": owner, "name": name })))
 }
 
 /// Admins can empty a repository from the trash without waiting the week.
@@ -431,12 +488,23 @@ pub async fn upkeep(st: AppState) {
 /// the trash, are purged the way the trash purges (LFS files collected, folders removed).
 pub async fn delete_account(st: &AppState, actor: &User, name: String, ip: &str) -> R<()> {
     let (me, ip2) = (actor.clone(), ip.to_string());
-    let (repo_ids, snippet_ids, lfs, exports) = st
+    let (repo_ids, snippet_ids, lfs, releases, exports) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
             let id: i64 = tx.query_row("SELECT id FROM users WHERE username = ?1", [&name], |r| r.get(0))?;
             super::admin::ensure_another_admin(&tx, id)?;
+            let sole: Option<String> = tx
+                .query_row(
+                    "SELECT o.username FROM org_members m JOIN users o ON o.id = m.org_id WHERE m.user_id = ?1 AND m.role = 'owner'
+                     AND NOT EXISTS (SELECT 1 FROM org_members x WHERE x.org_id = m.org_id AND x.role = 'owner' AND x.user_id != ?1) LIMIT 1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(org) = sole {
+                return Err(AppError::bad(format!("{name} is the only owner of {org}: make someone else an owner first, or delete it")));
+            }
             let ids: Vec<i64> = {
                 let mut s = tx.prepare("SELECT id FROM repos WHERE owner_id = ?1")?;
                 s.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?
@@ -447,16 +515,18 @@ pub async fn delete_account(st: &AppState, actor: &User, name: String, ip: &str)
             };
             let snippets = super::snippets::ids_of(&tx, id)?;
             let lfs = crate::lfs::held_by(&tx, true, id)?;
+            let releases = super::releases::ids_of(&tx, true, id)?;
             tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
             let e = Event { actor: Some(&me), subject: None, action: "user_deleted", detail: format!("{name} and {} repositories", ids.len()), ip: &ip2 };
             crate::security::append(&tx, &e)?;
             // After the entry above, so deleting yourself doesn't leave your id on it either.
             crate::security::forget_user(&tx, id)?;
             tx.commit()?;
-            Ok((ids, snippets, lfs, exports.into_iter().map(|e| (id, e)).collect::<Vec<_>>()))
+            Ok((ids, snippets, lfs, releases, exports.into_iter().map(|e| (id, e)).collect::<Vec<_>>()))
         })
         .await?;
     crate::lfs::collect(st, lfs).await;
+    super::releases::remove_files(st, releases).await;
     for id in repo_ids {
         for dir in [st.git.repo_path(id), trash_path(st, id), super::wiki::path(st, id)] {
             let _ = tokio::fs::remove_dir_all(dir).await;
@@ -497,9 +567,10 @@ pub async fn start_export(State(st): State<AppState>, Sudo(u): Sudo) -> J<Value>
         .db
         .call(move |c| {
             let tx = c.transaction()?;
-            let old: Option<(i64, String)> =
-                tx.query_row("SELECT id, status FROM exports WHERE user_id = ?1", [uid], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            if old.as_ref().is_some_and(|o| o.1 == "running") {
+            let old: Option<(i64, String, i64)> = tx
+                .query_row("SELECT id, status, created_at FROM exports WHERE user_id = ?1", [uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            if old.as_ref().is_some_and(|o| o.1 == "running" && o.2 > now() - 3600) {
                 return Err(AppError::conflict("Your data export is still being prepared"));
             }
             tx.execute("DELETE FROM exports WHERE user_id = ?1", [uid])?;

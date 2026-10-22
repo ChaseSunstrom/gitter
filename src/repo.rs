@@ -32,8 +32,27 @@ pub struct Repo {
     #[serde(skip)]
     pub can_read: bool,
     pub can_write: bool,
+    /// Settings, collaborators, tokens, secrets, delete.
+    pub can_admin: bool,
     pub is_owner: bool,
+    /// The viewer's role from collaborators and org membership (ROLE_* levels), before token limits.
+    #[serde(skip)]
+    pub role: u8,
 }
+
+/// Role levels: what a collaborator or org member may do.
+pub const ROLE_READ: u8 = 1;
+pub const ROLE_WRITE: u8 = 2;
+pub const ROLE_ADMIN: u8 = 3;
+
+/// The highest level user ?2 has on repository ?1 (owned by ?3) through
+/// collaborators or membership of the owning org.
+const ROLE_SQL: &str = "SELECT max(level) FROM (
+    SELECT CASE role WHEN 'admin' THEN 3 WHEN 'write' THEN 2 WHEN 'read' THEN 1 ELSE 0 END AS level
+        FROM repo_collaborators WHERE repo_id = ?1 AND user_id = ?2
+    UNION ALL
+    SELECT CASE WHEN m.role = 'owner' THEN 3 WHEN o.base_role = 'write' THEN 2 WHEN o.base_role = 'read' THEN 1 ELSE 0 END
+        FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE m.org_id = ?3 AND m.user_id = ?2)";
 
 pub const REPO_SELECT: &str = "SELECT r.id, r.owner_id, u.username, r.name, r.description, r.website, r.is_private,
     r.default_branch, r.forked_from, r.created_at, r.updated_at, r.pushed_at, r.hidden FROM repos r JOIN users u ON u.id = r.owner_id";
@@ -56,7 +75,9 @@ pub fn row_to_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
         path: PathBuf::new(),
         can_read: false,
         can_write: false,
+        can_admin: false,
         is_owner: false,
+        role: 0,
     })
 }
 
@@ -114,7 +135,7 @@ impl Repo {
     /// repository that moved is `AppError::moved` (the web and API redirect),
     /// but only for viewers who may see where it went.
     pub async fn load(st: &AppState, viewer: Option<&User>, owner: &str, name: &str) -> R<Repo> {
-        let (repo, moved) = Self::locate(st, owner, name).await?.ok_or_else(AppError::not_found)?;
+        let (repo, moved) = Self::locate(st, viewer, owner, name).await?.ok_or_else(AppError::not_found)?;
         let repo = Self::with_access(st, repo, viewer);
         if !moved {
             return Ok(repo);
@@ -128,20 +149,30 @@ impl Repo {
     /// Like `load`, but a moved repository is served at its old name: git and
     /// Git LFS clients don't follow redirects when pushing.
     pub async fn find(st: &AppState, viewer: Option<&User>, owner: &str, name: &str) -> R<Repo> {
-        let (repo, _) = Self::locate(st, owner, name).await?.ok_or_else(AppError::not_found)?;
+        let (repo, _) = Self::locate(st, viewer, owner, name).await?.ok_or_else(AppError::not_found)?;
         Ok(Self::with_access(st, repo, viewer))
     }
 
-    async fn locate(st: &AppState, owner: &str, name: &str) -> R<Option<(Repo, bool)>> {
+    /// The repository (and whether it moved), with the viewer's collaborator or org role, in one call.
+    pub async fn locate(st: &AppState, viewer: Option<&User>, owner: &str, name: &str) -> R<Option<(Repo, bool)>> {
         let (o, n) = (owner.to_string(), name.to_string());
-        st.db.call(move |c| Ok(lookup(c, &o, &n)?)).await
+        let vid = viewer.map(|u| u.id).unwrap_or(-1);
+        st.db
+            .call(move |c| {
+                let Some((mut r, moved)) = lookup(c, &o, &n)? else { return Ok(None) };
+                if vid >= 0 {
+                    let level: Option<i64> = c.query_row(ROLE_SQL, rusqlite::params![r.id, vid, r.owner_id], |x| x.get(0))?;
+                    r.role = level.unwrap_or(0) as u8;
+                }
+                Ok(Some((r, moved)))
+            })
+            .await
     }
 
     pub fn with_access(st: &AppState, mut repo: Repo, viewer: Option<&User>) -> Repo {
         repo.path = st.git.repo_path(repo.id);
-        let (read, write) = access(&repo, viewer);
-        repo.can_read = read;
-        repo.can_write = write;
+        let a = access(&repo, viewer);
+        (repo.can_read, repo.can_write, repo.can_admin) = (a.read, a.write, a.admin);
         repo.is_owner = viewer.is_some_and(|u| u.id == repo.owner_id);
         repo
     }
@@ -175,47 +206,89 @@ impl Repo {
         Ok(r)
     }
 
+    /// For settings, collaborators, tokens and secrets: the repository's admins.
+    pub async fn administrable(st: &AppState, viewer: Option<&User>, owner: &str, name: &str) -> R<Repo> {
+        let r = Self::writable(st, viewer, owner, name).await?;
+        if !r.can_admin {
+            return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "Only this repository's admins can do that"));
+        }
+        Ok(r)
+    }
+
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
 }
 
-/// (can read, can write). Owners and admins write; everyone reads public repos.
-/// A limited token narrows that: read-only tokens never write, and a deploy
-/// token sees other repositories as if signed out.
-pub fn access(repo: &Repo, viewer: Option<&User>) -> (bool, bool) {
-    let write = viewer.is_some_and(|u| u.id == repo.owner_id || u.is_admin);
-    let (mut read, mut write) = (!(repo.private || repo.hidden) || write, write);
-    if let Some(l) = viewer.and_then(|u| u.limits.as_ref()) {
-        if l.repo_id.is_some_and(|id| id != repo.id) {
-            (read, write) = (!(repo.private || repo.hidden), false);
-        }
-        if l.scope == crate::auth::Scope::Read {
-            write = false;
-        }
-    }
-    (read, write)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Access {
+    pub read: bool,
+    pub write: bool,
+    pub admin: bool,
 }
 
-/// Bytes account ?1 stores: its repositories and their wikis, its snippets, and
-/// the LFS objects its repositories hold (each once).
-pub const STORAGE_USED: &str = "COALESCE((SELECT sum(size_bytes + wiki_bytes) FROM repos WHERE owner_id = ?1), 0)
+/// What `viewer` may do with `repo`. The owner and site admins have admin;
+/// collaborators and org members their role (`repo.role`); everyone reads
+/// public repos. A moderator-hidden repo is for its admins only. A limited
+/// token narrows that: read-only tokens never write, only full-access tokens
+/// administer, and a deploy token sees other repositories as if signed out.
+pub fn access(repo: &Repo, viewer: Option<&User>) -> Access {
+    let level = match viewer {
+        Some(u) if u.id == repo.owner_id || u.is_admin => ROLE_ADMIN,
+        Some(_) => repo.role,
+        None => 0,
+    };
+    let public = !(repo.private || repo.hidden);
+    let usable = !repo.hidden || level >= ROLE_ADMIN;
+    let mut a = Access {
+        read: public || (usable && level >= ROLE_READ),
+        write: usable && level >= ROLE_WRITE,
+        admin: level >= ROLE_ADMIN,
+    };
+    if let Some(l) = viewer.and_then(|u| u.limits.as_ref()) {
+        if l.repo_id.is_some_and(|id| id != repo.id) {
+            a = Access { read: public, write: false, admin: false };
+        }
+        if l.scope == crate::auth::Scope::Read {
+            a.write = false;
+        }
+        if l.scope != crate::auth::Scope::All {
+            a.admin = false;
+        }
+    }
+    a
+}
+
+/// Bytes account ?1 stores: its repositories (and its organizations') with their
+/// wikis, LFS objects (each once) and release files, plus its snippets.
+pub const STORAGE_USED: &str = "COALESCE((SELECT sum(size_bytes + wiki_bytes) FROM repos WHERE owner_id IN (SELECT ?1 UNION ALL SELECT id FROM orgs WHERE created_by = ?1)), 0)
     + COALESCE((SELECT sum(size_bytes) FROM snippets WHERE owner_id = ?1), 0)
-    + COALESCE((SELECT sum(size) FROM (SELECT DISTINCT l.oid, l.size FROM lfs_objects l JOIN repos r ON r.id = l.repo_id WHERE r.owner_id = ?1)), 0)";
+    + COALESCE((SELECT sum(size) FROM (SELECT DISTINCT l.oid, l.size FROM lfs_objects l JOIN repos r ON r.id = l.repo_id
+        WHERE r.owner_id IN (SELECT ?1 UNION ALL SELECT id FROM orgs WHERE created_by = ?1))), 0)
+    + COALESCE((SELECT sum(a.size) FROM release_assets a JOIN releases rl ON rl.id = a.release_id JOIN repos r ON r.id = rl.repo_id
+        WHERE r.owner_id IN (SELECT ?1 UNION ALL SELECT id FROM orgs WHERE created_by = ?1)), 0)";
+
+/// The account whose limits `owner` uses, and whether it's a site admin. An
+/// organization shares its creator's quota and repository limit, so making
+/// organizations doesn't multiply them.
+pub fn payer(c: &rusqlite::Connection, owner: i64) -> rusqlite::Result<(i64, bool)> {
+    c.query_row(
+        "SELECT p.id, p.is_admin FROM users p WHERE p.id = coalesce((SELECT o.created_by FROM orgs o JOIN users x ON x.id = o.created_by WHERE o.id = ?1), ?1)",
+        [owner],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+}
+
+/// Bytes used against `owner`'s quota (its payer's, for an organization), and whether it's unlimited.
+pub fn usage(c: &rusqlite::Connection, owner: i64) -> rusqlite::Result<(i64, bool)> {
+    let (id, admin) = payer(c, owner)?;
+    Ok((c.query_row(&format!("SELECT {STORAGE_USED}"), [id], |r| r.get(0))?, admin))
+}
 
 /// Bytes an account may still store across its repositories (None = no limit).
 pub async fn storage_left(st: &AppState, owner_id: i64) -> R<Option<u64>> {
     let quota = st.settings.get().max_storage_mb * 1024 * 1024;
-    let (used, admin): (i64, bool) = st
-        .db
-        .call(move |c| {
-            Ok(c.query_row(
-                &format!("SELECT {STORAGE_USED}, is_admin FROM users WHERE id = ?1"),
-                [owner_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?)
-        })
-        .await?;
+    let (used, admin) = st.db.call(move |c| Ok(usage(c, owner_id)?)).await?;
     if quota == 0 || admin {
         return Ok(None);
     }
@@ -298,7 +371,9 @@ mod tests {
             path: PathBuf::new(),
             can_read: false,
             can_write: false,
+            can_admin: false,
             is_owner: false,
+            role: 0,
         }
     }
     fn user(id: i64, admin: bool) -> User {
@@ -314,24 +389,26 @@ mod tests {
 
     #[test]
     fn access_rules() {
-        assert_eq!(access(&repo(1, false), None), (true, false));
-        assert_eq!(access(&repo(1, true), None), (false, false));
-        assert_eq!(
-            access(&repo(1, true), Some(&user(2, false))),
-            (false, false)
-        );
-        assert_eq!(access(&repo(1, true), Some(&user(1, false))), (true, true));
-        assert_eq!(access(&repo(1, true), Some(&user(9, true))), (true, true));
-        assert_eq!(
-            access(&repo(1, false), Some(&user(2, false))),
-            (true, false)
-        );
+        let rw = |a: Access| (a.read, a.write, a.admin);
+        assert_eq!(rw(access(&repo(1, false), None)), (true, false, false));
+        assert_eq!(rw(access(&repo(1, true), None)), (false, false, false));
+        assert_eq!(rw(access(&repo(1, true), Some(&user(2, false)))), (false, false, false));
+        assert_eq!(rw(access(&repo(1, true), Some(&user(1, false)))), (true, true, true));
+        assert_eq!(rw(access(&repo(1, true), Some(&user(9, true)))), (true, true, true));
+        assert_eq!(rw(access(&repo(1, false), Some(&user(2, false)))), (true, false, false));
+        // Collaborator and org roles.
+        let with = |role, hidden| Repo { role, hidden, ..repo(1, true) };
+        assert_eq!(rw(access(&with(ROLE_READ, false), Some(&user(2, false)))), (true, false, false));
+        assert_eq!(rw(access(&with(ROLE_WRITE, false), Some(&user(2, false)))), (true, true, false));
+        assert_eq!(rw(access(&with(ROLE_ADMIN, false), Some(&user(2, false)))), (true, true, true));
+        assert_eq!(rw(access(&with(ROLE_WRITE, true), Some(&user(2, false)))), (false, false, false), "hidden: admins only");
+        assert_eq!(rw(access(&with(ROLE_ADMIN, true), Some(&user(2, false)))), (true, true, true));
         // Limited tokens.
         let lim = |scope, repo_id| User { limits: Some(crate::auth::Limits { scope, repo_id }), ..user(1, false) };
         use crate::auth::Scope;
-        assert_eq!(access(&repo(1, true), Some(&lim(Scope::Read, None))), (true, false));
-        assert_eq!(access(&repo(1, true), Some(&lim(Scope::Write, Some(1)))), (true, true));
-        assert_eq!(access(&repo(1, true), Some(&lim(Scope::Write, Some(7)))), (false, false));
-        assert_eq!(access(&repo(1, false), Some(&lim(Scope::All, Some(7)))), (true, false));
+        assert_eq!(rw(access(&repo(1, true), Some(&lim(Scope::Read, None)))), (true, false, false));
+        assert_eq!(rw(access(&repo(1, true), Some(&lim(Scope::Write, Some(1))))), (true, true, false), "only full tokens administer");
+        assert_eq!(rw(access(&repo(1, true), Some(&lim(Scope::Write, Some(7))))), (false, false, false));
+        assert_eq!(rw(access(&repo(1, false), Some(&lim(Scope::All, Some(7))))), (true, false, false));
     }
 }

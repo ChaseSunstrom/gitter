@@ -1711,6 +1711,7 @@ async fn rename_transfer_redirects_old_urls_and_needs_acceptance() {
     assert_eq!((s, r["name"].as_str()), (StatusCode::OK, Some("renamed")));
     let (s, h) = with_headers(&app, &anon, "GET", "/api/repos/alice/proj/issues?state=open", None).await;
     assert_eq!((s, location(&h).as_str()), (StatusCode::MOVED_PERMANENTLY, "/api/repos/alice/renamed/issues?state=open"));
+    assert_eq!(h.get("cache-control").and_then(|v| v.to_str().ok()), Some("no-store"), "a name can be reused, so redirects aren't cached");
     let (s, h) = with_headers(&app, &anon, "GET", "/alice/proj/issues", None).await;
     assert_eq!((s, location(&h).as_str()), (StatusCode::MOVED_PERMANENTLY, "/alice/renamed/issues"));
     let (s, h) = with_headers(&app, &anon, "GET", "/raw/alice/proj/main/README.md", None).await;
@@ -1957,4 +1958,782 @@ async fn export_and_self_delete_cover_the_whole_account() {
     }
     assert_eq!(std::fs::read_dir(d.join("exports")).map(|r| r.count()).unwrap_or(0), 0, "the export file goes too");
     assert_eq!(audit_count(&app, "user_deleted").await, 1);
+}
+
+// ---------------------------------------------------------------- webhooks
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(std::collections::HashMap<String, String>, String)>>>;
+
+/// A local HTTP server that records each request (lower-cased headers, body)
+/// and answers with the status in `status` (302 points somewhere else).
+struct Receiver {
+    url: String,
+    seen: Seen,
+    status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+}
+
+impl Receiver {
+    fn new() -> Receiver {
+        use std::io::{BufRead, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/hook", l.local_addr().unwrap().port());
+        let (seen, status): (Seen, _) = (Default::default(), std::sync::Arc::new(std::sync::atomic::AtomicU16::new(200)));
+        let (s2, st2) = (seen.clone(), status.clone());
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                let mut r = std::io::BufReader::new(conn.try_clone().unwrap());
+                let (mut line, mut head) = (String::new(), std::collections::HashMap::new());
+                r.read_line(&mut line).unwrap();
+                loop {
+                    line.clear();
+                    r.read_line(&mut line).unwrap();
+                    let Some((k, v)) = line.trim_end().split_once(':') else { break };
+                    head.insert(k.to_ascii_lowercase(), v.trim().to_string());
+                }
+                let mut body = vec![0; head.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0)];
+                r.read_exact(&mut body).unwrap();
+                s2.lock().unwrap().push((head, String::from_utf8_lossy(&body).into_owned()));
+                let code = st2.load(std::sync::atomic::Ordering::SeqCst);
+                let to = if code == 302 { "Location: http://127.0.0.1:9/elsewhere\r\n" } else { "" };
+                let _ = write!(&conn, "HTTP/1.1 {code} Hi\r\n{to}Content-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        Receiver { url, seen, status }
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.seen.lock().unwrap().iter().map(|(h, _)| h["x-gitter-event"].clone()).collect()
+    }
+
+    fn last(&self) -> (std::collections::HashMap<String, String>, Value) {
+        let (h, b) = self.seen.lock().unwrap().last().cloned().unwrap();
+        (h, serde_json::from_str(&b).unwrap())
+    }
+}
+
+/// (status, attempts, seconds until the next try) of the newest delivery.
+async fn newest_delivery(app: &App) -> (String, i64, Option<i64>) {
+    app.state
+        .db
+        .call(|c| Ok(c.query_row("SELECT status, attempts, next_at - strftime('%s','now') FROM webhook_deliveries ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?))
+        .await
+        .unwrap()
+}
+
+async fn make_due(app: &App) {
+    app.state.db.call(|c| Ok(c.execute("UPDATE webhook_deliveries SET next_at = 0 WHERE next_at IS NOT NULL", [])?)).await.unwrap();
+}
+
+#[tokio::test]
+async fn webhook_deliveries_are_signed_logged_retried_and_redelivered() {
+    use hmac::Mac;
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "s3cret", "events": ["issues", "push", "pull_request"], "allow_private": true });
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_i64().unwrap();
+
+    // A ping on create, signed with the secret.
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping"]);
+    let (h, body) = rx.seen.lock().unwrap()[0].clone();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    assert_eq!(h["x-gitter-signature-256"], format!("sha256={}", hex::encode(mac.finalize().into_bytes())));
+    assert_eq!(h["x-gitter-delivery"].len(), 36, "a uuid");
+    assert_eq!(h["content-type"], "application/json");
+    let ping: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((ping["hook"]["id"].as_i64(), ping["repository"]["full_name"].as_str()), (Some(id), Some("root1/r")));
+    assert_eq!(ping["sender"]["username"], "root1");
+
+    // Issues, a comment it didn't ask for, a web commit (push), a pull request and its merge.
+    app.req(&admin, "POST", "/api/repos/root1/r/issues", Some(json!({ "title": "Bug", "body": "It breaks" }))).await;
+    app.req(&admin, "POST", "/api/repos/root1/r/issues/1/comments", Some(json!({ "body": "On it", "state": "closed" }))).await;
+    let change = json!({ "branch": "main", "new_branch": "fix", "message": "Fix the bug", "changes": [{ "path": "fix.txt", "content": "fixed" }] });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(change)).await.0, StatusCode::OK);
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Fix", "head": "fix", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    // Deliveries go out in parallel, so look them up rather than rely on their order.
+    let got = |event: &str, action: &str| -> Value {
+        let seen = rx.seen.lock().unwrap();
+        let all = seen.iter().filter(|(h, _)| h["x-gitter-event"] == event).map(|(_, b)| serde_json::from_str::<Value>(b).unwrap());
+        all.filter(|p| action.is_empty() || p["action"] == action).last().unwrap_or_else(|| panic!("no {event} {action}"))
+    };
+    let mut events = rx.events();
+    events.sort();
+    assert_eq!(events, ["issues", "issues", "ping", "pull_request", "push"], "no issue_comment: it wasn't asked for");
+    let opened = got("issues", "opened");
+    assert_eq!((opened["issue"]["title"].as_str(), opened["issue"]["body"].as_str()), (Some("Bug"), Some("It breaks")));
+    assert_eq!(got("issues", "closed")["issue"]["state"], "closed");
+    let push = got("push", "");
+    assert_eq!((push["ref"].as_str(), push["created"].as_bool()), (Some("refs/heads/fix"), Some(true)));
+    assert_eq!(push["head_commit"]["message"], "Fix the bug");
+    assert_eq!(got("pull_request", "opened")["pull_request"]["head"], "fix");
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls/2/merge", Some(json!({ "method": "merge" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events().len(), 7);
+    assert_eq!(got("pull_request", "merged")["pull_request"]["merged"], true);
+    assert_eq!(got("push", "")["ref"], "refs/heads/main");
+
+    // The log: newest first, with what was sent and what came back.
+    let (s, v) = app.req(&admin, "GET", &format!("/api/repos/root1/r/hooks/{id}"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let log = v["deliveries"].as_array().unwrap();
+    assert_eq!(log.len(), 7);
+    assert!(log.iter().all(|d| d["status"] == "ok" && d["response_code"] == 200), "{log:?}");
+    let ping_id = log.last().unwrap()["id"].as_i64().unwrap();
+    let (_, d) = app.req(&admin, "GET", &format!("/api/repos/root1/r/hooks/{id}/deliveries/{ping_id}"), None).await;
+    assert_eq!(d["request_headers"]["X-Gitter-Event"], "ping");
+    assert_eq!(d["payload"].as_str().unwrap(), body);
+    assert_eq!(d["response_body"], "ok");
+    assert!(v["hook"].get("secret").is_none(), "the secret is never shown");
+
+    // A failing receiver: retried after 1 m, 5 m, 30 m, 2 h and 6 h, then given up.
+    rx.status.store(500, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(app.req(&admin, "POST", &format!("/api/repos/root1/r/hooks/{id}/ping"), None).await.0, StatusCode::OK);
+    for (i, wait) in [60, 300, 1800, 7200, 21600].into_iter().enumerate() {
+        gitter::webhooks::tick(&app.state).await;
+        let (status, attempts, next) = newest_delivery(&app).await;
+        assert_eq!((status.as_str(), attempts), ("pending", i as i64 + 1));
+        assert!(next.is_some_and(|n| (wait - 5..=wait).contains(&n)), "retry {i} after {next:?}, want {wait}");
+        gitter::webhooks::tick(&app.state).await;
+        assert_eq!(newest_delivery(&app).await.1, i as i64 + 1, "not before it's due");
+        make_due(&app).await;
+    }
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(newest_delivery(&app).await, ("failed".into(), 6, None));
+    let guids: Vec<String> = rx.seen.lock().unwrap()[7..].iter().map(|(h, _)| h["x-gitter-delivery"].clone()).collect();
+    assert!(guids.len() == 6 && guids.iter().all(|g| *g == guids[0]), "retries keep the delivery id: {guids:?}");
+
+    // Redeliver once the receiver works again.
+    rx.status.store(200, std::sync::atomic::Ordering::SeqCst);
+    let (_, v) = app.req(&admin, "GET", &format!("/api/repos/root1/r/hooks/{id}"), None).await;
+    let failed = v["deliveries"][0]["id"].as_i64().unwrap();
+    let (s, v) = app.req(&admin, "POST", &format!("/api/repos/root1/r/hooks/{id}/deliveries/{failed}/redeliver"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(newest_delivery(&app).await.0, "ok");
+    assert_eq!(rx.last().0["x-gitter-delivery"], guids[0]);
+
+    // Deliveries live in the database: a restarted server sends what was queued.
+    app.req(&admin, "POST", "/api/repos/root1/r/issues", Some(json!({ "title": "After restart" }))).await;
+    let restarted = gitter::AppState::new((*app.state.cfg).clone(), app.state.db.clone());
+    gitter::webhooks::tick(&restarted).await;
+    assert_eq!(rx.last().1["issue"]["title"], "After restart");
+
+    // Turned off: nothing is sent; deleted: its log goes with it.
+    let (s, v) = app.req(&admin, "PATCH", &format!("/api/repos/root1/r/hooks/{id}"), Some(json!({ "active": false }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    app.req(&admin, "POST", "/api/repos/root1/r/issues", Some(json!({ "title": "Quiet" }))).await;
+    let before = rx.seen.lock().unwrap().len();
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.seen.lock().unwrap().len(), before);
+    assert_eq!(app.req(&admin, "DELETE", &format!("/api/repos/root1/r/hooks/{id}"), None).await.0, StatusCode::OK);
+    let left: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT count(*) FROM webhook_deliveries", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn webhook_private_addresses_are_refused_unless_an_admin_allows_them() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    let bob = app.signup("bob").await;
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let rx = Receiver::new();
+    const SECRET: &str = "plain-secret-value";
+    let create = |url: &str, private: bool| json!({ "url": url, "secret": SECRET, "events": ["*"], "allow_private": private });
+
+    // Bad URLs, and the admin-only switch.
+    for bad in ["ftp://example.com/", "https://u:p@example.com/", "not a url", "http:///x"] {
+        let (s, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(bad, false))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let (s, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(&rx.url, true))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(json!({ "url": rx.url, "events": ["*"] }))).await.0, StatusCode::BAD_REQUEST, "a secret is required");
+    assert_eq!(app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(json!({ "url": rx.url, "secret": "k", "events": ["nope"] }))).await.0, StatusCode::BAD_REQUEST);
+
+    // By default 127.0.0.1 and localhost are never contacted.
+    let (s, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(&rx.url, false))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_i64().unwrap();
+    let local = rx.url.replace("127.0.0.1", "localhost");
+    let (_, v) = app.req(&bob, "POST", "/api/repos/bob/r/hooks", Some(create(&local, false))).await;
+    let id2 = v["id"].as_i64().unwrap();
+    gitter::webhooks::tick(&app.state).await;
+    assert!(rx.events().is_empty(), "nothing reached the receiver");
+    for h in [id, id2] {
+        let (_, v) = app.req(&bob, "GET", &format!("/api/repos/bob/r/hooks/{h}"), None).await;
+        let d = &v["deliveries"][0];
+        assert_eq!(d["status"], "pending", "{d}");
+        assert!(d["error"].as_str().unwrap().contains("private or reserved address"), "{d}");
+        assert!(!d["error"].as_str().unwrap().contains("127.0.0.1"), "no address in the message: {d}");
+        assert!(d["response_code"].is_null());
+    }
+    // The secret is sealed at rest.
+    let raw: Vec<u8> = app.state.db.call(move |c| Ok(c.query_row("SELECT secret FROM webhooks WHERE id = ?1", [id], |r| r.get(0))?)).await.unwrap();
+    assert!(!raw.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()), "sealed");
+    assert_eq!(gitter::security::open(&app.state.key, &raw).as_deref(), Some(SECRET.as_bytes()));
+
+    // Others can't see or change the hooks, nor can limited tokens (URLs can hold credentials);
+    // only the admin can allow private addresses.
+    let tok = app.req(&bob, "POST", "/api/me/tokens", Some(json!({ "name": "w", "scope": "write", "repo": "bob/r" }))).await.1["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "GET", "/api/repos/bob/r/hooks", &tok, None).await, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&app, "POST", &format!("/api/repos/bob/r/hooks/{id}/ping"), &tok, None).await, StatusCode::FORBIDDEN);
+    let carol = app.signup("carol").await;
+    assert_eq!(app.req(&carol, "GET", "/api/repos/bob/r/hooks", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&carol, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "active": false }))).await.0, StatusCode::FORBIDDEN);
+    // Not even with write access: hooks are for the repository's admins.
+    app.req(&bob, "PUT", "/api/repos/bob/r/collaborators/carol", Some(json!({ "role": "write" }))).await;
+    assert_eq!(app.req(&carol, "GET", "/api/repos/bob/r/hooks", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&carol, "GET", &format!("/api/repos/bob/r/hooks/{id}"), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "allow_private": true }))).await.0, StatusCode::FORBIDDEN);
+    let (s, v) = app.req(&admin, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "allow_private": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    make_due(&app).await;
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping"], "allowed now (the localhost hook still isn't)");
+
+    // A redirect is a reply, not followed.
+    rx.status.store(302, std::sync::atomic::Ordering::SeqCst);
+    app.req(&bob, "POST", &format!("/api/repos/bob/r/hooks/{id}/ping"), None).await;
+    gitter::webhooks::tick(&app.state).await;
+    let (_, v) = app.req(&bob, "GET", &format!("/api/repos/bob/r/hooks/{id}"), None).await;
+    assert_eq!((v["deliveries"][0]["response_code"].as_i64(), v["deliveries"][0]["status"].as_str()), (Some(302), Some("pending")));
+
+    // The owner changing the URL drops the admin's permission.
+    let moved = format!("{}/v2", rx.url);
+    let (s, v) = app.req(&bob, "PATCH", &format!("/api/repos/bob/r/hooks/{id}"), Some(json!({ "url": moved }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = app.req(&bob, "GET", &format!("/api/repos/bob/r/hooks/{id}"), None).await;
+    assert_eq!((v["hook"]["url"].as_str(), v["hook"]["allow_private"].as_bool()), (Some(moved.as_str()), Some(false)));
+}
+
+#[tokio::test]
+async fn webhook_ci_runs_are_announced_once_when_they_finish() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["ci_run"], "allow_private": true });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await.0, StatusCode::OK);
+    gitter::webhooks::tick(&app.state).await;
+    let commit = |path: &str, content: &str| json!({ "branch": "main", "message": "CI", "changes": [{ "path": path, "content": content }] });
+    // A broken pipeline fails at once; a good one is cancelled.
+    app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(commit(".gitter/ci.yml", "jobs:\n  a:\n    stepz: [x]\n"))).await;
+    app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(commit(".gitter/ci.yml", "jobs:\n  a:\n    steps: [echo]\n"))).await;
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping", "ci_run"], "the queued run isn't finished");
+    let (_, p) = rx.last();
+    assert_eq!((p["action"].as_str(), p["run"]["number"].as_i64(), p["run"]["status"].as_str()), (Some("completed"), Some(1), Some("failure")));
+    assert_eq!(p["sender"]["username"], "root1");
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/ci/runs/2/cancel", None).await.0, StatusCode::OK);
+    gitter::webhooks::tick(&app.state).await;
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(rx.events(), ["ping", "ci_run", "ci_run"]);
+    assert_eq!(rx.last().1["run"]["status"], "cancelled");
+}
+
+/// A raw-body request as `c` (release asset uploads and downloads): status, headers, body.
+async fn raw_as(app: &App, c: &Client, method: &str, path: &str, ctype: &str, body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut b = Request::builder().method(method).uri(path).header("host", "test.local").header("origin", ORIGIN);
+    if !ctype.is_empty() {
+        b = b.header("content-type", ctype);
+    }
+    if let Some(cookie) = &c.0 {
+        b = b.header("cookie", format!("gitter_session={cookie}"));
+    }
+    let resp = app.router.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+    let (s, h) = (resp.status(), resp.headers().clone());
+    (s, h, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+}
+
+async fn repo_id(app: &App, name: &'static str) -> i64 {
+    app.state.db.call(move |c| Ok(c.query_row("SELECT id FROM repos WHERE name = ?1", [name], |r| r.get(0))?)).await.unwrap()
+}
+
+#[tokio::test]
+async fn releases_from_tags_drafts_latest_and_access() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    for (n, private) in [("app", false), ("priv", true)] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n, "private": private, "readme": true }))).await;
+    }
+    let base = "/api/repos/alice/app/releases";
+    let path = app.state.git.repo_path(repo_id(&app, "app").await);
+    let (_, br) = app.req(&alice, "GET", "/api/repos/alice/app/branches", None).await;
+    let main = br["branches"][0]["sha"].as_str().unwrap().to_string();
+
+    // An existing tag is used as it is: the target only matters for a new one.
+    app.state.git.ok(&path, &["tag", "v0.9", "main"]).await.unwrap();
+    let (s, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v0.9", "target": "nope" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // A new tag at a branch: an annotated tag at its head.
+    let (s, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v1.0", "target": "main", "title": "First", "notes": "Hello **world**" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let v1 = v["id"].as_i64().unwrap();
+    let kind = app.state.git.ok(&path, &["cat-file", "-t", "refs/tags/v1.0"]).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&kind).trim(), "tag");
+    let (_, r) = app.req(&anon, "GET", &format!("{base}/{v1}"), None).await;
+    assert_eq!((r["tag"].as_str(), r["sha"].as_str(), r["title"].as_str(), r["author"].as_str()), (Some("v1.0"), Some(main.as_str()), Some("First"), Some("alice")), "{r}");
+
+    // One release per tag; bad names, unknown targets and non-writers are refused.
+    assert_eq!(app.req(&alice, "POST", base, Some(json!({ "tag": "v1.0" }))).await.0, StatusCode::CONFLICT);
+    for bad in [json!({ "tag": "../x" }), json!({ "tag": "v9", "target": "nope" }), json!({ "tag": "" }), json!({ "tag": "v9", "notes": "x".repeat(70_000) })] {
+        assert_eq!(app.req(&alice, "POST", base, Some(bad.clone())).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(app.req(&bob, "POST", base, Some(json!({ "tag": "v2" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&anon, "POST", base, Some(json!({ "tag": "v2" }))).await.0, StatusCode::UNAUTHORIZED);
+
+    // Drafts are for writers only, listed first; prereleases are never the latest.
+    let (_, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v2.0", "title": "Two", "draft": true }))).await;
+    let v2 = v["id"].as_i64().unwrap();
+    let tag_names = || async { names(&app.req(&Client::default(), "GET", "/api/repos/alice/app/tags", None).await.1["tags"], "name") };
+    assert!(!tag_names().await.contains(&"v2.0".to_string()), "a draft's new tag waits until it's published");
+    assert_eq!(app.req(&alice, "POST", base, Some(json!({ "tag": "v3", "target": "nope", "draft": true }))).await.0, StatusCode::BAD_REQUEST);
+    app.req(&alice, "POST", base, Some(json!({ "tag": "v1.1-rc", "prerelease": true }))).await;
+    let tags = |v: &Value| names(&v["releases"], "tag");
+    assert_eq!(tags(&app.req(&anon, "GET", base, None).await.1), ["v1.1-rc", "v1.0", "v0.9"]);
+    assert_eq!(tags(&app.req(&alice, "GET", base, None).await.1), ["v2.0", "v1.1-rc", "v1.0", "v0.9"]);
+    assert_eq!(app.req(&bob, "GET", &format!("{base}/{v2}"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&anon, "GET", &format!("{base}/latest"), None).await.1["tag"], "v1.0");
+    let (_, repo) = app.req(&anon, "GET", "/api/repos/alice/app", None).await;
+    assert_eq!((repo["latest_release"]["tag"].as_str(), repo["releases"].as_i64()), (Some("v1.0"), Some(3)), "{repo}");
+
+    // Publishing a draft makes it the latest; edits need write access.
+    let (s, v) = app.req(&alice, "PATCH", &format!("{base}/{v2}"), Some(json!({ "draft": false, "notes": "Now out" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, r) = app.req(&anon, "GET", &format!("{base}/{v2}"), None).await;
+    assert_eq!((r["draft"].as_bool(), r["notes"].as_str(), r["title"].as_str()), (Some(false), Some("Now out"), Some("Two")), "{r}");
+    assert!(r["published_at"].as_i64().is_some(), "{r}");
+    assert_eq!(r["sha"], main.as_str(), "publishing made the tag at the default branch: {r}");
+    assert!(tag_names().await.contains(&"v2.0".to_string()));
+    assert_eq!(app.req(&anon, "GET", &format!("{base}/latest"), None).await.1["tag"], "v2.0");
+    assert_eq!(app.req(&bob, "PATCH", &format!("{base}/{v1}"), Some(json!({ "title": "pwned" }))).await.0, StatusCode::FORBIDDEN);
+
+    // A draft of an existing tag that's deleted later isn't published at a guessed commit.
+    app.state.git.ok(&path, &["tag", "v4", "main"]).await.unwrap();
+    let (_, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v4", "draft": true }))).await;
+    let v4 = v["id"].as_i64().unwrap();
+    app.state.git.ok(&path, &["tag", "-d", "v4"]).await.unwrap();
+    assert_eq!(app.req(&alice, "PATCH", &format!("{base}/{v4}"), Some(json!({ "draft": false }))).await.0, StatusCode::CONFLICT);
+
+    // Private repositories keep their releases private.
+    app.req(&alice, "POST", "/api/repos/alice/priv/releases", Some(json!({ "tag": "v1" }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/priv/releases", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&anon, "GET", "/api/repos/alice/priv/releases/latest", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tags(&app.req(&alice, "GET", "/api/repos/alice/priv/releases", None).await.1), ["v1"]);
+
+    // Deleting a release keeps its tag.
+    assert_eq!(app.req(&bob, "DELETE", &format!("{base}/{v2}"), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "DELETE", &format!("{base}/{v2}"), None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&anon, "GET", &format!("{base}/{v2}"), None).await.0, StatusCode::NOT_FOUND);
+    let (_, t) = app.req(&anon, "GET", "/api/repos/alice/app/tags", None).await;
+    assert!(names(&t["tags"], "name").contains(&"v2.0".to_string()), "{t}");
+    assert_eq!(audit_count(&app, "release_deleted").await, 1);
+}
+
+#[tokio::test]
+async fn releases_assets_stream_with_quota_counts_and_cleanup() {
+    use sha2::{Digest, Sha256};
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let anon = Client::default();
+    for (n, private) in [("app", false), ("priv", true)] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": n, "private": private, "readme": true }))).await;
+    }
+    let release = |repo: &'static str, body: Value| {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", &format!("/api/repos/alice/{repo}/releases"), Some(body)).await.1["id"].as_i64().unwrap() }
+    };
+    let upload = |url: String, name: &str, body: Vec<u8>| {
+        let (app, alice, url) = (&app, alice.clone(), format!("{url}?name={name}"));
+        async move {
+            let (s, _, b) = raw_as(app, &alice, "POST", &url, "", body).await;
+            (s, serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null))
+        }
+    };
+    let data_dir = app.state.cfg.data_dir.clone();
+    let id = release("app", json!({ "tag": "v1" })).await;
+    let assets = format!("/api/repos/alice/app/releases/{id}/assets");
+    let data = b"#!/bin/sh\necho hi\n".repeat(100);
+
+    // Uploads stream in; the name is cut down to a safe file name.
+    let (s, _, b) = raw_as(&app, &alice, "POST", &format!("{assets}?name=dist%2F..%2Fmy%20tool%22.sh"), "text/x-sh", data.clone()).await;
+    let a: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+    assert_eq!(s, StatusCode::OK, "{a}");
+    assert_eq!((a["name"].as_str(), a["size"].as_u64(), a["content_type"].as_str()), (Some("my.tool..sh"), Some(data.len() as u64), Some("text/x-sh")), "{a}");
+    assert_eq!(a["sha256"], hex::encode(Sha256::digest(&data)));
+    let aid = a["id"].as_i64().unwrap();
+    let file = data_dir.join(format!("releases/{id}/{aid}"));
+    assert!(file.is_file());
+    assert_eq!(upload(assets.clone(), "my.tool..sh", data.clone()).await.0, StatusCode::CONFLICT);
+    assert_eq!(upload(assets.clone(), "", data.clone()).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(raw_as(&app, &bob, "POST", &format!("{assets}?name=x"), "", data.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(raw_as(&app, &anon, "POST", &format!("{assets}?name=x"), "", data.clone()).await.0, StatusCode::UNAUTHORIZED);
+
+    // Anyone who can read the repo downloads it as an attachment, and each download counts.
+    let url = format!("{assets}/{aid}");
+    let (s, h, got) = raw_as(&app, &anon, "GET", &url, "", vec![]).await;
+    assert_eq!((s, got == data), (StatusCode::OK, true));
+    assert_eq!(h["content-disposition"], "attachment; filename=\"my.tool..sh\"");
+    assert_eq!(h["content-type"], "application/octet-stream");
+    raw_as(&app, &bob, "GET", &url, "", vec![]).await;
+    let (_, r) = app.req(&anon, "GET", &format!("/api/repos/alice/app/releases/{id}"), None).await;
+    assert_eq!(r["assets"][0]["downloads"], 2, "{r}");
+    // Downloads aren't gzipped, so browsers know their size.
+    let req = Request::get(&url).header("host", "test.local").header("accept-encoding", "gzip").body(Body::empty()).unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.headers().get("content-encoding").is_none() && resp.headers()["content-length"] == data.len().to_string().as_str());
+    // Files past the API's 40 MB body cap stream in too.
+    let (s, big) = upload(assets.clone(), "big.bin", vec![0u8; 41 << 20]).await;
+    assert_eq!(s, StatusCode::OK, "{big}");
+    assert_eq!(app.req(&alice, "DELETE", &format!("{assets}/{}", big["id"]), None).await.0, StatusCode::OK);
+
+    // Private repositories' and drafts' assets: only for those who may see them, never cached.
+    let pid = release("priv", json!({ "tag": "v1" })).await;
+    let (_, pa) = upload(format!("/api/repos/alice/priv/releases/{pid}/assets"), "secret.bin", b"secret".to_vec()).await;
+    let purl = format!("/api/repos/alice/priv/releases/{pid}/assets/{}", pa["id"]);
+    let did = release("app", json!({ "tag": "v2", "draft": true })).await;
+    let (_, da) = upload(format!("/api/repos/alice/app/releases/{did}/assets"), "next.bin", b"draft".to_vec()).await;
+    let durl = format!("/api/repos/alice/app/releases/{did}/assets/{}", da["id"]);
+    for u in [&purl, &durl] {
+        assert_eq!(raw_as(&app, &anon, "GET", u, "", vec![]).await.0, StatusCode::NOT_FOUND, "{u}");
+        assert_eq!(raw_as(&app, &bob, "GET", u, "", vec![]).await.0, StatusCode::NOT_FOUND, "{u}");
+        let (s, h, _) = raw_as(&app, &alice, "GET", u, "", vec![]).await;
+        assert_eq!(s, StatusCode::OK, "{u}");
+        assert!(h["cache-control"].to_str().unwrap().contains("no-store"), "{u}");
+    }
+    // An asset id doesn't open through another repository's or release's URL.
+    assert_eq!(raw_as(&app, &alice, "GET", &format!("{assets}/{}", pa["id"]), "", vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(raw_as(&app, &alice, "GET", &format!("{assets}/{}", da["id"]), "", vec![]).await.0, StatusCode::NOT_FOUND);
+
+    // A release holds at most 1000 files.
+    let many = release("app", json!({ "tag": "many" })).await;
+    app.state
+        .db
+        .call(move |c| {
+            for i in 0..1000 {
+                c.execute("INSERT INTO release_assets(release_id, name, size, created_at) VALUES (?1, ?2, 0, 0)", rusqlite::params![many, format!("f{i}")])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(upload(format!("/api/repos/alice/app/releases/{many}/assets"), "one-more", b"x".to_vec()).await.0, StatusCode::BAD_REQUEST);
+
+    // Assets count toward the owner's storage, in total and per file; refused uploads leave nothing.
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 0", [])?)).await.unwrap();
+    let (_, me) = app.req(&alice, "GET", "/api/me", None).await;
+    assert_eq!(me["storage"]["used"], data.len() + 6 + 5, "{me}");
+    let big = vec![1u8; 700 * 1024];
+    assert_eq!(upload(assets.clone(), "a.bin", big.clone()).await.0, StatusCode::OK);
+    assert_eq!(upload(assets.clone(), "b.bin", big.clone()).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    let mut s = app.state.settings.get();
+    (s.max_storage_mb, s.max_lfs_mb) = (0, 1);
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    assert_eq!(upload(assets.clone(), "huge.bin", vec![2u8; (1 << 20) + 1]).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    // Parallel uploads can't overshoot the quota together.
+    let mut s = app.state.settings.get();
+    s.max_storage_mb = 2;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    let (x, y) = tokio::join!(upload(assets.clone(), "c.bin", big.clone()), upload(assets.clone(), "d.bin", big.clone()));
+    let mut got = [x.0, y.0];
+    got.sort();
+    assert_eq!(got, [StatusCode::OK, StatusCode::PAYLOAD_TOO_LARGE]);
+    let (_, me) = app.req(&alice, "GET", "/api/me", None).await;
+    assert!(me["storage"]["used"].as_u64().unwrap() <= 2 << 20, "{me}");
+    assert_eq!(std::fs::read_dir(data_dir.join("releases/tmp")).unwrap().count(), 0, "no temp files left");
+
+    // Deleting an asset, a release, the repository or the account removes the files.
+    assert_eq!(app.req(&bob, "DELETE", &url, None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&alice, "DELETE", &url, None).await.0, StatusCode::OK);
+    assert!(!file.exists());
+    assert_eq!(raw_as(&app, &anon, "GET", &url, "", vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&alice, "DELETE", &format!("/api/repos/alice/app/releases/{id}"), None).await.0, StatusCode::OK);
+    assert!(!data_dir.join(format!("releases/{id}")).exists());
+    assert!(data_dir.join(format!("releases/{pid}")).is_dir());
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/priv", Some(json!({ "confirm": "alice/priv" }))).await.0, StatusCode::OK);
+    assert!(data_dir.join(format!("releases/{pid}")).is_dir(), "kept while the repo is in the trash");
+    let priv_id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM repos WHERE deleted_name = 'priv'", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(app.req(&admin, "DELETE", &format!("/api/admin/trash/{priv_id}"), None).await.0, StatusCode::OK);
+    assert!(!data_dir.join(format!("releases/{pid}")).exists(), "purging the trash removes them");
+    assert!(data_dir.join(format!("releases/{did}")).is_dir());
+    let (s, v) = app.req(&admin, "DELETE", "/api/admin/users/alice", Some(json!({ "confirm": "alice" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(!data_dir.join(format!("releases/{did}")).exists());
+}
+
+#[tokio::test]
+async fn totp_secrets_are_sealed_at_rest() {
+    use gitter::security::{seal_totp_secrets, step_now, totp_code, use_code};
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let (_, setup) = app.req(&alice, "POST", "/api/me/2fa/setup", None).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    let (s, _) = app.req(&alice, "POST", "/api/me/2fa/enable", Some(json!({ "code": totp_code(&secret, step_now()).unwrap() }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let stored: String = app.state.db.call(|c| Ok(c.query_row("SELECT totp_secret FROM users WHERE username = 'alice'", [], |r| r.get(0))?)).await.unwrap();
+    assert!(stored.starts_with("sealed:") && !stored.contains(&secret), "{stored}");
+    // A secret stored before sealing still works, and the boot pass seals it.
+    let bob = app.signup("bob").await;
+    drop(bob);
+    let legacy = gitter::security::new_totp_secret();
+    let l2 = legacy.clone();
+    let bob_id: i64 = app
+        .state
+        .db
+        .call(move |c| {
+            c.execute("UPDATE users SET totp_secret = ?1 WHERE username = 'bob'", [&l2])?;
+            Ok(c.query_row("SELECT id FROM users WHERE username = 'bob'", [], |r| r.get(0))?)
+        })
+        .await
+        .unwrap();
+    let code = totp_code(&legacy, step_now()).unwrap();
+    assert!(use_code(&app.state.db, app.state.key.clone(), bob_id, &code).await.unwrap().is_some());
+    assert_eq!(seal_totp_secrets(&app.state.db, app.state.key.clone()).await.unwrap(), 1);
+    let sealed: String = app.state.db.call(move |c| Ok(c.query_row("SELECT totp_secret FROM users WHERE id = ?1", [bob_id], |r| r.get(0))?)).await.unwrap();
+    assert!(sealed.starts_with("sealed:"));
+    assert_eq!(gitter::security::open_text(&app.state.key, &sealed).as_deref(), Some(legacy.as_str()));
+    assert_eq!(seal_totp_secrets(&app.state.db, app.state.key.clone()).await.unwrap(), 0, "already sealed");
+}
+
+/// Push status for `user:password` to `repo` (a minimal receive-pack request).
+async fn can_push(app: &App, repo: &str, user: &str) -> StatusCode {
+    let req = Request::post(format!("/{repo}.git/git-receive-pack"))
+        .header("host", "test.local")
+        .header("authorization", basic(user, "correct horse"))
+        .header("content-type", "application/x-git-receive-pack-request")
+        .body(Body::from("0000"))
+        .unwrap();
+    status_with(app, req).await
+}
+
+#[tokio::test]
+async fn collaborators_get_exactly_their_role() {
+    let app = App::new();
+    let _admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "private": true, "readme": true }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p", None).await.0, StatusCode::NOT_FOUND);
+    // Only admins manage access.
+    assert_ne!(app.req(&bob, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "admin" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "read" }))).await.0, StatusCode::OK);
+    let (s, meta) = app.req(&bob, "GET", "/api/repos/alice/p", None).await;
+    assert_eq!((s, meta["can_write"].as_bool()), (StatusCode::OK, Some(false)));
+    let (_, list) = app.req(&bob, "GET", "/api/explore?q=p", None).await;
+    assert!(list.to_string().contains("alice"), "private repos you can read are listed: {list}");
+    assert_eq!(can_push(&app, "alice/p", "bob").await, StatusCode::FORBIDDEN);
+    // Write: push and manage issues, but no settings.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    assert_ne!(can_push(&app, "alice/p", "bob").await, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "POST", "/api/repos/alice/p/labels", Some(json!({ "name": "bug2", "color": "#ff0000" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/alice/p", Some(json!({ "description": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p/deploy-tokens", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PUT", "/api/repos/alice/p/ci/secrets/X", Some(json!({ "value": "y" }))).await.0, StatusCode::FORBIDDEN);
+    // Admin: settings too.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "admin" }))).await;
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/alice/p", Some(json!({ "description": "by bob" }))).await.0, StatusCode::OK);
+    let (_, acc) = app.req(&bob, "GET", "/api/repos/alice/p/collaborators", None).await;
+    assert!(acc["access"].to_string().contains("can do everything"), "{acc}");
+    assert_eq!(acc["collaborators"][0]["username"], "bob");
+    // Removing them revokes access; bad roles and organizations are refused.
+    assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "god" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/p/collaborators/bob", None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p", None).await.0, StatusCode::NOT_FOUND);
+    // A moderator-hidden repo is for its admins only.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET hidden = 1", [])?)).await.unwrap();
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p", None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn organizations_own_repos_and_share_them_with_members() {
+    let app = App::new();
+    let _admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let (s, v) = app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "acme", "display_name": "Acme Inc" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(app.req(&bob, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await.0, StatusCode::CONFLICT);
+    assert_eq!(app.req(&bob, "POST", "/api/orgs", Some(json!({ "name": "alice" }))).await.0, StatusCode::CONFLICT, "one namespace with users");
+    // Repos in the org: by those who'd have write on all of them.
+    let (s, v) = app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "x", "owner": "acme", "private": true, "readme": true }))).await;
+    assert_eq!((s, v["owner"].as_str()), (StatusCode::OK, Some("acme")), "{v}");
+    assert_ne!(app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "y", "owner": "acme" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/acme/x", None).await.0, StatusCode::NOT_FOUND);
+    // Members get the base permission (read by default).
+    assert_eq!(app.req(&alice, "PUT", "/api/orgs/acme/members/bob", Some(json!({ "role": "member" }))).await.0, StatusCode::OK);
+    let (s, meta) = app.req(&bob, "GET", "/api/repos/acme/x", None).await;
+    assert_eq!((s, meta["can_write"].as_bool()), (StatusCode::OK, Some(false)));
+    assert_eq!(can_push(&app, "acme/x", "bob").await, StatusCode::FORBIDDEN);
+    let listed = |v: Value| v["repos"].as_array().map_or(0, Vec::len);
+    assert_eq!(listed(app.req(&bob, "GET", "/api/users/acme", None).await.1), 1, "lists follow the base role");
+    assert_eq!(listed(app.req(&bob, "GET", "/api/feed", None).await.1), 1, "the dashboard lists repos shared with you");
+    assert_eq!(app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "write" }))).await.0, StatusCode::OK);
+    assert_ne!(can_push(&app, "acme/x", "bob").await, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/acme/x", Some(json!({ "description": "x" }))).await.0, StatusCode::FORBIDDEN, "members aren't admins");
+    assert_eq!(app.req(&bob, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "none" }))).await.0, StatusCode::FORBIDDEN);
+    app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "none" }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/acme/x", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(listed(app.req(&bob, "GET", "/api/users/acme", None).await.1), 0);
+    assert_eq!(listed(app.req(&bob, "GET", "/api/feed", None).await.1), 0);
+    // Owners administer every org repo; the last owner can't step down or leave.
+    app.req(&alice, "PUT", "/api/orgs/acme/members/bob", Some(json!({ "role": "owner" }))).await;
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/acme/x", Some(json!({ "description": "owned" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme/members/bob", None).await.0, StatusCode::OK, "bob leaves");
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme/members/alice", None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&alice, "PUT", "/api/orgs/acme/members/alice", Some(json!({ "role": "member" }))).await.0, StatusCode::BAD_REQUEST);
+    let (_, org) = app.req(&Client::default(), "GET", "/api/orgs/acme", None).await;
+    assert_eq!((org["org"]["display_name"].as_str(), org["members"].as_array().map(Vec::len)), (Some("Acme Inc"), Some(0)), "members are private");
+    let (_, org) = app.req(&alice, "GET", "/api/orgs/acme", None).await;
+    assert_eq!(org["members"][0]["role"], "owner");
+    let (_, mine) = app.req(&alice, "GET", "/api/me/orgs", None).await;
+    assert_eq!(mine["orgs"][0]["name"], "acme");
+    // Organizations can't sign in, and one that owns repos can't be deleted.
+    app.state
+        .db
+        .call(|c| Ok(c.execute("UPDATE users SET pass_hash = (SELECT pass_hash FROM users WHERE username = 'alice') WHERE username = 'acme'", [])?))
+        .await
+        .unwrap();
+    let (s, _, _) = login(&app, json!({ "login": "acme", "password": "correct horse" })).await;
+    assert_ne!(s, StatusCode::OK, "even with a password that matches");
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::BAD_REQUEST);
+    app.req(&alice, "DELETE", "/api/repos/acme/x", Some(json!({ "confirm": "acme/x" }))).await;
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "GET", "/api/orgs/acme", None).await.0, StatusCode::NOT_FOUND);
+}
+
+async fn user_id(app: &App, name: &str) -> i64 {
+    let n = name.to_string();
+    app.state.db.call(move |c| Ok(c.query_row("SELECT id FROM users WHERE username = ?1", [n], |r| r.get(0))?)).await.unwrap()
+}
+
+#[tokio::test]
+async fn organizations_share_their_creators_limits_and_trust() {
+    let app = App::new();
+    let root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    // Adding a site admin as an owner doesn't make an organization trusted with CI on the server.
+    app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "evil" }))).await;
+    assert_eq!(app.req(&alice, "PUT", "/api/orgs/evil/members/root1", Some(json!({ "role": "owner" }))).await.0, StatusCode::OK);
+    assert!(!gitter::ci::trigger::enabled(&app.state, user_id(&app, "evil").await).await);
+    app.req(&root, "POST", "/api/orgs", Some(json!({ "name": "staff" }))).await;
+    assert!(gitter::ci::trigger::enabled(&app.state, user_id(&app, "staff").await).await, "an org an admin made is");
+    // An organization's repositories count toward its creator's repository limit and storage.
+    let mut s = app.state.settings.get();
+    s.max_repos_per_user = 2;
+    s.max_storage_mb = 100;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    assert_eq!(app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "a1", "private": true }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "o1", "owner": "evil" }))).await.0, StatusCode::OK);
+    let (s, v) = app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "o2", "owner": "evil" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 5000000 WHERE name = 'o1'", [])?)).await.unwrap();
+    let (a, e) = (user_id(&app, "alice").await, user_id(&app, "evil").await);
+    let left = gitter::repo::storage_left(&app.state, a).await.unwrap().unwrap();
+    assert!(left <= 100 * 1024 * 1024 - 5_000_000, "{left}");
+    assert_eq!(gitter::repo::storage_left(&app.state, e).await.unwrap(), Some(left));
+    // Who belongs to an organization is for its members to see.
+    assert_eq!(app.req(&bob, "GET", "/api/orgs/evil", None).await.1["members"], json!([]));
+    assert_eq!(app.req(&bob, "GET", "/api/users/alice", None).await.1["orgs"], json!([]));
+    assert_eq!(app.req(&alice, "GET", "/api/users/alice", None).await.1["orgs"], json!(["evil"]));
+    // A token can't drop its owner's access; and an org's only owner can't be deleted out from under it.
+    app.req(&alice, "PUT", "/api/repos/alice/a1/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    let (_, t) = app.req(&bob, "POST", "/api/me/tokens", Some(json!({ "name": "t", "scope": "write" }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "DELETE", "/api/repos/alice/a1/collaborators/bob", &t, None).await, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "DELETE", "/api/repos/alice/a1/collaborators/bob", None).await.0, StatusCode::OK, "bob leaves");
+    app.req(&root, "DELETE", "/api/orgs/evil/members/root1", None).await;
+    let (s, v) = app.req(&root, "DELETE", "/api/admin/users/alice", Some(json!({ "confirm": "alice" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("only owner of evil"), "{v}");
+}
+
+#[tokio::test]
+async fn webhooks_log_drops_and_pause_for_suspended_owners() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    let bob = app.signup("bob").await;
+    app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let rx = Receiver::new();
+    let (s, v) = app.req(&admin, "POST", "/api/repos/bob/r/hooks", Some(json!({ "url": rx.url, "secret": "s", "events": ["*"], "allow_private": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_i64().unwrap();
+    // A receiver with a full queue: the next event is dropped, and the drop is on the hook's log.
+    app.state
+        .db
+        .call(move |c| {
+            for _ in 0..gitter::webhooks::MAX_WAITING {
+                c.execute("INSERT INTO webhook_deliveries(hook_id, guid, event, payload, next_at, created_at) VALUES (?1, 'g', 'push', '{}', 9999999999, 0)", [id])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    app.req(&admin, "POST", "/api/repos/bob/r/issues", Some(json!({ "title": "Dropped" }))).await;
+    let (status, _, next) = newest_delivery(&app).await;
+    assert_eq!((status.as_str(), next), ("failed", None));
+    let (_, v) = app.req(&admin, "GET", &format!("/api/repos/bob/r/hooks/{id}"), None).await;
+    assert!(v.to_string().contains("Dropped:"), "{v}");
+    // A suspended owner's hooks don't send.
+    let (s, v) = app.req(&admin, "PATCH", "/api/admin/users/bob", Some(json!({ "suspended": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    assert!(rx.events().is_empty(), "the ping waiting for bob's hook wasn't sent");
+}
+
+#[tokio::test]
+async fn transfers_and_trash_follow_org_ownership() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "proj", "readme": true }))).await;
+    // Admin collaborators manage settings but can't give the repository away.
+    app.req(&alice, "PUT", "/api/repos/alice/proj/collaborators/carol", Some(json!({ "role": "admin" }))).await;
+    let offer = |to: &str| json!({ "to": to, "confirm": "alice/proj" });
+    assert_eq!(app.req(&carol, "POST", "/api/repos/alice/proj/transfer", Some(offer("carol"))).await.0, StatusCode::FORBIDDEN);
+    // To an organization: one of its owners accepts; the old owner's secrets stay behind.
+    app.req(&bob, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await;
+    assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/proj/ci/secrets/TOKEN", Some(json!({ "value": "s3cret" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/proj/transfer", Some(offer("acme"))).await.0, StatusCode::OK);
+    let (_, list) = app.req(&bob, "GET", "/api/me/transfers", None).await;
+    let id = list["incoming"][0]["id"].as_i64().expect("an owner of acme sees the offer");
+    assert_eq!(app.req(&carol, "POST", &format!("/api/me/transfers/{id}/accept"), None).await.0, StatusCode::NOT_FOUND);
+    let (s, v) = app.req(&bob, "POST", &format!("/api/me/transfers/{id}/accept"), None).await;
+    assert_eq!((s, v["owner"].as_str()), (StatusCode::OK, Some("acme")), "{v}");
+    let secrets: i64 = app.state.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM ci_secrets WHERE repo_id = ?1", [id], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(secrets, 0, "CI secrets don't move with the code");
+    // Org owners see and restore its deleted repositories; members don't.
+    app.req(&bob, "PUT", "/api/orgs/acme/members/carol", Some(json!({ "role": "member" }))).await;
+    assert_eq!(app.req(&bob, "DELETE", "/api/repos/acme/proj", Some(json!({ "confirm": "acme/proj" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&carol, "POST", &format!("/api/me/trash/{id}/restore"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(app.req(&bob, "GET", "/api/me/trash", None).await.1["repos"][0]["name"], "proj");
+    let (s, v) = app.req(&bob, "POST", &format!("/api/me/trash/{id}/restore"), None).await;
+    assert_eq!((s, v["owner"].as_str()), (StatusCode::OK, Some("acme")), "{v}");
+    // A limited token can't list your trash or transfer offers (private repo names).
+    let (_, t) = app.req(&bob, "POST", "/api/me/tokens", Some(json!({ "name": "ci", "scope": "write" }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "GET", "/api/me/trash", &t, None).await, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&app, "GET", "/api/me/transfers", &t, None).await, StatusCode::FORBIDDEN);
+    // Deleting an organization purges what's left in its trash.
+    app.req(&bob, "DELETE", "/api/repos/acme/proj", Some(json!({ "confirm": "acme/proj" }))).await;
+    assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
+    assert!(!app.state.cfg.data_dir.join(format!("trash/{id}.git")).exists());
 }

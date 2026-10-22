@@ -8,9 +8,8 @@ scope: []
 depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
-updated: 2026-10-21T17:01:42Z
-inferred_deps: [T-0006]
-inferred_why: T-0006: sandboxed gating extends the core CI runner
+updated: 2026-10-22T00:39:12Z
+group: CI gating and pipeline features
 ---
 # CI trust and gating: sandboxed jobs (no host docker socket, cpu/mem/time limits, network p
 ## Raw request
@@ -29,4 +28,5 @@ inferred_why: T-0006: sandboxed gating extends the core CI runner
 ## Verification evidence
 ## Log
 - 2026-10-21T17:01:42Z created
+- 2026-10-22T00:39:12Z from T-0008 review: write collaborators (and org members with write) on an admin-owned repo can push .gitter/ci.yml that runs on the built-in host runner with the repo's secrets. Documented for now; T-0007 should gate built-in-runner jobs and secrets by the pusher's role (or need approval for non-admin pushers)
 ## Follow-ups captured

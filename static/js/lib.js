@@ -286,8 +286,9 @@ const AUDIT = {
   user_suspended: 'Suspended an account', user_unsuspended: 'Restored an account', user_deleted: 'Deleted an account',
   settings_changed: 'Changed site settings', invite_created: 'Created an invite link',
   moderation_dismiss: 'Dismissed a report', moderation_hide: 'Hid reported content', moderation_unhide: 'Unhid content', moderation_suspend: 'Suspended a reported account',
-  wiki_page_deleted: 'Deleted a wiki page', discussion_deleted: 'Deleted a discussion', discussion_reply_deleted: 'Removed a reply in a discussion', snippet_deleted: 'Deleted a snippet',
+  wiki_page_deleted: 'Deleted a wiki page', discussion_deleted: 'Deleted a discussion', discussion_reply_deleted: 'Removed a reply in a discussion', snippet_deleted: 'Deleted a snippet', release_deleted: 'Deleted a release',
   ci_secret_set: 'Set a CI secret', ci_secret_deleted: 'Deleted a CI secret', ci_runner_created: 'Added a CI runner', ci_runner_deleted: 'Removed a CI runner',
+  webhook_created: 'Added a webhook', webhook_changed: 'Changed a webhook', webhook_deleted: 'Deleted a webhook',
 };
 export const auditLabel = (a) => AUDIT[a] || String(a).replace(/_/g, ' ');
 /** "Firefox on Linux" from a user agent string. */

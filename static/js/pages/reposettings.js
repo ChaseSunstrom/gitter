@@ -1,8 +1,11 @@
-// Repository settings: name, description, website, default branch, visibility, transfer, delete.
-import { html, get, send, toast, action, confirmDialog, modal, timeEl, $ } from '../lib.js';
+// Repository settings: name, description, website, default branch, access, deploy tokens, CI secrets, webhooks, visibility, transfer, delete.
+import { html, get, send, toast, action, confirmDialog, modal, timeEl, avatar, $ } from '../lib.js';
 import { icon } from '../icons.js';
-import { loadRepo, repoUrl, repoPage, mountRepoHeader } from '../repohead.js';
+import { loadRepo, repoUrl, repoPage, mountRepoHeader, ciIcon } from '../repohead.js';
 import { navigate } from '../main.js';
+import { eventsLabel, deliveryState } from './webhook.js';
+
+const ROLES = [['read', 'Read'], ['write', 'Write'], ['admin', 'Admin']];
 
 /** Ask who should get the repository, with its name typed to confirm. Resolves to their username, or null. */
 function askRecipient(full) {
@@ -24,12 +27,14 @@ function askRecipient(full) {
 
 export default async function (ctx) {
   const meta = await loadRepo(ctx.params.owner, ctx.params.repo);
-  if (!meta.can_write) throw Object.assign(new Error('Only people who can write to this repository can change its settings'), { status: 403 });
+  if (!meta.can_admin) throw Object.assign(new Error('Only admins of this repository can change its settings'), { status: 403 });
   const api = repoUrl(meta.owner, meta.name);
   const full = `${meta.owner}/${meta.name}`;
-  const [deploy, secrets, offer] = await Promise.all([
+  const [access, deploy, secrets, hooks, offer] = await Promise.all([
+    get(`${api}/collaborators`, { fresh: true }),
     get(`${api}/deploy-tokens`, { fresh: true }).then((d) => d.tokens),
     get(`${api}/ci/secrets`, { fresh: true }).then((d) => d.secrets),
+    get(`${api}/hooks`, { fresh: true }).then((d) => d.hooks),
     get(`${api}/transfer`, { fresh: true }).then((d) => d.offer),
   ]);
   const body = html`<div class="mid stack" style="max-width:820px">
@@ -43,6 +48,19 @@ export default async function (ctx) {
         <span class="hint">The branch people see first, and the default target for pull requests.</span></div>` : ''}
       <div><button class="btn primary" id="s-save">Save changes</button></div>
     </div></form>
+
+    <div class="box" id="access"><div class="box-head"><b>Who has access</b></div><div class="box-body stack">
+      <ul class="access-list small">${access.access.map((a) => html`<li><b>${a.who}</b>${a.detail ? html` <span class="muted">(${a.detail})</span>` : ''} ${a.text}</li>`)}</ul>
+      <form id="collab-form" class="row wrap-ok">
+        <input class="input" name="user" placeholder="Username" autocomplete="off" spellcheck="false" aria-label="Username to add" required style="max-width:240px">
+        <select class="select" name="role" aria-label="Role" style="max-width:200px">${ROLES.map(([v, t]) => html`<option value="${v}" ${v === 'write' ? 'selected' : ''}>${t}</option>`)}</select>
+        <button class="btn primary" type="submit">Add</button>
+      </form>
+      ${access.collaborators.length ? html`<div class="list">${access.collaborators.map((c) => html`<div class="list-row">${avatar(c.username, 24)}<div class="grow"><a href="/${c.username}"><b>${c.username}</b></a>
+          <div class="small muted">${c.text}${c.added_by ? ` · added by ${c.added_by}` : ''}</div></div>
+        <select class="select" data-role="${c.username}" aria-label="Role for ${c.username}" style="max-width:160px">${ROLES.map(([v, t]) => html`<option value="${v}" ${v === c.role ? 'selected' : ''}>${t}</option>`)}</select>
+        <button class="btn sm danger" data-remove="${c.username}">Remove</button></div>`)}</div>` : html`<p class="muted small">No collaborators yet. Add someone to let them in.</p>`}
+    </div></div>
 
     <div class="box" id="deploy"><div class="box-head"><b>Deploy tokens</b></div><div class="box-body stack">
       <p class="muted small">Give a CI server or deploy machine access to this repository only. Use the token as the password, with any username.</p>
@@ -70,8 +88,17 @@ export default async function (ctx) {
         <button class="btn sm danger" data-sec-del="${s.name}">Delete</button></div>`)}</div>` : ''}
     </div></div>
 
+    <div class="box" id="hooks"><div class="box-head"><b>Webhooks</b><span class="grow"></span><a class="btn sm" href="/${full}/settings/hooks/new">${icon('plus', 'sm')} Add webhook</a></div>
+      <div class="box-body"><p class="muted small">Gitter sends a signed POST to each URL when something happens here: pushes, issues, comments, pull requests and finished CI runs.</p></div>
+      ${hooks.length ? html`<div class="list">${hooks.map((h) => {
+        const [ic, words] = h.last ? deliveryState(h.last) : [ciIcon('pending'), 'Nothing sent yet'];
+        return html`<a class="list-row" href="/${full}/settings/hooks/${h.id}">${ic}<div class="grow"><b class="mono">${h.url}</b>
+          <div class="small muted">${eventsLabel(h.events)}${h.active ? '' : ' · Turned off'} · ${h.last?.at ? html`Last delivery ${timeEl(h.last.at)}: ` : ''}${words}</div></div>${icon('chev-right', 'sm muted')}</a>`;
+      })}</div>` : ''}
+    </div>
+
     <div class="box danger-zone"><div class="box-head"><b class="c-red">Danger zone</b></div><div class="list">
-      <div class="list-row"><div class="grow"><b>Change visibility</b><div class="muted small">This repository is <b>${meta.private ? 'private' : 'public'}</b>. ${meta.private ? 'Making it public lets anyone see and clone it.' : 'Making it private hides it from everyone but you.'}</div></div>
+      <div class="list-row"><div class="grow"><b>Change visibility</b><div class="muted small">This repository is <b>${meta.private ? 'private' : 'public'}</b>. ${meta.private ? 'Making it public lets anyone see and clone it.' : 'Making it private hides it from everyone without access.'}</div></div>
         <button class="btn danger" id="s-vis">${icon(meta.private ? 'globe' : 'lock', 'sm')} Make ${meta.private ? 'public' : 'private'}</button></div>
       <div class="list-row" id="transfer"><div class="grow"><b>Transfer ownership</b><div class="muted small">${offer
           ? html`Offered to <b>${offer.to}</b>, who can accept or decline it until ${timeEl(offer.expires_at)}.`
@@ -104,7 +131,7 @@ export default async function (ctx) {
         const goPublic = meta.private;
         const ok = await confirmDialog({
           title: goPublic ? 'Make this repository public?' : 'Make this repository private?',
-          text: goPublic ? 'Anyone on the internet will be able to see and clone it.' : 'Only you will be able to see it. Stars from other people stay, but they lose access.',
+          text: goPublic ? 'Anyone on the internet will be able to see and clone it.' : 'Only people with access will be able to see it. Stars from others stay, but they lose access.',
           ok: goPublic ? 'Make public' : 'Make private', danger: true, typed: goPublic ? full : '',
         });
         if (!ok) return;
@@ -112,6 +139,28 @@ export default async function (ctx) {
         toast(goPublic ? 'Repository is now public' : 'Repository is now private');
         navigate(location.pathname, { replace: true });
       }));
+      const cf = $('#collab-form', el);
+      cf.addEventListener('submit', action(cf.querySelector('button'), async () => {
+        const user = cf.user.value.trim();
+        await send('PUT', `${api}/collaborators/${encodeURIComponent(user)}`, { role: cf.role.value });
+        toast(`Added ${user}`);
+        navigate(location.pathname, { replace: true, scroll: false });
+      }));
+      $('#access', el).addEventListener('change', async (e) => {
+        const s = e.target.closest('[data-role]');
+        if (!s) return;
+        try { await send('PUT', `${api}/collaborators/${encodeURIComponent(s.dataset.role)}`, { role: s.value }); } catch (x) { return toast(x.message, 'err'); }
+        toast(`${s.dataset.role} now has ${s.value} access`);
+        navigate(location.pathname, { replace: true, scroll: false });
+      });
+      $('#access', el).addEventListener('click', async (e) => {
+        const b = e.target.closest('[data-remove]');
+        if (!b) return;
+        if (!(await confirmDialog({ title: `Remove ${b.dataset.remove}?`, text: 'They lose access to this repository right away.', ok: 'Remove', danger: true }))) return;
+        try { await send('DELETE', `${api}/collaborators/${encodeURIComponent(b.dataset.remove)}`); } catch (x) { return toast(x.message, 'err'); }
+        toast(`Removed ${b.dataset.remove}`);
+        navigate(location.pathname, { replace: true, scroll: false });
+      });
       const dt = $('#dt-form', el);
       dt.addEventListener('submit', action(dt.querySelector('button'), async () => {
         const f = Object.fromEntries(new FormData(dt));

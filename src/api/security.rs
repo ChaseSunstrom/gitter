@@ -59,7 +59,7 @@ pub async fn setup(State(st): State<AppState>, Sudo(u): Sudo) -> J<serde_json::V
         return Err(AppError::conflict("Two-factor authentication is already on"));
     }
     let secret = security::new_totp_secret();
-    let (s2, uid) = (secret.clone(), u.id);
+    let (s2, uid) = (security::seal_text(&st.key, &secret), u.id);
     st.db
         .call(move |c| Ok(c.execute("UPDATE users SET totp_pending = ?1 WHERE id = ?2", rusqlite::params![s2, uid])?))
         .await?;
@@ -82,13 +82,13 @@ pub async fn enable(
 ) -> J<serde_json::Value> {
     let codes = security::new_recovery_codes();
     let hashes: Vec<String> = codes.iter().map(|c| c.1.clone()).collect();
-    let uid = u.id;
+    let (uid, key) = (u.id, st.key.clone());
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
             let pending: Option<String> =
                 tx.query_row("SELECT totp_pending FROM users WHERE id = ?1", [uid], |r| r.get(0))?;
-            let Some(secret) = pending else {
+            let Some(secret) = pending.and_then(|p| security::open_text(&key, &p)) else {
                 return Err(AppError::bad("Start the setup again"));
             };
             let Some(step) = security::check_totp(&secret, &req.code, 0) else {
@@ -241,7 +241,7 @@ pub async fn reauth(
         if req.code.trim().is_empty() {
             return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "Enter the code from your authenticator app").with_code("need_code"));
         }
-        if security::use_code(&st.db, u.id, &req.code).await?.is_none() {
+        if security::use_code(&st.db, st.key.clone(), u.id, &req.code).await?.is_none() {
             record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "2fa_failed", detail: "wrong code when confirming".into(), ip: &ip.0 }).await;
             return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "That code didn't work").with_code("need_code"));
         }

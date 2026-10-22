@@ -68,12 +68,15 @@ async fn moved_page(st: &AppState, req: Request) -> Option<String> {
     if !crate::validate::username(&o) || !crate::validate::repo_name(&n) {
         return None;
     }
-    let (repo, moved) = st.db.call(move |c| Ok(crate::repo::lookup(c, &o, &n)?)).await.ok()??;
+    let (o2, n2) = (o.clone(), n.clone());
+    let (_, moved) = st.db.call(move |c| Ok(crate::repo::lookup(c, &o2, &n2)?)).await.ok()??;
     if !moved {
         return None;
     }
+    // Moved (rare): look again with the viewer, for collaborators' and org members' roles.
     let (mut parts, _) = req.into_parts();
     let viewer = crate::auth::Viewer::from_request_parts(&mut parts, st).await.ok()?.0;
+    let (repo, _) = crate::repo::Repo::locate(st, viewer.as_ref(), &o, &n).await.ok()??;
     let repo = crate::repo::Repo::with_access(st, repo, viewer.as_ref());
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     repo.can_read.then(|| format!("/{}/{}{rest}{query}", repo.owner, repo.name))
@@ -83,7 +86,9 @@ fn redirect(status: StatusCode, to: &str) -> Response {
     match HeaderValue::from_str(to) {
         Ok(v) => {
             let body = axum::Json(serde_json::json!({ "error": "This repository moved", "location": to }));
-            (status, [(header::LOCATION, v)], body).into_response()
+            // Not cached: the name can be reused, and private repos redirect only for some viewers.
+            let headers = [(header::LOCATION, v), (header::CACHE_CONTROL, HeaderValue::from_static("no-store")), (header::VARY, HeaderValue::from_static("Cookie"))];
+            (status, headers, body).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }

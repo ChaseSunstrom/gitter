@@ -48,19 +48,22 @@ function heatmap(rows) {
   </div>`;
 }
 
-function sidebar(u, isMe) {
+function sidebar(u, isMe, d, org) {
   return html`<aside class="profile-side">
     <div class="profile-avatar">${avatar(u.username, 260, 'sq')}</div>
     <h1 class="profile-name">${u.display_name || u.username}</h1>
-    <p class="profile-handle muted">@${u.username}${u.is_admin ? html` <span class="tag-private">Admin</span>` : ''}</p>
+    <p class="profile-handle muted">@${u.username}${org ? html` <span class="tag-private">Organization</span>` : u.is_admin ? html` <span class="tag-private">Admin</span>` : ''}</p>
     ${u.bio ? html`<p class="profile-bio">${u.bio}</p>` : ''}
     ${isMe ? html`<a class="btn" href="/settings" style="width:100%">${icon('edit', 'sm')} Edit profile</a>` : ''}
-    ${state.me && !isMe ? html`<button class="btn ghost sm" id="report-user" style="width:100%">${icon('flag', 'sm')} Report this account</button>` : ''}
+    ${org?.can_create ? html`<a class="btn primary" href="/new?owner=${enc(u.username)}" style="width:100%">${icon('repo', 'sm')} New repository</a>` : ''}
+    ${org?.is_owner ? html`<a class="btn" href="/orgs/${enc(u.username)}/settings" style="width:100%">${icon('settings', 'sm')} Organization settings</a>` : ''}
+    ${state.me && !isMe && !org?.my_role ? html`<button class="btn ghost sm" id="report-user" style="width:100%">${icon('flag', 'sm')} Report this account</button>` : ''}
     <ul class="profile-facts small">
       ${u.location ? html`<li>${icon('globe', 'sm')}<span>${u.location}</span></li>` : ''}
       ${u.website ? html`<li>${icon('link', 'sm')}<a class="c-accent ellipsis" href="${safeUrl(u.website)}" target="_blank" rel="noopener nofollow ugc">${u.website.replace(/^https?:\/\//, '')}</a></li>` : ''}
-      <li>${icon('clock', 'sm')}<span>Joined ${day(u.created_at)}</span></li>
+      <li>${icon('clock', 'sm')}<span>${org ? 'Created' : 'Joined'} ${day(u.created_at)}</span></li>
     </ul>
+    ${d.orgs?.length ? html`<div class="section-title small">Organizations</div><div class="org-chips">${d.orgs.map((o) => html`<a href="/${o}" title="${o}">${avatar(o, 32, 'sq')}</a>`)}</div>` : ''}
   </aside>`;
 }
 
@@ -69,12 +72,13 @@ export default async function (ctx) {
   const tab = ['repos', 'stars'].includes(ctx.query.get('tab')) ? ctx.query.get('tab') : 'overview';
   const [d, stars] = await Promise.all([get(userUrl(name)), tab === 'stars' ? get(`${userUrl(name)}/stars`) : null]);
   const u = d.user;
+  const org = d.is_org ? await get(`/orgs/${enc(u.username)}`) : null;
   const isMe = state.me?.username?.toLowerCase() === u.username.toLowerCase();
   const base = `/${u.username}`;
   const tabs = html`<nav class="tabs profile-tabs" aria-label="Profile">
     <a href="${base}" class="${tab === 'overview' ? 'on' : ''}">${icon('book', 'sm')} Overview</a>
     <a href="${base}?tab=repos" class="${tab === 'repos' ? 'on' : ''}">${icon('repo', 'sm')} Repositories <span class="counter">${d.repos.length}</span></a>
-    <a href="${base}?tab=stars" class="${tab === 'stars' ? 'on' : ''}">${icon('star', 'sm')} Stars <span class="counter">${d.stars}</span></a>
+    ${org ? '' : html`<a href="${base}?tab=stars" class="${tab === 'stars' ? 'on' : ''}">${icon('star', 'sm')} Stars <span class="counter">${d.stars}</span></a>`}
     <span class="bar"></span></nav>`;
 
   let body;
@@ -83,8 +87,8 @@ export default async function (ctx) {
     body = html`<div class="stack">
       <div><div class="section-title">${top.length ? 'Recently updated' : 'Repositories'}</div>
         ${top.length ? html`<div class="repo-grid two stagger">${top.map((r, i) => html`<div style="--i:${i}">${repoCard(r, { owner: false })}</div>`)}</div>`
-          : html`<div class="box empty small">${icon('repo', 'big')}<h3>${isMe ? "You don't have any repositories yet" : `${u.username} doesn't have any public repositories yet`}</h3>${isMe ? html`<a class="btn primary sm" href="/new">Create one</a>` : ''}</div>`}</div>
-      ${heatmap(d.heatmap)}
+          : html`<div class="box empty small">${icon('repo', 'big')}<h3>${isMe ? "You don't have any repositories yet" : `${u.username} doesn't have any ${org?.my_role ? '' : 'public '}repositories yet`}</h3>${isMe || org?.can_create ? html`<a class="btn primary sm" href="/new${org ? `?owner=${enc(u.username)}` : ''}">Create one</a>` : ''}</div>`}</div>
+      ${org ? (org.members.length ? html`<div><div class="section-title">People <span class="counter">${org.members.length}</span></div><div class="box list">${org.members.map((m) => html`<a class="list-row" href="/${m.username}">${avatar(m.username, 24)}<b>${m.username}</b>${m.display_name ? html`<span class="muted small">${m.display_name}</span>` : ''}${m.role === 'owner' ? html`<span class="grow"></span><span class="pill">Owner</span>` : ''}</a>`)}</div></div>` : "") : heatmap(d.heatmap)}
       <div><div class="section-title">Recent activity</div><div class="box">${eventList(d.events, { compact: true })}</div></div>
     </div>`;
   } else if (tab === 'repos') {
@@ -102,7 +106,7 @@ export default async function (ctx) {
 
   return {
     title: u.display_name ? `${u.username} (${u.display_name})` : u.username,
-    html: html`<div class="wrap profile">${sidebar(u, isMe)}<section class="profile-main">${tabs}<div class="profile-body">${body}</div></section></div>`,
+    html: html`<div class="wrap profile">${sidebar(u, isMe, d, org)}<section class="profile-main">${tabs}<div class="profile-body">${body}</div></section></div>`,
     mount(el) {
       $('#report-user', el)?.addEventListener('click', () => reportDialog({ kind: 'user', user: u.username }, 'account'));
       const tabsEl = $('.profile-tabs', el);
