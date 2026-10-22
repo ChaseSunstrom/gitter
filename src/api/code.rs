@@ -1038,14 +1038,7 @@ pub async fn write_contents(
             if !validate::ref_name(nb) {
                 return Err(AppError::bad("That isn't a valid branch name"));
             }
-            if st
-                .git
-                .resolve(&r.path, &format!("refs/heads/{nb}"))
-                .await?
-                .is_some()
-            {
-                return Err(AppError::conflict("A branch with that name already exists"));
-            }
+            // One there already (or in the way) is refused when the commit tries to make it.
             nb.clone()
         }
         None => req.branch.clone(),
