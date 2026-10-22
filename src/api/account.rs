@@ -198,7 +198,7 @@ pub async fn login_2fa(
     Json(req): Json<TwoFactorLogin>,
 ) -> R<Response> {
     let Some(uid) = st.challenges.attempt(&req.challenge) else {
-        return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "That sign-in expired. Enter your password again.").with_code("restart"));
+        return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "That sign-in expired. Sign in again.").with_code("restart"));
     };
     // Counted before checking, so parallel guesses share the budget.
     let key = format!("2fa:{uid}");
@@ -380,6 +380,7 @@ pub async fn update_me(
 
 #[derive(Deserialize)]
 pub struct PasswordReq {
+    #[serde(default)]
     current: String,
     new: String,
 }
@@ -396,10 +397,8 @@ pub async fn change_password(
     if !st.limiter.allow(&key, 10, 600) {
         return Err(AppError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes."));
     }
-    if password_login(&st.db, &u.username, &req.current)
-        .await?
-        .is_none()
-    {
+    // An account made through a sign-in provider sets its first password without one.
+    if super::oauth::has_password(&st, u.id).await? && password_login(&st.db, &u.username, &req.current).await?.is_none() {
         return Err(AppError::bad("Your current password is incorrect"));
     }
     st.limiter.reset(&key);

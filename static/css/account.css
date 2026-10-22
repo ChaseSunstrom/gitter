@@ -94,6 +94,9 @@
 .auth-logo:hover .mark { transform: rotate(-8deg) scale(1.06); }
 .auth-card .btn.lg { width: 100%; }
 .auth-alt { text-align: center; }
+.oauth-list { display: grid; gap: 8px; }
+.or-sep { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+.or-sep::before, .or-sep::after { content: ''; flex: 1; border-top: 1px solid var(--line); }
 .pw-meter { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; height: 4px; }
 .pw-meter i { border-radius: 2px; background: var(--hover); transition: background .25s; }
 .pw-meter[data-s="0"] i:nth-child(-n+1) { background: var(--red); }

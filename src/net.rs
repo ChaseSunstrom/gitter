@@ -1,9 +1,9 @@
-//! Outbound HTTP to addresses people type in (webhooks now; imports and
-//! mirrors can reuse it). Only http and https. The host is looked up once,
-//! every address it gives is checked, and the connection goes to exactly
-//! those addresses, so a DNS answer that changes after the check (rebinding)
-//! can't reach inside. No redirects, no proxies, 10 seconds for the whole
-//! exchange, and only the first 64 KB of the reply is read.
+//! Outbound HTTP to addresses people type in (webhooks, sign-in providers).
+//! Only http and https. The host is looked up once, every address it gives is
+//! checked, and the connection goes to exactly those addresses, so a DNS
+//! answer that changes after the check (rebinding) can't reach inside. No
+//! redirects, no proxies, 10 seconds for the whole exchange, and only the
+//! first part of the reply is read (64 KB unless the caller asks for more).
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
@@ -22,6 +22,13 @@ pub struct Reply {
     pub status: u16,
     /// At most MAX_REPLY bytes.
     pub body: Vec<u8>,
+}
+
+/// Percent-encode everything but the unreserved characters (RFC 3986).
+pub fn enc(s: &str) -> String {
+    s.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
 }
 
 /// An http(s) URL with a host and no user name or password in it.
@@ -124,6 +131,11 @@ impl Resolver for PublicOnly {
 /// POST `body` to `url`. Blocking: call it from `spawn_blocking`. Any HTTP
 /// status is a reply (a redirect is not followed); Err says why there was none.
 pub fn post(url: &str, headers: &[(&str, String)], body: &[u8], allow_private: bool) -> Result<Reply, String> {
+    fetch(url, headers, Some(body), allow_private, MAX_REPLY)
+}
+
+/// POST `body` (or GET without one), reading at most `cap` bytes of the reply.
+pub fn fetch(url: &str, headers: &[(&str, String)], body: Option<&[u8]>, allow_private: bool, cap: u64) -> Result<Reply, String> {
     check_url(url)?;
     let cfg = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
@@ -137,14 +149,14 @@ pub fn post(url: &str, headers: &[(&str, String)], body: &[u8], allow_private: b
     } else {
         ureq::Agent::with_parts(cfg, DefaultConnector::default(), PublicOnly)
     };
-    let mut req = agent.post(url);
-    for (k, v) in headers {
-        req = req.header(*k, v);
-    }
-    let mut resp = req.send(body).map_err(describe)?;
+    let sent = match body {
+        Some(b) => headers.iter().fold(agent.post(url), |r, (k, v)| r.header(*k, v)).send(b),
+        None => headers.iter().fold(agent.get(url), |r, (k, v)| r.header(*k, v)).call(),
+    };
+    let mut resp = sent.map_err(describe)?;
     let mut out = Vec::new();
     // A reply cut short (a stall past the time limit) still counts by its status.
-    let _ = resp.body_mut().as_reader().take(MAX_REPLY).read_to_end(&mut out);
+    let _ = resp.body_mut().as_reader().take(cap).read_to_end(&mut out);
     Ok(Reply { status: resp.status().as_u16(), body: out })
 }
 

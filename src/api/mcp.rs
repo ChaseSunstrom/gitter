@@ -223,13 +223,8 @@ fn int(args: &Value, k: &str) -> Result<Option<i64>, Invalid> {
     }
 }
 
-fn enc(s: &str) -> String {
-    s.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
-        .collect()
-}
-
 fn query(pairs: &[(&str, Option<String>)]) -> String {
+    use crate::net::enc;
     let q: Vec<String> = pairs.iter().filter_map(|(k, v)| v.as_ref().map(|v| format!("{k}={}", enc(v)))).collect();
     if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) }
 }

@@ -1,5 +1,5 @@
 // App shell: router, navigation, prefetch, theme, top bar.
-import { html, raw, state, get, send, toastErr, popover, closePop, avatar, $, copy, ApiError } from './lib.js';
+import { html, raw, state, get, send, toastErr, popover, closePop, avatar, $, copy, ApiError, afterOAuth } from './lib.js';
 import { icon, logo } from './icons.js';
 import { initPalette, openPalette } from './palette.js';
 
@@ -374,6 +374,7 @@ async function boot() {
   });
   initPalette({ navigate, cycleTheme, skins: SKINS, setSkin });
   await navigate(location.href, { replace: true, scroll: false });
+  afterOAuth();
   // Warm the heavier modules while the browser is idle, so first visits to them are instant too.
   const warm = () => ['./hl.js', './md.js', './diffview.js', './pages/repo.js', './pages/issues.js', './pages/issue.js', './pages/commits.js']
     .forEach((m) => import(m).catch(() => {}));

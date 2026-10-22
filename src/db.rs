@@ -929,6 +929,36 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE mirrors ADD COLUMN once INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v29: signing in with GitHub, GitLab or OpenID Connect. `secret` is sealed with the
+    // server key (a new key leaves it unreadable: re-enter it). An identity is the
+    // provider's stable id for a person, never their email. Accounts made through a
+    // provider have pass_hash '!', which no password matches.
+    r#"
+    CREATE TABLE oauth_providers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slug TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        secret TEXT NOT NULL,
+        allow_private INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        allow_signup INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE identities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_id INTEGER NOT NULL REFERENCES oauth_providers(id) ON DELETE CASCADE,
+        subject TEXT NOT NULL,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        login TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        UNIQUE (provider_id, subject),
+        UNIQUE (provider_id, user_id)
+    );
+    CREATE INDEX identities_user ON identities(user_id);
+    "#,
 ];
 
 impl Db {
