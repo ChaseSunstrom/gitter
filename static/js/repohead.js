@@ -69,9 +69,37 @@ export function repoHeader(meta, tab) {
     <nav class="tabs repo-tabs" aria-label="Repository">
       ${TABS.filter(([k]) => k !== 'settings' || meta.can_admin).map(([k, ic, label, path]) => html`<a href="${base}${path}" class="${tab === k ? 'on' : ''}" data-tab="${k}">
         ${icon(ic, 'sm')}<span>${label}</span>${counts[k] ? html`<span class="counter">${num(counts[k])}</span>` : ''}</a>`)}
+      <button class="tab-more" id="tabs-more" type="button" aria-haspopup="menu" hidden>More ${icon('chev-down', 'sm')}</button>
       <span class="bar"></span>
     </nav>
   </div></div>`;
+}
+
+/** Show the repository tabs that fit; the rest go in the More menu (never the active one). */
+function fitTabs(root) {
+  const nav = root.querySelector('.repo-tabs');
+  const more = nav?.querySelector('#tabs-more');
+  if (!more) return;
+  const tabs = [...nav.querySelectorAll('a[data-tab]')];
+  tabs.forEach((a) => { a.hidden = false; });
+  more.hidden = true;
+  if (nav.scrollWidth > nav.clientWidth) {
+    more.hidden = false;
+    for (const a of tabs.slice().reverse()) {
+      if (nav.scrollWidth <= nav.clientWidth) break;
+      if (!a.classList.contains('on')) a.hidden = true;
+    }
+  }
+  more.dataset.tabs = tabs.filter((a) => a.hidden).map((a) => a.dataset.tab).join(' ');
+  placeTabBar(root);
+}
+
+let fitting = false;
+function watchTabs() {
+  if (fitting) return;
+  fitting = true;
+  let t;
+  addEventListener('resize', () => { clearTimeout(t); t = setTimeout(() => fitTabs(document), 100); });
 }
 
 /** Position a .tabs .bar under the active tab (animated by CSS). */
@@ -162,7 +190,17 @@ function countView(meta) {
 
 export function mountRepoHeader(root, meta) {
   countView(meta);
-  placeTabBar(root);
+  fitTabs(root);
+  // Widths change once the web font arrives.
+  document.fonts?.ready.then(() => fitTabs(root));
+  watchTabs();
+  $('#tabs-more', root)?.addEventListener('click', (e) => {
+    const hidden = [...root.querySelectorAll('.repo-tabs a[data-tab][hidden]')];
+    popover(e.currentTarget, html`<div class="menu" role="menu">${hidden.map((a) => {
+      const [, ic, label] = TABS.find(([k]) => k === a.dataset.tab);
+      return html`<a class="menu-item" role="menuitem" href="${a.getAttribute('href')}">${icon(ic, 'sm')}<span>${label}</span></a>`;
+    })}</div>`, { align: 'right', onMount: (pop) => pop.addEventListener('click', (ev) => { if (ev.target.closest('a')) closePop(); }) });
+  });
   paintCiStatus(root, meta);
   $('#report-btn', root)?.addEventListener('click', () => reportDialog({ kind: 'repo', owner: meta.owner, repo: meta.name }, 'repository'));
   const base = repoUrl(meta.owner, meta.name);

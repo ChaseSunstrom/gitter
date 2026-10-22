@@ -2,13 +2,13 @@
 id: T-0091
 type: FEATURE
 tier: M
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T16:03:41Z
-updated: 2026-10-22T16:03:41Z
+updated: 2026-10-22T17:07:17Z
 ---
 # Fetched packs are not verified (`transfer.fsckObjects` is not set), so malformed objects f
 ## Raw request
@@ -27,4 +27,5 @@ updated: 2026-10-22T16:03:41Z
 ## Verification evidence
 ## Log
 - 2026-10-22T16:03:41Z created
+- 2026-10-22T17:07:17Z dropped: fixed in T-0083 integration: fetch.fsckObjects on mirror fetches
 ## Follow-ups captured

@@ -915,5 +915,53 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Layout: long commit messages and a wide README stay inside the main column at
+// desktop widths, and every repository tab is on screen or in the More menu.
+{
+  const errors = [];
+  const bad = [];
+  try {
+    const h = { Origin: BASE };
+    await ctx.request.post(BASE + '/api/repos', { headers: h, data: { name: 'wide', readme: true } });
+    const readme = '# Wide\n\n```\n' + 'a_very_long_line_of_code_'.repeat(12) + '\n```\n\n| ' + Array.from({ length: 14 }, (_, i) => 'column' + i).join(' | ') + ' |\n|' + '---|'.repeat(14) + '\n| ' + Array.from({ length: 14 }, () => 'value').join(' | ') + ' |\n';
+    const w = await ctx.request.post(BASE + '/api/repos/alice/wide/contents', { headers: h, data: { branch: 'main', message: 'Merge build: T-1302, T-1361, T-1389, T-1405, T-1433, T-1469, T-1502, T-1511 and a few more words so it is long', changes: [{ path: 'README.md', content: readme }, ...Array.from({ length: 4 }, (_, i) => ({ path: `dir${i}/f.txt`, content: 'x' }))] } });
+    if (!w.ok()) throw new Error(`commit: ${w.status()}`);
+    const page = await ctx.newPage();
+    page.on('pageerror', (e) => errors.push(String(e)));
+    for (const width of [1767, 1360, 1024, 800]) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto(BASE + '/alice/wide', { waitUntil: 'networkidle' });
+      await page.waitForTimeout(300);
+      const m = await page.evaluate(() => {
+        const r = (s) => document.querySelector(s)?.getBoundingClientRect();
+        const nav = r('.repo-tabs');
+        const tabs = [...document.querySelectorAll('.repo-tabs a[data-tab]')];
+        const shown = tabs.filter((a) => a.offsetParent !== null);
+        const more = (document.querySelector('#tabs-more')?.dataset.tabs || '').split(' ');
+        return {
+          side: r('.repo-side')?.left, files: r('.files-box')?.right, readme: r('#readme')?.right, page: document.documentElement.clientWidth,
+          clipped: shown.filter((a) => a.getBoundingClientRect().right > nav.right + 1).map((a) => a.dataset.tab),
+          missing: tabs.filter((a) => a.offsetParent === null && !more.includes(a.dataset.tab)).map((a) => a.dataset.tab),
+        };
+      });
+      const edge = width > 1000 ? m.side : m.page;
+      if (m.files > edge + 1 || m.readme > edge + 1) bad.push(`${width}px: content runs to ${Math.round(Math.max(m.files, m.readme))}, past ${Math.round(edge)}`);
+      if (m.clipped.length || m.missing.length) bad.push(`${width}px: tabs cut off ${m.clipped} / unreachable ${m.missing}`);
+    }
+    // The More menu lists the tabs that didn't fit, as links.
+    await page.setViewportSize({ width: 800, height: 900 });
+    await page.goto(BASE + '/alice/wide', { waitUntil: 'networkidle' });
+    const btn = page.locator('#tabs-more');
+    if (await btn.isVisible()) {
+      await btn.click();
+      const links = await page.locator('.pop a[href*="/alice/wide/"]').count();
+      if (!links) bad.push('the More menu has no links');
+    } else bad.push('800px: no More menu');
+    await page.close();
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || bad.length) { failed++; console.log('✗ layout', { bad, errors }); }
+  else console.log('  ok long commit messages and wide READMEs stay in the main column; repo tabs fit or go in More');
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T17:01:51Z
-updated: 2026-10-22T16:18:07Z
+updated: 2026-10-22T16:18:08Z
 inferred_deps: [T-0007]
 inferred_why: T-0007: merge queue needs required checks and auto-merge
 group: CI gating and pipeline features
@@ -71,6 +71,7 @@ README: Merge queue paragraph under Branch rules
 - 2026-10-22T15:22:27Z planned from capture
 - 2026-10-22T15:22:32Z focused
 - 2026-10-22T16:18:07Z done
+- 2026-10-22T16:18:08Z committed b1bd3d6 (46 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

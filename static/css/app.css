@@ -61,7 +61,8 @@ main { min-height: calc(100vh - var(--header-h) - 80px); }
 .row { display: flex; align-items: center; gap: 8px; }
 .row.wrap-ok { flex-wrap: wrap; }
 .spread { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.stack { display: grid; gap: 16px; }
+/* One column that never grows past its container: long lines truncate or scroll inside their boxes. */
+.stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .grow { flex: 1; min-width: 0; }
 .muted { color: var(--muted); }
 .faint { color: var(--faint); }
@@ -70,6 +71,7 @@ main { min-height: calc(100vh - var(--header-h) - 80px); }
 .nowrap { white-space: nowrap; }
 .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .split { display: grid; grid-template-columns: minmax(0, 1fr) 296px; gap: 32px; align-items: start; }
+.split > * { min-width: 0; }
 .split.left { grid-template-columns: 296px minmax(0, 1fr); }
 @media (max-width: 1000px) { .split, .split.left { grid-template-columns: minmax(0, 1fr); } }
 .section-title { font-size: 13px; font-weight: 600; color: var(--ink-2); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
@@ -171,6 +173,7 @@ button.sig-badge { cursor: pointer; }
 .tabs a:hover, .tabs button:hover { color: var(--ink); }
 .tabs a:hover::before, .tabs button:hover::before { content: ""; position: absolute; inset: 4px 2px; background: var(--hover); border-radius: 7px; z-index: -1; }
 .tabs .on { color: var(--ink); font-weight: 600; }
+.tabs .tab-more { flex: none; }
 .tabs .bar { position: absolute; bottom: 0; height: 2px; border-radius: 2px; background: var(--grad); transition: left .35s var(--ease), width .35s var(--ease); pointer-events: none; }
 .seg { display: inline-flex; padding: 3px; background: var(--hover); border-radius: 9px; gap: 2px; }
 .seg button, .seg a { border: 0; background: none; padding: 4px 12px; border-radius: 7px; font-weight: 500; cursor: pointer; color: var(--muted); font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
