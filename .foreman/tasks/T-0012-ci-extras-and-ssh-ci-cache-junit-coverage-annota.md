@@ -9,8 +9,9 @@ depends_on: []
 source: user
 created: 2026-10-21T17:01:42Z
 updated: 2026-10-21T17:01:42Z
-inferred_deps: [T-0006]
-inferred_why: T-0006: CI extras extend the core pipeline runner
+inferred_deps: [T-0007]
+inferred_why: T-0007: pipeline extras need the sandboxed CI job runner
+group: CI gating and pipeline features
 ---
 # CI extras and SSH: CI cache, JUnit/coverage annotations, flaky-test detection, pipeline te
 ## Raw request

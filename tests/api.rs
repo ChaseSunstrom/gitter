@@ -1743,6 +1743,13 @@ async fn releases_from_tags_drafts_latest_and_access() {
     assert_eq!(app.req(&anon, "GET", &format!("{base}/latest"), None).await.1["tag"], "v2.0");
     assert_eq!(app.req(&bob, "PATCH", &format!("{base}/{v1}"), Some(json!({ "title": "pwned" }))).await.0, StatusCode::FORBIDDEN);
 
+    // A draft of an existing tag that's deleted later isn't published at a guessed commit.
+    app.state.git.ok(&path, &["tag", "v4", "main"]).await.unwrap();
+    let (_, v) = app.req(&alice, "POST", base, Some(json!({ "tag": "v4", "draft": true }))).await;
+    let v4 = v["id"].as_i64().unwrap();
+    app.state.git.ok(&path, &["tag", "-d", "v4"]).await.unwrap();
+    assert_eq!(app.req(&alice, "PATCH", &format!("{base}/{v4}"), Some(json!({ "draft": false }))).await.0, StatusCode::CONFLICT);
+
     // Private repositories keep their releases private.
     app.req(&alice, "POST", "/api/repos/alice/priv/releases", Some(json!({ "tag": "v1" }))).await;
     assert_eq!(app.req(&bob, "GET", "/api/repos/alice/priv/releases", None).await.0, StatusCode::NOT_FOUND);
@@ -1889,4 +1896,192 @@ async fn releases_assets_stream_with_quota_counts_and_cleanup() {
     let (s, v) = app.req(&admin, "DELETE", "/api/admin/users/alice", Some(json!({ "confirm": "alice" }))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert!(!data_dir.join(format!("releases/{did}")).exists());
+}
+
+#[tokio::test]
+async fn totp_secrets_are_sealed_at_rest() {
+    use gitter::security::{seal_totp_secrets, step_now, totp_code, use_code};
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let (_, setup) = app.req(&alice, "POST", "/api/me/2fa/setup", None).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    let (s, _) = app.req(&alice, "POST", "/api/me/2fa/enable", Some(json!({ "code": totp_code(&secret, step_now()).unwrap() }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let stored: String = app.state.db.call(|c| Ok(c.query_row("SELECT totp_secret FROM users WHERE username = 'alice'", [], |r| r.get(0))?)).await.unwrap();
+    assert!(stored.starts_with("sealed:") && !stored.contains(&secret), "{stored}");
+    // A secret stored before sealing still works, and the boot pass seals it.
+    let bob = app.signup("bob").await;
+    drop(bob);
+    let legacy = gitter::security::new_totp_secret();
+    let l2 = legacy.clone();
+    let bob_id: i64 = app
+        .state
+        .db
+        .call(move |c| {
+            c.execute("UPDATE users SET totp_secret = ?1 WHERE username = 'bob'", [&l2])?;
+            Ok(c.query_row("SELECT id FROM users WHERE username = 'bob'", [], |r| r.get(0))?)
+        })
+        .await
+        .unwrap();
+    let code = totp_code(&legacy, step_now()).unwrap();
+    assert!(use_code(&app.state.db, app.state.key.clone(), bob_id, &code).await.unwrap().is_some());
+    assert_eq!(seal_totp_secrets(&app.state.db, app.state.key.clone()).await.unwrap(), 1);
+    let sealed: String = app.state.db.call(move |c| Ok(c.query_row("SELECT totp_secret FROM users WHERE id = ?1", [bob_id], |r| r.get(0))?)).await.unwrap();
+    assert!(sealed.starts_with("sealed:"));
+    assert_eq!(gitter::security::open_text(&app.state.key, &sealed).as_deref(), Some(legacy.as_str()));
+    assert_eq!(seal_totp_secrets(&app.state.db, app.state.key.clone()).await.unwrap(), 0, "already sealed");
+}
+
+/// Push status for `user:password` to `repo` (a minimal receive-pack request).
+async fn can_push(app: &App, repo: &str, user: &str) -> StatusCode {
+    let req = Request::post(format!("/{repo}.git/git-receive-pack"))
+        .header("host", "test.local")
+        .header("authorization", basic(user, "correct horse"))
+        .header("content-type", "application/x-git-receive-pack-request")
+        .body(Body::from("0000"))
+        .unwrap();
+    status_with(app, req).await
+}
+
+#[tokio::test]
+async fn collaborators_get_exactly_their_role() {
+    let app = App::new();
+    let _admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "private": true, "readme": true }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p", None).await.0, StatusCode::NOT_FOUND);
+    // Only admins manage access.
+    assert_ne!(app.req(&bob, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "admin" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "read" }))).await.0, StatusCode::OK);
+    let (s, meta) = app.req(&bob, "GET", "/api/repos/alice/p", None).await;
+    assert_eq!((s, meta["can_write"].as_bool()), (StatusCode::OK, Some(false)));
+    let (_, list) = app.req(&bob, "GET", "/api/explore?q=p", None).await;
+    assert!(list.to_string().contains("alice"), "private repos you can read are listed: {list}");
+    assert_eq!(can_push(&app, "alice/p", "bob").await, StatusCode::FORBIDDEN);
+    // Write: push and manage issues, but no settings.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    assert_ne!(can_push(&app, "alice/p", "bob").await, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "POST", "/api/repos/alice/p/labels", Some(json!({ "name": "bug2", "color": "#ff0000" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/alice/p", Some(json!({ "description": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p/deploy-tokens", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PUT", "/api/repos/alice/p/ci/secrets/X", Some(json!({ "value": "y" }))).await.0, StatusCode::FORBIDDEN);
+    // Admin: settings too.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "admin" }))).await;
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/alice/p", Some(json!({ "description": "by bob" }))).await.0, StatusCode::OK);
+    let (_, acc) = app.req(&bob, "GET", "/api/repos/alice/p/collaborators", None).await;
+    assert!(acc["access"].to_string().contains("can do everything"), "{acc}");
+    assert_eq!(acc["collaborators"][0]["username"], "bob");
+    // Removing them revokes access; bad roles and organizations are refused.
+    assert_eq!(app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "god" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/alice/p/collaborators/bob", None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p", None).await.0, StatusCode::NOT_FOUND);
+    // A moderator-hidden repo is for its admins only.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET hidden = 1", [])?)).await.unwrap();
+    assert_eq!(app.req(&bob, "GET", "/api/repos/alice/p", None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn organizations_own_repos_and_share_them_with_members() {
+    let app = App::new();
+    let _admin = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let (s, v) = app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "acme", "display_name": "Acme Inc" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(app.req(&bob, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await.0, StatusCode::CONFLICT);
+    assert_eq!(app.req(&bob, "POST", "/api/orgs", Some(json!({ "name": "alice" }))).await.0, StatusCode::CONFLICT, "one namespace with users");
+    // Repos in the org: by those who'd have write on all of them.
+    let (s, v) = app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "x", "owner": "acme", "private": true, "readme": true }))).await;
+    assert_eq!((s, v["owner"].as_str()), (StatusCode::OK, Some("acme")), "{v}");
+    assert_ne!(app.req(&bob, "POST", "/api/repos", Some(json!({ "name": "y", "owner": "acme" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "GET", "/api/repos/acme/x", None).await.0, StatusCode::NOT_FOUND);
+    // Members get the base permission (read by default).
+    assert_eq!(app.req(&alice, "PUT", "/api/orgs/acme/members/bob", Some(json!({ "role": "member" }))).await.0, StatusCode::OK);
+    let (s, meta) = app.req(&bob, "GET", "/api/repos/acme/x", None).await;
+    assert_eq!((s, meta["can_write"].as_bool()), (StatusCode::OK, Some(false)));
+    assert_eq!(can_push(&app, "acme/x", "bob").await, StatusCode::FORBIDDEN);
+    let listed = |v: Value| v["repos"].as_array().map_or(0, Vec::len);
+    assert_eq!(listed(app.req(&bob, "GET", "/api/users/acme", None).await.1), 1, "lists follow the base role");
+    assert_eq!(listed(app.req(&bob, "GET", "/api/feed", None).await.1), 1, "the dashboard lists repos shared with you");
+    assert_eq!(app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "write" }))).await.0, StatusCode::OK);
+    assert_ne!(can_push(&app, "acme/x", "bob").await, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/acme/x", Some(json!({ "description": "x" }))).await.0, StatusCode::FORBIDDEN, "members aren't admins");
+    assert_eq!(app.req(&bob, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "none" }))).await.0, StatusCode::FORBIDDEN);
+    app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "none" }))).await;
+    assert_eq!(app.req(&bob, "GET", "/api/repos/acme/x", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(listed(app.req(&bob, "GET", "/api/users/acme", None).await.1), 0);
+    assert_eq!(listed(app.req(&bob, "GET", "/api/feed", None).await.1), 0);
+    // Owners administer every org repo; the last owner can't step down or leave.
+    app.req(&alice, "PUT", "/api/orgs/acme/members/bob", Some(json!({ "role": "owner" }))).await;
+    assert_eq!(app.req(&bob, "PATCH", "/api/repos/acme/x", Some(json!({ "description": "owned" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "DELETE", "/api/orgs/acme/members/bob", None).await.0, StatusCode::OK, "bob leaves");
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme/members/alice", None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(app.req(&alice, "PUT", "/api/orgs/acme/members/alice", Some(json!({ "role": "member" }))).await.0, StatusCode::BAD_REQUEST);
+    let (_, org) = app.req(&Client::default(), "GET", "/api/orgs/acme", None).await;
+    assert_eq!((org["org"]["display_name"].as_str(), org["members"].as_array().map(Vec::len)), (Some("Acme Inc"), Some(0)), "members are private");
+    let (_, org) = app.req(&alice, "GET", "/api/orgs/acme", None).await;
+    assert_eq!(org["members"][0]["role"], "owner");
+    let (_, mine) = app.req(&alice, "GET", "/api/me/orgs", None).await;
+    assert_eq!(mine["orgs"][0]["name"], "acme");
+    // Organizations can't sign in, and one that owns repos can't be deleted.
+    app.state
+        .db
+        .call(|c| Ok(c.execute("UPDATE users SET pass_hash = (SELECT pass_hash FROM users WHERE username = 'alice') WHERE username = 'acme'", [])?))
+        .await
+        .unwrap();
+    let (s, _, _) = login(&app, json!({ "login": "acme", "password": "correct horse" })).await;
+    assert_ne!(s, StatusCode::OK, "even with a password that matches");
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::BAD_REQUEST);
+    app.req(&alice, "DELETE", "/api/repos/acme/x", Some(json!({ "confirm": "acme/x" }))).await;
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "GET", "/api/orgs/acme", None).await.0, StatusCode::NOT_FOUND);
+}
+
+async fn user_id(app: &App, name: &str) -> i64 {
+    let n = name.to_string();
+    app.state.db.call(move |c| Ok(c.query_row("SELECT id FROM users WHERE username = ?1", [n], |r| r.get(0))?)).await.unwrap()
+}
+
+#[tokio::test]
+async fn organizations_share_their_creators_limits_and_trust() {
+    let app = App::new();
+    let root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    // Adding a site admin as an owner doesn't make an organization trusted with CI on the server.
+    app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "evil" }))).await;
+    assert_eq!(app.req(&alice, "PUT", "/api/orgs/evil/members/root1", Some(json!({ "role": "owner" }))).await.0, StatusCode::OK);
+    assert!(!gitter::ci::trigger::enabled(&app.state, user_id(&app, "evil").await).await);
+    app.req(&root, "POST", "/api/orgs", Some(json!({ "name": "staff" }))).await;
+    assert!(gitter::ci::trigger::enabled(&app.state, user_id(&app, "staff").await).await, "an org an admin made is");
+    // An organization's repositories count toward its creator's repository limit and storage.
+    let mut s = app.state.settings.get();
+    s.max_repos_per_user = 2;
+    s.max_storage_mb = 100;
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+    assert_eq!(app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "a1", "private": true }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "o1", "owner": "evil" }))).await.0, StatusCode::OK);
+    let (s, v) = app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "o2", "owner": "evil" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 5000000 WHERE name = 'o1'", [])?)).await.unwrap();
+    let (a, e) = (user_id(&app, "alice").await, user_id(&app, "evil").await);
+    let left = gitter::repo::storage_left(&app.state, a).await.unwrap().unwrap();
+    assert!(left <= 100 * 1024 * 1024 - 5_000_000, "{left}");
+    assert_eq!(gitter::repo::storage_left(&app.state, e).await.unwrap(), Some(left));
+    // Who belongs to an organization is for its members to see.
+    assert_eq!(app.req(&bob, "GET", "/api/orgs/evil", None).await.1["members"], json!([]));
+    assert_eq!(app.req(&bob, "GET", "/api/users/alice", None).await.1["orgs"], json!([]));
+    assert_eq!(app.req(&alice, "GET", "/api/users/alice", None).await.1["orgs"], json!(["evil"]));
+    // A token can't drop its owner's access; and an org's only owner can't be deleted out from under it.
+    app.req(&alice, "PUT", "/api/repos/alice/a1/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    let (_, t) = app.req(&bob, "POST", "/api/me/tokens", Some(json!({ "name": "t", "scope": "write" }))).await;
+    let t = t["token"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&app, "DELETE", "/api/repos/alice/a1/collaborators/bob", &t, None).await, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "DELETE", "/api/repos/alice/a1/collaborators/bob", None).await.0, StatusCode::OK, "bob leaves");
+    app.req(&root, "DELETE", "/api/orgs/evil/members/root1", None).await;
+    let (s, v) = app.req(&root, "DELETE", "/api/admin/users/alice", Some(json!({ "confirm": "alice" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("only owner of evil"), "{v}");
 }

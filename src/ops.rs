@@ -186,7 +186,8 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
                 eprintln!("warning: release file {name} is missing (deleted during the backup?)");
                 continue;
             }
-            tar.append_path_with_name(&src, name)?;
+            // Tolerates the file vanishing between the check and the copy.
+            append_tree(&mut tar, &src, name)?;
         }
         tar.into_inner()?.finish()?.flush()?;
         Ok((stores[0].len(), users, oids.len(), assets.len()))

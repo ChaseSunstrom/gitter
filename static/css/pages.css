@@ -143,6 +143,9 @@
 .settings-sec { display: grid; gap: 14px; }
 .danger-zone { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); }
 .danger-zone .list-row { padding: 14px 16px; }
+.org-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.org-chips img { border-radius: 6px; }
+.access-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
 
 /* ---------- search ---------- */
 .search-hit .lines { font-family: var(--mono); font-size: 12.5px; }

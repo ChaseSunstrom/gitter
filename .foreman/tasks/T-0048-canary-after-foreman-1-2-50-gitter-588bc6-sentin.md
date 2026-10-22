@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-21T23:48:09Z
 updated: 2026-10-21T23:48:09Z
+group: Foreman tooling and canary failures
 ---
 # Canary after Foreman 1.2.50: ✗ gitter-588bc6: Sentinel: 20 past check(s) from 10 finished
 ## Raw request

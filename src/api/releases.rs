@@ -276,7 +276,12 @@ pub async fn update(
     let pre = req.prerelease.unwrap_or(cur["prerelease"] == true);
     // Publishing a draft makes its new tag now (unless someone pushed that tag meanwhile).
     if cur["draft"] == true && !draft && cur["sha"].is_null() {
-        let (_, sha) = check_target(&st, &r, cur["target"].as_str().unwrap_or("")).await?;
+        // A draft of an existing tag keeps no target: if that tag was deleted, don't guess one.
+        let target = cur["target"].as_str().unwrap_or("");
+        if target.is_empty() {
+            return Err(AppError::conflict("This release's tag no longer exists. Push it again, or delete this draft and make a new one."));
+        }
+        let (_, sha) = check_target(&st, &r, target).await?;
         make_tag(&st, &r, &u, cur["tag"].as_str().unwrap_or(""), &sha, &title).await?;
     }
     st.db
@@ -388,11 +393,7 @@ pub async fn upload(
             )
             .map_err(taken("This release already has a file with that name"))?;
             let aid = tx.last_insert_rowid();
-            let (used, admin): (i64, bool) = tx.query_row(
-                &format!("SELECT {}, is_admin FROM users WHERE id = ?1", crate::repo::STORAGE_USED),
-                [owner],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let (used, admin) = crate::repo::usage(&tx, owner)?;
             if quota > 0 && !admin && used.max(0) as u64 > quota {
                 return Err(AppError::new(StatusCode::PAYLOAD_TOO_LARGE, "This account is out of storage"));
             }

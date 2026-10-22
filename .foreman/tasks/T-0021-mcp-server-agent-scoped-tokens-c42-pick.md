@@ -9,8 +9,8 @@ depends_on: []
 source: followup
 created: 2026-10-21T17:01:53Z
 updated: 2026-10-21T17:01:53Z
-inferred_deps: [T-0009]
-inferred_why: T-0009: agent-scoped tokens extend scoped token model
+inferred_deps: [T-0008]
+inferred_why: T-0008: agent-scoped tokens need org roles and access model
 ---
 # MCP server + agent-scoped tokens (C42 pick)
 ## Raw request

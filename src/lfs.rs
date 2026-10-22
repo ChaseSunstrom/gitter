@@ -324,11 +324,7 @@ async fn upload_inner(st: AppState, owner: String, name: String, oid: String, re
                 "INSERT OR IGNORE INTO lfs_objects(repo_id, oid, size, created_at) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![id, o, size as i64, crate::db::now()],
             )? == 1;
-            let (used, admin): (i64, bool) = tx.query_row(
-                &format!("SELECT {}, is_admin FROM users WHERE id = ?1", crate::repo::STORAGE_USED),
-                [owner],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let (used, admin) = crate::repo::usage(&tx, owner)?;
             let over = added && quota > 0 && !admin && used.max(0) as u64 > quota;
             if over {
                 tx.execute("DELETE FROM lfs_objects WHERE repo_id = ?1 AND oid = ?2", rusqlite::params![id, o])?;

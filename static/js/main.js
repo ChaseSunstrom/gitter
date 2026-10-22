@@ -11,6 +11,7 @@ const ROUTES = [
   ['/snippets', 'snippets', { view: 'list' }], ['/snippets/mine', 'snippets', { view: 'mine' }], ['/snippets/new', 'snippets', { view: 'edit' }],
   ['/snippets/:id', 'snippets', { view: 'show' }], ['/snippets/:id/edit', 'snippets', { view: 'edit' }],
   ['/snippets/:id/revisions', 'snippets', { view: 'revisions' }],
+  ['/orgs/new', 'orgs', { view: 'new' }], ['/orgs/:org/settings', 'orgs', { view: 'settings' }],
   ['/:user', 'profile'],
   ['/:owner/:repo', 'repo', { view: 'tree' }],
   ['/:owner/:repo/tree/*', 'repo', { view: 'tree' }],
@@ -282,6 +283,7 @@ export function renderTopbar() {
     popover(e.currentTarget, html`
       <a class="menu-item" href="/new">${icon('repo')} New repository</a>
       <a class="menu-item" href="/snippets/new">${icon('file-code')} New snippet</a>
+      <a class="menu-item" href="/orgs/new">${icon('users')} New organization</a>
       ${r ? html`<div class="menu-sep"></div><div class="menu-head">${r.owner}/${r.name}</div>
         <a class="menu-item" href="/${r.owner}/${r.name}/issues/new">${icon('issue')} New issue</a>
         <a class="menu-item" href="/${r.owner}/${r.name}/discussions/new">${icon('comment')} New discussion</a>
