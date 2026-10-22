@@ -175,7 +175,7 @@ pub async fn comment(State(st): State<AppState>, Authed(u): Authed, Path((o, n, 
         }
     };
     let (path, side, line, start, sha, original) = anchor;
-    let (reply, pending) = (req.in_reply_to, req.pending);
+    let (reply, pending, text) = (req.in_reply_to, req.pending, body.clone());
     let id = st
         .db
         .call(move |c| {
@@ -210,6 +210,7 @@ pub async fn comment(State(st): State<AppState>, Authed(u): Authed, Path((o, n, 
         .await?;
     if !pending {
         record_event(&st.db, u.id, Some(r.id), "comment", &issue.title, &num.to_string(), 1).await?;
+        super::notifications::notify(&st, r.id, super::notifications::Thread::Issue(iid), u.id, &text).await;
     }
     Ok(Json(json!({ "id": id })))
 }
@@ -349,7 +350,7 @@ pub async fn submit(State(st): State<AppState>, Authed(u): Authed, Path((o, n, n
     if !st.limiter.allow(&format!("comment:{}", u.id), 60, 600) {
         return Err(AppError::new(StatusCode::TOO_MANY_REQUESTS, "You're reviewing very quickly. Try again in a few minutes."));
     }
-    let (iid, uid) = (issue.id, u.id);
+    let (iid, uid, text) = (issue.id, u.id, body.clone());
     let id = st
         .db
         .call(move |c| {
@@ -385,6 +386,7 @@ pub async fn submit(State(st): State<AppState>, Authed(u): Authed, Path((o, n, n
         })
         .await?;
     record_event(&st.db, u.id, Some(r.id), "comment", &issue.title, &num.to_string(), 1).await?;
+    super::notifications::review(&st, r.id, iid, id, u.id, &text).await;
     if state == "approved" {
         let (st2, rid) = (st.clone(), r.id);
         tokio::spawn(async move { crate::protect::auto_merge(&st2, rid, None).await });

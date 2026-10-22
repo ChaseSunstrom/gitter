@@ -5,6 +5,7 @@ use rusqlite::types::Value;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::notifications::{Thread, notify};
 use super::{J, like, ok};
 use crate::auth::{Authed, User, Viewer};
 use crate::db::now;
@@ -291,7 +292,7 @@ pub async fn create(
     }
     let (rid, uid, can_label) = (r.id, u.id, r.can_write);
     let agent = u.agent().map(|a| a.name.clone());
-    let title = req.title.clone();
+    let (title, body) = (req.title.clone(), req.body.clone());
     // Looked up among the templates there are, so the name never reaches git.
     let template_labels = match &req.template {
         Some(f) => super::milestones::load_templates(&st, &r)
@@ -304,7 +305,7 @@ pub async fn create(
             .unwrap_or_default(),
         None => vec![],
     };
-    let num = st
+    let (id, num) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -321,7 +322,7 @@ pub async fn create(
                 )?;
             }
             tx.commit()?;
-            Ok(num)
+            Ok((id, num))
         })
         .await?;
     record_event(
@@ -335,6 +336,7 @@ pub async fn create(
     )
     .await?;
     crate::webhooks::issue(&st, r.id, u.id, num, false, "opened").await;
+    notify(&st, r.id, Thread::Issue(id), u.id, &body).await;
     Ok(Json(json!({ "number": num })))
 }
 
@@ -578,8 +580,10 @@ pub async fn update(
     };
     let (iid, rid, uid) = (issue.id, r.id, u.id);
     let edited = req.title.is_some() || req.body.is_some() || req.labels.is_some() || req.milestone.is_some() || assignees.is_some();
-    st.db
+    let added = st
+        .db
         .call(move |c| {
+            let mut added = vec![];
             let tx = c.transaction()?;
             let t = now();
             if let Some(title) = req.title {
@@ -613,6 +617,7 @@ pub async fn update(
                 tx.execute("UPDATE issues SET milestone_id = ?1 WHERE id = ?2", rusqlite::params![id, iid])?;
             }
             if let Some(names) = assignees {
+                let before: Vec<i64> = tx.prepare("SELECT user_id FROM issue_assignees WHERE issue_id = ?1")?.query_map([iid], |r| r.get(0))?.collect::<Result<_, _>>()?;
                 tx.execute("DELETE FROM issue_assignees WHERE issue_id = ?1", [iid])?;
                 let sql = format!(
                     "SELECT u.id FROM users u JOIN repos r ON r.id = ?2 WHERE u.username = ?1 AND {}",
@@ -623,18 +628,23 @@ pub async fn update(
                     let shown: String = name.chars().take(39).collect();
                     let who = who.ok_or_else(|| AppError::bad(format!("{shown} can't be assigned: only people with write access can")))?;
                     tx.execute("INSERT INTO issue_assignees(issue_id, user_id) VALUES (?1, ?2)", [iid, who])?;
+                    if !before.contains(&who) {
+                        added.push(who);
+                    }
                 }
             }
             tx.execute("UPDATE issues SET updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid])?;
             tx.commit()?;
-            Ok(())
+            Ok(added)
         })
         .await?;
+    super::notifications::tell(&st, r.id, Thread::Issue(issue.id), Some(u.id), added, "assign").await;
     if edited {
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, "edited").await;
     }
     if let Some(s) = new_state {
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
+        notify(&st, r.id, Thread::Issue(issue.id), u.id, "").await;
     }
     ok()
 }
@@ -673,7 +683,7 @@ pub async fn comment(
     if body.is_empty() && new_state.is_none() {
         return Err(AppError::bad("Write a comment"));
     }
-    let (iid, uid) = (issue.id, u.id);
+    let (iid, uid, text) = (issue.id, u.id, body.clone());
     let agent = u.agent().map(|a| a.name.clone());
     let id = st
         .db
@@ -718,6 +728,7 @@ pub async fn comment(
     if let Some(s) = new_state {
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
     }
+    notify(&st, r.id, Thread::Issue(iid), u.id, &text).await;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -917,9 +928,9 @@ pub async fn create_pull(
     }
     let (rid, uid) = (r.id, u.id);
     let agent = u.agent().map(|a| a.name.clone());
-    let title = req.title.clone();
+    let (title, body) = (req.title.clone(), req.body.clone());
     let (head_branch, base_branch) = (req.head.clone(), req.base.clone());
-    let num = st
+    let (id, num) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -936,7 +947,7 @@ pub async fn create_pull(
             let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, true, agent.as_deref())?;
             tx.execute("INSERT INTO pulls(issue_id, head_branch, base_branch) VALUES (?1, ?2, ?3)", rusqlite::params![id, req.head, req.base])?;
             tx.commit()?;
-            Ok(num)
+            Ok((id, num))
         })
         .await?;
     record_event(
@@ -950,6 +961,7 @@ pub async fn create_pull(
     )
     .await?;
     crate::webhooks::issue(&st, r.id, u.id, num, true, "opened").await;
+    notify(&st, r.id, Thread::Issue(id), u.id, &body).await;
     if let Err(e) = crate::ci::trigger::on_pull_opened(&st, &r, u.id, num, &head_branch, &base_branch).await {
         eprintln!("ci: {}#{num}: {}", r.full_name(), e.msg);
     }
@@ -1165,6 +1177,7 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
         new: Some(new_sha.clone()),
     };
     crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
+    notify(st, r.id, Thread::Issue(issue.id), u.id, "").await;
     crate::hooks::on_push(st, r, u, &[upd]).await;
     if req.delete_branch && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
         let _ = st
