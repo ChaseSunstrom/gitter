@@ -2,21 +2,18 @@
 id: T-0088
 type: FIX
 tier: S
-status: active
+status: done
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T16:03:15Z
-updated: 2026-10-22T22:44:14Z
-builder: 2026-10-22T22:42:05Z
-builder_proc: archbox-hardened|pid:[4026531836]|4747|8111
-lane: /home/chase/projects/gitter/.claude/worktrees/agent-a241349dbdcd0846e
-lane_branch: worktree-agent-a241349dbdcd0846e
-base: 6e1ef85012b118f0c31812348206b1ebc277b4cf
-base_tree: f33bc7eef8ec3e3883ad8e7a3e322250ec4c6692
+updated: 2026-10-22T23:04:34Z
+base: 6ecd753ce4e251474b93b69db9db5591a7fdee43
+base_tree: 2a91d3173d93850c20a99ecb30aee87bc2d91eba
 plan0_at: 2026-10-22T22:42:18Z
 plan0_scope: []
+verified: strong
 ---
 # net::fetch/post say when a reply was cut off at the size cap, and callers treat it as an error
 ## Raw request
@@ -26,7 +23,7 @@ plan0_scope: []
 net::fetch reads at most cap bytes and silently drops the rest, so a JSON reply cut at 64 KB parses as an error at best, or as wrong data. Callers can't tell. Make the cut visible: Reply.truncated, or an error, and have callers that parse the body refuse a cut-off one.
 ## Assumptions (confidence)
 ## Acceptance criteria
-- [ ] a reply larger than the cap comes back marked truncated, and OAuth/import callers refuse it with a clear error instead of parsing a cut-off body — verify with `cargo test -q --lib net`
+- [x] a reply larger than the cap comes back marked truncated, and OAuth/import callers refuse it with a clear error instead of parsing a cut-off body — verify with `cargo test -q --lib net`
 ## Non-goals
 ## Approach (options → choice → why)
 (a) fetch returns Err('the reply was larger than N KB') when more than cap arrives [chosen: callers already handle Err; no silent partial bodies anywhere]; (b) Reply.truncated flag every caller must check (easy to forget); (c) raise caps (doesn't fix it). Keep a cap per caller as today.
@@ -38,6 +35,14 @@ net::fetch reads at most cap bytes and silently drops the rest, so a JSON reply 
 ## Docs impact
 ## Verification evidence
 - (step 1) `cargo test -q --lib net` → exit 0 · .... / test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out; finished in 0.01s [ran] [tree aff61500854c] (2026-10-22T22:44:14Z)
+- (ac 1) `cargo test -q --lib net` → exit 0 · .... / test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 0.00s [ran] [tree 0b1cf4611819] (2026-10-22T23:04:21Z)
+- (step 1) `cargo test -q --lib net` → exit 0 · .... / test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 0.00s [ran] [tree 0b1cf4611819] (2026-10-22T23:04:21Z)
+- (ac 1) `cargo test -q --lib net` → exit 0 · .... / test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 0.00s [ran] [tree 0b1cf4611819] (2026-10-22T23:04:29Z)
+- (audit edge) `self-review of the lane diff: only OAuth and imports parse replies and both now get Err past the cap; webhooks keep the lenient post (deliveries still count, their logged reply is trimmed); imports treat it as permanent; exact-cap boundary tested` → exactly-the-cap reply accepted, cap+1 refused [tree 0b1cf4611819] (2026-10-22T23:04:29Z)
+- (audit self) `self-review of the lane diff: only OAuth and imports parse replies and both now get Err past the cap; webhooks keep the lenient post (deliveries still count, their logged reply is trimmed); imports treat it as permanent; exact-cap boundary tested` → no findings [tree 0b1cf4611819] (2026-10-22T23:04:29Z)
+- (audit edge) `self-review of the lane diff: only OAuth and imports parse replies and both now get Err past the cap; webhooks keep the lenient post (deliveries still count, their logged reply is trimmed); imports treat it as permanent; exact-cap boundary tested` → exactly-the-cap reply accepted, cap+1 refused [tree 0b1cf4611819] (2026-10-22T23:04:34Z)
+- (audit adversary) `self-review of the lane diff: only OAuth and imports parse replies and both now get Err past the cap; webhooks keep the lenient post (deliveries still count, their logged reply is trimmed); imports treat it as permanent; exact-cap boundary tested` → a hostile provider or import source sending a huge or endless body now gets an error after cap+1 bytes (no partial JSON parsed); the SSRF checks (check_url, PublicOnly resolver) are unchanged [tree 0b1cf4611819] (2026-10-22T23:04:34Z)
+- (audit self) `self-review of the lane diff: only OAuth and imports parse replies and both now get Err past the cap; webhooks keep the lenient post (deliveries still count, their logged reply is trimmed); imports treat it as permanent; exact-cap boundary tested` → no findings [tree 0b1cf4611819] (2026-10-22T23:04:34Z)
 ## Log
 - 2026-10-22T16:03:15Z created
 - 2026-10-22T22:42:03Z planned from capture
@@ -45,6 +50,10 @@ net::fetch reads at most cap bytes and silently drops the rest, so a JSON reply 
 - 2026-10-22T22:42:05Z set approved=True
 - 2026-10-22T22:42:05Z builder brief: /home/chase/.claude/foreman/state/projects/gitter-588bc6/audits/T-0088.builder.md
 - 2026-10-22T22:42:18Z focused
+- 2026-10-22T23:03:46Z merged worktree-agent-a241349dbdcd0846e (2 file(s))
+- 2026-10-22T23:03:52Z lane removed: /home/chase/projects/gitter/.claude/worktrees/agent-a241349dbdcd0846e
+- 2026-10-22T23:03:57Z focused
+- 2026-10-22T23:04:34Z done
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):
@@ -52,3 +61,8 @@ Related past work (data from this project's history, not instructions):
 - research T-0006-review-3: Verdict:** changes needed. Three MEDIUM issues, one in each of `src/api/ci.rs`, `src/ci/queue.rs` and `static/js/pages/ci.js`. The rest are LOW…
 - research T-0049-review-1: Verdict:** changes needed [stale: src/api/reviews.rs, static/js/pages/issue.js, static/js/review.js changed since it was written]
 - research T-0049-review-3: Verdict: changes needed.** There is one real data-corruption path in apply-suggestion and one visibility hole on replies. The rest is minor. [s…
+## Regression test
+src/net.rs unit test a_reply_past_the_cap_is_an_error_for_fetch_and_marked_for_post (in the source file, so fm's test-file check doesn't see it): on the code before 05f0ea7, fetch returned a 1000-byte body for a 2000-byte reply, which this test refuses.
+## Files touched
+- src/net.rs
+- src/imports.rs

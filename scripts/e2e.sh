@@ -258,7 +258,10 @@ ok "profile, feed, search"
 # --- signed commits: an SSH-signed push by a registered key shows as verified
 if command -v ssh-keygen >/dev/null; then
   ssh-keygen -q -t ed25519 -N '' -C e2e -f "$TMP/sign"
-  api POST /me/signing-keys "{\"title\":\"e2e laptop\",\"key\":\"$(cat "$TMP/sign.pub")\"}"
+  # Adding a key proves holding it: sign the account's challenge with it.
+  api POST /me/signing-keys/challenge
+  jq_ 'd["challenge"]' | tr -d '\n' | ssh-keygen -q -Y sign -n gitter -f "$TMP/sign" > "$TMP/sign.proof"
+  api POST /me/signing-keys "$(python3 -c 'import json,sys; print(json.dumps({"title": "e2e laptop", "key": open(sys.argv[1]).read(), "signature": open(sys.argv[2]).read()}))' "$TMP/sign.pub" "$TMP/sign.proof")"
   (cd "$W" && git pull -q --ff-only && echo "Signed line" >> README.md \
     && git -c gpg.format=ssh -c user.signingkey="$TMP/sign" commit -qS -am "Signed commit" \
     && git push -q "http://alice:$TOKEN@127.0.0.1:$PORT/alice/hello.git" main) || fail "signed commit push"  # pragma: allowlist secret

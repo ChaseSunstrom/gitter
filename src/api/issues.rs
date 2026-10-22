@@ -514,11 +514,22 @@ pub async fn show(
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let mut issue = load_issue(&st, &r, num, v.as_ref()).await?;
-    let pr = if issue.is_pr {
+    let mut pr = if issue.is_pr {
         Some(pull_status(&st, &r, &mut issue).await?)
     } else {
         None
     };
+    // Its author offers maintainers edits only while they can push to the fork.
+    if let (Some(p), Some(u)) = (pr.as_mut(), v.as_ref())
+        && issue.from_fork
+    {
+        let fork = issue.head_repo.as_deref().and_then(|h| h.split_once('/'));
+        let can = u.id == issue.author_id && match fork {
+            Some((fo, fname)) => Repo::readable(&st, Some(u), fo, fname).await.is_ok_and(|f| f.can_write),
+            None => false,
+        };
+        p["can_allow_edits"] = json!(can);
+    }
     let (iid, rid) = (issue.id, r.id);
     let vid = v.as_ref().map(|u| u.id).unwrap_or(-1);
     let viewer_admin = v.as_ref().is_some_and(|u| u.is_admin);
@@ -1301,7 +1312,8 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
 }
 
 /// A merge worked out but not landed: the commit the base branch would move to.
-pub(crate) struct MergePlan {
+/// (Public with `prepare_merge` and `land_merge` so tests can move a branch in between.)
+pub struct MergePlan {
     pub issue_id: i64,
     pub num: i64,
     pub title: String,
@@ -1317,7 +1329,7 @@ pub(crate) struct MergePlan {
 /// Check a merge may happen and make its commit (nothing moves yet). `queued`:
 /// for the merge queue, which checks the commit it makes rather than the head,
 /// so only the rule's other requirements (approvals) are looked at here.
-pub(crate) async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq, queued: bool) -> R<MergePlan> {
+pub async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, req: MergeReq, queued: bool) -> R<MergePlan> {
     crate::mirrors::refuse_writes(r)?;
     let issue = load_issue(st, r, num, Some(u)).await?;
     if !issue.is_pr {
@@ -1423,7 +1435,7 @@ pub(crate) async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User
 
 /// Move the base branch to the plan's commit (only if it's still where the plan
 /// found it) and record the pull request as merged by `u`.
-pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: MergePlan, delete_branch: bool) -> R<()> {
+pub async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: MergePlan, delete_branch: bool) -> R<()> {
     let MergePlan { issue_id, num, title, head_b, base_b, head, base, new_sha, from_fork } = plan;
     // Move the branch and record the merge in a task of its own, so a client
     // that disconnects halfway can't leave the branch moved and the PR open.
@@ -1474,14 +1486,19 @@ pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, p
     crate::api::deploy::pull_closed(st, r.id, num).await;
     crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
     notify(st, r.id, Thread::Issue(issue_id), u.id, "").await;
-    crate::hooks::on_push(st, r, u, &[upd]).await;
+    let mut upds = vec![upd];
     if delete_branch && !from_fork && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
-        let _ = st
-            .git
-            .delete_ref(&r.path, &format!("refs/heads/{head_b}"))
-            .await;
-        crate::hooks::forget_branches(st, r.id, vec![head_b.clone()]).await;
-        crate::mirrors::changed(st, r.id).await;
+        // Only the commit merged: a push to the branch meanwhile keeps it. Deleted like a push deletes it (webhook, pusher forgotten).
+        let head_ref = format!("refs/heads/{head_b}");
+        let o = st.git.run(&r.path, &["update-ref", "-d", &head_ref, &head], None, &[]).await;
+        if o.as_ref().is_ok_and(|o| o.code == 0) {
+            upds.push(RefUpdate { refname: head_ref, old: Some(head), new: None });
+        } else if st.git.resolve(&r.path, &head_ref).await.ok().flatten().as_deref() == Some(head.as_str()) {
+            // Not moved or gone, yet still there: worth a look.
+            let why = o.map_or_else(|e| e.msg, |o| String::from_utf8_lossy(&o.stderr).trim().to_string());
+            eprintln!("merge of {}#{num}: {head_ref} not deleted: {why}", r.full_name());
+        }
     }
+    crate::hooks::on_push(st, r, u, &upds).await;
     Ok(())
 }

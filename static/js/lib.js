@@ -297,7 +297,7 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   const v = JSON.parse(b.dataset.sig);
   popover(b, html`<div class="sig-pop"><b class="sig-badge ${v.status}">${SIG[v.status]}</b><p>${v.reason}</p>
-    ${v.signer ? html`<p class="small">Key owner: <a href="/${enc(v.signer)}">${v.signer}</a></p>` : ''}
+    ${v.signer ? html`<p class="small">Key owner: <a href="/${enc(v.signer)}">${v.signer}</a>${v.proved ? ' (proved they hold it)' : ' (never proved they hold it)'}</p>` : ''}
     ${v.key_fingerprint ? html`<p class="small muted">Key <code class="mono">${v.key_fingerprint}</code></p>` : ''}</div>`, { width: 320, align: 'right' });
 });
 

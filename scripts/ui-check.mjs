@@ -146,7 +146,7 @@ if ((await (await ctx.request.get(BASE + '/api/me/ssh-keys')).json()).keys.lengt
 // Signed commits (e2e.sh pushes one when ssh-keygen is installed): the key is listed in
 // settings; the list, the commit page and blame show Verified, and the badge says why.
 if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.length) {
-  await visit(ctx, '/settings/signing', ['Signing keys', 'e2e laptop', 'SSH']);
+  await visit(ctx, '/settings/signing', ['Signing keys', 'e2e laptop', 'SSH', 'Proved']);
   const log = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json()).commits;
   const signed = log.find((c) => c.subject === 'Signed commit')?.sha;
   const page = await ctx.newPage();
@@ -1193,6 +1193,24 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
   if (errors.length || steps.length < 3) { failed++; console.log('✗ deployments', { steps, errors }); }
   else console.log(`  ok deployments: ${steps.join(', ')}`);
+}
+
+// Markup: the issue sidebar's Labels block stands on its own, and the Star button says whether it's pressed.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  try {
+    await page.goto(BASE + '/alice/hello/issues/1', { waitUntil: 'networkidle' });
+    const labels = await page.locator('#labels-block .section-title').innerText();
+    if (!labels.includes('Labels')) throw new Error(`labels block: ${labels}`);
+    if (await page.locator('#assignees-block #label-list').count()) throw new Error('the labels sit inside the assignees block');
+    await page.goto(BASE + '/alice/hello', { waitUntil: 'networkidle' });
+    const pressed = await page.locator('#star-btn').getAttribute('aria-pressed');
+    if (!['true', 'false'].includes(pressed)) throw new Error(`aria-pressed=${pressed}`);
+  } catch (e) { errors.push(String(e)); }
+  await page.close();
+  if (errors.length) { failed++; console.log('✗ markup', errors); }
+  else console.log('  ok markup: the Labels block is its own, the Star button has aria-pressed');
 }
 
 await browser.close();

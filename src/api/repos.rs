@@ -629,10 +629,9 @@ pub async fn create_branch(
         .await?
         .ok_or_else(|| AppError::bad("Unknown starting point"))?;
     let refname = format!("refs/heads/{}", req.name);
-    st.git
-        .update_ref(&r.path, &refname, &sha, None)
-        .await
-        .map_err(|_| AppError::conflict("A branch with that name already exists"))?;
+    if let Some(x) = st.git.create_ref(&r.path, &refname, &sha).await? {
+        return Err(crate::git::in_way(&refname, &x));
+    }
     touch(&st.db, r.id, false).await?;
     let upd = RefUpdate { refname, old: None, new: Some(sha.clone()) };
     crate::hooks::on_push(&st, &r, &u, &[upd]).await;

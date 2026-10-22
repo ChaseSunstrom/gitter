@@ -1834,16 +1834,16 @@ async fn signed_commits_ssh_keys_verify_and_say_why_not() {
         run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", k.to_str().unwrap()], &[], None);
     }
     let pubfile = dir.path().join("k.pub");
-    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": std::fs::read_to_string(&pubfile).unwrap() }))).await;
+    let (s, k) = add_ssh_signing_key(&app, &alice, &key, &key).await;
     assert_eq!(s, StatusCode::OK, "{k}");
     assert_eq!((k["kind"].as_str(), k["title"].as_str()), (Some("ssh"), Some("laptop")), "the key's comment is the default title");
     let fp = k["fingerprint"].as_str().unwrap().to_string();
     let listed = run_tool("ssh-keygen", &["-l", "-f", pubfile.to_str().unwrap()], &[], None);
     assert_eq!(listed.split_whitespace().nth(1), Some(fp.as_str()), "same fingerprint as ssh-keygen");
-    // Someone else adding alice's public key changes nothing for her commits.
+    // Someone else can't add alice's public key: they can't sign with it.
     let carol = app.signup("carol").await;
-    let (s, _) = app.req(&carol, "POST", "/api/me/signing-keys", Some(json!({ "key": std::fs::read_to_string(&pubfile).unwrap() }))).await;
-    assert_eq!(s, StatusCode::OK);
+    let (s, e) = add_ssh_signing_key(&app, &carol, &key, &other).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
 
     let ssh = |k: &std::path::Path| vec!["-c".into(), "gpg.format=ssh".into(), "-c".into(), format!("user.signingkey={}", k.display())];
     let good = commit_on_main(&repo, "a.txt", "alice@example.com", &ssh(&key), &[]);
@@ -1858,6 +1858,7 @@ async fn signed_commits_ssh_keys_verify_and_say_why_not() {
     let v = |list: &Value, sha: &str| list["commits"].as_array().unwrap().iter().find(|c| c["sha"] == sha).unwrap()["verification"].clone();
     let g = v(&list, &good);
     assert_eq!((g["status"].as_str(), g["signer"].as_str(), g["key_fingerprint"].as_str()), (Some("verified"), Some("alice"), Some(fp.as_str())), "{g}");
+    assert_eq!(g["proved"], true, "alice proved she holds the key: {g}");
     assert_eq!(v(&list, &noreply)["status"], "verified", "the account's no-reply address counts as its email");
     let w = v(&list, &wrong_email);
     assert_eq!(w["status"], "unverified");
@@ -1907,9 +1908,24 @@ async fn signed_commits_gpg_keys_verify_once_registered() {
     let before = commit_verification(&app, &alice, &good).await;
     assert_eq!(before["status"], "unverified", "{before}");
     assert!(before["reason"].as_str().unwrap().contains("isn't registered"), "{before}");
-    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "title": "work", "key": armored }))).await;
+    // Proof must be a detached signature over the challenge: a signed message (gpg would call
+    // it good and ignore the challenge) or a signature over other text isn't.
+    let (_, ch) = app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await;
+    let challenge = ch["challenge"].as_str().unwrap();
+    let as_message = run_tool("gpg", &["--batch", "--armor", "-z", "0", "--sign", "-u", &fpr], &env, Some(challenge.as_bytes()));
+    let other_text = run_tool("gpg", &["--batch", "--armor", "--detach-sign", "-u", &fpr], &env, Some(b"something else"));
+    for (sig, why) in [(as_message.replace("PGP MESSAGE", "PGP SIGNATURE"), "a signed message"), (other_text, "other text")] {
+        let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": armored, "signature": sig }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{why}: {e}");
+    }
+    // A signer whose clock is off (here the signature predates the key by ten minutes) still
+    // proves it: the challenge, fresh and used once, is what dates the signature.
+    let back = (gitter::db::now() - 600).to_string();
+    let skewed = run_tool("gpg", &["--batch", "--armor", "--detach-sign", "--ignore-time-conflict", "--faked-system-time", &back, "-u", &fpr], &env, Some(challenge.as_bytes()));
+    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": armored, "signature": skewed }))).await;
     assert_eq!(s, StatusCode::OK, "{k}");
     assert_eq!((k["kind"].as_str(), k["fingerprint"].as_str()), (Some("gpg"), Some(fpr.as_str())));
+    assert!(k["proved_at"].is_i64(), "{k}");
     let after = commit_verification(&app, &alice, &good).await;
     assert_eq!((after["status"].as_str(), after["signer"].as_str()), (Some("verified"), Some("alice")), "adding a key re-checks commits seen before: {after}");
     assert_eq!(after["key_fingerprint"], fpr.as_str());
@@ -1931,6 +1947,214 @@ async fn signed_commits_gpg_keys_verify_once_registered() {
     let body: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["commit"]["verification"]["status"], "verified", "{body}");
     let _ = std::process::Command::new("gpgconf").args(["--kill", "all"]).envs(env).status();
+}
+
+#[tokio::test]
+async fn signing_gpg_cached_good_results_end_when_the_key_expires() {
+    if !have_tool("gpg") {
+        eprintln!("gpg isn't installed: GPG signature checks skipped");
+        return;
+    }
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    let home = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(home.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let env = [("GNUPGHOME", home.path().to_str().unwrap())];
+    run_tool("gpg", &["--batch", "--passphrase", "", "--quick-gen-key", "Alice <alice@example.com>", "ed25519", "sign", "seconds=6"], &env, None);
+    let colons = run_tool("gpg", &["--batch", "--with-colons", "--list-keys"], &env, None);
+    let fpr = colons.lines().find(|l| l.starts_with("fpr:")).unwrap().split(':').nth(9).unwrap().to_string();
+    let expires: u64 = colons.lines().find(|l| l.starts_with("pub:")).unwrap().split(':').nth(6).unwrap().parse().unwrap();
+    let armored = run_tool("gpg", &["--batch", "--armor", "--export", &fpr], &env, None);
+    let sign = vec!["-c".into(), "gpg.format=openpgp".into(), "-c".into(), format!("user.signingkey={fpr}")];
+    let good = commit_on_main(&repo, "a.txt", "alice@example.com", &sign, &env);
+    add_gpg_signing_key(&app, &alice, &armored, &fpr, &env).await;
+    assert_eq!(commit_verification(&app, &alice, &good).await["status"], "verified", "checked (and cached) while the key is valid");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    tokio::time::sleep(std::time::Duration::from_secs(expires.saturating_sub(now) + 1)).await;
+    let v = commit_verification(&app, &alice, &good).await;
+    assert_eq!(v["status"], "unverified", "the cached Good is re-checked once the key expires: {v}");
+    assert!(v["reason"].as_str().unwrap().contains("expired"), "{v}");
+    let _ = std::process::Command::new("gpgconf").args(["--kill", "all"]).envs(env).status();
+}
+
+#[tokio::test]
+async fn signing_tool_timeouts_are_remembered_for_a_minute() {
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: SSH signature checks skipped");
+        return;
+    }
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let repo = app.state.git.repo_path(1);
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("k");
+    run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", key.to_str().unwrap()], &[], None);
+    let ssh = vec!["-c".into(), "gpg.format=ssh".into(), "-c".into(), format!("user.signingkey={}", key.display())];
+    let signed = commit_on_main(&repo, "a.txt", "alice@example.com", &ssh, &[]);
+    // The same server (and cache), with a tool that never answers in time.
+    let mut slow = app.state.clone();
+    slow.signing = std::sync::Arc::new(gitter::signing::Signing::with_timeout(app.state.cfg.data_dir.join("gpg"), std::time::Duration::ZERO));
+    let req = Request::get(format!("/api/repos/alice/r/commit/{signed}")).header("host", "test.local").body(Body::empty()).unwrap();
+    let resp = gitter::router(slow).oneshot(req).await.unwrap();
+    let body: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let v = &body["commit"]["verification"];
+    assert_eq!(v["status"], "unknown", "a timeout is never Bad: {v}");
+    assert!(v["reason"].as_str().unwrap().contains("too long"), "{v}");
+    // Within the minute the commit isn't checked again, even with a tool that would answer.
+    let again = commit_verification(&app, &alice, &signed).await;
+    assert_eq!(&again, v, "remembered, not re-checked");
+}
+
+/// Register GPG key `fpr` (its `armored` public half) for `c`, signing the challenge with it.
+async fn add_gpg_signing_key(app: &App, c: &Client, armored: &str, fpr: &str, env: &[(&str, &str)]) -> Value {
+    let (s, ch) = app.req(c, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::OK, "{ch}");
+    let sig = run_tool("gpg", &["--batch", "--armor", "--detach-sign", "-u", fpr], env, Some(ch["challenge"].as_str().unwrap().as_bytes()));
+    let (s, k) = app.req(c, "POST", "/api/me/signing-keys", Some(json!({ "key": armored, "signature": sig }))).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    k
+}
+
+/// Sign `text` with the SSH private key at `key` in Gitter's proof namespace.
+fn ssh_sign(key: &std::path::Path, text: &str, namespace: &str) -> String {
+    run_tool("ssh-keygen", &["-q", "-Y", "sign", "-n", namespace, "-f", key.to_str().unwrap()], &[], Some(text.as_bytes()))
+}
+
+/// Ask to register the public half of SSH key `public` for `c`, proving it with a challenge
+/// signed by the private key `signer` (the same key, unless testing a wrong proof).
+async fn add_ssh_signing_key(app: &App, c: &Client, public: &std::path::Path, signer: &std::path::Path) -> (StatusCode, Value) {
+    let (s, ch) = app.req(c, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::OK, "{ch}");
+    let sig = ssh_sign(signer, ch["challenge"].as_str().unwrap(), "gitter");
+    let key = std::fs::read_to_string(public.with_extension("pub")).unwrap();
+    app.req(c, "POST", "/api/me/signing-keys", Some(json!({ "key": key, "signature": sig }))).await
+}
+
+#[tokio::test]
+async fn signing_keys_need_proof_of_possession() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let (s, _) = app.req(&Client::default(), "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, ch) = app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::OK, "{ch}");
+    let challenge = ch["challenge"].as_str().unwrap().to_string();
+    assert!(challenge.contains("alice"), "names the account: {challenge}");
+    let (_, again) = app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(again["challenge"], challenge.as_str(), "the same challenge while it lasts, so two tabs agree");
+    let (_, bobs) = app.req(&app.signup("bob").await, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_ne!(bobs["challenge"], challenge.as_str());
+
+    let pasted = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFxsPyhOovC3igNqTo8u07KB2pQB9asL+9wpOgr9jf9G test";
+    let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": pasted }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "no signature: {e}");
+    assert!(e["error"].as_str().unwrap().contains("challenge"), "{e}");
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: SSH proof checks skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (key, other) = (dir.path().join("k"), dir.path().join("o"));
+    for k in [&key, &other] {
+        run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", k.to_str().unwrap()], &[], None);
+    }
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    for (sig, why) in [
+        (ssh_sign(&other, &challenge, "gitter"), "another key's signature"),
+        (ssh_sign(&key, &challenge, "git"), "the commit namespace"),
+        (ssh_sign(&key, "some other text", "gitter"), "other text"),
+        (ssh_sign(&key, bobs["challenge"].as_str().unwrap(), "gitter"), "someone else's challenge"),
+        ("-----BEGIN SSH SIGNATURE-----\nnot base64\n-----END SSH SIGNATURE-----".into(), "garbage"),
+    ] {
+        let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": public, "signature": sig }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{why}: {e}");
+    }
+    let good = ssh_sign(&key, &challenge, "gitter");
+    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": public, "signature": good }))).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    assert!(k["proved_at"].is_i64(), "{k}");
+    // A challenge works once.
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    app.req(&alice, "DELETE", &format!("/api/me/signing-keys/{}", k["id"]), None).await;
+    let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": public, "signature": good }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "used up: {e}");
+    assert!(mine["keys"][0]["proved_at"].is_i64(), "{mine}");
+
+    // Keys added before proof was asked for stay, shown as not proved, on the key page and the badge.
+    let (s, k) = add_ssh_signing_key(&app, &alice, &key, &key).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    let id = k["id"].as_i64().unwrap();
+    app.state.db.call(move |c| Ok(c.execute("UPDATE signing_keys SET proved_at = NULL WHERE id = ?1", [id])?)).await.unwrap();
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    assert!(mine["keys"][0]["proved_at"].is_null(), "{mine}");
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let ssh = vec!["-c".into(), "gpg.format=ssh".into(), "-c".into(), format!("user.signingkey={}", key.display())];
+    let signed = commit_on_main(&app.state.git.repo_path(1), "a.txt", "alice@example.com", &ssh, &[]);
+    let v = commit_verification(&app, &alice, &signed).await;
+    assert_eq!((v["status"].as_str(), v["proved"].as_bool()), (Some("verified"), Some(false)), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("proof"), "{v}");
+}
+
+#[tokio::test]
+async fn signing_challenges_last_until_they_expire_and_work_once() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let challenge = || {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await.1["challenge"].as_str().unwrap().to_string() }
+    };
+    let set_expiry = |at: i64| app.state.db.call(move |c| Ok(c.execute("UPDATE signing_challenges SET expires_at = ?1", [at])?));
+    // Another tab asking (the settings page asks on every view) doesn't replace one being signed.
+    let first = challenge().await;
+    set_expiry(gitter::db::now() + 60).await.unwrap();
+    assert_eq!(challenge().await, first, "kept until it expires");
+
+    // Tokens can't ask for one or add a key: only a browser session can.
+    let mk = |body: Value| {
+        let (app, alice) = (&app, alice.clone());
+        async move { app.req(&alice, "POST", "/api/me/tokens", Some(body)).await.1["token"].as_str().unwrap().to_string() } // pragma: allowlist secret
+    };
+    let read = mk(json!({ "name": "ro", "scope": "read" })).await;
+    let agent = agent_token(&app, &alice, &["alice/r"], &["read_file"]).await;
+    let add = json!({ "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFxsPyhOovC3igNqTo8u07KB2pQB9asL+9wpOgr9jf9G t", "signature": "x" });
+    for t in [&read, &agent] {
+        assert_eq!(bearer(&app, "POST", "/api/me/signing-keys/challenge", t, None).await, StatusCode::FORBIDDEN);
+        assert_eq!(bearer(&app, "POST", "/api/me/signing-keys", t, Some(add.clone())).await, StatusCode::FORBIDDEN);
+    }
+
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: SSH proof checks skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (k1, k2) = (dir.path().join("k1"), dir.path().join("k2"));
+    for k in [&k1, &k2] {
+        run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", k.to_str().unwrap()], &[], None);
+    }
+    let body = |k: &std::path::Path, text: &str| {
+        json!({ "key": std::fs::read_to_string(k.with_extension("pub")).unwrap(), "signature": ssh_sign(k, text, "gitter") })
+    };
+    // Expired: refused, and the next ask gives a new one.
+    set_expiry(gitter::db::now() - 1).await.unwrap();
+    let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(body(&k1, &first))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    let text = challenge().await;
+    assert_ne!(text, first, "an expired challenge is replaced");
+    // One challenge signed by two keys, sent at once: only one of them gets in.
+    let (a, b) = tokio::join!(
+        app.req(&alice, "POST", "/api/me/signing-keys", Some(body(&k1, &text))),
+        app.req(&alice, "POST", "/api/me/signing-keys", Some(body(&k2, &text)))
+    );
+    let mut codes = [a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::BAD_REQUEST], "{a:?} {b:?}");
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    assert_eq!(mine["keys"].as_array().unwrap().len(), 1, "{mine}");
 }
 
 #[tokio::test]
@@ -1957,12 +2181,19 @@ async fn signed_commits_keys_are_validated_owned_and_audited() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(e["error"].as_str().unwrap().contains("private"), "{e}");
 
-    let (s, k) = add(&alice, format!("  {key}\n")).await;
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: the rest needs keys that can sign");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (key, bobs) = (dir.path().join("k"), dir.path().join("b"));
+    for k in [&key, &bobs] {
+        run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f", k.to_str().unwrap()], &[], None);
+    }
+    let (s, k) = add_ssh_signing_key(&app, &alice, &key, &key).await;
     assert_eq!(s, StatusCode::OK, "{k}");
-    assert_eq!(k["fingerprint"], "SHA256:tOn8xeW71HpDpSvWJO1qQFsmVDC03PosHw9pOnPgg1M");
-    assert_eq!(add(&alice, key.into()).await.0, StatusCode::CONFLICT, "already added");
-    // Adding someone else's public key doesn't lock them out (and can't verify as them).
-    let (s, b) = add(&bob, key.into()).await;
+    assert_eq!(add_ssh_signing_key(&app, &alice, &key, &key).await.0, StatusCode::CONFLICT, "already added");
+    let (s, b) = add_ssh_signing_key(&app, &bob, &bobs, &bobs).await;
     assert_eq!(s, StatusCode::OK, "{b}");
     let (_, theirs) = app.req(&bob, "GET", "/api/me/signing-keys", None).await;
     assert_eq!(theirs["keys"].as_array().unwrap().len(), 1);
@@ -2612,11 +2843,161 @@ async fn web_branch_tags_conflict_only_when_the_tag_exists() {
     assert_eq!(e.status, StatusCode::CONFLICT, "{}", e.msg);
     assert!(e.msg.contains("created by someone else"), "{}", e.msg);
     assert_eq!(insights_git(&repo, &["rev-parse", "v2"]), sha, "the pushed tag stays");
-    // A tag that can't be made for another reason (`v3` is in the way of `v3/rc`) isn't blamed on anyone.
+    // A tag that can't be made for another reason (`v3` is in the way of `v3/rc`) isn't blamed on anyone: it's named.
     insights_git(&repo, &["tag", "v3", "main"]);
     let (s, e) = app.req(&alice, "POST", "/api/repos/alice/t/releases", Some(json!({ "tag": "v3/rc" }))).await;
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{e}");
+    assert_eq!(s, StatusCode::CONFLICT, "{e}");
     assert!(!e["error"].as_str().unwrap().contains("someone else"), "{e}");
+    assert!(e["error"].as_str().unwrap().contains("refs/tags/v3 "), "{e}");
+}
+
+#[tokio::test]
+async fn ref_clash_names_the_ref_in_the_way_as_a_409() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "c", "readme": true }))).await;
+    let branch = |name: &str| json!({ "name": name, "from": "main" });
+    let err = |v: &Value| v["error"].as_str().unwrap_or("").to_string();
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("v3"))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("x/y"))).await.0, StatusCode::OK);
+    // Under a branch, over one, and the branch itself.
+    for (name, blocker) in [("v3/rc", "refs/heads/v3"), ("v3/rc/1", "refs/heads/v3"), ("x", "refs/heads/x/y"), ("v3", "refs/heads/v3")] {
+        let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch(name))).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{name}: {v}");
+        assert!(err(&v).contains(&format!("{blocker} ")), "{name}: {v}");
+    }
+    // A sibling or a longer name sharing the prefix isn't in the way.
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("x/z"))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("v31"))).await.0, StatusCode::OK);
+    // A web commit to a new branch says the same before making anything.
+    let change = json!({ "branch": "main", "new_branch": "v3/fix", "message": "Fix", "changes": [{ "path": "f.txt", "content": "f" }] });
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/contents", Some(change)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(err(&v).contains("refs/heads/v3 "), "{v}");
+    let change = json!({ "branch": "main", "new_branch": "x/y", "message": "Fix", "changes": [{ "path": "f.txt", "content": "f" }] });
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/contents", Some(change)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(err(&v).contains("refs/heads/x/y already exists"), "{v}");
+    // A branch locked by another git (a stale or live `.lock`) is busy, not a server error.
+    let lock = app.state.git.repo_path(1).join("refs/heads/busy.lock");
+    std::fs::write(&lock, "").unwrap();
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("busy"))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(err(&v).contains("busy"), "{v}");
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/branches", Some(branch("busy"))).await.0, StatusCode::OK);
+    // Tags: a branch `v3` doesn't stop a tag `v3/rc`; a tag `t1` stops `t1/rc`, and `t2/rc` stops `t2`.
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": "v3/rc" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": "t1" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": "t2/rc" }))).await.0, StatusCode::OK);
+    // A draft's tag waits for publishing, but a clash shows now.
+    for (tag, blocker, draft) in [("t1/rc", "refs/tags/t1", false), ("t2", "refs/tags/t2/rc", false), ("t1/rc", "refs/tags/t1", true)] {
+        let (s, v) = app.req(&alice, "POST", "/api/repos/alice/c/releases", Some(json!({ "tag": tag, "draft": draft }))).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{tag} draft {draft}: {v}");
+        assert!(err(&v).contains(&format!("{blocker} ")), "{tag}: {v}");
+    }
+}
+
+/// The push webhook payloads delivered so far, once at least `n` have gone out (or after 5 s).
+async fn push_payloads(app: &App, rx: &Receiver, n: usize) -> Vec<Value> {
+    let get = || -> Vec<Value> {
+        let seen = rx.seen.lock().unwrap();
+        seen.iter().filter(|(h, _)| h["x-gitter-event"] == "push").map(|(_, b)| serde_json::from_str::<Value>(b).unwrap()).collect()
+    };
+    for _ in 0..100 {
+        gitter::webhooks::tick(&app.state).await;
+        if get().len() >= n {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    get()
+}
+
+#[tokio::test]
+async fn ref_clash_merge_branch_deletion_and_web_tags_run_the_push_hooks() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let change = json!({ "branch": "main", "new_branch": "fix", "message": "Fix", "changes": [{ "path": "fix.txt", "content": "fixed" }] });
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(change)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let head = v["sha"].as_str().unwrap().to_string();
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Fix", "head": "fix", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let n = v["number"].as_i64().unwrap();
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["push"], "allow_private": true }); // pragma: allowlist secret
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await.0, StatusCode::OK);
+    gitter::webhooks::tick(&app.state).await;
+    let pushes = || -> Vec<Value> {
+        let seen = rx.seen.lock().unwrap();
+        seen.iter().filter(|(h, _)| h["x-gitter-event"] == "push").map(|(_, b)| serde_json::from_str::<Value>(b).unwrap()).collect()
+    };
+    let pushers = || async {
+        let q = "SELECT count(*) FROM branch_pushers WHERE branch = 'fix'";
+        app.state.db.call(move |c| Ok(c.query_row(q, [], |r| r.get::<_, i64>(0))?)).await.unwrap()
+    };
+    assert_eq!(pushers().await, 1);
+
+    // The merge moves main and deletes the head branch: a push webhook for each, the pusher forgotten.
+    let (s, v) = app.req(&admin, "POST", &format!("/api/repos/root1/r/pulls/{n}/merge"), Some(json!({ "method": "merge", "delete_branch": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    gitter::webhooks::tick(&app.state).await;
+    let got = pushes();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let gone = got.iter().find(|p| p["ref"] == "refs/heads/fix").unwrap_or_else(|| panic!("no deletion: {got:?}"));
+    assert_eq!((gone["deleted"].as_bool(), gone["before"].as_str()), (Some(true), Some(head.as_str())), "{gone}");
+    assert!(got.iter().any(|p| p["ref"] == "refs/heads/main" && p["deleted"] == false), "{got:?}");
+    assert_eq!(pushers().await, 0);
+
+    // A tag made on the web (a release) is announced like a pushed one.
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/releases", Some(json!({ "tag": "v1" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let got = push_payloads(&app, &rx, 3).await;
+    assert_eq!(got.len(), 3, "{got:?}");
+    let tag = got.iter().find(|p| p["ref"] == "refs/tags/v1").unwrap_or_else(|| panic!("no tag push: {got:?}"));
+    assert_eq!((tag["created"].as_bool(), tag["before"].is_null()), (Some(true), true), "{tag}");
+    // So is the tag made when a draft is published.
+    let (_, d) = app.req(&admin, "POST", "/api/repos/root1/r/releases", Some(json!({ "tag": "v2", "draft": true }))).await;
+    gitter::webhooks::tick(&app.state).await;
+    assert_eq!(pushes().len(), 3, "a draft makes no tag yet");
+    let (s, v) = app.req(&admin, "PATCH", &format!("/api/repos/root1/r/releases/{}", d["id"]), Some(json!({ "draft": false }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let got = push_payloads(&app, &rx, 4).await;
+    assert!(got.iter().any(|p| p["ref"] == "refs/tags/v2" && p["created"] == true), "{got:?}");
+}
+
+#[tokio::test]
+async fn ref_clash_merge_keeps_a_head_branch_that_moved_meanwhile() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let change = json!({ "branch": "main", "new_branch": "fix", "message": "Fix", "changes": [{ "path": "fix.txt", "content": "fixed" }] });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(change)).await.0, StatusCode::OK);
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Fix", "head": "fix", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let n = v["number"].as_i64().unwrap();
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["push"], "allow_private": true }); // pragma: allowlist secret
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/hooks", Some(hook)).await.0, StatusCode::OK);
+
+    // The merge is worked out, then the branch moves on before it lands (called directly: the API does both at once).
+    let u = gitter::auth::user_by_id(&app.state.db, 1).await.unwrap().unwrap();
+    let r = gitter::repo::Repo::writable(&app.state, Some(&u), "root1", "r").await.unwrap();
+    let req = serde_json::from_value(json!({ "method": "merge", "delete_branch": true })).unwrap();
+    let plan = gitter::api::issues::prepare_merge(&app.state, &r, &u, n, req, false).await.unwrap();
+    let more = json!({ "branch": "fix", "message": "More", "changes": [{ "path": "more.txt", "content": "more" }] });
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/contents", Some(more)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let moved = v["sha"].as_str().unwrap().to_string();
+    gitter::api::issues::land_merge(&app.state, &r, &u, plan, true).await.unwrap();
+
+    // The new commit isn't lost with the branch, and no deletion is announced.
+    assert_eq!(insights_git(&app.state.git.repo_path(1), &["rev-parse", "refs/heads/fix"]).trim(), moved);
+    let got = push_payloads(&app, &rx, 2).await;
+    assert_eq!(got.len(), 2, "the push to fix and the merge into main: {got:?}");
+    assert!(got.iter().all(|p| p["deleted"] == false), "{got:?}");
 }
 
 #[tokio::test]
@@ -4661,4 +5042,52 @@ async fn merge_queue_lands_in_order_ejects_failures_and_retests() {
     let (_, p) = app.req(&bob, "POST", "/api/repos/alice/q/pulls", Some(json!({ "title": "to dev", "head": "four", "base": "dev" }))).await;
     let (s, e) = app.req(&bob, "POST", &queue(p["number"].as_i64().unwrap()), Some(json!({}))).await;
     assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("doesn't use a merge queue"), "{e}");
+}
+
+#[tokio::test]
+async fn releases_follow_collaborator_and_org_access_and_org_deletion_removes_files() {
+    let app = App::new();
+    let _root = app.signup("root1").await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    let dave = app.signup("dave").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "p", "private": true, "readme": true }))).await;
+    let base = "/api/repos/alice/p/releases";
+    // A read collaborator sees releases but can't make, change or delete one; a write collaborator can.
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "read" }))).await;
+    assert_eq!(app.req(&bob, "GET", base, None).await.0, StatusCode::OK);
+    assert_eq!(app.req(&bob, "POST", base, Some(json!({ "tag": "v1" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&carol, "POST", base, Some(json!({ "tag": "v1" }))).await.0, StatusCode::NOT_FOUND, "a stranger can't even see the private repo");
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "write" }))).await;
+    let (s, v) = app.req(&bob, "POST", base, Some(json!({ "tag": "v1" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["id"].as_i64().unwrap();
+    app.req(&alice, "PUT", "/api/repos/alice/p/collaborators/bob", Some(json!({ "role": "read" }))).await;
+    assert_eq!(app.req(&bob, "PATCH", &format!("{base}/{id}"), Some(json!({ "title": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.req(&bob, "DELETE", &format!("{base}/{id}"), None).await.0, StatusCode::FORBIDDEN);
+
+    // Organization members get the base role: write makes releases, read doesn't.
+    app.req(&alice, "POST", "/api/orgs", Some(json!({ "name": "acme" }))).await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "x", "owner": "acme", "private": true, "readme": true }))).await;
+    app.req(&alice, "PUT", "/api/orgs/acme/members/carol", Some(json!({ "role": "member" }))).await;
+    let obase = "/api/repos/acme/x/releases";
+    app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "read" }))).await;
+    assert_eq!(app.req(&carol, "POST", obase, Some(json!({ "tag": "v1" }))).await.0, StatusCode::FORBIDDEN);
+    app.req(&alice, "PATCH", "/api/orgs/acme", Some(json!({ "base_role": "write" }))).await;
+    let (s, v) = app.req(&carol, "POST", obase, Some(json!({ "tag": "v1" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let rid = v["id"].as_i64().unwrap();
+    assert_eq!(app.req(&dave, "POST", obase, Some(json!({ "tag": "v2" }))).await.0, StatusCode::NOT_FOUND, "non-members stay out");
+
+    // Deleting the organization removes its release files.
+    let (s, _, _) = raw_as(&app, &carol, "POST", &format!("{obase}/{rid}/assets?name=a.bin"), "", b"data".to_vec()).await;
+    assert_eq!(s, StatusCode::OK);
+    let rdir = app.state.cfg.data_dir.join(format!("releases/{rid}"));
+    assert!(rdir.is_dir());
+    assert_eq!(app.req(&alice, "DELETE", "/api/repos/acme/x", Some(json!({ "confirm": "acme/x" }))).await.0, StatusCode::OK);
+    assert_eq!(app.req(&alice, "DELETE", "/api/orgs/acme", Some(json!({ "confirm": "acme" }))).await.0, StatusCode::OK);
+    assert!(!rdir.exists(), "the organization's release files went with it");
+    let left = app.state.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM releases WHERE id = ?1", [rid], |r| r.get::<_, i64>(0))?)).await.unwrap();
+    assert_eq!(left, 0);
 }

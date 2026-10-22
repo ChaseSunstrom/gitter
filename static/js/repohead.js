@@ -53,7 +53,7 @@ export function repoHeader(meta, tab) {
       <div class="repo-actions">
         ${state.me ? html`<button class="btn sm" id="watch-btn" aria-haspopup="menu">${icon('eye', 'sm')}<span>Watch</span>${icon('chev-down', 'sm')}</button>` : ''}
         <div class="btn-group">
-          <button class="btn sm star-btn ${meta.starred ? 'on' : ''}" id="star-btn" aria-pressed="${meta.starred}">${icon('star', 'sm')}<span>${meta.starred ? 'Starred' : 'Star'}</span></button>
+          <button class="btn sm star-btn ${meta.starred ? 'on' : ''}" id="star-btn" aria-pressed="${meta.starred ? 'true' : 'false'}">${icon('star', 'sm')}<span>${meta.starred ? 'Starred' : 'Star'}</span></button>
           <a class="btn sm" href="${base}/insights" title="Stargazers"><span class="count" id="star-count">${num(meta.stars)}</span></a>
         </div>
         <div class="btn-group">
