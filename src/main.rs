@@ -56,11 +56,22 @@ usage:
                                or set GITTER_RUNNER_TOKEN)
   gitter --version
 
+client (like gh; `gitter <command> --help` for each):
+  gitter login URL [--token T]  save a server and an access token (or GITTER_TOKEN) to ~/.config/gitter/config.json
+  gitter repo create|clone|list|view
+  gitter issue list|create|view|close|comment
+  gitter pr create|list|view|checkout|merge
+  gitter ci status|logs|rerun   runs on the server
+  gitter ci run [--here]        run .gitter/ci.yml on this machine, no server needed
+
 Settings come from environment variables; see the README.";
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("serve");
+    if matches!(cmd, "login" | "repo" | "issue" | "pr" | "ci") {
+        return gitter::cli::main(&args);
+    }
     let cfg = config();
     match cmd {
         "serve" => serve(cfg),
