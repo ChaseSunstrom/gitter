@@ -1834,16 +1834,16 @@ async fn signed_commits_ssh_keys_verify_and_say_why_not() {
         run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", k.to_str().unwrap()], &[], None);
     }
     let pubfile = dir.path().join("k.pub");
-    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": std::fs::read_to_string(&pubfile).unwrap() }))).await;
+    let (s, k) = add_ssh_signing_key(&app, &alice, &key, &key).await;
     assert_eq!(s, StatusCode::OK, "{k}");
     assert_eq!((k["kind"].as_str(), k["title"].as_str()), (Some("ssh"), Some("laptop")), "the key's comment is the default title");
     let fp = k["fingerprint"].as_str().unwrap().to_string();
     let listed = run_tool("ssh-keygen", &["-l", "-f", pubfile.to_str().unwrap()], &[], None);
     assert_eq!(listed.split_whitespace().nth(1), Some(fp.as_str()), "same fingerprint as ssh-keygen");
-    // Someone else adding alice's public key changes nothing for her commits.
+    // Someone else can't add alice's public key: they can't sign with it.
     let carol = app.signup("carol").await;
-    let (s, _) = app.req(&carol, "POST", "/api/me/signing-keys", Some(json!({ "key": std::fs::read_to_string(&pubfile).unwrap() }))).await;
-    assert_eq!(s, StatusCode::OK);
+    let (s, e) = add_ssh_signing_key(&app, &carol, &key, &other).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
 
     let ssh = |k: &std::path::Path| vec!["-c".into(), "gpg.format=ssh".into(), "-c".into(), format!("user.signingkey={}", k.display())];
     let good = commit_on_main(&repo, "a.txt", "alice@example.com", &ssh(&key), &[]);
@@ -1858,6 +1858,7 @@ async fn signed_commits_ssh_keys_verify_and_say_why_not() {
     let v = |list: &Value, sha: &str| list["commits"].as_array().unwrap().iter().find(|c| c["sha"] == sha).unwrap()["verification"].clone();
     let g = v(&list, &good);
     assert_eq!((g["status"].as_str(), g["signer"].as_str(), g["key_fingerprint"].as_str()), (Some("verified"), Some("alice"), Some(fp.as_str())), "{g}");
+    assert_eq!(g["proved"], true, "alice proved she holds the key: {g}");
     assert_eq!(v(&list, &noreply)["status"], "verified", "the account's no-reply address counts as its email");
     let w = v(&list, &wrong_email);
     assert_eq!(w["status"], "unverified");
@@ -1907,9 +1908,19 @@ async fn signed_commits_gpg_keys_verify_once_registered() {
     let before = commit_verification(&app, &alice, &good).await;
     assert_eq!(before["status"], "unverified", "{before}");
     assert!(before["reason"].as_str().unwrap().contains("isn't registered"), "{before}");
-    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "title": "work", "key": armored }))).await;
-    assert_eq!(s, StatusCode::OK, "{k}");
+    // Proof must be a detached signature over the challenge: a signed message (gpg would call
+    // it good and ignore the challenge) or a signature over other text isn't.
+    let (_, ch) = app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await;
+    let challenge = ch["challenge"].as_str().unwrap();
+    let as_message = run_tool("gpg", &["--batch", "--armor", "-z", "0", "--sign", "-u", &fpr], &env, Some(challenge.as_bytes()));
+    let other_text = run_tool("gpg", &["--batch", "--armor", "--detach-sign", "-u", &fpr], &env, Some(b"something else"));
+    for (sig, why) in [(as_message.replace("PGP MESSAGE", "PGP SIGNATURE"), "a signed message"), (other_text, "other text")] {
+        let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": armored, "signature": sig }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{why}: {e}");
+    }
+    let k = add_gpg_signing_key(&app, &alice, &armored, &fpr, &env).await;
     assert_eq!((k["kind"].as_str(), k["fingerprint"].as_str()), (Some("gpg"), Some(fpr.as_str())));
+    assert!(k["proved_at"].is_i64(), "{k}");
     let after = commit_verification(&app, &alice, &good).await;
     assert_eq!((after["status"].as_str(), after["signer"].as_str()), (Some("verified"), Some("alice")), "adding a key re-checks commits seen before: {after}");
     assert_eq!(after["key_fingerprint"], fpr.as_str());
@@ -1993,12 +2004,94 @@ async fn signing_tool_timeouts_are_remembered_for_a_minute() {
     assert_eq!(&again, v, "remembered, not re-checked");
 }
 
-/// Register GPG key `fpr` (its `armored` public half) for `c`.
+/// Register GPG key `fpr` (its `armored` public half) for `c`, signing the challenge with it.
 async fn add_gpg_signing_key(app: &App, c: &Client, armored: &str, fpr: &str, env: &[(&str, &str)]) -> Value {
-    let _ = (fpr, env);
-    let (s, k) = app.req(c, "POST", "/api/me/signing-keys", Some(json!({ "key": armored }))).await;
+    let (s, ch) = app.req(c, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::OK, "{ch}");
+    let sig = run_tool("gpg", &["--batch", "--armor", "--detach-sign", "-u", fpr], env, Some(ch["challenge"].as_str().unwrap().as_bytes()));
+    let (s, k) = app.req(c, "POST", "/api/me/signing-keys", Some(json!({ "key": armored, "signature": sig }))).await;
     assert_eq!(s, StatusCode::OK, "{k}");
     k
+}
+
+/// Sign `text` with the SSH private key at `key` in Gitter's proof namespace.
+fn ssh_sign(key: &std::path::Path, text: &str, namespace: &str) -> String {
+    run_tool("ssh-keygen", &["-q", "-Y", "sign", "-n", namespace, "-f", key.to_str().unwrap()], &[], Some(text.as_bytes()))
+}
+
+/// Ask to register the public half of SSH key `public` for `c`, proving it with a challenge
+/// signed by the private key `signer` (the same key, unless testing a wrong proof).
+async fn add_ssh_signing_key(app: &App, c: &Client, public: &std::path::Path, signer: &std::path::Path) -> (StatusCode, Value) {
+    let (s, ch) = app.req(c, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::OK, "{ch}");
+    let sig = ssh_sign(signer, ch["challenge"].as_str().unwrap(), "gitter");
+    let key = std::fs::read_to_string(public.with_extension("pub")).unwrap();
+    app.req(c, "POST", "/api/me/signing-keys", Some(json!({ "key": key, "signature": sig }))).await
+}
+
+#[tokio::test]
+async fn signing_keys_need_proof_of_possession() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let (s, _) = app.req(&Client::default(), "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, ch) = app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(s, StatusCode::OK, "{ch}");
+    let challenge = ch["challenge"].as_str().unwrap().to_string();
+    assert!(challenge.contains("alice"), "names the account: {challenge}");
+    let (_, again) = app.req(&alice, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_eq!(again["challenge"], challenge.as_str(), "the same challenge while it lasts, so two tabs agree");
+    let (_, bobs) = app.req(&app.signup("bob").await, "POST", "/api/me/signing-keys/challenge", None).await;
+    assert_ne!(bobs["challenge"], challenge.as_str());
+
+    let pasted = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFxsPyhOovC3igNqTo8u07KB2pQB9asL+9wpOgr9jf9G test";
+    let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": pasted }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "no signature: {e}");
+    assert!(e["error"].as_str().unwrap().contains("challenge"), "{e}");
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: SSH proof checks skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (key, other) = (dir.path().join("k"), dir.path().join("o"));
+    for k in [&key, &other] {
+        run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", k.to_str().unwrap()], &[], None);
+    }
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    for (sig, why) in [
+        (ssh_sign(&other, &challenge, "gitter"), "another key's signature"),
+        (ssh_sign(&key, &challenge, "git"), "the commit namespace"),
+        (ssh_sign(&key, "some other text", "gitter"), "other text"),
+        (ssh_sign(&key, bobs["challenge"].as_str().unwrap(), "gitter"), "someone else's challenge"),
+        ("-----BEGIN SSH SIGNATURE-----\nnot base64\n-----END SSH SIGNATURE-----".into(), "garbage"),
+    ] {
+        let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": public, "signature": sig }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{why}: {e}");
+    }
+    let good = ssh_sign(&key, &challenge, "gitter");
+    let (s, k) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": public, "signature": good }))).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    assert!(k["proved_at"].is_i64(), "{k}");
+    // A challenge works once.
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    app.req(&alice, "DELETE", &format!("/api/me/signing-keys/{}", k["id"]), None).await;
+    let (s, e) = app.req(&alice, "POST", "/api/me/signing-keys", Some(json!({ "key": public, "signature": good }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "used up: {e}");
+    assert!(mine["keys"][0]["proved_at"].is_i64(), "{mine}");
+
+    // Keys added before proof was asked for stay, shown as not proved, on the key page and the badge.
+    let (s, k) = add_ssh_signing_key(&app, &alice, &key, &key).await;
+    assert_eq!(s, StatusCode::OK, "{k}");
+    let id = k["id"].as_i64().unwrap();
+    app.state.db.call(move |c| Ok(c.execute("UPDATE signing_keys SET proved_at = NULL WHERE id = ?1", [id])?)).await.unwrap();
+    let (_, mine) = app.req(&alice, "GET", "/api/me/signing-keys", None).await;
+    assert!(mine["keys"][0]["proved_at"].is_null(), "{mine}");
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let ssh = vec!["-c".into(), "gpg.format=ssh".into(), "-c".into(), format!("user.signingkey={}", key.display())];
+    let signed = commit_on_main(&app.state.git.repo_path(1), "a.txt", "alice@example.com", &ssh, &[]);
+    let v = commit_verification(&app, &alice, &signed).await;
+    assert_eq!((v["status"].as_str(), v["proved"].as_bool()), (Some("verified"), Some(false)), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("proof"), "{v}");
 }
 
 #[tokio::test]
@@ -2025,12 +2118,19 @@ async fn signed_commits_keys_are_validated_owned_and_audited() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(e["error"].as_str().unwrap().contains("private"), "{e}");
 
-    let (s, k) = add(&alice, format!("  {key}\n")).await;
+    if !have_tool("ssh-keygen") {
+        eprintln!("ssh-keygen isn't installed: the rest needs keys that can sign");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (key, bobs) = (dir.path().join("k"), dir.path().join("b"));
+    for k in [&key, &bobs] {
+        run_tool("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f", k.to_str().unwrap()], &[], None);
+    }
+    let (s, k) = add_ssh_signing_key(&app, &alice, &key, &key).await;
     assert_eq!(s, StatusCode::OK, "{k}");
-    assert_eq!(k["fingerprint"], "SHA256:tOn8xeW71HpDpSvWJO1qQFsmVDC03PosHw9pOnPgg1M");
-    assert_eq!(add(&alice, key.into()).await.0, StatusCode::CONFLICT, "already added");
-    // Adding someone else's public key doesn't lock them out (and can't verify as them).
-    let (s, b) = add(&bob, key.into()).await;
+    assert_eq!(add_ssh_signing_key(&app, &alice, &key, &key).await.0, StatusCode::CONFLICT, "already added");
+    let (s, b) = add_ssh_signing_key(&app, &bob, &bobs, &bobs).await;
     assert_eq!(s, StatusCode::OK, "{b}");
     let (_, theirs) = app.req(&bob, "GET", "/api/me/signing-keys", None).await;
     assert_eq!(theirs["keys"].as_array().unwrap().len(), 1);

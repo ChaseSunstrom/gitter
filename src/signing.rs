@@ -63,6 +63,10 @@ pub struct Verification {
     pub key_fingerprint: Option<String>,
     /// The account the signing key belongs to.
     pub signer: Option<String>,
+    /// The signer proved they hold the key (signed a challenge with it when adding it);
+    /// false for keys added before that was asked.
+    #[serde(default)]
+    pub proved: bool,
 }
 
 /// One commit's signature check. It depends only on the commit and, for GPG, the
@@ -203,6 +207,50 @@ impl Signing {
         self.key_added();
     }
 
+    /// `sig` in a file of its own in the home, for a tool to read; removed when dropped.
+    async fn sig_file(&self, sig: &str) -> Result<TempFile, Fail> {
+        self.ensure_home()?;
+        let file = TempFile(self.home.join(format!("sig-{}", random_hex())));
+        tokio::fs::write(&file.0, sig).await.map_err(|_| Fail::Broken)?;
+        Ok(file)
+    }
+
+    /// An empty, private gpg home of its own; removed when dropped.
+    fn scratch(&self) -> Result<TempDir, Fail> {
+        self.ensure_home()?;
+        let dir = TempDir(self.home.join(format!("parse-{}", random_hex())));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(&dir.0).map_err(|_| Fail::Broken)?;
+        Ok(dir)
+    }
+
+    /// `ssh-keygen -Y check-novalidate`: is `sig` good over `payload` in `namespace`, and by which key?
+    async fn ssh_verify(&self, git: &Git, namespace: &str, payload: &[u8], sig: &str) -> Result<(Outcome, Option<String>), Fail> {
+        let file = self.sig_file(sig).await?;
+        let f = file.0.to_string_lossy();
+        let args = ["-Y", "check-novalidate", "-n", namespace, "-s", &f];
+        self.tool(git, "ssh-keygen", &args, payload, self.timeout).await.and_then(|o| parse_ssh(&o, namespace))
+    }
+
+    /// gpg's status lines for detached signature `sig` over `payload`, against the keyring at `home`.
+    async fn gpg_verify(&self, git: &Git, home: &Path, payload: &[u8], sig: &str) -> Result<String, Fail> {
+        let file = self.sig_file(sig).await?;
+        let (f, h) = (file.0.to_string_lossy(), home.to_string_lossy());
+        let args = [
+            "--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--no-auto-key-retrieve", "--trust-model", "always", "--status-fd", "1",
+            "--verify", &f, "-",
+        ];
+        let o = self.tool(git, "gpg", &args, payload, self.timeout).await?;
+        let status = String::from_utf8_lossy(&o.stdout).into_owned();
+        // No verdict at all and a failed exit: gpg itself broke (a locked keyring...). Not cached.
+        if !o.status.success() && !status.lines().any(|l| SIG_STATUS.iter().any(|k| l.starts_with(k))) {
+            return Err(Fail::Broken);
+        }
+        Ok(status)
+    }
+
     /// Put every registered GPG key in the keyring, once per process.
     async fn sync(&self, st: &AppState) -> Result<(), Fail> {
         self.synced
@@ -259,51 +307,32 @@ impl Signing {
 
     /// The outcome, the key's fingerprint and, for a good GPG signature, when the key expires.
     async fn run_check(&self, st: &AppState, kind: &str, payload: &[u8], sig: &str) -> Result<(Outcome, Option<String>, Option<i64>), Fail> {
-        if kind == "gpg" {
-            self.sync(st).await?;
-        }
-        self.ensure_home()?;
-        let mut b = [0u8; 8];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
-        let file = TempFile(self.home.join(format!("sig-{}", hex::encode(b))));
-        tokio::fs::write(&file.0, sig).await.map_err(|_| Fail::Broken)?;
-        let f = file.0.to_string_lossy();
-        let h = self.home.to_string_lossy();
         if kind == "ssh" {
             // Checks the signature against the public key inside it; whose key that is, the database says.
-            let args = ["-Y", "check-novalidate", "-n", "git", "-s", &f];
-            self.tool(&st.git, "ssh-keygen", &args, payload, self.timeout).await.and_then(|o| parse_ssh(&o)).map(|(o, fp)| (o, fp, None))
-        } else {
-            // Only signature packets: gpg would otherwise check a signed message carried
-            // in the header (and ignore the commit) and still report a good signature.
-            if !only_signature_packets(sig) {
-                return Ok((Outcome::Bad, None, None));
-            }
-            let args = [
-                "--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--no-auto-key-retrieve", "--trust-model", "always", "--status-fd", "1",
-                "--verify", &f, "-",
-            ];
-            let o = self.tool(&st.git, "gpg", &args, payload, self.timeout).await?;
-            let status = String::from_utf8_lossy(&o.stdout);
-            // No verdict at all and a failed exit: gpg itself broke (a locked keyring...). Not cached.
-            if !o.status.success() && !status.lines().any(|l| SIG_STATUS.iter().any(|k| l.starts_with(k))) {
-                return Err(Fail::Broken);
-            }
-            let (outcome, fpr) = parse_gpg(&status);
-            let (Outcome::Good, Some(primary), Some(sub)) = (outcome, &fpr, signing_subkey(&status)) else { return Ok((outcome, fpr, None)) };
-            // ponytail: one more gpg run per good GPG check (they're memoised); memo per key if it shows.
-            let args = ["--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--with-colons", "--fixed-list-mode", "--list-keys", primary.as_str()];
-            let o = self.tool(&st.git, "gpg", &args, b"", self.timeout).await?;
-            if !o.status.success() {
-                return Err(Fail::Broken);
-            }
-            let expires = key_expiry(&String::from_utf8_lossy(&o.stdout), primary, sub);
-            // Expired since gpg answered: say so rather than cache a Good that's already over.
-            if expires.is_some_and(|e| e <= crate::db::now()) {
-                return Ok((Outcome::Expired, fpr, None));
-            }
-            Ok((outcome, fpr, expires))
+            return self.ssh_verify(&st.git, "git", payload, sig).await.map(|(o, fp)| (o, fp, None));
         }
+        // Only signature packets: gpg would otherwise check a signed message carried
+        // in the header (and ignore the commit) and still report a good signature.
+        if !only_signature_packets(sig) {
+            return Ok((Outcome::Bad, None, None));
+        }
+        self.sync(st).await?;
+        let status = self.gpg_verify(&st.git, &self.home, payload, sig).await?;
+        let (outcome, fpr) = parse_gpg(&status);
+        let (Outcome::Good, Some(primary), Some(sub)) = (outcome, &fpr, signing_subkey(&status)) else { return Ok((outcome, fpr, None)) };
+        // ponytail: one more gpg run per good GPG check (they're memoised); memo per key if it shows.
+        let h = self.home.to_string_lossy();
+        let args = ["--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--with-colons", "--fixed-list-mode", "--list-keys", primary.as_str()];
+        let o = self.tool(&st.git, "gpg", &args, b"", self.timeout).await?;
+        if !o.status.success() {
+            return Err(Fail::Broken);
+        }
+        let expires = key_expiry(&String::from_utf8_lossy(&o.stdout), primary, sub);
+        // Expired since gpg answered: say so rather than cache a Good that's already over.
+        if expires.is_some_and(|e| e <= crate::db::now()) {
+            return Ok((Outcome::Expired, fpr, None));
+        }
+        Ok((outcome, fpr, expires))
     }
 }
 
@@ -324,8 +353,14 @@ impl Drop for TempDir {
     }
 }
 
+fn random_hex() -> String {
+    let mut b = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+    hex::encode(b)
+}
+
 /// `ssh-keygen -Y check-novalidate` output: `Good "git" signature with ED25519 key SHA256:…`.
-fn parse_ssh(o: &std::process::Output) -> Result<(Outcome, Option<String>), Fail> {
+fn parse_ssh(o: &std::process::Output, namespace: &str) -> Result<(Outcome, Option<String>), Fail> {
     // OpenSSH before 8.4 has no check-novalidate and prints its usage.
     if String::from_utf8_lossy(&o.stderr).contains("usage:") {
         return Err(Fail::Missing);
@@ -334,7 +369,7 @@ fn parse_ssh(o: &std::process::Output) -> Result<(Outcome, Option<String>), Fail
     let fp = out
         .lines()
         .next()
-        .filter(|l| o.status.success() && l.starts_with("Good \"git\" signature"))
+        .filter(|l| o.status.success() && l.starts_with(&format!("Good \"{namespace}\" signature")))
         .and_then(|l| l.rsplit_once(" key "))
         .map(|(_, f)| f.trim().to_string())
         .filter(|f| f.starts_with("SHA256:"));
@@ -523,14 +558,7 @@ fn ssh_key(text: &str) -> Option<NewKey> {
 }
 
 async fn gpg_key(st: &AppState, text: &str) -> R<NewKey> {
-    st.signing.ensure_home().map_err(|_| AppError::internal("can't create the GPG home"))?;
-    let mut b = [0u8; 8];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
-    let scratch = TempDir(st.signing.home.join(format!("parse-{}", hex::encode(b))));
-    let mut db = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut db, 0o700);
-    db.create(&scratch.0).map_err(|e| AppError::internal(format!("GPG scratch home: {e}")))?;
+    let scratch = st.signing.scratch().map_err(|_| AppError::internal("can't make a scratch GPG home"))?;
     let status = st.signing.gpg_import(&st.git, &scratch.0, text.as_bytes(), st.signing.timeout).await.map_err(|f| match f {
         Fail::Missing => AppError::bad("This server can't read GPG keys (gpg isn't installed)"),
         Fail::Broken | Fail::TimedOut => AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Couldn't read the key just now. Try again."),
@@ -550,6 +578,39 @@ async fn gpg_key(st: &AppState, text: &str) -> R<NewKey> {
         [f] => Ok(NewKey { kind: "gpg", fingerprint: f.to_string(), label, key: text.to_string() }),
         [] => Err(AppError::bad("That isn't a GPG public key gpg can read")),
         _ => Err(AppError::bad("Add one GPG key at a time")),
+    }
+}
+
+/// SSH signatures proving a key are made in this namespace, so a commit signature can't stand in.
+pub const PROOF_NAMESPACE: &str = "gitter";
+
+/// Check that `sig` is key `k`'s signature over `challenge`: whoever adds a key must hold
+/// its private half. A GPG signature is checked in a keyring holding only that key.
+pub async fn prove(st: &AppState, k: &NewKey, challenge: &str, sig: &str) -> R<()> {
+    let s = &st.signing;
+    let sig = sig.trim().replace("\r\n", "\n") + "\n";
+    let wrong = || AppError::bad("That isn't this key's signature over the challenge. Sign the exact text shown, with the key you're adding.");
+    let armor = if k.kind == "ssh" { "-----BEGIN SSH SIGNATURE-----" } else { "-----BEGIN PGP SIGNATURE-----" };
+    if sig.len() > MAX_SIG || !sig.starts_with(armor) || (k.kind == "gpg" && !only_signature_packets(&sig)) {
+        return Err(wrong());
+    }
+    let res = if k.kind == "ssh" {
+        s.ssh_verify(&st.git, PROOF_NAMESPACE, challenge.as_bytes(), &sig).await
+    } else {
+        async {
+            let scratch = s.scratch()?;
+            s.gpg_import(&st.git, &scratch.0, k.key.as_bytes(), s.timeout).await?;
+            Ok(parse_gpg(&s.gpg_verify(&st.git, &scratch.0, challenge.as_bytes(), &sig).await?))
+        }
+        .await
+    };
+    match res {
+        Ok((Outcome::Good, Some(fp))) if fp == k.fingerprint => Ok(()),
+        Ok((Outcome::Expired, _)) => Err(AppError::bad("That key has expired. Extend it (gpg --quick-set-expire), then export and add it again.")),
+        Ok((Outcome::Revoked, _)) => Err(AppError::bad("That key was revoked.")),
+        Ok(_) => Err(wrong()),
+        Err(Fail::Missing) => Err(AppError::bad(format!("This server can't check {} signatures.", k.kind.to_uppercase()))),
+        Err(Fail::Broken | Fail::TimedOut) => Err(AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Couldn't check the signature just now. Try again.")),
     }
 }
 
@@ -644,11 +705,12 @@ async fn try_verify(st: &AppState, r: &Repo, shas: &[&str]) -> R<HashMap<String,
 }
 
 fn unknown(why: &str) -> Verification {
-    Verification { status: "unknown".into(), reason: why.into(), key_fingerprint: None, signer: None }
+    Verification { status: "unknown".into(), reason: why.into(), key_fingerprint: None, signer: None, proved: false }
 }
 
-/// The accounts that registered each of these fingerprints, with the key's kind.
-async fn owners(st: &AppState, fprs: HashSet<String>) -> R<HashMap<String, Vec<(String, User)>>> {
+/// The accounts that registered each of these fingerprints, with the key's kind and
+/// whether they proved they hold it.
+async fn owners(st: &AppState, fprs: HashSet<String>) -> R<HashMap<String, Vec<(String, User, bool)>>> {
     if fprs.is_empty() {
         return Ok(HashMap::new());
     }
@@ -657,13 +719,13 @@ async fn owners(st: &AppState, fprs: HashSet<String>) -> R<HashMap<String, Vec<(
         .call(move |c| {
             let marks = vec!["?"; fprs.len()].join(",");
             let mut s = c.prepare(&format!(
-                "SELECT k.fingerprint, k.kind, u.id, u.username, u.display_name, u.email, u.is_admin
+                "SELECT k.fingerprint, k.kind, k.proved_at IS NOT NULL, u.id, u.username, u.display_name, u.email, u.is_admin
                  FROM signing_keys k JOIN users u ON u.id = k.user_id WHERE k.fingerprint IN ({marks})"
             ))?;
             let rows = s.query_map(rusqlite::params_from_iter(&fprs), |r| {
-                Ok((r.get::<_, String>(0)?, (r.get::<_, String>(1)?, User::from_row(r)?)))
+                Ok((r.get::<_, String>(0)?, (r.get::<_, String>(1)?, User::from_row(r)?, r.get::<_, bool>(2)?)))
             })?;
-            let mut out: HashMap<String, Vec<(String, User)>> = HashMap::new();
+            let mut out: HashMap<String, Vec<(String, User, bool)>> = HashMap::new();
             for row in rows {
                 let (f, o) = row?;
                 out.entry(f).or_default().push(o);
@@ -673,17 +735,18 @@ async fn owners(st: &AppState, fprs: HashSet<String>) -> R<HashMap<String, Vec<(
         .await
 }
 
-fn verdict(c: &Check, owners: &[(String, User)]) -> Verification {
+fn verdict(c: &Check, owners: &[(String, User, bool)]) -> Verification {
     let (kind, a) = if c.kind == "ssh" { ("SSH", "an") } else { ("GPG", "a") };
-    let says = |status: &str, reason: String, signer: Option<&User>| Verification {
+    let says = |status: &str, reason: String, signer: Option<(&User, bool)>| Verification {
         status: status.into(),
         reason,
         key_fingerprint: c.fingerprint.clone(),
-        signer: signer.map(|u| u.username.clone()),
+        signer: signer.map(|(u, _)| u.username.clone()),
+        proved: signer.is_some_and(|(_, p)| p),
     };
     let unregistered = || says("unverified", format!("Signed with {a} {kind} key that isn't registered to any account here."), None);
     match c.outcome {
-        Outcome::Unsigned => Verification { status: "unsigned".into(), reason: String::new(), key_fingerprint: None, signer: None },
+        Outcome::Unsigned => Verification { status: "unsigned".into(), reason: String::new(), key_fingerprint: None, signer: None, proved: false },
         Outcome::Bad => says("unverified", "The signature doesn't match this commit, so the commit may have been changed after it was signed.".into(), None),
         Outcome::Expired => says("unverified", "The signature, or the GPG key that made it, has expired.".into(), None),
         Outcome::Revoked => says("unverified", "The GPG key that made this signature was revoked.".into(), None),
@@ -692,14 +755,26 @@ fn verdict(c: &Check, owners: &[(String, User)]) -> Verification {
         Outcome::TimedOut => unknown("Checking this signature took too long. It's tried again a minute later."),
         Outcome::Good => {
             // Several accounts may have added the same public key: the signature
-            // verifies for the one whose email is the committer's.
-            let mine: Vec<&User> = owners.iter().filter(|(k, _)| *k == c.kind).map(|(_, u)| u).collect();
-            match (mine.iter().find(|u| owns_email(u, &c.committer_email)), mine.as_slice()) {
-                (Some(u), _) => says("verified", format!("Signed with {}'s {kind} key.", u.username), Some(u)),
-                (None, []) => unregistered(),
-                (None, [u]) => {
+            // verifies for the one whose email is the committer's. Once someone proved they
+            // hold it, those who only pasted it (before proof was asked for) don't count.
+            let mut mine: Vec<(&User, bool)> = owners.iter().filter(|(k, ..)| *k == c.kind).map(|(_, u, p)| (u, *p)).collect();
+            if mine.iter().any(|(_, p)| *p) {
+                mine.retain(|(_, p)| *p);
+            }
+            match (mine.iter().find(|(u, _)| owns_email(u, &c.committer_email)), mine.as_slice()) {
+                (Some(&(u, proved)), _) => {
                     let name = &u.username;
-                    says("unverified", format!("Signed with {name}'s {kind} key, but the committer email isn't {name}'s."), Some(u))
+                    let reason = if proved {
+                        format!("Signed with {name}'s {kind} key, which {name} proved they hold.")
+                    } else {
+                        format!("Signed with {name}'s {kind} key. It was added before keys needed proof that the account holds them.")
+                    };
+                    says("verified", reason, Some((u, proved)))
+                }
+                (None, []) => unregistered(),
+                (None, &[(u, proved)]) => {
+                    let name = &u.username;
+                    says("unverified", format!("Signed with {name}'s {kind} key, but the committer email isn't {name}'s."), Some((u, proved)))
                 }
                 (None, _) => says("unverified", format!("Signed with a registered {kind} key, but the committer email isn't that of anyone who added it."), None),
             }

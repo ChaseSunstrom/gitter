@@ -641,11 +641,12 @@ pub async fn list_signing_keys(State(st): State<AppState>, Authed(u): Authed) ->
     let keys = st
         .db
         .call(move |c| {
-            let mut s = c.prepare("SELECT id, kind, title, fingerprint, created_at FROM signing_keys WHERE user_id = ?1 ORDER BY id DESC")?;
+            let mut s = c.prepare("SELECT id, kind, title, fingerprint, created_at, proved_at FROM signing_keys WHERE user_id = ?1 ORDER BY id DESC")?;
             let v = s
                 .query_map([u.id], |r| {
                     Ok(json!({ "id": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?, "title": r.get::<_, String>(2)?,
-                               "fingerprint": r.get::<_, String>(3)?, "created_at": r.get::<_, i64>(4)? }))
+                               "fingerprint": r.get::<_, String>(3)?, "created_at": r.get::<_, i64>(4)?,
+                               "proved_at": r.get::<_, Option<i64>>(5)? }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(v)
@@ -654,11 +655,46 @@ pub async fn list_signing_keys(State(st): State<AppState>, Authed(u): Authed) ->
     Ok(Json(json!({ "keys": keys })))
 }
 
+/// How long a signing key challenge lasts, and when a fresh one replaces it (seconds).
+const CHALLENGE_TTL: i64 = 3600;
+const CHALLENGE_RENEW: i64 = 600;
+
+/// The text to sign, with the key being added, to prove holding it. The account keeps one
+/// at a time: asking again gives the same one (two tabs agree) until it's nearly over.
+pub async fn signing_key_challenge(State(st): State<AppState>, Authed(u): Authed) -> J<serde_json::Value> {
+    let mut b = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+    // Names the account and the site, so whoever is asked to sign it sees what it's for.
+    let fresh = format!("Gitter signing key for {} at {}: {}", u.username, st.cfg.url, hex::encode(b));
+    let (text, expires_at) = st
+        .db
+        .call(move |c| {
+            let at = now();
+            let cur: Option<(String, i64)> = c
+                .query_row("SELECT challenge, expires_at FROM signing_challenges WHERE user_id = ?1", [u.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((text, exp)) = cur.filter(|(_, exp)| exp - at > CHALLENGE_RENEW) {
+                return Ok((text, exp));
+            }
+            c.execute(
+                "INSERT INTO signing_challenges(user_id, challenge, expires_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(user_id) DO UPDATE SET challenge = excluded.challenge, expires_at = excluded.expires_at",
+                rusqlite::params![u.id, fresh, at + CHALLENGE_TTL],
+            )?;
+            Ok((fresh, at + CHALLENGE_TTL))
+        })
+        .await?;
+    Ok(Json(json!({ "challenge": text, "expires_at": expires_at, "ssh_namespace": crate::signing::PROOF_NAMESPACE })))
+}
+
 #[derive(Deserialize)]
 pub struct SigningKeyReq {
     #[serde(default)]
     title: String,
     key: String,
+    /// The key's signature over the account's challenge (`POST /me/signing-keys/challenge`).
+    #[serde(default)]
+    signature: String,
 }
 
 /// Register an SSH or GPG public key for commit signatures. A sensitive action:
@@ -679,7 +715,22 @@ pub async fn add_signing_key(
         (true, "") => format!("{} key", k.kind.to_uppercase()),
         (true, label) => label.chars().take(80).collect(),
     };
-    let (uid, kind, fp, key) = (u.id, k.kind, k.fingerprint.clone(), k.key.clone());
+    if req.signature.trim().is_empty() {
+        return Err(AppError::bad("Sign this account's challenge with the key and paste the signature: whoever adds a key must hold its private half."));
+    }
+    let uid = u.id;
+    let challenge: Option<String> = st
+        .db
+        .call(move |c| {
+            let q = "SELECT challenge FROM signing_challenges WHERE user_id = ?1 AND expires_at > ?2";
+            Ok(c.query_row(q, rusqlite::params![uid, now()], |r| r.get(0)).optional()?)
+        })
+        .await?;
+    let Some(challenge) = challenge else {
+        return Err(AppError::bad("There's no challenge to sign, or it has run out (they last an hour). Get a new one and sign that."));
+    };
+    crate::signing::prove(&st, &k, &challenge, &req.signature).await?;
+    let (kind, fp, key) = (k.kind, k.fingerprint.clone(), k.key.clone());
     let row = st
         .db
         .call(move |c| {
@@ -691,11 +742,13 @@ pub async fn add_signing_key(
                 return Err(AppError::bad("You have 50 signing keys already. Remove some first."));
             }
             let at = now();
+            // Used once: the signature can't add the key again later.
+            c.execute("DELETE FROM signing_challenges WHERE user_id = ?1 AND challenge = ?2", rusqlite::params![uid, challenge])?;
             c.execute(
-                "INSERT INTO signing_keys(user_id, kind, title, key, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO signing_keys(user_id, kind, title, key, fingerprint, created_at, proved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                 rusqlite::params![uid, kind, title, key, fp, at],
             )?;
-            Ok(json!({ "id": c.last_insert_rowid(), "kind": kind, "title": title, "fingerprint": fp, "created_at": at }))
+            Ok(json!({ "id": c.last_insert_rowid(), "kind": kind, "title": title, "fingerprint": fp, "created_at": at, "proved_at": at }))
         })
         .await?;
     if kind == "gpg" {

@@ -1014,6 +1014,17 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE pulls ADD COLUMN maintainer_can_modify INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX pulls_head_repo ON pulls(head_repo_id, head_branch);
     "#,
+    // v32: proof of possession for signing keys. Adding one needs a signature, made with it,
+    // over the account's current challenge (one at a time, used once); proved_at is NULL for
+    // keys added before that was asked.
+    r#"
+    ALTER TABLE signing_keys ADD COLUMN proved_at INTEGER;
+    CREATE TABLE signing_challenges (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        challenge TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 impl Db {
