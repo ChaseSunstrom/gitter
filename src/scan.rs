@@ -205,13 +205,17 @@ fn entropy(s: &[u8]) -> f64 {
 
 fn random_enough(v: &[u8]) -> bool {
     let low = v.to_ascii_lowercase();
+    let has = |f: fn(&u8) -> bool| v.iter().any(f);
     (16..=200).contains(&v.len())
-        && v.iter().any(u8::is_ascii_digit)
-        && v.iter().any(u8::is_ascii_alphabetic)
+        && has(u8::is_ascii_digit)
+        && has(u8::is_ascii_alphabetic)
+        // Mixed case, or long (hex): `chacha20poly1305` in prose isn't a password.
+        && ((has(u8::is_ascii_uppercase) && has(u8::is_ascii_lowercase)) || v.len() >= 32)
         && !v.iter().any(|b| b.is_ascii_whitespace())
         && !v.starts_with(b"$")
         && !PLACEHOLDERS.iter().any(|p| low.windows(p.len()).any(|w| w == p.as_bytes()))
-        && entropy(v) >= 3.5
+        // Random hex carries 4 bits a character at most.
+        && entropy(v) >= if v.len() >= 32 { 3.0 } else { 3.5 }
 }
 
 /// A random-looking value assigned to a secret-sounding name
@@ -830,7 +834,8 @@ mod tests {
     fn assignments_need_a_random_value() {
         assert_eq!(kinds(&["api_key = \"q8Zr2LmX9vT4kWp7Ns3B\""]), ["Secret in an assignment"]);
         assert_eq!(kinds(&["\"password\": \"hX7#kQ2mZ9vL4pR8wT\","]), ["Secret in an assignment"]);
-        assert_eq!(kinds(&["DB_PASSWORD=Jq3Vn8Ls2Kd7Xw4Rt9"]), ["Secret in an assignment"]);
+        assert_eq!(kinds(&[&format!("DB_PASSWORD={}", "Jq3Vn8Ls2Kd7Xw4Rt9")]), ["Secret in an assignment"]);
+        assert_eq!(kinds(&[&format!("token: {}", "3f786850e387550fdab836ed7e6dc881")]), ["Secret in an assignment"], "long hex");
         for fine in [
             "password = \"changeme1234567890\"",
             "token = get_token(config, 1234567890abcdef)",
@@ -840,6 +845,7 @@ mod tests {
             "\"node_modules/js-tokens\": {",
             "token = \"aaaaaaaaaaaaaaaaaaaa1\"",
             "name = \"tokenizers-0.15.2-abc123def456\"",
+            "CI secrets: chacha20poly1305 at rest",
         ] {
             assert!(kinds(&[fine]).is_empty(), "{fine}");
         }
