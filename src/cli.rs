@@ -327,10 +327,16 @@ fn clean(s: &str, colors: bool) -> String {
                 continue;
             }
         }
-        if !c.is_control() || matches!(c, '\n' | '\t') || (colors && c == '\r') {
+        // Also no bidi overrides or zero-width characters, which can make text read differently than it is.
+        let invisible = matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+        if (!c.is_control() || matches!(c, '\n' | '\t') || (colors && c == '\r')) && !invisible {
             out.push(c);
         }
         rest = &rest[c.len_utf8()..];
+    }
+    // A log can't leave the terminal in a color (or concealed) state.
+    if colors && out.contains('\x1b') {
+        out.push_str("\x1b[0m");
     }
     out
 }
@@ -391,7 +397,9 @@ pub fn main(raw: &[String]) -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
-    let cx = Ctx { a, cfg: load()? };
+    // `ci run` needs no server, so no config either (a missing HOME or a broken file doesn't matter).
+    let local = a.pos(0) == Some("ci") && a.pos(1) == Some("run");
+    let cx = Ctx { cfg: if local { Config::default() } else { load()? }, a };
     let sub = cx.a.pos(1).unwrap_or("");
     match (cx.a.pos(0).unwrap_or(""), sub) {
         ("login", _) => login(cx),
@@ -601,7 +609,10 @@ fn issue_view(cx: &Ctx) -> Result<()> {
 fn issue_close(cx: &Ctx) -> Result<()> {
     let (api, r) = cx.repo()?;
     let n = cx.number(2)?;
-    api.call("PATCH", &format!("/api/repos/{r}/issues/{n}"), Some(json!({ "state": "closed" })))?;
+    let v = api.call("PATCH", &format!("/api/repos/{r}/issues/{n}"), Some(json!({ "state": "closed" })))?;
+    if cx.a.has("--json") {
+        return print_json(&v);
+    }
     println!("Closed #{n}");
     Ok(())
 }
@@ -610,7 +621,10 @@ fn issue_comment(cx: &Ctx) -> Result<()> {
     let (api, r) = cx.repo()?;
     let n = cx.number(2)?;
     let body = cx.a.get("--body").ok_or_else(|| anyhow!("usage: gitter issue comment N --body B"))?;
-    api.call("POST", &format!("/api/repos/{r}/issues/{n}/comments"), Some(json!({ "body": body })))?;
+    let v = api.call("POST", &format!("/api/repos/{r}/issues/{n}/comments"), Some(json!({ "body": body })))?;
+    if cx.a.has("--json") {
+        return print_json(&v);
+    }
     println!("Commented on #{n}");
     Ok(())
 }
@@ -771,7 +785,10 @@ fn ci_logs(cx: &Ctx) -> Result<()> {
 fn ci_rerun(cx: &Ctx) -> Result<()> {
     let (api, r) = cx.repo()?;
     let n = cx.number(2)?;
-    api.call("POST", &format!("/api/repos/{r}/ci/runs/{n}/rerun"), Some(json!({ "all": cx.a.has("--all") })))?;
+    let v = api.call("POST", &format!("/api/repos/{r}/ci/runs/{n}/rerun"), Some(json!({ "all": cx.a.has("--all") })))?;
+    if cx.a.has("--json") {
+        return print_json(&v);
+    }
     println!("Re-running run #{n}: gitter ci logs {n} to follow it");
     Ok(())
 }
@@ -836,7 +853,11 @@ fn ci_run(cx: &Ctx) -> Result<()> {
     let branch = git(&["symbolic-ref", "--short", "-q", "HEAD"], None).unwrap_or_default();
     let folder = root.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let scratch = Scratch(std::env::temp_dir().join(format!("gitter-ci-{}-{:08x}", std::process::id(), rand::random::<u32>())));
-    std::fs::create_dir_all(&scratch.0)?;
+    // Private to you, and never an existing path (a planted symlink is refused, not followed).
+    let mut dir = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(&scratch.0).with_context(|| format!("creating {}", scratch.0.display()))?;
 
     let jobs = pipeline.jobs;
     // None: not run yet; Some(status).
@@ -924,7 +945,9 @@ mod tests {
     #[test]
     fn terminal_text_is_cleaned_and_remotes_parsed() {
         assert_eq!(clean("a\x1b]0;pwned\x07b\x1b[2Jc\r\n", false), "a]0;pwnedb[2Jc\n");
-        assert_eq!(clean("\x1b[31mred\x1b[0m\x1b[2J\r", true), "\x1b[31mred\x1b[0m[2J\r");
+        assert_eq!(clean("\x1b[31mred\x1b[0m\x1b[2J\r", true), "\x1b[31mred\x1b[0m[2J\r\x1b[0m", "colors are reset at the end");
+        assert_eq!(clean("\x1b[8mhidden", true), "\x1b[8mhidden\x1b[0m");
+        assert_eq!(clean("abc\u{202e}fed\u{200b}", false), "abcfed", "no bidi overrides or zero-width characters");
         assert_eq!(clean("\x1b[", true), "[");
         assert_eq!(strip_userinfo("https://me:pw@git.example.com/a/b.git"), "https://git.example.com/a/b.git");
         assert_eq!(repo_name("alice/proj.git/").as_deref(), Some("alice/proj"));

@@ -86,8 +86,8 @@ function* rowsOf(f, mode) {
         const [, o, n, t] = r.ctx;
         const c = lineHtml(t, lang);
         yield mode === 'split'
-          ? `<tr class="ctx"><td class="dn" data-n="${o}"></td><td class="dc">${c}</td><td class="dn" data-n="${n}"></td><td class="dc">${c}</td></tr>`
-          : `<tr class="ctx"><td class="dn" data-n="${o}"></td><td class="dn" data-n="${n}"></td><td class="dc">${c}</td></tr>`;
+          ? `<tr class="ctx"><td class="dn" data-n="${o}" data-side="old"></td><td class="dc">${c}</td><td class="dn" data-n="${n}" data-side="new"></td><td class="dc">${c}</td></tr>`
+          : `<tr class="ctx"><td class="dn" data-n="${o}" data-side="old"></td><td class="dn" data-n="${n}" data-side="new"></td><td class="dc">${c}</td></tr>`;
         continue;
       }
       let dr = null, ar = null;
@@ -96,12 +96,12 @@ function* rowsOf(f, mode) {
       const ah = r.add ? lineHtml(r.add[3], lang, ar) : '';
       if (mode === 'split') {
         yield '<tr>'
-          + (r.del ? `<td class="dn del" data-n="${r.del[1]}"></td><td class="dc del">${dh}</td>` : '<td class="dn empty"></td><td class="dc empty"></td>')
-          + (r.add ? `<td class="dn add" data-n="${r.add[2]}"></td><td class="dc add">${ah}</td>` : '<td class="dn empty"></td><td class="dc empty"></td>')
+          + (r.del ? `<td class="dn del" data-n="${r.del[1]}" data-side="old"></td><td class="dc del">${dh}</td>` : '<td class="dn empty"></td><td class="dc empty"></td>')
+          + (r.add ? `<td class="dn add" data-n="${r.add[2]}" data-side="new"></td><td class="dc add">${ah}</td>` : '<td class="dn empty"></td><td class="dc empty"></td>')
           + '</tr>';
       } else {
-        if (r.del) yield `<tr class="del"><td class="dn" data-n="${r.del[1]}"></td><td class="dn"></td><td class="dc">${dh}</td></tr>`;
-        if (r.add) yield `<tr class="add"><td class="dn"></td><td class="dn" data-n="${r.add[2]}"></td><td class="dc">${ah}</td></tr>`;
+        if (r.del) yield `<tr class="del"><td class="dn" data-n="${r.del[1]}" data-side="old"></td><td class="dn"></td><td class="dc">${dh}</td></tr>`;
+        if (r.add) yield `<tr class="add"><td class="dn"></td><td class="dn" data-n="${r.add[2]}" data-side="new"></td><td class="dc">${ah}</td></tr>`;
       }
     }
   }
@@ -193,7 +193,8 @@ export function diffView(diff, opts = {}) {
 }
 
 /**
- * Wire up a rendered diff. opts: { key (viewed state), load(query) -> one file's diff for `path=…&old=…` (enables "Load diff") }
+ * Wire up a rendered diff. opts: { key (viewed state), load(query) -> one file's diff for `path=…&old=…` (enables "Load diff"),
+ *   decorate(file, body) (after rows are added: e.g. place review threads), lineClick({ file, side, line, tr, shift }) (clicking a line number) }
  */
 export async function mountDiff(root, diff, opts = {}) {
   const el = root.querySelector('.diff');
@@ -216,6 +217,7 @@ export async function mountDiff(root, diff, opts = {}) {
     body._shown = Math.max(CHUNK, body._shown || 0);
     const warn = warning(scan(files[i].hunks.map((h) => h.lines.map((l) => l[3]).join('\n')).join('\n')));
     body.innerHTML = `${warn}${tableOpen(mode)}${first}</tbody></table>${done ? '' : '<div class="dmore"><span class="spin"></span></div>'}`;
+    opts.decorate?.(files[i], body, mode);
     if (done) return;
     const tbody = body.querySelector('tbody'), more = body.querySelector('.dmore');
     const ob = new IntersectionObserver((es) => {
@@ -223,6 +225,7 @@ export async function mountDiff(root, diff, opts = {}) {
       const [rows, fin] = take(gen, CHUNK);
       tbody.insertAdjacentHTML('beforeend', rows);
       body._shown += CHUNK;
+      opts.decorate?.(files[i], body, mode);
       if (fin) { ob.disconnect(); more.remove(); return; }
       ob.unobserve(more); ob.observe(more); // fire again if it's still on screen
     }, { rootMargin: '1500px 0px' });
@@ -242,6 +245,12 @@ export async function mountDiff(root, diff, opts = {}) {
 
   el.addEventListener('click', async (e) => {
     const t = e.target;
+    const num = opts.lineClick && t.closest('td.dn[data-n]');
+    if (num) {
+      const sec = num.closest('.dfile');
+      opts.lineClick({ file: files[+sec.dataset.i], side: num.dataset.side, line: +num.dataset.n, tr: num.closest('tr'), shift: e.shiftKey, mode });
+      return;
+    }
     const lb = t.closest('[data-load]');
     if (lb && opts.load) {
       const i = +lb.dataset.load, f = files[i];

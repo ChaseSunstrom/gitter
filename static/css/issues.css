@@ -134,3 +134,27 @@ a.branch-name:hover { text-decoration: underline; }
   .label-col { min-width: 0; }
   .merge-form .select { min-width: 0; width: 100%; }
 }
+
+/* code review */
+.tl-review { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 14px; align-items: start; }
+.tl-review .comment-head .c-green, .tl-review .comment-head .c-red { display: inline-flex; }
+.rcard-thread { border-top: 1px solid var(--line); padding: 10px 14px; display: grid; gap: 8px; }
+.rsnippet pre { margin: 4px 0 0; padding: 8px 10px; background: var(--surface-2); border-radius: 6px; font-size: 12px; overflow-x: auto; white-space: pre; }
+.rthread { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); margin: 6px 8px; font: 14px/1.55 var(--sans); white-space: normal; }
+.rthread > summary { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; list-style: none; }
+.rthread > summary::-webkit-details-marker { display: none; }
+.rthread.resolved > summary { color: var(--muted); }
+.rc { padding: 8px 12px; border-top: 1px solid var(--line); }
+.rc-head { display: flex; align-items: center; gap: 8px; }
+.rc-body { margin-top: 6px; }
+.rthread-foot { border-top: 1px solid var(--line); padding: 8px 12px; display: grid; gap: 8px; }
+.rreply { display: flex; gap: 8px; align-items: flex-start; }
+.rreply textarea { min-height: 34px; flex: 1; }
+.rreply textarea:focus { min-height: 80px; }
+.rcomposer { margin: 6px 8px; padding: 10px; display: grid; gap: 8px; font: 14px/1.55 var(--sans); white-space: normal; }
+.rthread-row > td, .rcomposer-row > td { padding: 0 !important; background: var(--surface-2); }
+.pr-files td.dn[data-n] { cursor: pointer; }
+.pr-files td.dn[data-n]:hover { color: var(--accent); }
+tr.rsel > td { background: color-mix(in srgb, var(--accent) 12%, transparent) !important; }
+.review-bar { margin-bottom: 10px; min-height: 32px; }
+.review-form textarea { min-height: 90px; }

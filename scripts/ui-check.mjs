@@ -66,8 +66,8 @@ const pages = [
   ['/alice/hello/issues?state=closed', ['Crash on start']],
   ['/alice/hello/issues/1', ['Crash on start', 'Looking into it']],
   ['/alice/hello/pulls?state=closed', ['Add lib']],
-  ['/alice/hello/pull/2', ['Add lib']],
-  ['/alice/hello/pull/2/files', ['src/lib.rs']],
+  ['/alice/hello/pull/2', ['Add lib', 'approved these changes', 'Ship it', 'Looks good here', 'Reviewers']],
+  ['/alice/hello/pull/2/files', ['src/lib.rs', 'Looks good here', 'Review changes']],
   ['/alice/hello/pull/2/commits', ['Add lib']],
   ['/alice/hello/compare/main...pw-branch', []],
   ['/alice/hello/labels', ['bug']],
@@ -143,6 +143,25 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   const why = await page.locator('.sig-pop').innerText().catch(() => '');
   if (errors.length || !badges.list || !badges.commit || !badges.blame || !why.includes("alice's SSH key")) { failed++; console.log('✗ signature badges', { signed, badges, why, errors }); }
   else console.log('  ok signing keys are listed; commits, the commit page and blame show Verified, and the badge says why');
+  await page.close();
+}
+
+// Code review: clicking a line number opens the comment composer under that line.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(BASE + '/alice/hello/pull/2/files', { waitUntil: 'networkidle' });
+  await page.locator('td.dn[data-side="new"][data-n="1"]').first().click();
+  const open = await page.locator('.rcomposer textarea').count();
+  if (errors.length || !open) { failed++; console.log('✗ review composer', { open, errors }); }
+  else console.log('  ok a line number opens the review composer');
+  // SHOTS=<dir> saves pictures of the review pages to look at.
+  if (process.env.SHOTS) {
+    await page.screenshot({ path: `${process.env.SHOTS}/review-files.png`, fullPage: true });
+    await page.goto(BASE + '/alice/hello/pull/2', { waitUntil: 'networkidle' });
+    await page.screenshot({ path: `${process.env.SHOTS}/review-conversation.png`, fullPage: true });
+  }
   await page.close();
 }
 
