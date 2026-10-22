@@ -266,10 +266,15 @@ async fn download_inner(st: AppState, owner: String, name: String, oid: String, 
         .into_response())
 }
 
-/// A stored object's length and a body streaming it. The body holds `slot`
-/// until it's sent, and stops if the client reads nothing for a minute.
+/// A stored object's length and a body streaming it.
 pub async fn object_body(data: &Path, oid: &str, slot: Slot) -> R<(u64, Body)> {
-    let f = tokio::fs::File::open(object_path(data, oid)).await?;
+    file_body(&object_path(data, oid), slot).await
+}
+
+/// A file's length and a body streaming it. The body holds `slot` until it's
+/// sent, and stops if the client reads nothing for a minute.
+pub async fn file_body(path: &Path, slot: Slot) -> R<(u64, Body)> {
+    let f = tokio::fs::File::open(path).await?;
     let len = f.metadata().await?.len();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(4);
     tokio::spawn(async move {
@@ -340,7 +345,7 @@ async fn upload_inner(st: AppState, owner: String, name: String, oid: String, re
 }
 
 /// A temp file removed when dropped, so a cancelled upload leaves nothing behind.
-struct Tmp(PathBuf);
+pub struct Tmp(pub PathBuf);
 
 impl Drop for Tmp {
     fn drop(&mut self) {
@@ -353,19 +358,36 @@ fn too_slow(bytes: u64, window: Duration) -> bool {
     window > STALL && bytes < window.as_secs() * MIN_RATE
 }
 
+fn internal(e: std::io::Error) -> (StatusCode, String) {
+    let e = AppError::internal(format!("upload: {e}"));
+    (e.status, e.msg)
+}
+
 /// Stream an upload into a temp file while hashing it; it's moved into place
 /// only when it's within `limit` and its sha256 is `oid`. Returns its size.
 async fn receive(data: &Path, oid: &str, limit: u64, too_big: &str, body: Body) -> Result<u64, (StatusCode, String)> {
+    let (tmp, n, hash) = spool(&data.join("lfs/tmp"), limit, too_big, body).await?;
+    if hash != oid {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "The content doesn't match its object id (sha256)".into()));
+    }
+    let dest = object_path(data, oid);
+    if let Some(dir) = dest.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(internal)?;
+    }
+    tokio::fs::rename(&tmp.0, &dest).await.map_err(internal)?;
+    Ok(n)
+}
+
+/// Stream an upload into a new temp file under `dir`, refusing it past `limit`
+/// bytes, when it stalls, or when it's too slow. Returns the file (gone when
+/// dropped, unless renamed first), its size and its sha256.
+pub async fn spool(dir: &Path, limit: u64, too_big: &str, body: Body) -> Result<(Tmp, u64, String), (StatusCode, String)> {
     let mut rnd = [0u8; 8];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
-    let tmp = Tmp(data.join("lfs/tmp").join(format!("{oid}.{}", hex::encode(rnd))));
+    let tmp = Tmp(dir.join(hex::encode(rnd)));
     // Bytes received since `window` began; checked, then restarted, about every minute.
     let (mut window, mut recent) = (std::time::Instant::now(), 0u64);
-    let internal = |e: std::io::Error| {
-        let e = AppError::internal(format!("lfs upload {oid}: {e}"));
-        (e.status, e.msg)
-    };
-    tokio::fs::create_dir_all(data.join("lfs/tmp")).await.map_err(internal)?;
+    tokio::fs::create_dir_all(dir).await.map_err(internal)?;
     let mut f = tokio::fs::File::create(&tmp.0).await.map_err(internal)?;
     let (mut hash, mut n) = (Sha256::new(), 0u64);
     let mut stream = body.into_data_stream();
@@ -390,17 +412,8 @@ async fn receive(data: &Path, oid: &str, limit: u64, too_big: &str, body: Body) 
         hash.update(&chunk);
         f.write_all(&chunk).await.map_err(internal)?;
     }
-    if hex::encode(hash.finalize()) != oid {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "The content doesn't match its object id (sha256)".into()));
-    }
     f.sync_all().await.map_err(internal)?;
-    drop(f);
-    let dest = object_path(data, oid);
-    if let Some(dir) = dest.parent() {
-        tokio::fs::create_dir_all(dir).await.map_err(internal)?;
-    }
-    tokio::fs::rename(&tmp.0, &dest).await.map_err(internal)?;
-    Ok(n)
+    Ok((tmp, n, hex::encode(hash.finalize())))
 }
 
 /// Remove the files of these objects that no repository holds any more.

@@ -5,6 +5,7 @@ pub mod code;
 pub mod discussions;
 pub mod issues;
 pub mod moderation;
+pub mod releases;
 pub mod repos;
 pub mod security;
 pub mod snippets;
@@ -12,7 +13,7 @@ pub mod wiki;
 
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts};
 use axum::http::request::Parts;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
@@ -148,6 +149,18 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/status"), get(ci::statuses))
         .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
         .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
+        .route(&format!("{repo}/releases"), get(releases::list).post(releases::create))
+        .route(&format!("{repo}/releases/latest"), get(releases::latest))
+        .route(
+            &format!("{repo}/releases/{{id}}"),
+            get(releases::show).patch(releases::update).delete(releases::delete),
+        )
+        // Release files stream in (up to the Git LFS file limit), past the API's 40 MB cap.
+        .route(&format!("{repo}/releases/{{id}}/assets"), post(releases::upload).layer(DefaultBodyLimit::disable()))
+        .route(
+            &format!("{repo}/releases/{{id}}/assets/{{asset}}"),
+            get(releases::download).delete(releases::delete_asset),
+        )
         .route(&format!("{repo}/wiki"), get(wiki::pages).post(wiki::create))
         .route(
             &format!("{repo}/wiki/{{page}}"),

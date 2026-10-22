@@ -144,11 +144,12 @@ pub fn access(repo: &Repo, viewer: Option<&User>) -> (bool, bool) {
     (read, write)
 }
 
-/// Bytes account ?1 stores: its repositories and their wikis, its snippets, and
-/// the LFS objects its repositories hold (each once).
+/// Bytes account ?1 stores: its repositories and their wikis, its snippets, the
+/// LFS objects its repositories hold (each once) and their release files.
 pub const STORAGE_USED: &str = "COALESCE((SELECT sum(size_bytes + wiki_bytes) FROM repos WHERE owner_id = ?1), 0)
     + COALESCE((SELECT sum(size_bytes) FROM snippets WHERE owner_id = ?1), 0)
-    + COALESCE((SELECT sum(size) FROM (SELECT DISTINCT l.oid, l.size FROM lfs_objects l JOIN repos r ON r.id = l.repo_id WHERE r.owner_id = ?1)), 0)";
+    + COALESCE((SELECT sum(size) FROM (SELECT DISTINCT l.oid, l.size FROM lfs_objects l JOIN repos r ON r.id = l.repo_id WHERE r.owner_id = ?1)), 0)
+    + COALESCE((SELECT sum(a.size) FROM release_assets a JOIN releases rl ON rl.id = a.release_id JOIN repos r ON r.id = rl.repo_id WHERE r.owner_id = ?1), 0)";
 
 /// Bytes an account may still store across its repositories (None = no limit).
 pub async fn storage_left(st: &AppState, owner_id: i64) -> R<Option<u64>> {
