@@ -221,9 +221,17 @@ async fn serve_inner(
             max_push = max_push.min(left);
         }
     }
+    // Push protection: a pre-receive hook scans what the push adds, before any ref moves.
+    let guard = match (&user, push && is_post) {
+        (Some(u), true) => Some(crate::scan::PushGuard::start(&st, &repo, u).await?),
+        _ => None,
+    };
     let mut cmd = st.git.command(None);
     // The current push limit overrides whatever was stored when the repo was created.
     cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
+    if let Some(g) = &guard {
+        g.apply(&mut cmd);
+    }
     if crate::auth::basic_secret(&headers).is_some_and(|s| s.starts_with(crate::ci::queue::JOB_TOKEN_PREFIX)) {
         // A CI runner fetches the one commit it builds (only commits a ref can reach).
         cmd.arg("-c").arg("uploadpack.allowReachableSHA1InWant=true");
@@ -334,13 +342,17 @@ async fn serve_inner(
             }
         }
         drop(stdout);
-        drop(tx);
         if aborted {
             let _ = child.start_kill();
             feeder.abort();
         }
         let _ = feeder.await;
         let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        // What push protection refused is on record before the client hears the push is over.
+        if let Some(g) = guard {
+            g.finish(&st2).await;
+        }
+        drop(tx);
         if let (Some(before), Some(user)) = (before, user)
             && let Err(e) = after_push(&st2, &repo, &user, before).await
         {

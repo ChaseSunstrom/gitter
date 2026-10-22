@@ -72,6 +72,10 @@ fn main() -> anyhow::Result<()> {
     if matches!(cmd, "login" | "repo" | "issue" | "pr" | "ci") {
         return gitter::cli::main(&args);
     }
+    // Run by git as the push-protection hook (GITTER_DATA/hooks/pre-receive), not by people.
+    if cmd == "pre-receive" {
+        std::process::exit(gitter::scan::hook_main());
+    }
     let cfg = config();
     match cmd {
         "serve" => serve(cfg),

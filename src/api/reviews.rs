@@ -527,6 +527,7 @@ pub async fn apply(
     }
     crate::repo::need_room(&st, r.owner_id, content.len()).await?;
     let changes = [Change::Write(&path, &content, mode.as_deref() == Some("100755"))];
+    crate::scan::guard_commit(&st, &r, &u, Some(&head), &changes).await?;
     let (an, ae) = u.signature();
     let message = format!("Apply suggestion from review\n\nOn {path} line {line} of #{num}.");
     let spec = CommitSpec { branch: &branch, parent: Some(&head), expect_old: Some(&head), changes: &changes, message: &message, author: (&an, &ae) };

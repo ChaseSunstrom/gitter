@@ -15,6 +15,8 @@ pub struct AppError {
     pub retry_after: Option<i64>,
     /// The repository asked for was renamed or transferred (see `Moved`).
     pub moved: Option<Box<Moved>>,
+    /// More for the web app to show (sent as `details`).
+    pub details: Option<Box<serde_json::Value>>,
 }
 
 /// A repository's old and new `(owner, name)`. Rides on a 404 as a response
@@ -36,7 +38,12 @@ impl AppError {
             code: None,
             retry_after: None,
             moved: None,
+            details: None,
         }
+    }
+    pub fn with_details(mut self, v: serde_json::Value) -> Self {
+        self.details = Some(Box::new(v));
+        self
     }
     pub fn moved(from: (&str, &str), to: (&str, &str)) -> Self {
         let mut e = Self::not_found();
@@ -86,10 +93,13 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let body = match self.code {
+        let mut body = match self.code {
             Some(c) => serde_json::json!({ "error": self.msg, "code": c }),
             None => serde_json::json!({ "error": self.msg }),
         };
+        if let Some(d) = self.details {
+            body["details"] = *d;
+        }
         let mut r = (self.status, Json(body)).into_response();
         if let Some(s) = self.retry_after
             && let Ok(v) = axum::http::HeaderValue::from_str(&s.to_string())

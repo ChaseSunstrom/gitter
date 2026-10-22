@@ -1024,6 +1024,7 @@ pub async fn write_contents(
             None => Change::Delete(p),
         })
         .collect();
+    crate::scan::guard_commit(&st, &r, &u, head.as_deref(), &changes).await?;
     let (an, ae) = u.signature();
     let spec = CommitSpec {
         branch: &target,
