@@ -626,6 +626,12 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   if (errors.length) { failed++; console.log('✗ viewers, image diff, drop upload, revert', steps, errors); }
   else console.log(`  ok ${steps.join(', ')}`);
   await page.close();
+  // The branches above started CI runs: let them finish, so the server stops with nothing running.
+  for (let i = 0; i < 120; i++) {
+    const { runs } = await (await ctx.request.get(BASE + '/api/repos/alice/hello/ci/runs')).json();
+    if (!runs.some((r) => r.status === 'queued' || r.status === 'running')) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
 }
 
 await browser.close();
