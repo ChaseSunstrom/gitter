@@ -41,6 +41,14 @@ GONE=$(c "$B/api/me/trash" | python3 -c 'import json,sys; print(json.load(sys.st
 RID=$(c -X POST "$B/api/repos/alice/keep/releases" --data '{"tag":"v1","title":"Kept release"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 AID=$(curl -sf -b "$TMP/jar" -H "Origin: $B" --data-binary @"$TMP/asset.bin" "$B/api/repos/alice/keep/releases/$RID/assets?name=asset.bin" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || fail "release file upload"
+# A container image, pushed the way clients do it: the blob, then the manifest naming it.
+printf 'layer bytes %.0s' $(seq 500) >"$TMP/layer.bin"
+LD="sha256:$(sha256sum "$TMP/layer.bin" | cut -d' ' -f1)"
+curl -sf "${AUTH[@]}" -X POST --data-binary @"$TMP/layer.bin" "$B/v2/alice/keep/blobs/uploads/?digest=$LD" >/dev/null || fail "registry blob push"
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%s},"layers":[]}' \
+  "$LD" "$(wc -c <"$TMP/layer.bin")" >"$TMP/manifest.json"
+curl -sf "${AUTH[@]}" -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @"$TMP/manifest.json" \
+  "$B/v2/alice/keep/manifests/v1" >/dev/null || fail "registry manifest push"
 
 GITTER_DATA=$TMP/a $BIN backup "$TMP/backup.tar.gz" || fail "backup"
 [ -s "$TMP/backup.tar.gz" ] || fail "backup file is empty"
@@ -82,5 +90,7 @@ c2 -X POST "$B2/api/auth/login" --data '{"login":"alice","password":"correct hor
 c2 -X POST "$B2/api/me/trash/$GONE/restore" >/dev/null || fail "restore from the trash after a backup restore"
 git clone -q "$B2/alice/gone.git" "$TMP/gone" && [ -f "$TMP/gone/README.md" ] || fail "a trashed repository's files must survive the backup"
 curl -sf "$B2/api/repos/alice/keep/releases/$RID/assets/$AID" | cmp -s - "$TMP/asset.bin" || fail "release file missing or different after restore"
-echo "✓ restored server has the same history, issues, wiki, discussions, snippets, trash, logins, clones, LFS files, release files and the key for CI secrets"
+curl -sf "${AUTH[@]}" "$B2/v2/alice/keep/manifests/v1" | cmp -s - "$TMP/manifest.json" || fail "image manifest missing or different after restore"
+curl -sf "${AUTH[@]}" "$B2/v2/alice/keep/blobs/$LD" | cmp -s - "$TMP/layer.bin" || fail "image blob missing or different after restore"
+echo "✓ restored server has the same history, issues, wiki, discussions, snippets, trash, logins, clones, LFS files, release files, images and the key for CI secrets"
 echo "Backup round-trip passed."

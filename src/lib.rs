@@ -12,6 +12,7 @@ pub mod langs;
 pub mod lfs;
 pub mod net;
 pub mod ops;
+pub mod registry;
 pub mod repo;
 pub mod security;
 pub mod settings;
@@ -121,6 +122,9 @@ pub fn router(st: AppState) -> Router {
         )
         .route("/{owner}/{repo}/info/lfs/locks", any(lfs::no_locks))
         .route("/{owner}/{repo}/info/lfs/locks/verify", any(lfs::no_locks))
+        .route("/v2", any(registry::ping))
+        .route("/v2/", any(registry::ping))
+        .route("/v2/{*rest}", any(registry::v2))
         .layer(DefaultBodyLimit::disable());
 
     let app = Router::new()

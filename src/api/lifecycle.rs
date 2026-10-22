@@ -206,6 +206,8 @@ pub async fn accept(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp,
                         + COALESCE((SELECT sum(size) FROM lfs_objects
                             WHERE repo_id = r.id AND oid NOT IN (SELECT l.oid FROM lfs_objects l JOIN repos x ON x.id = l.repo_id WHERE x.owner_id = t.to_id)), 0)
                         + COALESCE((SELECT sum(a.size) FROM release_assets a JOIN releases rl ON rl.id = a.release_id WHERE rl.repo_id = r.id), 0)
+                        + COALESCE((SELECT sum(size) FROM registry_blobs
+                            WHERE repo_id = r.id AND digest NOT IN (SELECT b.digest FROM registry_blobs b JOIN repos x ON x.id = b.repo_id WHERE x.owner_id = t.to_id)), 0)
                      FROM repo_transfers t JOIN repos r ON r.id = t.repo_id JOIN users fu ON fu.id = r.owner_id JOIN users tu ON tu.id = t.to_id
                      WHERE t.repo_id = ?1 AND t.expires_at > ?3 AND r.deleted_at IS NULL AND r.owner_id = t.from_id
                        AND (t.to_id = ?2 OR t.to_id IN (SELECT org_id FROM org_members WHERE user_id = ?2 AND role = 'owner'))",
@@ -329,14 +331,16 @@ pub async fn purge(st: &AppState, id: i64, actor: Option<&User>, ip: &str) -> R<
             let Some(row) = row else { return Ok(None) };
             let oids = crate::lfs::held_by(&tx, false, id)?;
             let releases = super::releases::ids_of(&tx, false, id)?;
+            let blobs = crate::registry::held_by(&tx, false, id)?;
             tx.execute("DELETE FROM repos WHERE id = ?1", [id])?;
             tx.commit()?;
-            Ok(Some((row, oids, releases)))
+            Ok(Some((row, oids, releases, blobs)))
         })
         .await?;
-    let Some(((owner_id, owner, name), oids, releases)) = found else { return Ok(false) };
+    let Some(((owner_id, owner, name), oids, releases, blobs)) = found else { return Ok(false) };
     crate::lfs::collect(st, oids).await;
     super::releases::remove_files(st, releases).await;
+    crate::registry::collect(st, blobs).await;
     // The live path too, in case moving it into the trash failed halfway.
     for dir in [trash_path(st, id), st.git.repo_path(id), super::wiki::path(st, id)] {
         if let Err(e) = tokio::fs::remove_dir_all(&dir).await
@@ -488,7 +492,7 @@ pub async fn upkeep(st: AppState) {
 /// the trash, are purged the way the trash purges (LFS files collected, folders removed).
 pub async fn delete_account(st: &AppState, actor: &User, name: String, ip: &str) -> R<()> {
     let (me, ip2) = (actor.clone(), ip.to_string());
-    let (repo_ids, snippet_ids, lfs, releases, exports) = st
+    let (repo_ids, snippet_ids, lfs, releases, exports, blobs) = st
         .db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -516,17 +520,19 @@ pub async fn delete_account(st: &AppState, actor: &User, name: String, ip: &str)
             let snippets = super::snippets::ids_of(&tx, id)?;
             let lfs = crate::lfs::held_by(&tx, true, id)?;
             let releases = super::releases::ids_of(&tx, true, id)?;
+            let blobs = crate::registry::held_by(&tx, true, id)?;
             tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
             let e = Event { actor: Some(&me), subject: None, action: "user_deleted", detail: format!("{name} and {} repositories", ids.len()), ip: &ip2 };
             crate::security::append(&tx, &e)?;
             // After the entry above, so deleting yourself doesn't leave your id on it either.
             crate::security::forget_user(&tx, id)?;
             tx.commit()?;
-            Ok((ids, snippets, lfs, releases, exports.into_iter().map(|e| (id, e)).collect::<Vec<_>>()))
+            Ok((ids, snippets, lfs, releases, exports.into_iter().map(|e| (id, e)).collect::<Vec<_>>(), blobs))
         })
         .await?;
     crate::lfs::collect(st, lfs).await;
     super::releases::remove_files(st, releases).await;
+    crate::registry::collect(st, blobs).await;
     for id in repo_ids {
         for dir in [st.git.repo_path(id), trash_path(st, id), super::wiki::path(st, id)] {
             let _ = tokio::fs::remove_dir_all(dir).await;

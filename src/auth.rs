@@ -357,8 +357,10 @@ pub fn basic_secret(headers: &HeaderMap) -> Option<String> {
     dec.split_once(':').map(|(_, s)| s.to_string())
 }
 
-/// Username + password, or username + access token (used by git over HTTP).
-pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>> {
+/// Username + password, or username + access token (used by git over HTTP, Git
+/// LFS and the registry). Failed passwords are limited per name and per address
+/// (`ip`), so rotating names can't turn each request into a password hash.
+pub async fn user_by_basic(st: &AppState, headers: &HeaderMap, ip: &str) -> R<Option<User>> {
     let Some(v) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -395,7 +397,8 @@ pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>
         return Ok(None);
     }
     let key = format!("basic:{}", name.to_lowercase());
-    if st.limiter.blocked(&key, 10) {
+    let by_ip = format!("basic-ip:{}", ip_bucket(ip));
+    if st.limiter.blocked(&key, 10) || st.limiter.blocked(&by_ip, 30) {
         return Err(AppError::new(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "Too many failed attempts. Wait a minute.",
@@ -404,6 +407,7 @@ pub async fn user_by_basic(st: &AppState, headers: &HeaderMap) -> R<Option<User>
     let u = password_login(&st.db, name, secret).await?;
     if u.is_none() {
         st.limiter.fail(&key, 60);
+        st.limiter.fail(&by_ip, 60);
     }
     if let Some(u) = &u
         && has_2fa(&st.db, u.id).await?

@@ -39,6 +39,7 @@ const ROUTES = [
   ['/:owner/:repo/discussions/:n', 'discussions', { view: 'show' }],
   ['/:owner/:repo/releases', 'releases', { view: 'list' }], ['/:owner/:repo/releases/new', 'releases', { view: 'edit' }],
   ['/:owner/:repo/releases/:id', 'releases', { view: 'show' }], ['/:owner/:repo/releases/:id/edit', 'releases', { view: 'edit' }],
+  ['/:owner/:repo/packages', 'packages'],
 ];
 
 function compile([pattern, page, extra = {}]) {

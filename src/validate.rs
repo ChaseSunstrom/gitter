@@ -20,6 +20,7 @@ const RESERVED: &[&str] = &[
     "notifications",
     "org",
     "orgs",
+    "packages",
     "raw",
     "robots.txt",
     "runners",
@@ -30,6 +31,7 @@ const RESERVED: &[&str] = &[
     "static",
     "user",
     "users",
+    // The container registry's API.
     "v2",
 ];
 

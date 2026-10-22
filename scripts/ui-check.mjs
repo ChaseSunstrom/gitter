@@ -51,6 +51,7 @@ const pages = [
   ['/alice', ['alice']],
   ['/alice?tab=stars', ['alice']],
   ['/alice/hello', ['README.md', 'src', 'Releases', 'Version one', 'Latest']],
+  ['/alice/hello/packages', ['Packages', 'alice/hello', 'docker pull', 'v1', 'Publish an image', 'docker login']],
   ['/alice/hello/releases', ['Draft a new release', 'Next up', 'Draft', 'Version one', 'Latest', 'First stable release', 'hello.txt', '1 download', 'Source code (zip)', 'Source code (tar.gz)']],
   ['/alice/hello/releases/1', ['All releases', 'Version one', 'v1.0', 'hello.txt', 'Source code (zip)']],
   ['/alice/hello/releases/new', ['New release', 'New tag at', 'Release notes', 'This is a pre-release', 'Save draft', 'Publish release']],
