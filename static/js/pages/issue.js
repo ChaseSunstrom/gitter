@@ -196,14 +196,27 @@ function mergeBox(meta, data, pd) {
   </div>`;
 }
 
+const assigneeList = (meta, issue) => issue.assignees.length
+  ? html`${issue.assignees.map((a) => html`<a class="row small" href="/${meta.owner}/${meta.name}/${issue.is_pr ? 'pulls' : 'issues'}?assignee=${encodeURIComponent(a)}">${avatar(a, 20)} ${a}</a>`)}`
+  : html`<span class="muted small">No one assigned</span>`;
+
 function sidebar(meta, data, rv) {
   const { issue, participants, all_labels } = data;
   return html`<aside class="issue-side">
     ${issue.is_pr ? reviewersBlock(rv) : ''}
-    <div class="side-block" id="labels-block">
+    <div class="side-block" id="assignees-block">
+      <div class="section-title">${icon('user', 'sm')} Assignees
+        ${data.can_write ? html`<span class="grow"></span><button class="btn ghost sm icon" id="edit-assignees" aria-label="Edit assignees">${icon('settings', 'sm')}</button>` : ''}</div>
+      <div class="assignee-list" id="assignee-list">${assigneeList(meta, issue)}</div>
+    </div>
       <div class="section-title">${icon('label', 'sm')} Labels
         ${data.can_write ? html`<span class="grow"></span><button class="btn ghost sm icon" id="edit-labels" aria-label="Edit labels">${icon('settings', 'sm')}</button>` : ''}</div>
       <div class="row wrap-ok" id="label-list">${issue.labels.length ? issue.labels.map((l) => labelChip(l, `/${meta.owner}/${meta.name}/issues?label=${encodeURIComponent(l.name)}`)) : html`<span class="muted small">None yet</span>`}</div>
+    </div>
+    <div class="side-block" id="milestone-block">
+      <div class="section-title">${icon('flag', 'sm')} Milestone
+        ${data.can_write ? html`<span class="grow"></span><button class="btn ghost sm icon" id="edit-milestone" aria-label="Set milestone">${icon('settings', 'sm')}</button>` : ''}</div>
+      ${issue.milestone ? html`<a class="small" href="/${meta.owner}/${meta.name}/milestone/${issue.milestone.number}">${issue.milestone.title}</a>` : html`<span class="muted small">No milestone</span>`}
     </div>
     <div class="side-block">
       <div class="section-title">${icon('users', 'sm')} ${plural(participants.length, 'participant')}</div>
@@ -349,6 +362,43 @@ function mountConversation(el, meta, api, data, mdCtx) {
           ? html`${issue.labels.map((l) => labelChip(l, `/${meta.owner}/${meta.name}/issues?label=${encodeURIComponent(l.name)}`))}`
           : html`<span class="muted small">None yet</span>`).s;
       } catch (err) { toastErr(err); cb.checked = !cb.checked; }
+    });
+  });
+
+  // Assignees picker (writers): people with write access, up to 10.
+  $('#edit-assignees', el)?.addEventListener('click', async (e) => {
+    const anchor = e.currentTarget;
+    const { users } = await get(`${api}/assignees`).catch((err) => { toastErr(err); return { users: [] }; });
+    const chosen = new Set(issue.assignees);
+    const pop = popover(anchor, html`<div class="menu-head">Assign up to 10 people</div>
+      ${users.map((u) => html`<label class="menu-item label-opt"><input type="checkbox" value="${u}" ${chosen.has(u) ? 'checked' : ''}>${avatar(u, 18)}<span class="grow">${u}</span></label>`)}`,
+    { align: 'right', width: 250 });
+    pop.addEventListener('change', async (ev) => {
+      const cb = ev.target.closest('input[type=checkbox]');
+      if (!cb) return;
+      cb.checked ? chosen.add(cb.value) : chosen.delete(cb.value);
+      try {
+        await send('PATCH', `${api}/issues/${issue.number}`, { assignees: [...chosen] });
+        issue.assignees = [...chosen].sort();
+        $('#assignee-list', el).innerHTML = assigneeList(meta, issue).s;
+      } catch (err) { toastErr(err); cb.checked = !cb.checked; cb.checked ? chosen.add(cb.value) : chosen.delete(cb.value); }
+    });
+  });
+
+  // Milestone picker (writers): one open milestone, or none.
+  $('#edit-milestone', el)?.addEventListener('click', async (e) => {
+    const anchor = e.currentTarget;
+    const { milestones } = await get(`${api}/milestones`).catch((err) => { toastErr(err); return { milestones: [] }; });
+    const pop = popover(anchor, html`<div class="menu-head">Set milestone</div>
+      ${milestones.map((m) => html`<button class="menu-item" data-ms="${m.number}">${icon(issue.milestone?.number === m.number ? 'check' : 'flag', 'sm')}<span class="grow">${m.title}</span>${m.due_on ? html`<span class="faint small">${m.due_on}</span>` : ''}</button>`)}
+      ${issue.milestone ? html`<button class="menu-item" data-ms="0">${icon('x', 'sm')} Clear milestone</button>` : ''}
+      <div class="menu-sep"></div><a class="menu-item" href="/${meta.owner}/${meta.name}/milestones">${icon('settings', 'sm')} Manage milestones</a>`,
+    { align: 'right', width: 250 });
+    pop.addEventListener('click', async (ev) => {
+      const b = ev.target.closest('[data-ms]');
+      if (!b) return;
+      closePop();
+      try { await send('PATCH', `${api}/issues/${issue.number}`, { milestone: +b.dataset.ms }); refresh(); } catch (err) { toastErr(err); }
     });
   });
 
