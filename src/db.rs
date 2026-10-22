@@ -633,6 +633,20 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo_id, name, version, file)
     );
     "#,
+    // v19: SSH keys that sign in to git over SSH (apart from signing_keys, like GitHub).
+    // A key belongs to one account, so the fingerprint alone says whose it is.
+    r#"
+    CREATE TABLE ssh_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        last_used INTEGER
+    );
+    CREATE INDEX ssh_keys_user ON ssh_keys(user_id);
+    "#,
 ];
 
 impl Db {

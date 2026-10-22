@@ -732,6 +732,82 @@ pub async fn delete_signing_key(
     ok()
 }
 
+/// Authentication keys for git over SSH (separate from signing keys).
+pub async fn list_ssh_keys(State(st): State<AppState>, Authed(u): Authed) -> J<serde_json::Value> {
+    let keys = st
+        .db
+        .call(move |c| {
+            let mut s = c.prepare("SELECT id, title, fingerprint, created_at, last_used FROM ssh_keys WHERE user_id = ?1 ORDER BY id DESC")?;
+            let v = s
+                .query_map([u.id], |r| {
+                    Ok(json!({ "id": r.get::<_, i64>(0)?, "title": r.get::<_, String>(1)?, "fingerprint": r.get::<_, String>(2)?,
+                               "created_at": r.get::<_, i64>(3)?, "last_used": r.get::<_, Option<i64>>(4)? }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await?;
+    let url = st.ssh_url.get();
+    Ok(Json(json!({ "keys": keys, "enabled": url.is_some(), "url": url })))
+}
+
+/// Add a key that signs in to git over SSH as this account. A sensitive action, like adding a password.
+pub async fn add_ssh_key(
+    State(st): State<AppState>,
+    Sudo(u): Sudo,
+    ip: ClientIp,
+    Json(req): Json<SigningKeyReq>,
+) -> J<serde_json::Value> {
+    let title = req.title.trim().to_string();
+    if title.chars().count() > 80 {
+        return Err(AppError::bad("Keep the title to 80 characters"));
+    }
+    let (fp, key, comment) = crate::ssh::parse_key(&req.key)?;
+    let title = match (title.is_empty(), comment.trim()) {
+        (false, _) => title,
+        (true, "") => "SSH key".to_string(),
+        (true, c) => c.chars().take(80).collect(),
+    };
+    let (uid, fp2) = (u.id, fp.clone());
+    let row = st
+        .db
+        .call(move |c| {
+            let n: i64 = c.query_row("SELECT count(*) FROM ssh_keys WHERE user_id = ?1", [uid], |r| r.get(0))?;
+            if n >= crate::ssh::MAX_KEYS {
+                return Err(AppError::bad(format!("You have {} SSH keys already. Remove some first.", crate::ssh::MAX_KEYS)));
+            }
+            let at = now();
+            // The fingerprint is unique: a key signs in to one account only.
+            let added = c.execute(
+                "INSERT INTO ssh_keys(user_id, title, key, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(fingerprint) DO NOTHING",
+                rusqlite::params![uid, title, key, fp2, at],
+            )?;
+            if added == 0 {
+                return Err(AppError::conflict("That key is already in use. Each SSH key can belong to one account only."));
+            }
+            Ok(json!({ "id": c.last_insert_rowid(), "title": title, "fingerprint": fp2, "created_at": at, "last_used": null }))
+        })
+        .await?;
+    record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "ssh_key_added", detail: fp, ip: &ip.0 }).await;
+    Ok(Json(row))
+}
+
+pub async fn delete_ssh_key(State(st): State<AppState>, Sudo(u): Sudo, ip: ClientIp, Path(id): Path<i64>) -> J<serde_json::Value> {
+    let uid = u.id;
+    let gone: Option<String> = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row("DELETE FROM ssh_keys WHERE id = ?1 AND user_id = ?2 RETURNING fingerprint", [id, uid], |r| r.get(0))
+                .optional()?)
+        })
+        .await?;
+    match gone {
+        Some(fp) => record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "ssh_key_deleted", detail: fp, ip: &ip.0 }).await,
+        None => return Err(AppError::not_found()),
+    }
+    ok()
+}
+
 #[derive(Serialize)]
 pub struct EventOut {
     kind: String,

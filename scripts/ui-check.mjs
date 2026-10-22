@@ -128,6 +128,18 @@ if ((await ctx.request.get(BASE + '/api/repos/alice/media')).ok()) pages.push(['
 for (const [p, e] of pages) await visit(ctx, p, e);
 await visit(ctx, '/alice/hello/pull/2/files', ['src/lib.rs'], { dark: true });
 
+// Git over SSH (e2e.sh turns it on and adds a key): the key is listed, and the clone menu offers the SSH URL.
+if ((await (await ctx.request.get(BASE + '/api/me/ssh-keys')).json()).keys.length) {
+  await visit(ctx, '/settings/ssh', ['SSH keys', 'e2e ssh', 'SHA256:', 'last used']);
+  const page = await ctx.newPage();
+  await page.goto(BASE + '/alice/hello', { waitUntil: 'networkidle' });
+  await page.click('#clone-btn');
+  const url = await page.locator('#ssh-url').inputValue({ timeout: 5000 }).catch(() => '');
+  if (!url.startsWith('ssh://git@') || !url.endsWith('/alice/hello.git')) { failed++; console.log('✗ clone menu SSH URL', { url }); }
+  else console.log('  ok SSH keys are listed, and the clone menu offers the SSH URL');
+  await page.close();
+}
+
 // Signed commits (e2e.sh pushes one when ssh-keygen is installed): the key is listed in
 // settings; the list, the commit page and blame show Verified, and the badge says why.
 if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.length) {

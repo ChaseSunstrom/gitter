@@ -246,25 +246,32 @@ pub fn server_key(data_dir: &std::path::Path) -> std::io::Result<[u8; 32]> {
     }
     let mut k = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut k);
-    std::fs::create_dir_all(data_dir)?;
-    // Written whole to a temp file, then linked into place (never over an existing key),
-    // so a crash or a full disk can't leave a short key behind.
-    let tmp = data_dir.join(format!(".key-{}.tmp", hex::encode(&k[..6])));
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    let mut f = o.open(&tmp)?;
-    std::io::Write::write_all(&mut f, &k)?;
-    f.sync_all()?;
-    let linked = std::fs::hard_link(&tmp, &p);
-    let _ = std::fs::remove_file(&tmp);
-    match linked {
+    match write_new_secret(&p, &k) {
         Ok(()) => Ok(k),
         // Another process made it first: use theirs.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => server_key(data_dir),
         Err(e) => Err(e),
     }
+}
+
+/// Create the private file `p` holding `bytes`, never over an existing one
+/// (AlreadyExists then). Written whole to a temp file and linked into place,
+/// so a crash or a full disk can't leave a short secret behind.
+pub fn write_new_secret(p: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = p.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut r = [0u8; 6];
+    rand::rngs::OsRng.fill_bytes(&mut r);
+    let tmp = dir.join(format!(".key-{}.tmp", hex::encode(r)));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(&tmp)?;
+    let written = std::io::Write::write_all(&mut f, bytes).and_then(|_| f.sync_all());
+    let linked = written.and_then(|_| std::fs::hard_link(&tmp, p));
+    let _ = std::fs::remove_file(&tmp);
+    linked
 }
 
 /// Encrypt with ChaCha20-Poly1305: a random nonce followed by the ciphertext.

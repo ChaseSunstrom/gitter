@@ -65,6 +65,7 @@ function emptyRepo(meta) {
       <div class="row wrap-ok">
         <input class="input mono" readonly value="${url}" style="max-width:520px" aria-label="Clone URL">
         <button class="btn" data-copy="${url}" data-copy-label="Clone URL copied">${icon('copy', 'sm')} Copy</button>
+        ${meta.ssh_url ? html`<button class="btn" data-copy="${meta.ssh_url}" data-copy-label="SSH URL copied">${icon('copy', 'sm')} Copy SSH URL</button>` : ''}
         ${meta.can_write ? html`<a class="btn" href="${base}/new/main">${icon('file', 'sm')} Create a file</a><a class="btn" href="${base}/upload/main">${icon('upload', 'sm')} Upload files</a>` : ''}
       </div>
       <div class="setup-grid">

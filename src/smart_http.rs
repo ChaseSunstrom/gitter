@@ -136,6 +136,85 @@ async fn serve(
     }
 }
 
+// ---------- shared by git over HTTP and git over SSH (`crate::ssh`) ----------
+
+/// Count a transfer starting from `ip` and take one of its slots: HTTP and SSH share both limits.
+pub fn start(st: &AppState, ip: &str) -> Result<Slot, AppError> {
+    if let Err(wait) = st.limiter.check(&format!("git:{}", crate::auth::ip_bucket(ip)), TRANSFER_STARTS_PER_MIN, 60) {
+        return Err(AppError::slow_down("Too many git requests from your network. Try again shortly.", wait));
+    }
+    Slot::take(st, ip).ok_or_else(|| AppError::slow_down("Too many git transfers running from your network. Try again when one finishes.", 10))
+}
+
+/// The repository a git client asked for, if `user` may read it (and push to
+/// it, for a push). `find`: a renamed or transferred repository is served at
+/// its old URL too. No read access is a 404, like a repository that isn't there.
+pub async fn open(st: &AppState, user: Option<&User>, owner: &str, name: &str, push: bool) -> Result<Repo, AppError> {
+    let not_found = || AppError::new(StatusCode::NOT_FOUND, "Repository not found");
+    let repo = match Repo::find(st, user, owner, name).await {
+        Ok(r) => r,
+        Err(e) if e.status == StatusCode::NOT_FOUND => return Err(not_found()),
+        Err(e) => return Err(e),
+    };
+    if !repo.can_read {
+        return Err(not_found());
+    }
+    if push && !repo.can_write {
+        return Err(AppError::new(StatusCode::FORBIDDEN, "You don't have push access to this repository"));
+    }
+    Ok(repo)
+}
+
+/// Before a push runs: the per-account write rate (a push is a change like any
+/// other), then the refs as they are, for `after_push` to compare with.
+pub async fn before_push(st: &AppState, repo: &Repo, user: Option<&User>) -> Result<HashMap<String, String>, AppError> {
+    let rate = st.settings.get().write_rate_per_min;
+    if rate > 0
+        && let Some(u) = user.filter(|u| !u.is_admin)
+        && let Err(wait) = st.limiter.check(&format!("write:{}", u.id), rate, 60)
+    {
+        return Err(AppError::slow_down("You're pushing very often. Wait a moment and try again.", wait));
+    }
+    ref_map(st, repo).await
+}
+
+/// The biggest pack git may take now: the site's push limit, or what the
+/// owner has left (git itself refuses a bigger pack, so nothing is half-written).
+pub async fn push_limit(st: &AppState, repo: &Repo, push: bool) -> Result<u64, AppError> {
+    let max_push = st.settings.get().max_push_bytes();
+    if !push {
+        return Ok(max_push);
+    }
+    match crate::repo::storage_left(st, repo.owner_id).await? {
+        Some(0) => Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "This account is out of storage. Delete something, or ask the site admin for more space.",
+        )),
+        Some(left) => Ok(max_push.min(left)),
+        None => Ok(max_push),
+    }
+}
+
+/// `git` set up for a transfer; callers add the service and its arguments.
+pub fn transfer_command(st: &AppState, max_push: u64) -> tokio::process::Command {
+    let mut cmd = st.git.command(None);
+    // The current push limit overrides whatever was stored when the repo was created.
+    cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
+    cmd
+}
+
+/// A refusal from the shared checks as git over HTTP says it: anonymous
+/// clients are asked to sign in instead of hearing what exists.
+fn refuse(e: AppError, anonymous: bool) -> Response {
+    if anonymous && matches!(e.status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN) {
+        return challenge();
+    }
+    match e.retry_after {
+        Some(wait) => too_many(&e.msg, wait),
+        None => plain(e.status, &e.msg),
+    }
+}
+
 async fn serve_inner(
     st: AppState,
     owner: String,
@@ -146,42 +225,15 @@ async fn serve_inner(
 ) -> Result<Response, AppError> {
     let headers = req.headers().clone();
     let ip = crate::api::client_ip(&st, &headers, req.extensions());
-    if let Err(wait) = st.limiter.check(&format!("git:{}", crate::auth::ip_bucket(&ip)), TRANSFER_STARTS_PER_MIN, 60) {
-        return Ok(too_many("Too many git requests from your network. Try again shortly.", wait));
-    }
-    let Some(slot) = Slot::take(&st, &ip) else {
-        return Ok(too_many("Too many git transfers running from your network. Try again when one finishes.", 10));
+    let slot = match start(&st, &ip) {
+        Ok(s) => s,
+        Err(e) => return Ok(refuse(e, false)),
     };
     let user = user_by_basic(&st, &headers, &ip).await?;
-    // `find`: a renamed or transferred repository is served at its old URL too.
-    let repo = match Repo::find(&st, user.as_ref(), &owner, &name).await {
+    let repo = match open(&st, user.as_ref(), &owner, &name, push).await {
         Ok(r) => r,
-        Err(e) if e.status == StatusCode::NOT_FOUND => {
-            return Ok(if user.is_none() {
-                challenge()
-            } else {
-                plain(StatusCode::NOT_FOUND, "Repository not found")
-            });
-        }
-        Err(e) => return Err(e),
+        Err(e) => return Ok(refuse(e, user.is_none())),
     };
-    if !repo.can_read {
-        return Ok(if user.is_none() {
-            challenge()
-        } else {
-            plain(StatusCode::NOT_FOUND, "Repository not found")
-        });
-    }
-    if push && !repo.can_write {
-        return Ok(if user.is_none() {
-            challenge()
-        } else {
-            plain(
-                StatusCode::FORBIDDEN,
-                "You don't have push access to this repository",
-            )
-        });
-    }
 
     let is_post = req.method() == Method::POST;
     // A clone or fetch starts with this advertisement; CI runners fetching a job don't count.
@@ -191,39 +243,21 @@ async fn serve_inner(
     {
         st.traffic.record(repo.id, "clone", &ip, None, None);
     }
-    // A push is a change like any other for the per-account rate limit.
-    let rate = st.settings.get().write_rate_per_min;
-    if push
-        && is_post
-        && rate > 0
-        && let Some(u) = user.as_ref().filter(|u| !u.is_admin)
-        && let Err(wait) = st.limiter.check(&format!("write:{}", u.id), rate, 60)
-    {
-        return Ok(too_many("You're pushing very often. Wait a moment and try again.", wait));
-    }
     let before = if push && is_post {
-        Some(ref_map(&st, &repo).await?)
+        match before_push(&st, &repo, user.as_ref()).await {
+            Ok(b) => Some(b),
+            Err(e) => return Ok(refuse(e, false)),
+        }
     } else {
         None
     };
 
     let permit = st.git.permit_stream().await?;
-    let mut max_push = st.settings.get().max_push_bytes();
-    if push {
-        // git itself refuses a pack bigger than what the owner has left, so nothing is half-written.
-        if let Some(left) = crate::repo::storage_left(&st, repo.owner_id).await? {
-            if left == 0 {
-                return Ok(plain(
-                    StatusCode::FORBIDDEN,
-                    "This account is out of storage. Delete something, or ask the site admin for more space.",
-                ));
-            }
-            max_push = max_push.min(left);
-        }
-    }
-    let mut cmd = st.git.command(None);
-    // The current push limit overrides whatever was stored when the repo was created.
-    cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
+    let max_push = match push_limit(&st, &repo, push).await {
+        Ok(m) => m,
+        Err(e) => return Ok(refuse(e, false)),
+    };
+    let mut cmd = transfer_command(&st, max_push);
     if crate::auth::basic_secret(&headers).is_some_and(|s| s.starts_with(crate::ci::queue::JOB_TOKEN_PREFIX)) {
         // A CI runner fetches the one commit it builds (only commits a ref can reach).
         cmd.arg("-c").arg("uploadpack.allowReachableSHA1InWant=true");
@@ -421,7 +455,8 @@ pub struct RefUpdate {
     pub new: Option<String>,
 }
 
-async fn after_push(
+/// After a push (HTTP or SSH): record what moved and run the post-push hooks.
+pub async fn after_push(
     st: &AppState,
     repo: &Repo,
     user: &User,

@@ -227,6 +227,7 @@ pub async fn show(
         "releases": releases, "latest_release": latest_release,
         "fork_of": parent, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
+        "ssh_url": st.ssh_url.get().map(|b| format!("{b}{}/{}.git", r.owner, r.name)),
     })))
 }
 
