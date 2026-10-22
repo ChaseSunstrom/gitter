@@ -260,3 +260,145 @@ async fn discussions_and_reviews_notify_and_merges_tell_participants() {
     assert_eq!(count(&app, &bob).await, 1, "the reviewer hears of the merge");
     assert_eq!(count(&app, &alice).await, 1, "still just bob's review: the merge was alice's own");
 }
+
+/// Notifications rows for `user`, readable or not.
+async fn rows(app: &App, user: &'static str) -> i64 {
+    app.state
+        .db
+        .call(move |c| Ok(c.query_row("SELECT count(*) FROM notifications n JOIN users u ON u.id = n.user_id WHERE u.username = ?1", [user], |r| r.get(0))?))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mentions_in_indented_list_items_notify_but_indented_code_does_not() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    let dave = app.signup("dave").await;
+    ok(&app, &alice, "POST", "/api/repos", Some(json!({ "name": "p" }))).await;
+    issue(&app, &alice, "alice/p", "Plan", "- first\n    - cc @bob\n- second\n\n    more on it, @carol\n\nThen:\n\n    @dave in code").await;
+    assert_eq!(count(&app, &bob).await, 1, "a nested list item isn't code");
+    assert_eq!(count(&app, &carol).await, 1, "nor is a list item's second paragraph");
+    assert_eq!(count(&app, &dave).await, 0, "an indented code block is");
+}
+
+#[tokio::test]
+async fn a_mention_past_a_reviews_200th_line_comment_notifies() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    ok(&app, &alice, "POST", "/api/repos", Some(json!({ "name": "p", "readme": true }))).await;
+    ok(&app, &alice, "POST", "/api/repos/alice/p/contents", Some(json!({ "branch": "main", "new_branch": "f", "message": "F", "changes": [{ "path": "f.txt", "content": "x\n" }] }))).await;
+    let pr = ok(&app, &alice, "POST", "/api/repos/alice/p/pulls", Some(json!({ "title": "Add f", "head": "f", "base": "main" }))).await["number"].as_i64().unwrap();
+    let line = |body: &str| json!({ "path": "f.txt", "side": "new", "line": 1, "body": body, "pending": true });
+    ok(&app, &bob, "POST", &format!("/api/repos/alice/p/pulls/{pr}/comments"), Some(line("nit"))).await;
+    // 250 more pending line comments (straight into the database: the API takes 60 in 10 minutes).
+    app.state
+        .db
+        .call(|c| {
+            for _ in 0..250 {
+                c.execute(
+                    "INSERT INTO review_comments(issue_id, review_id, author_id, path, side, line, start_line, commit_sha, original, in_reply_to, body, created_at, updated_at)
+                     SELECT issue_id, review_id, author_id, path, side, line, start_line, commit_sha, original, in_reply_to, body, created_at, updated_at
+                     FROM review_comments WHERE id = (SELECT min(id) FROM review_comments)",
+                    [],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    ok(&app, &bob, "POST", &format!("/api/repos/alice/p/pulls/{pr}/comments"), Some(line("@carol what do you think?"))).await;
+    ok(&app, &bob, "POST", &format!("/api/repos/alice/p/pulls/{pr}/reviews"), Some(json!({ "event": "comment" }))).await;
+    let items = inbox(&app, &carol, "").await;
+    assert_eq!(items.len(), 1, "the mention in the 252nd line comment");
+    assert_eq!((items[0]["number"].as_i64(), items[0]["reason"].as_str()), (Some(pr), Some("mention")));
+}
+
+#[tokio::test]
+async fn old_read_and_done_notifications_are_pruned() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    ok(&app, &alice, "POST", "/api/repos", Some(json!({ "name": "p" }))).await;
+    // (unread, done, days since its news, kept?)
+    let cases = [(0, 1, 100, false), (0, 1, 50, true), (0, 0, 200, false), (0, 0, 100, true), (1, 0, 400, true)];
+    for (i, (unread, done, days, _)) in cases.into_iter().enumerate() {
+        let n = issue(&app, &bob, "alice/p", &format!("Issue {i}"), "").await;
+        let t = gitter::db::now() - days * 86400;
+        app.state
+            .db
+            .call(move |c| Ok(c.execute("UPDATE notifications SET unread = ?1, done = ?2, updated_at = ?3 WHERE issue_id = (SELECT id FROM issues WHERE number = ?4)", [unread, done, t, n])?))
+            .await
+            .unwrap();
+    }
+    assert_eq!(rows(&app, "alice").await, 5);
+    // One far along the ids: the sweep goes 10,000 ids at a time and must reach it.
+    app.state
+        .db
+        .call(|c| Ok(c.execute("UPDATE notifications SET id = id + 25000 WHERE issue_id = (SELECT id FROM issues WHERE title = 'Issue 2')", [])?))
+        .await
+        .unwrap();
+    assert_eq!(gitter::api::notifications::sweep(&app.state).await.unwrap(), 2);
+    let left: Vec<String> = app
+        .state
+        .db
+        .call(|c| Ok(c.prepare("SELECT i.title FROM notifications n JOIN issues i ON i.id = n.issue_id ORDER BY i.number")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?))
+        .await
+        .unwrap();
+    let kept: Vec<String> = cases.iter().enumerate().filter(|(_, c)| c.3).map(|(i, _)| format!("Issue {i}")).collect();
+    assert_eq!(left, kept, "done ones go after 90 days, read ones after 180, unread ones stay");
+    let facet = &ok(&app, &alice, "GET", "/api/notifications", None).await["repos"];
+    assert_eq!(facet, &json!([{ "repo": "alice/p", "count": 2, "unread": 1 }]), "the repository facet counts open ones");
+    assert_eq!(gitter::api::notifications::sweep(&app.state).await.unwrap(), 0, "a second sweep finds nothing");
+}
+
+#[tokio::test]
+async fn hidden_issues_and_suspended_accounts_never_notify() {
+    let app = App::new();
+    let alice = app.signup("alice").await; // the first account: an admin
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    let dave = app.signup("dave").await;
+    ok(&app, &alice, "POST", "/api/repos", Some(json!({ "name": "p" }))).await;
+
+    // A moderator hides bob's issue: only bob and admins see it now, so only they hear of it.
+    let n = issue(&app, &bob, "alice/p", "Spam", "").await;
+    comment(&app, &carol, "alice/p", n, "Hm").await;
+    app.state.db.call(move |c| Ok(c.execute("UPDATE issues SET hidden = 1 WHERE number = ?1", [n])?)).await.unwrap();
+    ok(&app, &alice, "POST", "/api/notifications/read", Some(json!({}))).await;
+    comment(&app, &bob, "alice/p", n, "@dave @carol look").await;
+    assert_eq!(rows(&app, "carol").await, 0, "a participant who can't see it any more");
+    assert_eq!(rows(&app, "dave").await, 0, "nor someone mentioned");
+    assert_eq!(count(&app, &alice).await, 1, "the owner, an admin, still can");
+
+    // A suspended account hears of nothing, its own threads and mentions included.
+    let m = issue(&app, &dave, "alice/p", "Ideas", "").await;
+    ok(&app, &alice, "PATCH", "/api/admin/users/dave", Some(json!({ "suspended": true }))).await;
+    comment(&app, &carol, "alice/p", m, "@dave what about this").await;
+    assert_eq!(rows(&app, "dave").await, 0);
+    assert_eq!(rows(&app, "carol").await, 0, "and carol wrote it herself");
+}
+
+#[tokio::test]
+async fn mentions_are_capped_per_author_per_hour() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let carol = app.signup("carol").await;
+    let dave = app.signup("dave").await;
+    ok(&app, &alice, "POST", "/api/repos", Some(json!({ "name": "p" }))).await;
+    let n = issue(&app, &alice, "alice/p", "Thread", "").await;
+    // 200 mentions per author per hour: four comments naming 50 people each use them up.
+    let fifty: String = (0..50).map(|i| format!("@ghost{i} ")).collect();
+    for _ in 0..4 {
+        comment(&app, &bob, "alice/p", n, &fifty).await;
+    }
+    comment(&app, &bob, "alice/p", n, "@carol too").await;
+    assert_eq!(count(&app, &carol).await, 0, "bob's mentions are used up for the hour");
+    comment(&app, &dave, "alice/p", n, "@carol").await;
+    assert_eq!(count(&app, &carol).await, 1, "the cap is per author");
+}
