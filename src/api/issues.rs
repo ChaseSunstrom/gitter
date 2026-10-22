@@ -38,6 +38,13 @@ pub struct IssueRow {
     labels: Vec<Label>,
     head: Option<String>,
     base: Option<String>,
+    /// From a fork: "owner/name" of that fork (null once it's gone, or for a same-repository PR).
+    head_repo: Option<String>,
+    /// Where the head is here: refs/heads/<branch>, or refs/pull/<n>/head for a PR from a fork.
+    #[serde(skip)]
+    pub(crate) head_ref: Option<String>,
+    #[serde(skip)]
+    pub(crate) from_fork: bool,
     /// Hidden by a moderator: shown only to its author and admins.
     hidden: bool,
     /// The agent token that opened it for `author`, if one did.
@@ -58,7 +65,10 @@ const ISSUE_SELECT: &str = "SELECT i.id, i.number, i.title, i.body, i.state, i.i
         SELECT 1 FROM reviews x WHERE x.issue_id = v.issue_id AND x.author_id = v.author_id AND x.state IN ('approved', 'changes_requested')
         AND (x.submitted_at > v.submitted_at OR (x.submitted_at = v.submitted_at AND x.id > v.id)))) THEN 'changes_requested'
     WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.issue_id = i.id AND v.state = 'approved') THEN 'approved' END,
-    i.agent, ms.number, ms.title
+    i.agent, ms.number, ms.title,
+    CASE WHEN p.from_fork = 1 THEN 'refs/pull/' || i.number || '/head' ELSE 'refs/heads/' || p.head_branch END,
+    (SELECT hu.username || '/' || hr.name FROM repos hr JOIN users hu ON hu.id = hr.owner_id WHERE hr.id = p.head_repo_id AND p.from_fork = 1),
+    coalesce(p.from_fork, 0)
     FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id LEFT JOIN milestones ms ON ms.id = i.milestone_id";
 
 fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
@@ -86,7 +96,115 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
             .map(|n| r.get::<_, String>(18).map(|t| json!({ "number": n, "title": t })))
             .transpose()?,
         assignees: vec![],
+        head_ref: r.get(19)?,
+        head_repo: r.get(20)?,
+        from_fork: r.get::<_, i64>(21)? != 0,
     })
+}
+
+/// The ref holding a pull request's head here: its branch, or for one from a fork,
+/// the copy of the fork's branch.
+pub fn head_ref(number: i64, head_branch: &str, from_fork: bool) -> String {
+    if from_fork { format!("refs/pull/{number}/head") } else { format!("refs/heads/{head_branch}") }
+}
+
+/// Copy a fork's branch into repository `base_id` as `dest` (a pull request's head, or a ref of
+/// the moment), within its owner's storage. Some(sha) when the branch is there.
+pub async fn fetch_branch(st: &AppState, base_id: i64, fork: &std::path::Path, branch: &str, dest: &str) -> R<Option<String>> {
+    let base = st.git.repo_path(base_id);
+    let owner: i64 = st.db.call(move |c| Ok(c.query_row("SELECT owner_id FROM repos WHERE id = ?1", [base_id], |r| r.get(0))?)).await?;
+    let left = crate::repo::storage_left(st, owner).await?;
+    if left == Some(0) {
+        return Err(AppError::bad("This repository's owner is out of storage, so nothing more is copied in"));
+    }
+    let mut cmd = st.git.command(Some(&base));
+    cmd.args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", &fork.to_string_lossy(), &format!("+refs/heads/{branch}:{dest}")]);
+    match crate::mirrors::exec(st, cmd, left.map(|l| (base.as_path(), l))).await {
+        Ok(()) => {}
+        // ponytail: exec reports its own stop (storage, time) as text starting "Stopped"; any other failure is a missing branch.
+        Err(e) if e.starts_with("Stopped") => return Err(AppError::bad(e)),
+        Err(_) => return Ok(None),
+    }
+    crate::hooks::refresh_size(st, base_id).await;
+    st.git.resolve(&base, dest).await
+}
+
+/// A reopened pull request from a fork catches up with its branch (it stops following while closed).
+async fn refresh_fork_head(st: &AppState, r: &Repo, issue: &IssueRow) {
+    if !issue.from_fork {
+        return;
+    }
+    let iid = issue.id;
+    let found = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row("SELECT p.head_repo_id, p.head_branch FROM pulls p JOIN repos h ON h.id = p.head_repo_id AND h.deleted_at IS NULL WHERE p.issue_id = ?1", [iid], |x| {
+                Ok((x.get::<_, i64>(0)?, x.get::<_, String>(1)?))
+            })
+            .optional()?)
+        })
+        .await;
+    if let Ok(Some((fid, branch))) = found
+        && let Err(e) = fetch_branch(st, r.id, &st.git.repo_path(fid), &branch, &format!("refs/pull/{}/head", issue.number)).await
+    {
+        eprintln!("forks: {}#{}: {}", r.full_name(), issue.number, e.msg);
+    }
+}
+
+/// After a push to `repo`: open pull requests from its pushed branches into other repositories
+/// (it's their fork) take the new commits.
+pub async fn sync_fork_pulls(st: &AppState, repo: &Repo, updates: &[crate::smart_http::RefUpdate]) {
+    let branches: Vec<String> = updates.iter().filter(|u| u.new.is_some()).filter_map(|u| u.refname.strip_prefix("refs/heads/").map(String::from)).collect();
+    if branches.is_empty() {
+        return;
+    }
+    let rid = repo.id;
+    let prs: Vec<(i64, i64, String)> = st
+        .db
+        .call(move |c| {
+            let mut q = c.prepare(
+                "SELECT i.repo_id, i.number, p.head_branch FROM pulls p JOIN issues i ON i.id = p.issue_id
+                 WHERE p.from_fork = 1 AND p.head_repo_id = ?1 AND i.state = 'open'",
+            )?;
+            Ok(q.query_map([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap_or_default();
+    for (base_id, number, branch) in prs.into_iter().filter(|p| branches.contains(&p.2)) {
+        if let Err(e) = fetch_branch(st, base_id, &repo.path, &branch, &format!("refs/pull/{number}/head")).await {
+            eprintln!("forks: pull {number} of repository {base_id}: {}", e.msg);
+        }
+        crate::mergequeue::kick(st, base_id);
+    }
+}
+
+/// Branches of `fork` that `u` may push to without write access there: those with an open
+/// pull request into a repository `u` can write to, whose author allowed edits from maintainers
+/// and can still write to `fork` (a grant only counts from someone who could push there).
+pub async fn maintainer_branches(st: &AppState, fork: &Repo, u: &crate::auth::User) -> R<Vec<String>> {
+    let fid = fork.id;
+    let prs: Vec<(String, String, String, i64)> = st
+        .db
+        .call(move |c| {
+            let mut q = c.prepare(
+                "SELECT p.head_branch, bu.username, b.name, i.author_id FROM pulls p JOIN issues i ON i.id = p.issue_id
+                 JOIN repos b ON b.id = i.repo_id JOIN users bu ON bu.id = b.owner_id
+                 WHERE p.from_fork = 1 AND p.head_repo_id = ?1 AND p.maintainer_can_modify = 1 AND i.state = 'open' AND b.deleted_at IS NULL",
+            )?;
+            Ok(q.query_map([fid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?)
+        })
+        .await?;
+    let mut out = vec![];
+    for (branch, owner, name, author) in prs {
+        if out.contains(&branch) || !Repo::readable(st, Some(u), &owner, &name).await.is_ok_and(|b| b.can_write) {
+            continue;
+        }
+        let Some(author) = crate::auth::user_by_id(&st.db, author).await? else { continue };
+        if Repo::readable(st, Some(&author), &fork.owner, &fork.name).await.is_ok_and(|f| f.can_write) {
+            out.push(branch);
+        }
+    }
+    Ok(out)
 }
 
 /// Fill in the labels and assignees of `items`.
@@ -432,7 +550,7 @@ pub(super) async fn pull_shas(st: &AppState, r: &Repo, issue: &IssueRow) -> R<(S
         .db
         .call(move |c| Ok(c.query_row("SELECT head_branch, base_branch, head_sha, base_sha FROM pulls WHERE issue_id = ?1", [iid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
         .await?;
-    let head = st.git.resolve(&r.path, &format!("refs/heads/{head_b}")).await?;
+    let head = st.git.resolve(&r.path, &head_ref(issue.number, &head_b, issue.from_fork)).await?;
     let base = st.git.resolve(&r.path, &format!("refs/heads/{base_b}")).await?;
     Ok(if issue.state == "open" { (head_b, head.or(head0), base.or(base0)) } else { (head_b, head0.or(head), base0.or(base)) })
 }
@@ -452,10 +570,7 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
             )?)
         })
         .await?;
-    let head = st
-        .git
-        .resolve(&r.path, &format!("refs/heads/{head_b}"))
-        .await?;
+    let head = st.git.resolve(&r.path, &head_ref(issue.number, &head_b, issue.from_fork)).await?;
     let base = st
         .git
         .resolve(&r.path, &format!("refs/heads/{base_b}"))
@@ -474,7 +589,13 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
     };
     let mut status = json!({ "head": head_b, "base": base_b, "head_sha": show_head,
         "base_sha": show_base, "merged_sha": merged_sha, "merged_by": merged_by, "merged_at": merged_at,
-        "head_exists": head.is_some(), "base_exists": base.is_some() });
+        "head_exists": head.is_some(), "base_exists": base.is_some(), "from_fork": issue.from_fork, "head_repo": issue.head_repo });
+    if issue.from_fork {
+        let iid3 = iid;
+        let m: bool = st.db.call(move |c| Ok(c.query_row("SELECT maintainer_can_modify FROM pulls WHERE issue_id = ?1", [iid3], |x| x.get(0))?)).await?;
+        status["maintainer_can_modify"] = json!(m);
+        status["ci_note"] = json!("CI doesn't start on its own for pull requests from forks: their code would run with this repository's secrets.");
+    }
     if issue.state != "open" {
         return Ok(status);
     }
@@ -649,6 +770,9 @@ pub async fn update(
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, "edited").await;
     }
     if let Some(s) = new_state {
+        if s == "open" {
+            refresh_fork_head(&st, &r, &issue).await;
+        }
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
         notify(&st, r.id, Thread::Issue(issue.id), u.id, "").await;
     }
@@ -732,6 +856,9 @@ pub async fn comment(
         crate::webhooks::comment(&st, r.id, u.id, id, "created").await;
     }
     if let Some(s) = new_state {
+        if s == "open" {
+            refresh_fork_head(&st, &r, &issue).await;
+        }
         crate::webhooks::issue(&st, r.id, u.id, num, issue.is_pr, if s == "closed" { "closed" } else { "reopened" }).await;
     }
     notify(&st, r.id, Thread::Issue(iid), u.id, &text).await;
@@ -900,6 +1027,25 @@ pub struct PullReq {
     body: String,
     head: String,
     base: String,
+    /// "owner/name" of a fork (or the repository this one was forked from) the head branch is in.
+    #[serde(default)]
+    head_repo: Option<String>,
+    /// From a fork: people with write access here may push to that branch of the fork.
+    #[serde(default)]
+    maintainer_can_modify: bool,
+}
+
+/// The repository a pull request's head comes from, when it isn't this one: readable by `u`,
+/// and in the same family (this repository's fork, the one it was forked from, or a sibling fork).
+pub(crate) async fn head_repo(st: &AppState, r: &Repo, u: Option<&crate::auth::User>, name: Option<&str>) -> R<Option<Repo>> {
+    let Some(full) = name.map(str::trim).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&r.full_name())) else { return Ok(None) };
+    let (o, n) = full.split_once('/').ok_or_else(|| AppError::bad("Name the head repository as owner/name"))?;
+    let h = Repo::readable(st, u, o, n).await?;
+    let family = h.forked_from == Some(r.id) || r.forked_from == Some(h.id) || (h.forked_from.is_some() && h.forked_from == r.forked_from);
+    if !family || h.id == r.id {
+        return Err(AppError::bad(format!("{full} isn't a fork of {} (or the repository it was forked from)", r.full_name())));
+    }
+    Ok(Some(h))
 }
 
 pub async fn create_pull(
@@ -913,49 +1059,37 @@ pub async fn create_pull(
     if !validate::ref_name(&req.head) || !validate::ref_name(&req.base) {
         return Err(AppError::bad("Pick two branches"));
     }
-    if req.head == req.base {
+    let fork = head_repo(&st, &r, Some(&u), req.head_repo.as_deref()).await?;
+    if req.head == req.base && fork.is_none() {
         return Err(AppError::bad("Pick two different branches"));
     }
-    let head = st
-        .git
-        .resolve(&r.path, &format!("refs/heads/{}", req.head))
-        .await?
-        .ok_or_else(|| AppError::bad("The source branch doesn't exist"))?;
     let base = st
         .git
         .resolve(&r.path, &format!("refs/heads/{}", req.base))
         .await?
         .ok_or_else(|| AppError::bad("The target branch doesn't exist"))?;
-    if st.git.count(&r.path, &format!("{base}..{head}")).await? == 0 {
-        return Err(AppError::bad(format!(
-            "{} has nothing that {} doesn't already have",
-            req.head, req.base
-        )));
+    if fork.as_ref().is_some_and(|f| f.private && !f.can_write) {
+        // Its commits would be copied here, for this repository's readers to see.
+        return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "Only someone who can push to a private fork opens pull requests from it"));
     }
-    let (rid, uid) = (r.id, u.id);
-    let agent = u.agent().map(|a| a.name.clone());
-    let (title, body) = (req.title.clone(), req.body.clone());
-    let (head_branch, base_branch) = (req.head.clone(), req.base.clone());
-    let (id, num) = st
-        .db
-        .call(move |c| {
-            let tx = c.transaction()?;
-            let dup: Option<i64> = tx
-                .query_row(
-                    "SELECT i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.state = 'open' AND p.head_branch = ?2 AND p.base_branch = ?3",
-                    rusqlite::params![rid, req.head, req.base],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(d) = dup {
-                return Err(AppError::conflict(format!("Pull request #{d} is already open for these branches")));
-            }
-            let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, true, agent.as_deref())?;
-            tx.execute("INSERT INTO pulls(issue_id, head_branch, base_branch) VALUES (?1, ?2, ?3)", rusqlite::params![id, req.head, req.base])?;
-            tx.commit()?;
-            Ok((id, num))
-        })
-        .await?;
+    // In a task of its own, so a client that goes away can't leave the copy behind (or a pull request without its head).
+    let (st2, r2, u2) = (st.clone(), r.clone(), u.clone());
+    let opened = tokio::spawn(async move {
+        // A fork's commits are copied here (a ref of their own until the pull request has a number) to compare.
+        let pending = format!("refs/pull/new-{}/head", crate::auth::new_secret("").0.replace(['-', '_'], "x"));
+        let head = match &fork {
+            Some(f) => fetch_branch(&st2, r2.id, &f.path, &req.head, &pending).await,
+            None => st2.git.resolve(&r2.path, &format!("refs/heads/{}", req.head)).await,
+        };
+        let opened = open_pull(&st2, &r2, &u2, req, fork.as_ref(), head, &base).await;
+        if fork.is_some() {
+            let _ = st2.git.delete_ref(&r2.path, &pending).await;
+        }
+        opened
+    })
+    .await
+    .map_err(AppError::internal)?;
+    let (id, num, title, body, head_branch, base_branch, from_fork) = opened?;
     record_event(
         &st.db,
         u.id,
@@ -968,10 +1102,92 @@ pub async fn create_pull(
     .await?;
     crate::webhooks::issue(&st, r.id, u.id, num, true, "opened").await;
     notify(&st, r.id, Thread::Issue(id), u.id, &body).await;
-    if let Err(e) = crate::ci::trigger::on_pull_opened(&st, &r, u.id, num, &head_branch, &base_branch).await {
+    // A fork's code doesn't run here on its own (it would get this repository's secrets).
+    if !from_fork && let Err(e) = crate::ci::trigger::on_pull_opened(&st, &r, u.id, num, &head_branch, &base_branch).await {
         eprintln!("ci: {}#{num}: {}", r.full_name(), e.msg);
     }
     Ok(Json(json!({ "number": num })))
+}
+
+type Opened = (i64, i64, String, String, String, String, bool);
+
+/// The pull request's row (and, from a fork, its head ref), once its head is known.
+async fn open_pull(st: &AppState, r: &Repo, u: &crate::auth::User, req: PullReq, fork: Option<&Repo>, head: R<Option<String>>, base: &str) -> R<Opened> {
+    let head = head?.ok_or_else(|| AppError::bad("The source branch doesn't exist"))?;
+    if st.git.count(&r.path, &format!("{base}..{head}")).await? == 0 {
+        return Err(AppError::bad(format!(
+            "{} has nothing that {} doesn't already have",
+            req.head, req.base
+        )));
+    }
+    let (rid, uid) = (r.id, u.id);
+    let (from_fork, fork_id, edits) = (fork.is_some(), fork.map(|f| f.id), fork.is_some_and(|f| f.can_write) && req.maintainer_can_modify);
+    let agent = u.agent().map(|a| a.name.clone());
+    let (title, body) = (req.title.clone(), req.body.clone());
+    let (head_branch, base_branch) = (req.head.clone(), req.base.clone());
+    let created = st
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let dup: Option<i64> = tx
+                .query_row(
+                    "SELECT i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.state = 'open' AND p.head_branch = ?2 AND p.base_branch = ?3
+                     AND p.from_fork = ?4 AND p.head_repo_id IS ?5",
+                    rusqlite::params![rid, req.head, req.base, from_fork, fork_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(d) = dup {
+                return Err(AppError::conflict(format!("Pull request #{d} is already open for these branches")));
+            }
+            let (id, num) = insert_issue(&tx, rid, uid, &req.title, &req.body, true, agent.as_deref())?;
+            tx.execute(
+                "INSERT INTO pulls(issue_id, head_branch, base_branch, from_fork, head_repo_id, maintainer_can_modify) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, req.head, req.base, from_fork, fork_id, edits],
+            )?;
+            tx.commit()?;
+            Ok((id, num))
+        })
+        .await;
+    let (id, num) = created?;
+    if from_fork {
+        let upd = st.git.run(&r.path, &["update-ref", &format!("refs/pull/{num}/head"), &head], None, &[]).await;
+        if !upd.as_ref().is_ok_and(|o| o.code == 0) {
+            // No pull request without its head: take the row back.
+            let _ = st.db.call(move |c| Ok(c.execute("DELETE FROM issues WHERE id = ?1", [id])?)).await;
+            return Err(AppError::internal(format!("pull request head: {}", upd.map_or_else(|e| e.msg, |o| o.text()))));
+        }
+    }
+    Ok((id, num, title, body, head_branch, base_branch, from_fork))
+}
+
+#[derive(Deserialize)]
+pub struct PullUpdate {
+    maintainer_can_modify: Option<bool>,
+}
+
+/// The author of a pull request from a fork allows (or stops) edits from maintainers.
+pub async fn update_pull(State(st): State<AppState>, Authed(u): Authed, Path((o, n, num)): Path<(String, String, i64)>, Json(req): Json<PullUpdate>) -> J<serde_json::Value> {
+    let r = Repo::readable(&st, Some(&u), &o, &n).await?;
+    let issue = load_issue(&st, &r, num, Some(&u)).await?;
+    if !issue.is_pr {
+        return Err(AppError::not_found());
+    }
+    if let Some(m) = req.maintainer_can_modify {
+        if issue.author_id != u.id {
+            return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "Only the pull request's author decides whether maintainers may push to it"));
+        }
+        if !issue.from_fork {
+            return Err(AppError::bad("Only a pull request from a fork has that setting"));
+        }
+        let fork = issue.head_repo.as_deref().and_then(|h| h.split_once('/')).unwrap_or_default();
+        if m && !Repo::readable(&st, Some(&u), fork.0, fork.1).await.is_ok_and(|f| f.can_write) {
+            return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "Only someone who can push to the fork can let maintainers push to it"));
+        }
+        let iid = issue.id;
+        st.db.call(move |c| Ok(c.execute("UPDATE pulls SET maintainer_can_modify = ?2 WHERE issue_id = ?1", rusqlite::params![iid, m])?)).await?;
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 pub async fn pull_diff(
@@ -1063,6 +1279,8 @@ pub(crate) struct MergePlan {
     pub head: String,
     pub base: String,
     pub new_sha: String,
+    /// From a fork: its branch is the fork's, never deleted here.
+    pub from_fork: bool,
 }
 
 /// Check a merge may happen and make its commit (nothing moves yet). `queued`:
@@ -1083,7 +1301,7 @@ pub(crate) async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User
     );
     let head = st
         .git
-        .resolve(&r.path, &format!("refs/heads/{head_b}"))
+        .resolve(&r.path, issue.head_ref.as_deref().unwrap_or_default())
         .await?
         .ok_or_else(|| AppError::conflict("The source branch is gone"))?;
     let base = st
@@ -1169,13 +1387,13 @@ pub(crate) async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User
         }
         _ => return Err(AppError::bad("Unknown merge method")),
     };
-    Ok(MergePlan { issue_id: issue.id, num, title: issue.title, head_b, base_b, head, base, new_sha })
+    Ok(MergePlan { issue_id: issue.id, num, title: issue.title, head_b, base_b, head, base, new_sha, from_fork: issue.from_fork })
 }
 
 /// Move the base branch to the plan's commit (only if it's still where the plan
 /// found it) and record the pull request as merged by `u`.
 pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: MergePlan, delete_branch: bool) -> R<()> {
-    let MergePlan { issue_id, num, title, head_b, base_b, head, base, new_sha } = plan;
+    let MergePlan { issue_id, num, title, head_b, base_b, head, base, new_sha, from_fork } = plan;
     // Move the branch and record the merge in a task of its own, so a client
     // that disconnects halfway can't leave the branch moved and the PR open.
     let (st2, path, full) = (st.clone(), r.path.clone(), r.full_name());
@@ -1225,7 +1443,7 @@ pub(crate) async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, p
     crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
     notify(st, r.id, Thread::Issue(issue_id), u.id, "").await;
     crate::hooks::on_push(st, r, u, &[upd]).await;
-    if delete_branch && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
+    if delete_branch && !from_fork && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
         let _ = st
             .git
             .delete_ref(&r.path, &format!("refs/heads/{head_b}"))

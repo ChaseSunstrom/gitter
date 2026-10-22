@@ -200,7 +200,8 @@ pub async fn set_auto_merge(State(st): State<AppState>, Authed(u): Authed, Path(
         .call(move |c| {
             let Some((head, base)) = c
                 .query_row(
-                    "SELECT p.head_branch, p.base_branch FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.number = ?2 AND i.is_pr = 1 AND i.state = 'open'",
+                    "SELECT CASE WHEN p.from_fork = 1 THEN 'refs/pull/' || i.number || '/head' ELSE 'refs/heads/' || p.head_branch END, p.base_branch
+                     FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.number = ?2 AND i.is_pr = 1 AND i.state = 'open'",
                     params![id, num],
                     |x| Ok((x.get::<_, String>(0)?, x.get::<_, String>(1)?)),
                 )
@@ -216,7 +217,7 @@ pub async fn set_auto_merge(State(st): State<AppState>, Authed(u): Authed, Path(
     if queued {
         return Err(AppError::conflict("This branch uses a merge queue: add the pull request to the queue instead"));
     }
-    let sha = st.git.resolve(&r.path, &format!("refs/heads/{branch}")).await?.ok_or_else(|| AppError::conflict("The source branch is gone"))?;
+    let sha = st.git.resolve(&r.path, &branch).await?.ok_or_else(|| AppError::conflict("The source branch is gone"))?;
     let n = st
         .db
         .call(move |c| {

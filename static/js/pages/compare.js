@@ -6,31 +6,42 @@ import { diffView, mountDiff } from '../diffview.js';
 import { mdEditor, mountMdEditor, clearDraft } from '../mdeditor.js';
 import { navigate } from '../main.js';
 
-function pick(meta, rest) {
+/** base...head, where head may be in a fork: "owner:branch" (a fork of the same name) or ?head_repo=owner/name. */
+function pick(meta, rest, query) {
   const [b, h] = (rest || '').split('...');
   const base = b || meta.default_branch;
-  const head = h ?? (meta.branches.find((x) => x !== base) || '');
-  return { base, head };
+  let head = h ?? '';
+  let headRepo = query?.get('head_repo') || '';
+  const m = /^([^:/]+):(.+)$/.exec(head);
+  if (m) { headRepo = headRepo || `${m[1]}/${meta.name}`; head = m[2]; }
+  if (headRepo.toLowerCase() === `${meta.owner}/${meta.name}`.toLowerCase()) headRepo = '';
+  if (!h && !headRepo) head = meta.branches.find((x) => x !== base) || '';
+  return { base, head, headRepo };
 }
+const headQ = (headRepo) => (headRepo ? `&head_repo=${enc(headRepo)}` : '');
 
 /** "fix/readme-typos" -> "Fix readme typos" */
 const humanize = (b) => { const s = b.split('/').pop().replace(/[-_]+/g, ' ').trim(); return s ? s[0].toUpperCase() + s.slice(1) : b; };
 
 export async function prefetch(ctx) {
   const meta = await get(repoUrl(ctx.params.owner, ctx.params.repo));
-  const { base, head } = pick(meta, ctx.params.rest);
-  if (head && head !== base) get(`${repoUrl(ctx.params.owner, ctx.params.repo)}/compare?base=${enc(base)}&head=${enc(head)}`);
+  const { base, head, headRepo } = pick(meta, ctx.params.rest, ctx.query);
+  if (head && (headRepo || head !== base)) get(`${repoUrl(ctx.params.owner, ctx.params.repo)}/compare?base=${enc(base)}&head=${enc(head)}${headQ(headRepo)}`);
 }
 
 export default async function (ctx) {
   const { owner, repo } = ctx.params;
   const meta = await loadRepo(owner, repo);
-  const { base, head } = pick(meta, ctx.params.rest);
+  const { base, head, headRepo } = pick(meta, ctx.params.rest, ctx.query);
   const root = `/${owner}/${repo}`;
-  const url = (b, h) => `${root}/compare/${encPath(b)}...${encPath(h)}`;
-  const same = !head || head === base;
-  const d = same ? null : await get(`${repoUrl(owner, repo)}/compare?base=${enc(base)}&head=${enc(head)}`);
-  const can = !!state.me && d && d.ahead > 0 && meta.branches.includes(head) && meta.branches.includes(base);
+  const url = (b, h, hr = headRepo) => `${root}/compare/${encPath(b)}...${encPath(h)}${hr ? `?head_repo=${enc(hr)}` : ''}`;
+  // Pull requests can come from forks of this repository, the one it was forked from, or its siblings.
+  const network = (await get(`${repoUrl(owner, repo)}/network`).catch(() => ({ repos: [] }))).repos;
+  const headMeta = headRepo ? await loadRepo(...headRepo.split('/')).catch(() => null) : meta;
+  const same = !head || (!headRepo && head === base) || !headMeta;
+  const d = same ? null : await get(`${repoUrl(owner, repo)}/compare?base=${enc(base)}&head=${enc(head)}${headQ(headRepo)}`);
+  const can = !!state.me && d && d.ahead > 0 && headMeta.branches.includes(head) && meta.branches.includes(base);
+  const parent = meta.fork_of;
   // The repository's pull request template (.gitter/pull_request_template.md) starts the description.
   const prTemplate = can ? (await get(`${repoUrl(owner, repo)}/issue-templates`).catch(() => ({}))).pull || '' : '';
   const title = d?.commits.length === 1 ? d.commits[0].subject : humanize(head || '');
@@ -39,7 +50,11 @@ export default async function (ctx) {
     ${icon('pr', 'muted')}
     <span class="muted small">base</span>${refPicker(meta, base, 'base-picker')}
     ${icon('arrow-left', 'muted')}
-    <span class="muted small">compare</span>${head ? refPicker(meta, head, 'head-picker') : html`<button class="btn sm" id="head-picker">${icon('branch', 'sm')} Choose a branch ${icon('chev-down', 'sm')}</button>`}
+    <span class="muted small">compare</span>
+    ${network.length ? html`<select class="select sm" id="head-repo" aria-label="Repository to compare from"><option value="">${owner}/${repo}</option>
+      ${network.map((r) => html`<option value="${r.full_name}" ${r.full_name.toLowerCase() === headRepo.toLowerCase() ? 'selected' : ''}>${r.full_name}</option>`)}</select>` : ''}
+    ${head && headMeta ? refPicker(headMeta, head, 'head-picker') : html`<button class="btn sm" id="head-picker">${icon('branch', 'sm')} Choose a branch ${icon('chev-down', 'sm')}</button>`}
+    ${parent && !headRepo ? html`<a class="small c-accent" id="to-parent" href="/${parent.owner}/${parent.name}/compare/...${encPath(head || meta.default_branch)}?head_repo=${enc(`${owner}/${repo}`)}">Open a pull request into ${parent.owner}/${parent.name}</a>` : ''}
     <span class="grow"></span>
     ${d ? (d.ahead > 0
       ? html`<span class="small c-green row">${icon('check', 'sm')} ${plural(d.ahead, 'commit')} ahead${d.behind ? html`, ${plural(d.behind, 'commit')} behind` : ''}</span>`
@@ -59,6 +74,7 @@ export default async function (ctx) {
     const form = can ? html`<form class="box pr-form" id="pr-form"><div class="box-body stack">
       <div class="row">${avatar(state.me.username, 32)}<input class="input lg-input" name="title" value="${title}" maxlength="256" required aria-label="Pull request title"></div>
       ${mdEditor({ id: 'pr-body', value: prTemplate, placeholder: 'Describe what this changes and why', rows: 6 })}
+      ${headRepo && headMeta?.can_write ? html`<label class="check small"><input type="checkbox" name="maintainer_can_modify" checked> Allow edits from maintainers: people who can write to ${owner}/${repo} may push to ${head} in ${headRepo}</label>` : ''}
       <div class="row" style="justify-content:flex-end"><button class="btn primary" type="submit">${icon('pr', 'sm')} Create pull request</button></div>
     </div></form>` : !state.me ? html`<div class="box"><div class="box-body row">${icon('pr')}<span class="grow">Sign in to open a pull request.</span><a class="btn primary" href="/login?next=${encodeURIComponent(location.pathname)}">Sign in</a></div></div>` : '';
     main = html`<div class="stack">
@@ -83,14 +99,19 @@ export default async function (ctx) {
     mount(el) {
       mountRepoHeader(el, meta);
       mountRefPicker(el, meta, base, (r) => url(r, head || r), 'base-picker');
-      mountRefPicker(el, meta, head || base, (r) => url(base, r), 'head-picker');
-      if (d && d.ahead > 0) mountDiff(el, d.diff, { load: (q) => get(`${repoUrl(owner, repo)}/compare?base=${enc(base)}&head=${enc(head)}&${q}`).then((x) => x.diff.files[0]) });
+      mountRefPicker(el, headMeta || meta, head || base, (r) => url(base, r), 'head-picker');
+      $('#head-repo', el)?.addEventListener('change', (e) => {
+        const r = network.find((x) => x.full_name === e.target.value);
+        navigate(r ? url(base, r.default_branch, r.full_name) : url(base, meta.branches.find((x) => x !== base) || base, ''));
+      });
+      if (d && d.ahead > 0) mountDiff(el, d.diff, { load: (q) => get(`${repoUrl(owner, repo)}/compare?base=${enc(base)}&head=${enc(head)}${headQ(headRepo)}&${q}`).then((x) => x.diff.files[0]) });
       mountMdEditor(el, { owner, repo, rev: meta.default_branch, dir: '' });
       const f = $('#pr-form', el);
       if (f) {
         const btn = f.querySelector('[type=submit]');
         f.addEventListener('submit', action(btn, async () => {
-          const r = await send('POST', `${repoUrl(owner, repo)}/pulls`, { title: f.title.value.trim(), body: $('#pr-body', f).value, head, base });
+          const r = await send('POST', `${repoUrl(owner, repo)}/pulls`, { title: f.title.value.trim(), body: $('#pr-body', f).value, head, base,
+            head_repo: headRepo || undefined, maintainer_can_modify: !!f.maintainer_can_modify?.checked });
           clearDraft('pr-body');
           navigate(`${root}/pull/${r.number}`);
         }));

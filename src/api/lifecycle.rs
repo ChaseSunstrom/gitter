@@ -750,7 +750,7 @@ fn write_tar(out: &FsPath, json_files: &[(&str, Vec<u8>)], bundles: &[(String, P
 /// `git bundle create` of every ref. False when there's nothing to bundle yet (an empty repository).
 async fn bundle(st: &AppState, repo: &FsPath, out: &FsPath) -> R<bool> {
     let dst = out.to_string_lossy().into_owned();
-    let o = st.git.run_timeout(repo, &["bundle", "create", "--quiet", &dst, "--exclude=refs/gitter-queue/*", "--all"], None, &[], Duration::from_secs(600)).await?;
+    let o = st.git.run_timeout(repo, &["bundle", "create", "--quiet", &dst, "--exclude=refs/gitter-queue/*", "--exclude=refs/gitter-compare/*", "--all"], None, &[], Duration::from_secs(600)).await?;
     if o.code == 0 {
         return Ok(true);
     }

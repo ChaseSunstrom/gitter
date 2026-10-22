@@ -699,10 +699,40 @@ pub async fn commit(
     Ok(Json(json!({ "commit": info, "diff": d })))
 }
 
+/// The repositories a pull request can come from into this one (or go to from it): the one it
+/// was forked from, that one's other forks, and its own forks, as far as the viewer can see.
+pub async fn network(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n)): Path<(String, String)>) -> J<serde_json::Value> {
+    let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
+    let (rid, parent) = (r.id, r.forked_from);
+    let vis = super::visible_params(v.as_ref());
+    let repos = st
+        .db
+        .call(move |c| {
+            let mut q = c.prepare(&format!(
+                "SELECT u.username || '/' || r.name, r.default_branch, coalesce(r.id = ?2, 0) FROM repos r JOIN users u ON u.id = r.owner_id
+                 WHERE r.id != ?1 AND (r.id = ?2 OR r.forked_from = ?1 OR (?2 IS NOT NULL AND r.forked_from = ?2)) AND {}
+                 ORDER BY coalesce(r.id = ?2, 0) DESC, u.username, r.name LIMIT 100",
+                super::VISIBLE.replace('?', "?3")
+            ))?;
+            let rows = q.query_map(rusqlite::params![rid, parent, vis[0]], |x| {
+                Ok(serde_json::json!({ "full_name": x.get::<_, String>(0)?, "default_branch": x.get::<_, String>(1)?, "parent": x.get::<_, bool>(2)? }))
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await?;
+    Ok(Json(serde_json::json!({ "repos": repos })))
+}
+
+/// Where a fork's branch is copied to be compared here: hidden from git clients and exports.
+pub const COMPARE_REFS: &str = "refs/gitter-compare";
+
 #[derive(Deserialize)]
 pub struct CompareQ {
     base: String,
     head: String,
+    /// "owner/name" of a fork (or the parent) the head branch is in.
+    #[serde(default)]
+    head_repo: Option<String>,
     #[serde(flatten)]
     file: FileQ,
 }
@@ -766,7 +796,26 @@ pub async fn compare(
 ) -> J<serde_json::Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let base = resolve_rev(&st, &r, Some(&q.base)).await?;
-    let head = resolve_rev(&st, &r, Some(&q.head)).await?;
+    let head = match crate::api::issues::head_repo(&st, &r, v.as_ref(), q.head_repo.as_deref()).await? {
+        None => resolve_rev(&st, &r, Some(&q.head)).await?,
+        Some(f) => {
+            // Its branch is copied here under a hidden ref of the moment, so the two can be compared.
+            if !validate::ref_name(&q.head) {
+                return Err(AppError::bad("Pick a branch"));
+            }
+            let at = format!("{COMPARE_REFS}/{}-{}", f.id, crate::auth::new_secret("").0.replace(['-', '_'], "x"));
+            // In a task of its own, so a client that goes away can't leave the ref behind.
+            let (st2, rid, rpath, fpath, branch) = (st.clone(), r.id, r.path.clone(), f.path.clone(), q.head.clone());
+            let got = tokio::spawn(async move {
+                let got = crate::api::issues::fetch_branch(&st2, rid, &fpath, &branch, &at).await;
+                let _ = st2.git.delete_ref(&rpath, &at).await;
+                got
+            })
+            .await
+            .map_err(AppError::internal)?;
+            got?.ok_or_else(|| AppError::bad(format!("{} has no branch {}", f.full_name(), q.head)))?
+        }
+    };
     let c = compare_shas(&st, &r.path, &base, &head, &q.file).await?;
     Ok(Json(c.to_json()))
 }

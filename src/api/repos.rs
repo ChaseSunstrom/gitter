@@ -584,7 +584,7 @@ pub async fn branches(
     let open_prs: Vec<(String, i64)> = st
         .db
         .call(move |c| {
-            let mut s = c.prepare("SELECT p.head_branch, i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.state = 'open'")?;
+            let mut s = c.prepare("SELECT p.head_branch, i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.state = 'open' AND p.from_fork = 0")?;
             let v = s.query_map([rid], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             Ok(v)
         })

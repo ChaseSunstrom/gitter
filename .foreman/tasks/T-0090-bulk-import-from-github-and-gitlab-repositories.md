@@ -8,7 +8,7 @@ scope: []
 depends_on: [T-0084]
 source: user
 created: 2026-10-22T16:03:31Z
-updated: 2026-10-22T21:08:41Z
+updated: 2026-10-22T21:08:42Z
 base: 9e408687d37bd18c30c5896a7dc5eac98b32fb31
 base_tree: 638a50040442be6a040723ef0a7c11354794169c
 plan0_at: 2026-10-22T20:19:41Z
@@ -73,6 +73,7 @@ README: Import from GitHub or GitLab; token usernames for git over HTTPS; trash 
 - 2026-10-22T20:19:41Z focused
 - 2026-10-22T20:38:56Z scope: net.rs (response headers), mirrors.rs (pull takes extra refspecs, clean pub), repos.rs (owner_for/create_empty factored), auth.rs (accept GitLab's oauth2 username for tokens), validate.rs + auth.js (reserve 'import'), main.js route, newrepo.js link
 - 2026-10-22T21:08:41Z done
+- 2026-10-22T21:08:42Z committed 802b8e6 (29 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses mirrors::git (pinned, credential via GIT_CONFIG_* env, protocol.allow=never) and its leased worker/backoff pattern from T-0083, hooks::after_import, security::seal for the token, net::get_json from T-0089 (or added here first), issues/pulls/comments/labels/milestones/releases tables as they are. No new crate.

@@ -40,6 +40,10 @@ pub struct Repo {
     /// The viewer's role from collaborators and org membership (ROLE_* levels), before token limits.
     #[serde(skip)]
     pub role: u8,
+    /// A push by someone without write access, allowed for these branches only: a pull request's
+    /// author let maintainers of the repository it goes into edit them (empty: no such push).
+    #[serde(skip)]
+    pub push_only: Vec<String>,
 }
 
 /// Role levels: what a collaborator or org member may do.
@@ -82,6 +86,7 @@ pub fn row_to_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
         can_admin: false,
         is_owner: false,
         role: 0,
+        push_only: vec![],
     })
 }
 
@@ -401,6 +406,7 @@ mod tests {
             can_admin: false,
             is_owner: false,
             role: 0,
+            push_only: vec![],
         }
     }
     fn user(id: i64, admin: bool) -> User {

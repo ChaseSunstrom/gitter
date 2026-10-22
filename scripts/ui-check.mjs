@@ -1130,5 +1130,41 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// A pull request from a fork: nina (made by the inbox check; bob has two-factor sign-in by now) forks alice/hello and
+// pushes a branch; from the fork's compare page it goes to alice/hello's, opens there, and shows nina:branch and the maintainer setting.
+{
+  const fctx = await browser.newContext();
+  const page = await fctx.newPage();
+  const errors = [], steps = [];
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('pageerror', (e) => errors.push(String(e)));
+  try {
+    const post = async (path, data) => {
+      const r = await fctx.request.post(BASE + path, { headers: { Origin: BASE }, data });
+      if (!r.ok()) throw new Error(`${path}: ${r.status()} ${await r.text()}`);
+    };
+    await post('/api/auth/login', { login: 'nina', password: 'nina horse battery' }); // pragma: allowlist secret
+    await post('/api/repos/alice/hello/fork', {});
+    await post('/api/repos/nina/hello/branches', { name: 'fork-fix', from: 'main' });
+    await post('/api/repos/nina/hello/contents', { branch: 'fork-fix', message: 'Fix from a fork', changes: [{ path: 'FORK.md', content: 'hi\n' }] });
+    await page.goto(BASE + '/nina/hello/compare/main...fork-fix', { waitUntil: 'networkidle' });
+    await Promise.all([page.waitForURL(/\/alice\/hello\/compare\//), page.click('#to-parent')]);
+    await page.waitForSelector('#pr-form');
+    if ((await page.locator('#head-repo').inputValue()) !== 'nina/hello') throw new Error('the fork is not picked');
+    steps.push('compared with the parent');
+    await Promise.all([page.waitForURL(/\/alice\/hello\/pull\/\d+$/), page.click('#pr-form button[type=submit]')]);
+    await page.waitForSelector('#fork-note');
+    if (!(await page.locator('#page').innerText()).includes('nina:fork-fix')) throw new Error('no nina:fork-fix on the page');
+    if (!(await page.locator('#maintainer-edits').isChecked())) throw new Error('maintainer edits should start on');
+    steps.push('opened it, shown as nina:fork-fix');
+    await page.uncheck('#maintainer-edits');
+    await page.locator('.toast', { hasText: 'Only you push' }).waitFor({ timeout: 5000 });
+    steps.push('turned maintainer edits off');
+  } catch (e) { errors.push(String(e)); }
+  await fctx.close();
+  if (errors.length || steps.length < 3) { failed++; console.log('✗ pull request from a fork', { steps, errors }); }
+  else console.log(`  ok pull request from a fork: ${steps.join(', ')}`);
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

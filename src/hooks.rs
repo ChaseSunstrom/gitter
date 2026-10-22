@@ -15,11 +15,16 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     st.git.maintain_soon(repo.path.clone());
     refresh_size(st, repo.id).await;
     record_pushers(st, repo.id, user.id, updates).await;
-    crate::ci::trigger::on_push(st, repo, user.id, updates).await;
+    // A maintainer's push to a fork's pull request branch doesn't run the fork's CI (with its secrets).
+    if repo.push_only.is_empty() {
+        crate::ci::trigger::on_push(st, repo, user.id, updates).await;
+    }
     crate::webhooks::push(st, repo, user.id, updates).await;
     crate::mirrors::changed(st, repo.id).await;
     // A queued pull request's branch, or the branch it's tested against, may have moved.
     crate::mergequeue::kick(st, repo.id);
+    // Pull requests from this repository's branches into the one it was forked from (or its forks).
+    crate::api::issues::sync_fork_pulls(st, repo, updates).await;
 }
 
 /// Who moved each branch last (a scheduled run counts as theirs). A deleted

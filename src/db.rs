@@ -1006,6 +1006,14 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo_id, kind, remote_id)
     );
     "#,
+    // v31: pull requests from forks. Their head lives in this repository as refs/pull/N/head,
+    // copied from the fork's branch (head_repo_id, NULL once that fork is gone).
+    r#"
+    ALTER TABLE pulls ADD COLUMN from_fork INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE pulls ADD COLUMN head_repo_id INTEGER REFERENCES repos(id) ON DELETE SET NULL;
+    ALTER TABLE pulls ADD COLUMN maintainer_can_modify INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX pulls_head_repo ON pulls(head_repo_id, head_branch);
+    "#,
 ];
 
 impl Db {

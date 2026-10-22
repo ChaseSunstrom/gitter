@@ -187,7 +187,7 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
             // An agent's run also waits for a person to approve it (they read what it will run).
             c.execute(
                 "UPDATE ci_runs SET agent = COALESCE(?1, (SELECT agent FROM agent_branches WHERE repo_id = ?2 AND branch = ?4),
-                     (SELECT a.agent FROM agent_branches a JOIN pulls p ON p.head_branch = a.branch JOIN issues i ON i.id = p.issue_id
+                     (SELECT a.agent FROM agent_branches a JOIN pulls p ON p.head_branch = a.branch AND p.from_fork = 0 JOIN issues i ON i.id = p.issue_id
                       WHERE a.repo_id = ?2 AND i.repo_id = ?2 AND i.number = ci_runs.pr_number))
                  WHERE repo_id = ?2 AND number = ?3",
                 rusqlite::params![agent, repo_id, n, branch],
@@ -240,7 +240,7 @@ async fn on_branch(st: &AppState, repo: &Repo, actor_id: i64, u: &RefUpdate, bra
         .call(move |c| {
             let mut q = c.prepare(
                 "SELECT i.number, p.base_branch FROM pulls p JOIN issues i ON i.id = p.issue_id
-                 WHERE i.repo_id = ?1 AND i.state = 'open' AND p.head_branch = ?2",
+                 WHERE i.repo_id = ?1 AND i.state = 'open' AND p.head_branch = ?2 AND p.from_fork = 0",
             )?;
             Ok(q.query_map(rusqlite::params![id, b], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
         })

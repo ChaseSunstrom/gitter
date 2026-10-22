@@ -90,11 +90,14 @@ function header(meta, data, pd) {
   const base = `/${meta.owner}/${meta.name}`;
   let line;
   if (issue.is_pr) {
-    const branch = (b, exists) => html`<a class="branch-name" href="${exists ? `${base}/tree/${encPath(b)}` : '#'}">${b}</a>`;
+    // A pull request's head can be a branch in a fork: shown and linked there as owner:branch.
+    const branch = (b, exists, head = false) => (head && pull.from_fork
+      ? html`<a class="branch-name" href="${pull.head_repo ? `/${pull.head_repo}/tree/${encPath(b)}` : '#'}" title="${pull.head_repo || 'a deleted fork'}">${(pull.head_repo || 'deleted fork').split('/')[0]}:${b}</a>`
+      : html`<a class="branch-name" href="${exists ? `${base}/tree/${encPath(b)}` : '#'}">${b}</a>`);
     const count = plural(pd.commits.length, 'commit');
     line = issue.state === 'merged'
-      ? html`<b>${pull.merged_by || issue.author}</b> merged ${count} into ${branch(pull.base, pull.base_exists)} from ${branch(pull.head, pull.head_exists)} ${pull.merged_at ? timeEl(pull.merged_at) : ''}`
-      : html`<b>${issue.author}</b> wants to merge ${count} into ${branch(pull.base, pull.base_exists)} from ${branch(pull.head, pull.head_exists)}`;
+      ? html`<b>${pull.merged_by || issue.author}</b> merged ${count} into ${branch(pull.base, pull.base_exists)} from ${branch(pull.head, pull.head_exists, true)} ${pull.merged_at ? timeEl(pull.merged_at) : ''}`
+      : html`<b>${issue.author}</b> wants to merge ${count} into ${branch(pull.base, pull.base_exists)} from ${branch(pull.head, pull.head_exists, true)}`;
   } else {
     line = html`<b>${issue.author}</b> opened this issue ${timeEl(issue.created_at)} · ${plural(issue.comments, 'comment')}`;
   }
@@ -170,7 +173,7 @@ function mergeBox(meta, data, pd) {
       <span class="merge-icon">${icon('merged')}</span>
       <div class="grow"><b>Pull request merged</b><div class="muted small">${pull.merged_by ? html`${pull.merged_by} merged ` : 'Merged '}${pull.merged_sha ? html`commit <a class="sha" href="${base}/commit/${pull.merged_sha}">${short(pull.merged_sha)}</a> ` : ''}into ${pull.base}${pull.merged_at ? html` ${timeEl(pull.merged_at)}` : ''}.</div></div>
       ${meta.can_write ? html`<button class="btn sm" id="revert-pr" title="Open a pull request that undoes this one">${icon('history', 'sm')} Revert</button>` : ''}
-      ${pull.head_exists && meta.can_write && pull.head !== meta.default_branch ? html`<button class="btn sm" id="delete-head">${icon('trash', 'sm')} Delete branch</button>` : ''}
+      ${pull.head_exists && !pull.from_fork && meta.can_write && pull.head !== meta.default_branch ? html`<button class="btn sm" id="delete-head">${icon('trash', 'sm')} Delete branch</button>` : ''}
     </div>`;
   }
   if (issue.state === 'closed') {
@@ -214,11 +217,14 @@ function mergeBox(meta, data, pd) {
         <option value="squash">Squash and merge</option>
         ${pull.can_ff && !queued ? html`<option value="ff">Fast-forward</option>` : ''}
       </select>
-      ${queued ? '' : html`<label class="check small"><input type="checkbox" name="delete_branch" ${pull.head !== meta.default_branch ? '' : 'disabled'}> Delete ${pull.head} after merging</label>`}
+      ${queued || pull.from_fork ? '' : html`<label class="check small"><input type="checkbox" name="delete_branch" ${pull.head !== meta.default_branch ? '' : 'disabled'}> Delete ${pull.head} after merging</label>`}
       ${(blocked.length || queued) && pull.can_bypass ? html`<label class="check small"><input type="checkbox" name="bypass_rules"> ${queued ? 'Merge now, skipping the queue' : 'Merge without waiting'} (you're an admin)</label>` : ''}
       <span class="grow"></span>
       <button class="btn green" type="submit">${icon(queued ? 'clock' : 'merged', 'sm')} ${queued ? 'Add to merge queue' : 'Merge pull request'}</button>
     </form>` : !meta.can_write && pull.mergeable ? html`<div class="muted small merge-note">Only people with write access can merge.</div>` : ''}
+    ${pull.from_fork ? html`<div class="muted small merge-note" id="fork-note">${pull.ci_note}
+      ${state.me?.username === issue.author ? html`<label class="check"><input type="checkbox" id="maintainer-edits" ${pull.maintainer_can_modify ? 'checked' : ''}> Allow edits from maintainers (people who can write here may push to ${pull.head} in your fork)</label>`
+        : pull.maintainer_can_modify ? html`<div>The author allows edits from maintainers: if you can write here, you may push to ${pull.head} in ${pull.head_repo}.</div>` : ''}</div>` : ''}
   </div>`;
 }
 
@@ -482,6 +488,12 @@ function mountConversation(el, meta, api, data, mdCtx) {
     toast(`Deleted ${data.pull.head}`);
     refresh();
   }));
+  $('#maintainer-edits', el)?.addEventListener('change', async (e) => {
+    try {
+      await send('PATCH', `${api}/pulls/${issue.number}`, { maintainer_can_modify: e.target.checked });
+      toast(e.target.checked ? 'Maintainers may push to your branch' : 'Only you push to your branch');
+    } catch (x) { e.target.checked = !e.target.checked; toastErr(x); }
+  });
 }
 
 function startEdit(el, api, issue, id, cid, c, mdCtx) {

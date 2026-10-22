@@ -62,18 +62,22 @@ pub async fn enqueue(State(st): State<AppState>, Authed(u): Authed, Path((o, n, 
         return Err(AppError::bad("The merge queue merges with a merge commit or a squash"));
     }
     let (rid, n2) = (r.id, num);
-    let pull: Option<(String, String)> = st
+    let pull: Option<(String, String, bool)> = st
         .db
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT p.head_branch, p.base_branch FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.number = ?2 AND i.state = 'open'",
+                "SELECT p.head_branch, p.base_branch, p.from_fork FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.number = ?2 AND i.state = 'open'",
                 params![rid, n2],
-                |x| Ok((x.get(0)?, x.get(1)?)),
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)),
             )
             .optional()?)
         })
         .await?;
-    let Some((head_b, base_b)) = pull else { return Err(AppError::conflict("That pull request isn't open")) };
+    let Some((head_b, base_b, from_fork)) = pull else { return Err(AppError::conflict("That pull request isn't open")) };
+    if from_fork {
+        // The queue tests with CI, which would run the fork's code with this repository's secrets.
+        return Err(AppError::conflict("Pull requests from forks can't go through the merge queue"));
+    }
     let b2 = base_b.clone();
     let queued = st.db.call(move |c| Ok(protect::effective(&protect::load(c, rid)?, &b2).is_some_and(|x| x.merge_queue))).await?;
     if !queued {
@@ -300,7 +304,7 @@ async fn step(st: &AppState, repo_id: i64, e: &Entry) -> R<bool> {
                 eject(st, repo_id, e, &why).await?;
                 return Ok(true);
             }
-            let plan = MergePlan { issue_id: e.issue_id, num: e.number, title: e.title.clone(), head_b: e.head_branch.clone(), base_b: e.base.clone(), head: e.head_sha.clone(), base, new_sha: test };
+            let plan = MergePlan { issue_id: e.issue_id, num: e.number, title: e.title.clone(), head_b: e.head_branch.clone(), base_b: e.base.clone(), head: e.head_sha.clone(), base, new_sha: test, from_fork: false };
             match land_merge(st, &repo, &user, plan, false).await {
                 Ok(()) => remove(st, repo_id, e.id).await?,
                 // The branch moved just now: the next pass tests on its new tip.

@@ -124,7 +124,7 @@ pub fn clean(err: &str, remote: &Remote) -> String {
 
 /// Run a prepared git command to its end, within TIMEOUT. `cap`: a fetch into
 /// `repo` is stopped once the packs it's writing pass this many bytes.
-async fn exec(st: &AppState, mut cmd: tokio::process::Command, cap: Option<(&Path, u64)>) -> Result<(), String> {
+pub(crate) async fn exec(st: &AppState, mut cmd: tokio::process::Command, cap: Option<(&Path, u64)>) -> Result<(), String> {
     let _permit = st.git.permit_stream().await.map_err(|e| e.msg)?;
     // Its own process group, so stopping it stops the helpers it started too.
     cmd.process_group(0).stdout(std::process::Stdio::null());

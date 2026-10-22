@@ -507,6 +507,10 @@ pub async fn apply(
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
     crate::mirrors::refuse_writes(&r)?;
     let (issue, branch, head, _) = pull(&st, &r, num, Some(&u)).await?;
+    if issue.from_fork {
+        // The branch is in the fork; a commit here would land on a branch of the same name instead.
+        return Err(AppError::bad("Suggestions on a pull request from a fork are applied by its author, in the fork"));
+    }
     crate::protect::direct(&st, &r, &branch, false).await?;
     if issue.state != "open" {
         return Err(AppError::bad("This pull request isn't open"));

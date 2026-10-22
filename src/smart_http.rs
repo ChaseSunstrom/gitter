@@ -151,7 +151,7 @@ pub fn start(st: &AppState, ip: &str) -> Result<Slot, AppError> {
 /// its old URL too. No read access is a 404, like a repository that isn't there.
 pub async fn open(st: &AppState, user: Option<&User>, owner: &str, name: &str, push: bool) -> Result<Repo, AppError> {
     let not_found = || AppError::new(StatusCode::NOT_FOUND, "Repository not found");
-    let repo = match Repo::find(st, user, owner, name).await {
+    let mut repo = match Repo::find(st, user, owner, name).await {
         Ok(r) => r,
         Err(e) if e.status == StatusCode::NOT_FOUND => return Err(not_found()),
         Err(e) => return Err(e),
@@ -160,7 +160,15 @@ pub async fn open(st: &AppState, user: Option<&User>, owner: &str, name: &str, p
         return Err(not_found());
     }
     if push && !repo.can_write {
-        return Err(AppError::new(StatusCode::FORBIDDEN, "You don't have push access to this repository"));
+        // A maintainer of the repository a pull request from here goes into, when its author allowed edits.
+        let allowed = match user {
+            Some(u) if u.limits.is_none() => crate::api::issues::maintainer_branches(st, &repo, u).await?,
+            _ => vec![],
+        };
+        if allowed.is_empty() {
+            return Err(AppError::new(StatusCode::FORBIDDEN, "You don't have push access to this repository"));
+        }
+        repo.push_only = allowed;
     }
     if push {
         crate::mirrors::refuse_writes(&repo)?;
@@ -213,12 +221,16 @@ pub async fn transfer_command(
     cmd.arg("-c").arg(format!("receive.maxInputSize={max_push}"));
     // The merge queue's test commits are the server's own: not shown, not pushable.
     cmd.arg("-c").arg(format!("transfer.hideRefs={}", crate::mergequeue::REF_PREFIX));
+    cmd.arg("-c").arg(format!("transfer.hideRefs={}", crate::api::code::COMPARE_REFS));
     let mut guard = None;
     if receives {
         // The pre-receive hook: branch rules binding the pusher, then push protection.
         cmd.arg("-c").arg(format!("core.hooksPath={}", crate::protect::hook_dir(st)?.display()));
         if let Some(rules) = crate::protect::rules_env(st, repo).await? {
             cmd.env("GITTER_RULES", rules);
+        }
+        if !repo.push_only.is_empty() {
+            cmd.env("GITTER_ONLY_BRANCHES", serde_json::to_string(&repo.push_only).map_err(AppError::internal)?);
         }
         if let Some(u) = user {
             let g = crate::scan::PushGuard::start(st, repo, u).await?;
@@ -474,8 +486,8 @@ pub async fn ref_map(st: &AppState, repo: &Repo) -> Result<HashMap<String, Strin
             l.split_once(' ')
                 .map(|(a, b)| (a.to_string(), b.to_string()))
         })
-        // The merge queue's own refs aren't anyone's push.
-        .filter(|(name, _)| !name.starts_with(crate::mergequeue::REF_PREFIX))
+        // The merge queue's own refs, and pull request heads (kept by Gitter, never pushed), aren't anyone's push.
+        .filter(|(name, _)| !name.starts_with(crate::mergequeue::REF_PREFIX) && !name.starts_with(crate::api::code::COMPARE_REFS) && !name.starts_with("refs/pull/"))
         .collect())
 }
 

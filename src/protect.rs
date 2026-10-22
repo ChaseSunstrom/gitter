@@ -346,6 +346,10 @@ pub fn pre_receive() -> i32 {
         eprintln!("Gitter couldn't read the refs this push updates (names must be UTF-8), so it refuses the push.");
         return 1;
     };
+    let code = check_refs(std::env::var("GITTER_ONLY_BRANCHES").ok().as_deref(), &input);
+    if code != 0 {
+        return code;
+    }
     if let Ok(rules) = std::env::var("GITTER_RULES") {
         let code = check_rules(&rules, &input);
         if code != 0 {
@@ -353,6 +357,36 @@ pub fn pre_receive() -> i32 {
         }
     }
     crate::scan::check(&input)
+}
+
+/// Pull request refs are the server's (a fork's branch copied here); `only`: a maintainer's push
+/// to a fork reaches just the branches its pull requests allow, and doesn't delete them.
+fn check_refs(only: Option<&str>, input: &str) -> i32 {
+    let only: Option<Vec<String>> = match only.map(serde_json::from_str) {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(_)) => {
+            eprintln!("Gitter couldn't read which branches this push may change, so it refuses the push.");
+            return 1;
+        }
+    };
+    let mut refused = vec![];
+    for line in input.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(_), Some(new), Some(name)) = (f.next(), f.next(), f.next()) else { continue };
+        if name.starts_with("refs/pull/") {
+            refused.push(format!("{name}: pull request refs are kept by Gitter"));
+        } else if let Some(only) = &only {
+            let ok = name.strip_prefix("refs/heads/").is_some_and(|b| only.iter().any(|o| o == b)) && !new.bytes().all(|b| b == b'0');
+            if !ok {
+                refused.push(format!("{name}: as a maintainer you can push only to {} here (not delete it)", only.join(", ")));
+            }
+        }
+    }
+    for r in &refused {
+        eprintln!("Gitter refused {r}");
+    }
+    i32::from(!refused.is_empty())
 }
 
 /// The branch-rule half of the hook.
@@ -411,8 +445,9 @@ async fn try_auto_merge(st: &AppState, repo_id: i64, sha: Option<String>) -> R<(
         .db
         .call(move |c| {
             let mut q = c.prepare(
-                "SELECT i.number, p.head_branch, p.auto_merge, p.auto_merge_by, p.auto_merge_sha,
-                        (SELECT b.user_id FROM branch_pushers b WHERE b.repo_id = i.repo_id AND b.branch = p.head_branch)
+                "SELECT i.number, CASE WHEN p.from_fork = 1 THEN 'refs/pull/' || i.number || '/head' ELSE 'refs/heads/' || p.head_branch END,
+                        p.auto_merge, p.auto_merge_by, p.auto_merge_sha,
+                        (SELECT b.user_id FROM branch_pushers b WHERE b.repo_id = i.repo_id AND b.branch = p.head_branch AND p.from_fork = 0)
                  FROM pulls p JOIN issues i ON i.id = p.issue_id
                  WHERE i.repo_id = ?1 AND i.state = 'open' AND p.auto_merge IS NOT NULL AND p.auto_merge_by IS NOT NULL",
             )?;
@@ -434,7 +469,7 @@ async fn try_auto_merge(st: &AppState, repo_id: i64, sha: Option<String>) -> R<(
             clear(st, repo_id, number).await?;
             continue;
         };
-        let Some(head_sha) = st.git.resolve(&repo.path, &format!("refs/heads/{head}")).await? else { continue };
+        let Some(head_sha) = st.git.resolve(&repo.path, &head).await? else { continue };
         if sha.as_ref().is_some_and(|s| *s != head_sha) {
             continue;
         }
@@ -481,6 +516,20 @@ mod tests {
 
     fn rule(p: &str) -> Rule {
         Rule { id: 0, pattern: p.into(), require_pr: false, approvals: 0, checks: vec![], allow_force_push: true, allow_deletion: true, enforce_admins: false, merge_queue: false }
+    }
+
+    #[test]
+    fn pull_refs_are_kept_and_maintainers_reach_only_their_branches() {
+        let (z, a) = ("0".repeat(40), "a".repeat(40));
+        let line = |name: &str, new: &str| format!("{a} {new} {name}\n");
+        assert_eq!(check_refs(None, &line("refs/heads/main", &a)), 0);
+        assert_eq!(check_refs(None, &line("refs/pull/1/head", &a)), 1);
+        let only = Some(r#"["feature"]"#);
+        assert_eq!(check_refs(only, &line("refs/heads/feature", &a)), 0);
+        assert_eq!(check_refs(only, &line("refs/heads/feature", &z)), 1, "not deleting it");
+        assert_eq!(check_refs(only, &line("refs/heads/main", &a)), 1);
+        assert_eq!(check_refs(only, &line("refs/tags/v1", &a)), 1);
+        assert_eq!(check_refs(Some("not json"), &line("refs/heads/feature", &a)), 1);
     }
 
     #[test]
