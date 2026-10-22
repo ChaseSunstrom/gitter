@@ -45,7 +45,7 @@ const HELP: &str = "gitter — fast, simple git hosting
 
 usage:
   gitter                       start the server (same as `gitter serve`)
-  gitter backup <file.tar.gz>  back up accounts, issues, repositories, wikis and snippets (safe while running; - for stdout)
+  gitter backup <file.tar.gz>  back up accounts, issues, repositories, wikis, snippets and release files (safe while running; - for stdout)
   gitter verify <file>         check a backup end to end without restoring it (- for stdin)
   gitter restore <file> [--force]
                                restore a backup into GITTER_DATA (- for stdin; --force moves existing data aside)
@@ -179,8 +179,15 @@ async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
         );
         *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
     }
+    match gitter::security::seal_totp_secrets(&st.db, st.key.clone()).await {
+        Ok(0) => {}
+        Ok(n) => println!("sealed {n} two-factor secret(s) with the server key"),
+        Err(e) => eprintln!("sealing two-factor secrets: {}", e.msg),
+    }
     tokio::spawn(gitter::ci::upkeep(st.clone()));
+    tokio::spawn(gitter::api::lifecycle::upkeep(st.clone()));
     tokio::spawn(gitter::ci::runner::builtin(st.clone()));
+    tokio::spawn(gitter::webhooks::run(st.clone()));
     let st2 = st.clone();
     tokio::spawn(async move {
         st2.git.sweep().await;

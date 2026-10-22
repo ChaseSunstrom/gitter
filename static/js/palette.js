@@ -75,7 +75,7 @@ function commands() {
     if (me) add(g, 'pr', 'New pull request', base + '/compare');
     if (r.can_write) add(g, 'file', 'New file', `${base}/new/${encPath(state.rev || r.default_branch)}`);
     if (r.can_write) add(g, 'upload', 'Upload files', `${base}/upload/${encPath(state.rev || r.default_branch)}`);
-    if (r.can_write) add(g, 'settings', 'Repository settings', base + '/settings');
+    if (r.can_admin) add(g, 'settings', 'Repository settings', base + '/settings');
     add(g, 'copy', 'Copy clone URL', () => navigator.clipboard?.writeText(r.clone_url).then(() => toast('Clone URL copied')));
     for (const b of (r.branches || []).slice(0, 50)) add('Switch branch', 'branch', b, `${base}/tree/${encPath(b)}`);
   }

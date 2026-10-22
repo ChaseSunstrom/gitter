@@ -27,6 +27,8 @@ pub const DEFAULT_LABELS: &[(&str, &str)] = &[
 #[derive(Deserialize)]
 pub struct CreateReq {
     name: String,
+    /// An organization to create it in (default: yourself).
+    owner: Option<String>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -44,22 +46,19 @@ async fn insert_repo(
     forked_from: Option<i64>,
 ) -> R<i64> {
     let max = st.settings.get().max_repos_per_user;
-    if !owner.is_admin
-        && let Err(wait) = st.limiter.check(&format!("create:{}", owner.id), 30, 3600)
+    // An organization's repositories count toward its creator's limits.
+    let oid = owner.id;
+    let (payer, admin) = st.db.call(move |c| Ok(crate::repo::payer(c, oid)?)).await?;
+    if !admin
+        && let Err(wait) = st.limiter.check(&format!("create:{payer}"), 30, 3600)
     {
         return Err(AppError::slow_down("You've created a lot of repositories in the last hour. Try again later.", wait));
     }
-    let (oid, admin, n, d) = (
-        owner.id,
-        owner.is_admin,
-        name.to_string(),
-        description.to_string(),
-    );
+    let (n, d) = (name.to_string(), description.to_string());
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
-            let count: i64 = tx.query_row("SELECT count(*) FROM repos WHERE owner_id = ?1", [oid], |r| r.get(0))?;
-            if count >= max && !admin {
+            if !admin && super::lifecycle::live_repos(&tx, payer)? >= max {
                 return Err(AppError::bad(format!("You've reached the limit of {max} repositories")));
             }
             let exists = tx.query_row("SELECT 1 FROM repos WHERE owner_id = ?1 AND name = ?2", rusqlite::params![oid, n], |_| Ok(())).optional()?;
@@ -72,6 +71,7 @@ async fn insert_repo(
                 rusqlite::params![oid, n, d, private as i64, forked_from, t],
             )?;
             let id = tx.last_insert_rowid();
+            crate::repo::claim_name(&tx, oid, &n)?;
             for (name, color) in DEFAULT_LABELS {
                 tx.execute("INSERT INTO labels(repo_id, name, color) VALUES (?1, ?2, ?3)", rusqlite::params![id, name, color])?;
             }
@@ -103,7 +103,30 @@ pub async fn create(
     if description.chars().count() > 350 {
         return Err(AppError::bad("Keep the description under 350 characters"));
     }
-    let id = insert_repo(&st, &u, &name, &description, req.private, None).await?;
+    // In an organization, the org owns it: its quota, its name.
+    let owner = match req.owner.as_deref().filter(|o| !o.eq_ignore_ascii_case(&u.username)) {
+        None => u.clone(),
+        Some(org) => {
+            let o = org.to_string();
+            let found: Option<User> = st
+                .db
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT id, username, display_name, email, is_admin FROM users WHERE username = ?1 AND is_org = 1",
+                        [&o],
+                        User::from_row,
+                    )
+                    .optional()?)
+                })
+                .await?;
+            let org = found.ok_or_else(|| AppError::bad("No organization with that name"))?;
+            if !crate::api::orgs::can_create_in(&st, org.id, &u).await? {
+                return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "You can't create repositories in that organization"));
+            }
+            org
+        }
+    };
+    let id = insert_repo(&st, &owner, &name, &description, req.private, None).await?;
     let path = st.git.repo_path(id);
     if let Err(e) = init_repo(&st, &u, id, &name, &description, req.readme).await {
         drop_row(&st, id).await;
@@ -111,7 +134,7 @@ pub async fn create(
         return Err(e);
     }
     record_event(&st.db, u.id, Some(id), "create", &name, "", 1).await?;
-    Ok(Json(json!({ "owner": u.username, "name": name })))
+    Ok(Json(json!({ "owner": owner.username, "name": name })))
 }
 
 async fn init_repo(
@@ -173,24 +196,25 @@ pub async fn show(
             let q = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [rid], |r| r.get(0)) };
             let stars = q("SELECT count(*) FROM stars WHERE repo_id = ?1")?;
             let starred = c.query_row("SELECT count(*) FROM stars WHERE repo_id = ?1 AND user_id = ?2", [rid, vid], |r| r.get::<_, i64>(0))? > 0;
-            let forks = q("SELECT count(*) FROM repos WHERE forked_from = ?1")?;
+            let forks = q("SELECT count(*) FROM repos WHERE forked_from = ?1 AND deleted_at IS NULL")?;
             let issues = q("SELECT count(*) FROM issues WHERE repo_id = ?1 AND is_pr = 0 AND state = 'open'")?;
             let pulls = q("SELECT count(*) FROM issues WHERE repo_id = ?1 AND is_pr = 1 AND state = 'open'")?;
             let language: String = c.query_row("SELECT language FROM repos WHERE id = ?1", [rid], |r| r.get(0))?;
             let parent: Option<(String, String, bool)> = match fork_of {
                 Some(pid) => c
                     .query_row(
-                        "SELECT u.username, p.name, p.is_private OR p.hidden FROM repos p JOIN users u ON u.id = p.owner_id WHERE p.id = ?1",
+                        "SELECT u.username, p.name, p.is_private OR p.hidden OR p.deleted_at IS NOT NULL FROM repos p JOIN users u ON u.id = p.owner_id WHERE p.id = ?1",
                         [pid],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
                     )
                     .optional()?,
                 None => None,
             };
-            Ok((stars, starred, forks, issues, pulls, language, parent))
+            let releases = super::releases::summary(c, rid)?;
+            Ok((stars, starred, forks, issues, pulls, language, parent, releases))
         })
         .await?;
-    let (stars, starred, forks, issues, pulls, language, parent) = counts;
+    let (stars, starred, forks, issues, pulls, language, parent, (releases, latest_release)) = counts;
     let parent = parent
         .filter(|p| !p.2)
         .map(|p| json!({ "owner": p.0, "name": p.1 }));
@@ -200,7 +224,8 @@ pub async fn show(
         "updated_at": r.updated_at, "pushed_at": r.pushed_at, "language": language,
         "empty": branches.is_empty(), "branches": branches, "tags": tags,
         "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
-        "fork_of": parent, "can_write": r.can_write, "is_owner": r.is_owner, "hidden": r.hidden,
+        "releases": releases, "latest_release": latest_release,
+        "fork_of": parent, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
     })))
 }
@@ -222,7 +247,7 @@ pub async fn update(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<UpdateReq>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, v.as_ref(), &owner, &name).await?;
+    let r = Repo::administrable(&st, v.as_ref(), &owner, &name).await?;
     let visibility = req.private.filter(|p| *p != r.private);
     // Publishing a private repo can't be undone (people may clone it), so it needs a fresh password.
     if visibility.is_some() && !fresh {
@@ -255,11 +280,11 @@ pub async fn update(
         return Err(AppError::bad("That branch doesn't exist"));
     }
     let new_head = req.default_branch.clone();
-    let (id, oid) = (r.id, r.owner_id);
+    let (id, oid, old_name) = (r.id, r.owner_id, r.name.clone());
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
-            if let Some(n) = req.name {
+            if let Some(n) = req.name.as_deref().map(str::trim) {
                 let clash = tx
                     .query_row(
                         "SELECT 1 FROM repos WHERE owner_id = ?1 AND name = ?2 AND id != ?3",
@@ -274,8 +299,11 @@ pub async fn update(
                 }
                 tx.execute(
                     "UPDATE repos SET name = ?1 WHERE id = ?2",
-                    rusqlite::params![n.trim(), id],
+                    rusqlite::params![n, id],
                 )?;
+                // The old name keeps working (web and API redirect, git is served there).
+                crate::repo::add_redirect(&tx, oid, &old_name, id)?;
+                crate::repo::claim_name(&tx, oid, n)?;
             }
             if let Some(d) = req.description {
                 tx.execute(
@@ -332,24 +360,12 @@ pub async fn remove(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<DeleteReq>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     if !req.confirm.eq_ignore_ascii_case(&r.full_name()) {
         return Err(AppError::bad(format!("Type {} to confirm", r.full_name())));
     }
-    let id = r.id;
-    let lfs = st
-        .db
-        .call(move |c| {
-            let oids = crate::lfs::held_by(c, false, id)?;
-            c.execute("DELETE FROM repos WHERE id = ?1", [id])?;
-            Ok(oids)
-        })
-        .await?;
-    crate::lfs::collect(&st, lfs).await;
-    if let Err(e) = tokio::fs::remove_dir_all(&r.path).await {
-        eprintln!("removing {}: {e}", r.path.display());
-    }
-    let _ = tokio::fs::remove_dir_all(super::wiki::path(&st, id)).await;
+    // Into the trash for a week (restorable); the upkeep loop purges it after.
+    super::lifecycle::trash(&st, &r).await?;
     record(&st.db, Event { actor: Some(&u), subject: Some(r.owner_id), action: "repo_deleted", detail: r.full_name(), ip: &ip.0 }).await;
     ok()
 }
@@ -616,7 +632,7 @@ pub async fn deploy_tokens(
     Authed(u): Authed,
     Path((owner, name)): Path<(String, String)>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     let rid = r.id;
     let rows = st
         .db
@@ -641,7 +657,7 @@ pub async fn create_deploy_token(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<DeployReq>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     let t = super::account::TokenReq::deploy(req.name, req.write, req.expires_days);
     let raw = super::account::issue_token(&st, &u, &ip.0, t, Some((r.id, r.full_name()))).await?;
     Ok(Json(json!({ "token": raw })))
@@ -653,7 +669,7 @@ pub async fn delete_deploy_token(
     ip: ClientIp,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> J<serde_json::Value> {
-    let r = Repo::writable(&st, Some(&u), &owner, &name).await?;
+    let r = Repo::administrable(&st, Some(&u), &owner, &name).await?;
     let rid = r.id;
     let gone: Option<String> = st
         .db

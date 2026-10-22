@@ -29,6 +29,8 @@ const MAX_SIG: usize = 64 * 1024;
 /// New signature checks per request; the rest are checked on later views.
 const MAX_CHECKS: usize = 100;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Commits bigger than this (a huge message) aren't read for badges.
+const MAX_COMMIT: usize = 1 << 20;
 const SSH_TYPES: &[&str] = &[
     "ssh-ed25519",
     "ecdsa-sha2-nistp256",
@@ -86,6 +88,7 @@ enum Outcome {
 }
 
 /// Why a tool gave no answer.
+#[derive(Debug)]
 enum Fail {
     /// Not installed (or too old to know the command).
     Missing,
@@ -148,13 +151,22 @@ impl Signing {
         }
     }
 
-    /// Import armored GPG keys into the keyring; returns gpg's status lines.
-    async fn gpg_import(&self, git: &Git, keys: &[u8], timeout: Duration) -> Result<String, Fail> {
+    /// Import armored GPG keys into the keyring at `home`; returns gpg's status lines.
+    async fn gpg_import(&self, git: &Git, home: &Path, keys: &[u8], timeout: Duration) -> Result<String, Fail> {
         self.ensure_home()?;
-        let h = self.home.to_string_lossy();
+        let h = home.to_string_lossy();
         let args = ["--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--status-fd", "1", "--import"];
         let o = self.tool(git, "gpg", &args, keys, timeout).await?;
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    }
+
+    /// A GPG key now registered to an account: into the server's keyring, and
+    /// commits checked without it get checked again.
+    pub async fn add_gpg_key(&self, git: &Git, key: &str) {
+        if let Err(f) = self.gpg_import(git, &self.home, key.as_bytes(), TOOL_TIMEOUT).await {
+            eprintln!("signing: importing a GPG key failed ({f:?}); it's imported at the next start");
+        }
+        self.key_added();
     }
 
     /// Put every registered GPG key in the keyring, once per process.
@@ -171,8 +183,17 @@ impl Signing {
                     .await
                     .map_err(|_| Fail::Broken)?;
                 // ponytail: one import of every key; a few minutes allowed. Chunk it if instances get huge.
+                // Leftovers of checks and key parsing a crash cut short.
+                if let Ok(rd) = std::fs::read_dir(&self.home) {
+                    for e in rd.flatten() {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        if n.starts_with("sig-") || n.starts_with("parse-") {
+                            let _ = std::fs::remove_dir_all(e.path()).or_else(|_| std::fs::remove_file(e.path()));
+                        }
+                    }
+                }
                 if !keys.is_empty() {
-                    self.gpg_import(&st.git, keys.join("\n").as_bytes(), Duration::from_secs(300)).await?;
+                    self.gpg_import(&st.git, &self.home, keys.join("\n").as_bytes(), Duration::from_secs(300)).await?;
                 }
                 Ok(())
             })
@@ -216,9 +237,22 @@ impl Signing {
             let args = ["-Y", "check-novalidate", "-n", "git", "-s", &f];
             self.tool(&st.git, "ssh-keygen", &args, payload, TOOL_TIMEOUT).await.and_then(|o| parse_ssh(&o))
         } else {
-            let args = ["--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--trust-model", "always", "--status-fd", "1", "--verify", &f, "-"];
+            // Only signature packets: gpg would otherwise check a signed message carried
+            // in the header (and ignore the commit) and still report a good signature.
+            if !only_signature_packets(sig) {
+                return Ok((Outcome::Bad, None));
+            }
+            let args = [
+                "--homedir", &h, "--batch", "--no-tty", "--no-autostart", "--no-auto-key-retrieve", "--trust-model", "always", "--status-fd", "1",
+                "--verify", &f, "-",
+            ];
             let o = self.tool(&st.git, "gpg", &args, payload, TOOL_TIMEOUT).await?;
-            Ok(parse_gpg(&String::from_utf8_lossy(&o.stdout)))
+            let status = String::from_utf8_lossy(&o.stdout);
+            // No verdict at all and a failed exit: gpg itself broke (a locked keyring...). Not cached.
+            if !o.status.success() && !status.lines().any(|l| SIG_STATUS.iter().any(|k| l.starts_with(k))) {
+                return Err(Fail::Broken);
+            }
+            Ok(parse_gpg(&status))
         }
     }
 }
@@ -229,6 +263,14 @@ struct TempFile(PathBuf);
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -252,6 +294,71 @@ fn parse_ssh(o: &std::process::Output) -> Result<(Outcome, Option<String>), Fail
     })
 }
 
+/// Status lines that mean gpg reached a verdict about a signature.
+const SIG_STATUS: &[&str] = &[
+    "[GNUPG:] NEWSIG", "[GNUPG:] GOODSIG", "[GNUPG:] BADSIG", "[GNUPG:] ERRSIG", "[GNUPG:] VALIDSIG",
+    "[GNUPG:] EXPSIG", "[GNUPG:] EXPKEYSIG", "[GNUPG:] REVKEYSIG", "[GNUPG:] NODATA",
+];
+
+/// Is this armored block nothing but OpenPGP signature packets (tag 2), as a
+/// detached signature is? A signed message (one-pass signature, literal data,
+/// compressed data) is refused.
+fn only_signature_packets(armored: &str) -> bool {
+    let mut lines = armored.lines().map(str::trim).skip_while(|l| !l.starts_with("-----BEGIN PGP SIGNATURE-----")).skip(1);
+    // Armor headers ("Version: ..."), then a blank line, then base64 up to the "=CRC" line.
+    let mut body = String::new();
+    let mut in_headers = true;
+    for l in lines.by_ref() {
+        if l.starts_with("-----END") {
+            break;
+        }
+        if in_headers {
+            if l.is_empty() {
+                in_headers = false;
+            } else if !l.contains(": ") {
+                in_headers = false;
+                body.push_str(l);
+            }
+            continue;
+        }
+        if l.starts_with('=') {
+            continue;
+        }
+        body.push_str(l);
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body) else { return false };
+    let mut rest = &bytes[..];
+    let mut packets = 0;
+    while let Some((&b, tail)) = rest.split_first() {
+        if b & 0x80 == 0 {
+            return false;
+        }
+        let (tag, len, tail) = if b & 0x40 != 0 {
+            // New format: one, two or five length octets (partial lengths aren't used by signatures).
+            match tail {
+                [o1, t @ ..] if *o1 < 192 => (b & 0x3f, *o1 as usize, t),
+                [o1, o2, t @ ..] if *o1 < 224 => (b & 0x3f, ((*o1 as usize - 192) << 8) + *o2 as usize + 192, t),
+                [255, a, b2, c, d, t @ ..] => (b & 0x3f, u32::from_be_bytes([*a, *b2, *c, *d]) as usize, t),
+                _ => return false,
+            }
+        } else {
+            let tag = (b >> 2) & 0x0f;
+            match (b & 3, tail) {
+                (0, [l, t @ ..]) => (tag, *l as usize, t),
+                (1, [a, b2, t @ ..]) => (tag, u16::from_be_bytes([*a, *b2]) as usize, t),
+                (2, [a, b2, c, d, t @ ..]) => (tag, u32::from_be_bytes([*a, *b2, *c, *d]) as usize, t),
+                _ => return false,
+            }
+        };
+        if tag != 2 || len > tail.len() {
+            return false;
+        }
+        rest = &tail[len..];
+        packets += 1;
+    }
+    packets > 0
+}
+
 /// gpg's machine-readable status lines (`--status-fd`).
 fn parse_gpg(status: &str) -> (Outcome, Option<String>) {
     let (mut good, mut bad, mut expired, mut revoked, mut nokey, mut errsig) = (false, false, false, false, false, false);
@@ -261,7 +368,8 @@ fn parse_gpg(status: &str) -> (Outcome, Option<String>) {
         let t: Vec<&str> = rest.split(' ').collect();
         match t[0] {
             "GOODSIG" => good = true,
-            "BADSIG" => bad = true,
+            // Literal data means a signed message, not a detached signature over the commit.
+            "BADSIG" | "PLAINTEXT" => bad = true,
             "EXPSIG" | "EXPKEYSIG" => expired = true,
             "REVKEYSIG" => revoked = true,
             // The primary key's fingerprint comes last: keys are registered by it.
@@ -295,8 +403,8 @@ fn parse_gpg(status: &str) -> (Outcome, Option<String>) {
     (o, fpr)
 }
 
-/// Check a pasted public key; a GPG key also goes into the keyring (that's how
-/// it's read, and harmless: only a database row makes a key count).
+/// Check a pasted public key. A GPG key is read in a throwaway keyring; it joins
+/// the server's keyring only once it's registered (`add_gpg_key`).
 pub async fn parse_key(st: &AppState, text: &str) -> R<NewKey> {
     let text = text.trim();
     if text.len() > MAX_KEY {
@@ -338,7 +446,15 @@ fn ssh_key(text: &str) -> Option<NewKey> {
 }
 
 async fn gpg_key(st: &AppState, text: &str) -> R<NewKey> {
-    let status = st.signing.gpg_import(&st.git, text.as_bytes(), TOOL_TIMEOUT).await.map_err(|f| match f {
+    st.signing.ensure_home().map_err(|_| AppError::internal("can't create the GPG home"))?;
+    let mut b = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+    let scratch = TempDir(st.signing.home.join(format!("parse-{}", hex::encode(b))));
+    let mut db = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut db, 0o700);
+    db.create(&scratch.0).map_err(|e| AppError::internal(format!("GPG scratch home: {e}")))?;
+    let status = st.signing.gpg_import(&st.git, &scratch.0, text.as_bytes(), TOOL_TIMEOUT).await.map_err(|f| match f {
         Fail::Missing => AppError::bad("This server can't read GPG keys (gpg isn't installed)"),
         Fail::Broken => AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Couldn't read the key just now. Try again."),
     })?;
@@ -441,7 +557,7 @@ async fn try_verify(st: &AppState, r: &Repo, shas: &[&str]) -> R<HashMap<String,
         .into_iter()
         .map(|(sha, c)| {
             let v = match c {
-                Ok(c) => verdict(&c, c.fingerprint.as_ref().and_then(|f| owners.get(f))),
+                Ok(c) => verdict(&c, c.fingerprint.as_ref().and_then(|f| owners.get(f)).map_or(&[][..], Vec::as_slice)),
                 Err(v) => v,
             };
             (sha, v)
@@ -453,8 +569,8 @@ fn unknown(why: &str) -> Verification {
     Verification { status: "unknown".into(), reason: why.into(), key_fingerprint: None, signer: None }
 }
 
-/// The accounts that registered these fingerprints, with the key's kind.
-async fn owners(st: &AppState, fprs: HashSet<String>) -> R<HashMap<String, (String, User)>> {
+/// The accounts that registered each of these fingerprints, with the key's kind.
+async fn owners(st: &AppState, fprs: HashSet<String>) -> R<HashMap<String, Vec<(String, User)>>> {
     if fprs.is_empty() {
         return Ok(HashMap::new());
     }
@@ -469,12 +585,17 @@ async fn owners(st: &AppState, fprs: HashSet<String>) -> R<HashMap<String, (Stri
             let rows = s.query_map(rusqlite::params_from_iter(&fprs), |r| {
                 Ok((r.get::<_, String>(0)?, (r.get::<_, String>(1)?, User::from_row(r)?)))
             })?;
-            Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+            let mut out: HashMap<String, Vec<(String, User)>> = HashMap::new();
+            for row in rows {
+                let (f, o) = row?;
+                out.entry(f).or_default().push(o);
+            }
+            Ok(out)
         })
         .await
 }
 
-fn verdict(c: &Check, owner: Option<&(String, User)>) -> Verification {
+fn verdict(c: &Check, owners: &[(String, User)]) -> Verification {
     let (kind, a) = if c.kind == "ssh" { ("SSH", "an") } else { ("GPG", "a") };
     let says = |status: &str, reason: String, signer: Option<&User>| Verification {
         status: status.into(),
@@ -490,17 +611,20 @@ fn verdict(c: &Check, owner: Option<&(String, User)>) -> Verification {
         Outcome::Revoked => says("unverified", "The GPG key that made this signature was revoked.".into(), None),
         Outcome::Unsupported => says("unverified", "This kind of signature can't be checked here (only SSH and GPG signatures can).".into(), None),
         Outcome::NoKey => unregistered(),
-        Outcome::Good => match owner {
-            Some((k, u)) if *k == c.kind => {
-                let name = &u.username;
-                if owns_email(u, &c.committer_email) {
-                    says("verified", format!("Signed with {name}'s {kind} key."), Some(u))
-                } else {
+        Outcome::Good => {
+            // Several accounts may have added the same public key: the signature
+            // verifies for the one whose email is the committer's.
+            let mine: Vec<&User> = owners.iter().filter(|(k, _)| *k == c.kind).map(|(_, u)| u).collect();
+            match (mine.iter().find(|u| owns_email(u, &c.committer_email)), mine.as_slice()) {
+                (Some(u), _) => says("verified", format!("Signed with {}'s {kind} key.", u.username), Some(u)),
+                (None, []) => unregistered(),
+                (None, [u]) => {
+                    let name = &u.username;
                     says("unverified", format!("Signed with {name}'s {kind} key, but the committer email isn't {name}'s."), Some(u))
                 }
+                (None, _) => says("unverified", format!("Signed with a registered {kind} key, but the committer email isn't that of anyone who added it."), None),
             }
-            _ => unregistered(),
-        },
+        }
     }
 }
 
@@ -517,7 +641,20 @@ async fn raw_commits(git: &Git, repo: &Path, shas: &[&str]) -> R<Vec<(String, Ve
     if shas.is_empty() {
         return Ok(vec![]);
     }
+    // Sizes first: a commit with a multi-megabyte message isn't read for a badge.
     let input = shas.join("\n") + "\n";
+    let sizes = git.run(repo, &["cat-file", "--batch-check"], Some(input.as_bytes()), &[]).await?;
+    let small: Vec<String> = String::from_utf8_lossy(&sizes.stdout)
+        .lines()
+        .filter_map(|l| match l.split(' ').collect::<Vec<_>>()[..] {
+            [sha, "commit", n] if n.parse::<usize>().is_ok_and(|n| n <= MAX_COMMIT) => Some(sha.to_string()),
+            _ => None,
+        })
+        .collect();
+    if small.is_empty() {
+        return Ok(vec![]);
+    }
+    let input = small.join("\n") + "\n";
     let o = git.run(repo, &["cat-file", "--batch"], Some(input.as_bytes()), &[]).await?;
     if o.code != 0 {
         return Err(AppError::internal(format!("git cat-file: {}", String::from_utf8_lossy(&o.stderr).trim())));
@@ -615,6 +752,22 @@ mod tests {
         assert_eq!(parse_gpg(missing), (Outcome::NoKey, Some("FPR".into())));
         assert_eq!(parse_gpg("[GNUPG:] EXPKEYSIG 4B9A Alice\n[GNUPG:] VALIDSIG SUB x\n").0, Outcome::Expired);
         assert_eq!(parse_gpg("[GNUPG:] NODATA 1\n").0, Outcome::Bad);
+    }
+
+    #[test]
+    fn only_detached_signatures_count() {
+        use base64::Engine;
+        let arm = |b: &[u8]| format!("-----BEGIN PGP SIGNATURE-----\n\n{}\n=abcd\n-----END PGP SIGNATURE-----\n", base64::engine::general_purpose::STANDARD.encode(b));
+        // New-format signature packet (0xc2), then old-format (0x88): fine.
+        assert!(only_signature_packets(&arm(&[0xc2, 3, 1, 2, 3, 0x88, 2, 9, 9])));
+        // One-pass signature (tag 4), literal data (tag 11), compressed (tag 8): refused.
+        assert!(!only_signature_packets(&arm(&[0xc4, 1, 0, 0xc2, 1, 0])));
+        assert!(!only_signature_packets(&arm(&[0xc2, 1, 0, 0xcb, 1, 0])), "an old-style signed message");
+        assert!(!only_signature_packets(&arm(&[0xa3, 1, 0])));
+        assert!(!only_signature_packets(&arm(&[0xc2, 9, 1])), "length past the end");
+        assert!(!only_signature_packets(&arm(&[])));
+        assert!(only_signature_packets("-----BEGIN PGP SIGNATURE-----\nVersion: x\n\nwgMBAgM=\n=x\n-----END PGP SIGNATURE-----"));
+        assert_eq!(parse_gpg("[GNUPG:] PLAINTEXT 62 0\n[GNUPG:] GOODSIG 4B9A Alice\n[GNUPG:] VALIDSIG S x\n").0, Outcome::Bad);
     }
 
     #[test]

@@ -9,8 +9,9 @@ depends_on: []
 source: followup
 created: 2026-10-21T17:01:51Z
 updated: 2026-10-21T17:01:51Z
-inferred_deps: [T-0007, T-0028]
-inferred_why: T-0007: merge queue needs required status checks; T-0028: queue merges via merge_pull; fix atomicity first
+inferred_deps: [T-0007]
+inferred_why: T-0007: merge queue needs required checks and auto-merge
+group: CI gating and pipeline features
 ---
 # Merge queue (C27)
 ## Raw request

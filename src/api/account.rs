@@ -209,7 +209,7 @@ pub async fn login_2fa(
         .db
         .call(move |c| Ok(c.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1 AND suspended = 0"), [uid], User::from_row)?))
         .await?;
-    match crate::security::use_code(&st.db, uid, &req.code).await? {
+    match crate::security::use_code(&st.db, st.key.clone(), uid, &req.code).await? {
         Some(how) => {
             st.challenges.finish(&req.challenge);
             st.limiter.reset(&key);
@@ -607,12 +607,12 @@ pub async fn add_signing_key(
         (true, "") => format!("{} key", k.kind.to_uppercase()),
         (true, label) => label.chars().take(80).collect(),
     };
-    let (uid, kind, fp, key) = (u.id, k.kind, k.fingerprint.clone(), k.key);
+    let (uid, kind, fp, key) = (u.id, k.kind, k.fingerprint.clone(), k.key.clone());
     let row = st
         .db
         .call(move |c| {
-            if c.query_row("SELECT 1 FROM signing_keys WHERE fingerprint = ?1", [&fp], |_| Ok(())).optional()?.is_some() {
-                return Err(AppError::conflict("That key is already added to an account"));
+            if c.query_row("SELECT 1 FROM signing_keys WHERE fingerprint = ?1 AND user_id = ?2", rusqlite::params![&fp, uid], |_| Ok(())).optional()?.is_some() {
+                return Err(AppError::conflict("You've already added that key"));
             }
             let n: i64 = c.query_row("SELECT count(*) FROM signing_keys WHERE user_id = ?1", [uid], |r| r.get(0))?;
             if n >= 50 {
@@ -627,7 +627,7 @@ pub async fn add_signing_key(
         })
         .await?;
     if kind == "gpg" {
-        st.signing.key_added();
+        st.signing.add_gpg_key(&st.git, &k.key).await;
     }
     let detail = format!("{} key {}", kind.to_uppercase(), k.fingerprint);
     record(&st.db, Event { actor: Some(&u), subject: Some(u.id), action: "signing_key_added", detail, ip: &ip.0 }).await;
@@ -742,7 +742,15 @@ pub async fn profile(
             )?;
             let heat: Vec<(String, i64)> = hs.query_map([id, since], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let ev = events(c, "e.user_id = ?", vec![Value::Integer(id)], v.as_ref(), 30)?;
-            Ok(json!({ "user": p, "repos": repos, "stars": stars, "heatmap": heat, "events": ev }))
+            let is_org: bool = c.query_row("SELECT is_org FROM users WHERE id = ?1", [id], |r| r.get(0))?;
+            // Someone's organizations are shown to themselves, site admins and fellow members.
+            let (vid, vadmin) = v.as_ref().map_or((-1, false), |u| (u.id, u.is_admin));
+            let mut q = c.prepare(
+                "SELECT u.username FROM org_members m JOIN users u ON u.id = m.org_id WHERE m.user_id = ?1
+                 AND (?1 = ?2 OR ?3 OR EXISTS (SELECT 1 FROM org_members f WHERE f.org_id = m.org_id AND f.user_id = ?2)) ORDER BY u.username",
+            )?;
+            let orgs: Vec<String> = q.query_map(rusqlite::params![id, vid, vadmin], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            Ok(json!({ "user": p, "is_org": is_org, "orgs": orgs, "repos": repos, "stars": stars, "heatmap": heat, "events": ev }))
         })
         .await?;
     Ok(Json(out))
@@ -776,15 +784,23 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
                 let ev = events(c, "1=1", vec![], None, 40)?;
                 let trending = repo_cards(
                     c,
-                    "WHERE r.is_private = 0 AND r.hidden = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id AND s.created_at > strftime('%s','now') - 7*86400) DESC, r.updated_at DESC LIMIT 8",
+                    "WHERE r.is_private = 0 AND r.hidden = 0 AND r.deleted_at IS NULL ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id AND s.created_at > strftime('%s','now') - 7*86400) DESC, r.updated_at DESC LIMIT 8",
                     vec![],
                 )?;
                 return Ok(json!({ "events": ev, "repos": [], "trending": trending }));
             };
             // Through VISIBLE, so a deploy token (one repo only) doesn't list the owner's private repos.
-            let mut p = vec![Value::Integer(u.id)];
+            // Yours, plus those shared with you (VISIBLE drops org repos the base role doesn't open).
+            let mut p = vec![Value::Integer(u.id), Value::Integer(u.id), Value::Integer(u.id)];
             p.extend(visible_params(Some(&u)));
-            let mine = repo_cards(c, &format!("WHERE r.owner_id = ? AND {VISIBLE} ORDER BY r.updated_at DESC LIMIT 100"), p)?;
+            let mine = repo_cards(
+                c,
+                &format!(
+                    "WHERE (r.owner_id = ? OR r.id IN (SELECT repo_id FROM repo_collaborators WHERE user_id = ?) OR r.owner_id IN (SELECT org_id FROM org_members WHERE user_id = ?))
+                     AND {VISIBLE} ORDER BY r.updated_at DESC LIMIT 100"
+                ),
+                p,
+            )?;
             let ev = events(
                 c,
                 "e.user_id = ? OR e.repo_id IN (SELECT repo_id FROM stars WHERE user_id = ?) OR e.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)",
@@ -795,7 +811,7 @@ pub async fn feed(State(st): State<AppState>, Viewer(v): Viewer) -> J<serde_json
             let global = if ev.len() < 10 { events(c, "1=1", vec![], Some(&u), 30)? } else { vec![] };
             let trending = repo_cards(
                 c,
-                "WHERE r.is_private = 0 AND r.hidden = 0 ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) DESC, r.updated_at DESC LIMIT 6",
+                "WHERE r.is_private = 0 AND r.hidden = 0 AND r.deleted_at IS NULL ORDER BY (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) DESC, r.updated_at DESC LIMIT 6",
                 vec![],
             )?;
             Ok(json!({ "events": ev, "global": global, "repos": mine, "trending": trending }))

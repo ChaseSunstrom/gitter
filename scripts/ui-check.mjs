@@ -44,12 +44,17 @@ const r = await ctx.request.post(BASE + '/api/auth/login', { headers: { Origin: 
 if (!r.ok()) { console.log('✗ login failed', r.status()); process.exit(1); }
 const sha = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json()).commits.at(-1).sha;
 const snip = (await (await ctx.request.get(BASE + '/api/snippets')).json()).items[0].id;
+const hook = (await (await ctx.request.get(BASE + '/api/repos/alice/hello/hooks')).json()).hooks[0];
 
 const pages = [
   ['/', ['Your repositories']],
   ['/alice', ['alice']],
   ['/alice?tab=stars', ['alice']],
-  ['/alice/hello', ['README.md', 'src']],
+  ['/alice/hello', ['README.md', 'src', 'Releases', 'Version one', 'Latest']],
+  ['/alice/hello/releases', ['Draft a new release', 'Next up', 'Draft', 'Version one', 'Latest', 'First stable release', 'hello.txt', '1 download', 'Source code (zip)', 'Source code (tar.gz)']],
+  ['/alice/hello/releases/1', ['All releases', 'Version one', 'v1.0', 'hello.txt', 'Source code (zip)']],
+  ['/alice/hello/releases/new', ['New release', 'New tag at', 'Release notes', 'This is a pre-release', 'Save draft', 'Publish release']],
+  ['/alice/hello/releases/1/edit', ['Edit Version one', 'hello.txt', 'Delete release', 'Update release']],
   ['/alice/hello/tree/main/src', ['main.rs']],
   ['/alice/hello/blob/main/src/main.rs', ['println']],
   ['/alice/hello/blob/main/README.md', ['hello']],
@@ -69,7 +74,15 @@ const pages = [
   ['/alice/hello/issues/new', []],
   ['/alice/hello/insights', ['Alice']],
   ['/alice/hello/search?q=println', ['src/main.rs']],
-  ['/alice/hello/settings', ['Danger zone', 'CI secrets']],
+  ['/alice/hello/settings', ['Danger zone', 'CI secrets', 'Webhooks', hook.url, 'Issues', 'Who has access', 'Site admins', 'Transfer ownership', 'Recently deleted']],
+  [`/alice/hello/settings/hooks/${hook.id}`, ['Payload URL', 'Recent deliveries', 'ping', 'issues', 'Delivered', 'Send a ping']],
+  ['/alice/hello/settings/hooks/new', ['Add webhook', 'Payload URL', 'Allow private addresses']],
+  ['/alice/secret/settings', ['Who has access', 'bob']],
+  ['/acme', ['Acme Inc', 'Organization', 'People', 'tools']],
+  ['/orgs/acme/settings', ['What members can do', 'Members', 'bob']],
+  ['/orgs/new', ['Create an organization']],
+  // Renamed in e2e.sh: the old page address redirects to the new one.
+  ['/alice/old-name', ['new-name', 'README.md']],
   ['/alice/hello/ci', ['CI runs', 'Add CI', '#1']],
   ['/alice/hello/ci/1', ['Add CI', 'build', 'test', 'Say hello', 'Set up job', 'Passed']],
   ['/admin/runners', ['Runners', 'built-in', 'Add a runner']],
@@ -85,7 +98,9 @@ const pages = [
   ['/settings/security', ['Two-factor authentication', 'This browser', 'Security log']],
   ['/admin/audit', ['The log is intact', 'Created the account']],
   ['/settings/appearance', []],
-  ['/admin', ['Site administration', 'Storage']],
+  ['/settings/account', ['Change password', 'Export your data', 'Your export is ready', 'Delete your account']],
+  ['/settings/repositories', ['Transfers', 'bob/present', 'Accept', 'Recently deleted', 'scratch']],
+  ['/admin', ['Site administration', 'Storage', 'Recently deleted repositories', 'alice/scratch']],
   ['/admin/users', ['alice', 'bob']],
   ['/admin/settings', ['Instance name', 'Largest Git LFS file', 'Jobs the built-in runner runs at once']],
   ['/alice/hello/wiki', ['Hello wiki', 'Setup', 'Pages']],
@@ -199,6 +214,40 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   const all = await page.locator('.dfile .dtable tr.add').count();
   if (errors.length || first > 1100 || all !== 5000) { failed++; console.log(`✗ big diff: first chunk ${first} rows, ${all} added rows after scrolling`, errors); }
   else console.log(`  ok big diff loads on demand (${first} rows first, ${all} after scrolling)`);
+  await page.close();
+}
+
+// Webhooks: add one with the form, open its ping in the delivery log, redeliver it.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const steps = [];
+  try {
+    await page.goto(BASE + '/alice/hello/settings/hooks/new', { waitUntil: 'networkidle' });
+    await page.fill('#h-url', hook.url + '/from-browser');
+    await page.fill('#h-secret', 'browser-secret');
+    await page.check('input[name=which][value=some]');
+    await page.check('input[name=ev][value=push]');
+    await page.check('#h-private');
+    await page.click('#hook-form button[type=submit]');
+    await page.waitForURL(/\/settings\/hooks\/\d+$/);
+    steps.push('added');
+    for (let i = 0; i < 25 && !(await page.locator('.hook-delivery', { hasText: 'Delivered' }).count()); i++) {
+      await page.waitForTimeout(200);
+      await page.reload({ waitUntil: 'networkidle' });
+    }
+    await page.locator('.hook-delivery summary', { hasText: 'ping' }).first().click();
+    await page.locator('.hook-delivery[open] [data-redeliver]').waitFor({ timeout: 5000 });
+    const shown = await page.locator('.hook-delivery[open]').innerText();
+    if (!shown.includes('X-Gitter-Signature-256') || !shown.includes('"hook"')) throw new Error('delivery details missing: ' + shown.slice(0, 300));
+    steps.push('read its ping');
+    await page.click('.hook-delivery[open] [data-redeliver]');
+    await page.locator('.hook-delivery .pill', { hasText: 'Redelivery' }).waitFor({ timeout: 5000 });
+    steps.push('redelivered it');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || steps.length < 3) { failed++; console.log('✗ webhook form and delivery log', steps, errors); }
+  else console.log(`  ok webhook ${steps.join(', ')} in the browser`);
   await page.close();
 }
 
@@ -325,7 +374,7 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close(); await apage.close();
 }
 
-// Wiki, discussion and snippet forms work end to end.
+// Wiki, discussion, snippet and release forms work end to end.
 {
   const page = await ctx.newPage();
   const errors = [];
@@ -358,9 +407,40 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
     await page.waitForFunction(() => document.querySelector('#page').innerText.includes('browser snippet'));
     if (!(await text()).includes('Secret')) throw new Error('snippet not secret');
     steps.push('secret snippet');
+    await page.goto(BASE + '/alice/hello/releases/new', { waitUntil: 'networkidle' });
+    await page.fill('#rel-tag', 'v2.0-beta');
+    await page.fill('#rel-title', 'Beta from the browser');
+    await page.check('#rel-pre');
+    await page.setInputFiles('#rel-files', { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('uploaded from chromium') });
+    await page.click('#rel-form button[data-draft=""]');
+    await page.waitForURL(/\/releases\/\d+$/);
+    await page.waitForFunction(() => document.querySelector('#page').innerText.includes('notes.txt'));
+    if (!(await text()).includes('Pre-release')) throw new Error('release not marked as a pre-release');
+    const href = await page.getAttribute('a[download][href*="/assets/"]', 'href');
+    if ((await (await ctx.request.get(BASE + href)).text()) !== 'uploaded from chromium') throw new Error('release file differs');
+    steps.push('pre-release with a file');
   } catch (e) { errors.push(String(e)); }
-  if (errors.length) { failed++; console.log('✗ wiki/discussion/snippet forms', steps, errors); }
+  if (errors.length) { failed++; console.log('✗ wiki/discussion/snippet/release forms', steps, errors); }
   else console.log(`  ok ${steps.join(', ')} made in the browser`);
+  await page.close();
+}
+
+// Settings → Repositories: accept the transfer e2e.sh offered, and restore the repository it deleted.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  try {
+    await page.goto(BASE + '/settings/repositories', { waitUntil: 'networkidle' });
+    await page.click('[data-offer] [data-accept]');
+    await page.waitForSelector('[data-offer]', { state: 'detached', timeout: 5000 });
+    await page.click('[data-trash] [data-restore]');
+    await page.waitForSelector('[data-trash]', { state: 'detached', timeout: 5000 });
+  } catch (e) { errors.push(String(e)); }
+  const present = (await ctx.request.get(BASE + '/api/repos/alice/present')).status();
+  const scratch = (await ctx.request.get(BASE + '/api/repos/alice/scratch')).status();
+  if (errors.length || present !== 200 || scratch !== 200) { failed++; console.log('✗ settings → repositories', { present, scratch, errors }); }
+  else console.log('  ok a transfer accepted and a deleted repository restored from settings');
   await page.close();
 }
 

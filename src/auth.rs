@@ -281,7 +281,7 @@ async fn job_user(db: &Db, raw: &str) -> R<Option<User>> {
         Ok(c.query_row(
             "SELECT u.id, u.username, u.display_name, u.email, u.is_admin, r.repo_id FROM ci_jobs j
              JOIN ci_runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id JOIN users u ON u.id = p.owner_id
-             WHERE j.token_hash = ?1 AND j.status = 'running' AND u.suspended = 0",
+             WHERE j.token_hash = ?1 AND j.status = 'running' AND u.suspended = 0 AND p.deleted_at IS NULL",
             [hash],
             |r| {
                 let mut u = User::from_row(r)?;
@@ -364,7 +364,7 @@ pub async fn password_login(db: &Db, name: &str, pw: &str) -> R<Option<User>> {
     let row = db
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT id, username, display_name, email, is_admin, pass_hash FROM users WHERE (username = ?1 OR (email = ?1 AND email != '')) AND suspended = 0",
+                "SELECT id, username, display_name, email, is_admin, pass_hash FROM users WHERE (username = ?1 OR (email = ?1 AND email != '')) AND suspended = 0 AND is_org = 0",
                 [&n],
                 |r| Ok((User::from_row(r)?, r.get::<_, String>("pass_hash")?)),
             )

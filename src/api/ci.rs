@@ -327,7 +327,7 @@ fn secret_name(s: &str) -> bool {
 }
 
 pub async fn secrets(State(st): State<AppState>, Authed(u): Authed, Path((o, n)): Path<(String, String)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let id = r.id;
     let list: Vec<Value> = st
         .db
@@ -352,7 +352,7 @@ pub async fn set_secret(
     Path((o, n, name)): Path<(String, String, String)>,
     Json(req): Json<SecretReq>,
 ) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     if !secret_name(&name) {
         return Err(AppError::bad("Secret names use A–Z, 0–9 and _, start with a letter or _, and don't start with GITTER"));
     }
@@ -382,7 +382,7 @@ pub async fn set_secret(
 }
 
 pub async fn delete_secret(State(st): State<AppState>, Sudo(u): Sudo, ip: ClientIp, Path((o, n, name)): Path<(String, String, String)>) -> J<Value> {
-    let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    let r = Repo::administrable(&st, Some(&u), &o, &n).await?;
     let (id, n2) = (r.id, name.clone());
     let gone = st.db.call(move |c| Ok(c.execute("DELETE FROM ci_secrets WHERE repo_id = ?1 AND name = ?2", rusqlite::params![id, n2])?)).await?;
     if gone == 0 {

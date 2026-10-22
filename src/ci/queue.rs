@@ -12,6 +12,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use super::config::Job;
 use crate::db::now;
 
+/// True for an owner `u` that is a site admin, or an org a site admin created.
+/// (Not "has an admin among its owners": any owner can add anyone as an owner.)
+pub const ADMIN_OWNED: &str = "(u.is_admin = 1 OR EXISTS (SELECT 1 FROM orgs o JOIN users a ON a.id = o.created_by WHERE o.id = u.id AND a.is_admin = 1))";
+
 /// Job tokens: one per attempt, good while it runs (also reads the repository).
 pub const JOB_TOKEN_PREFIX: &str = "gcj_";
 
@@ -103,10 +107,10 @@ pub fn claim(c: &mut Connection, runner_id: i64, labels: &[String], admins_only:
     let tx = c.transaction()?;
     let picked = {
         // ponytail: parses each queued job's labels; a runs_on column if queues get long.
-        let mut q = tx.prepare_cached(
+        let mut q = tx.prepare_cached(&format!(
             "SELECT j.id, j.spec FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
-             JOIN users u ON u.id = p.owner_id WHERE j.status = 'queued' AND (?1 = 0 OR u.is_admin = 1) ORDER BY j.id LIMIT 10000",
-        )?;
+             JOIN users u ON u.id = p.owner_id WHERE j.status = 'queued' AND p.deleted_at IS NULL AND (?1 = 0 OR {ADMIN_OWNED}) ORDER BY j.id LIMIT 10000"
+        ))?;
         let rows = q.query_map([admins_only], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut found = None;
         for row in rows {

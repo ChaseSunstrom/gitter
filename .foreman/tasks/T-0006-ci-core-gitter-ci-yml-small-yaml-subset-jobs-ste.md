@@ -8,7 +8,7 @@ scope: []
 depends_on: [T-0002]
 source: user
 created: 2026-10-21T17:01:42Z
-updated: 2026-10-22T00:08:08Z
+updated: 2026-10-22T00:08:09Z
 base: 5a67c7a92b9dc2febd3e66c65f34268bc55f2caa
 base_tree: 7da4362137363dceec0d0331e52c4a205824eb45
 plan0_at: 2026-10-21T22:09:16Z
@@ -121,6 +121,7 @@ README CI section; help text
 - 2026-10-21T23:06:43Z focused
 - 2026-10-21T23:59:10Z scope: CI touches auth (job tokens), smart_http (fetch by sha for job tokens), ops (secret.key in backups), security (server key), main (runner CLI, shutdown), and the repo/admin/settings UI
 - 2026-10-22T00:08:08Z done
+- 2026-10-22T00:08:09Z committed 77c5dcb (60 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses: git::Git (clone/checkout via the scrubbed git command, run_timeout), auth::Limiter + new_secret/sha256 (runner and job tokens), hooks::on_push (trigger point), security::record (secret changes), smart_http access rules (job clones over HTTP with a job token), axum SSE (logs), tower-free in-process queue for the embedded runner. New crates only where nothing fits: chacha20poly1305 (secret encryption; no AEAD in the tree) and ureq (blocking HTTP client for the remote runner, later webhooks/imports; no client in the tree). No YAML or cron crate: both subsets are small and parsed in src/ci/.

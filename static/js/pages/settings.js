@@ -1,9 +1,9 @@
-// Account settings: profile, password, access tokens, appearance.
+// Account settings: profile, account (password, export, delete), repositories (transfers, trash), access tokens, appearance.
 import { html, raw, state, get, send, $, action, toast, timeEl, confirmDialog, avatar, copy, auditLabel, deviceName, bytes } from '../lib.js';
 import { icon } from '../icons.js';
 import { refresh, renderTopbar, setTheme, getTheme, SKINS, getSkin, setSkin } from '../main.js';
 
-const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Password'], ['security', 'lock', 'Security'], ['tokens', 'key', 'Access tokens'], ['signing', 'edit', 'Signing keys'], ['appearance', 'sun', 'Appearance']];
+const TABS = [['profile', 'user', 'Profile'], ['account', 'shield', 'Account'], ['repositories', 'repo', 'Repositories'], ['security', 'lock', 'Security'], ['tokens', 'key', 'Access tokens'], ['signing', 'edit', 'Signing keys'], ['appearance', 'sun', 'Appearance']];
 
 function nav(tab) {
   return html`<nav class="settings-nav" aria-label="Settings">${TABS.map(([k, ic, label]) =>
@@ -29,7 +29,7 @@ function profileTab(p, storage) {
   </form>`;
 }
 
-function accountTab() {
+function accountTab(exp) {
   return html`<form id="pw-form" class="stack settings-form" novalidate>
     <h2>Change password</h2>
     <div class="field"><label for="current">Current password</label><input class="input" id="current" name="current" type="password" autocomplete="current-password" required></div>
@@ -37,7 +37,53 @@ function accountTab() {
     <div class="field"><label for="confirm">Confirm new password</label><input class="input" id="confirm" name="confirm" type="password" autocomplete="new-password" required></div>
     <p class="field-err" id="pw-err" role="alert" hidden></p>
     <div class="row"><button class="btn primary" type="submit">Update password</button></div>
-  </form>`;
+  </form>
+  <div class="stack settings-form" style="margin-top:28px">
+    <h2>Export your data</h2>
+    <p class="muted">Download a .tar.gz with your profile, a git bundle of each repository you own (and its wiki), your snippets, the issues, pull requests, comments and discussions you wrote, and your security log. It's ready to download for a day.</p>
+    ${exportBox(exp)}
+  </div>
+  <div class="stack settings-form" style="margin-top:28px">
+    <h2>Delete account</h2>
+    <div class="box danger-zone"><div class="list"><div class="list-row"><div class="grow"><b>Delete your account</b>
+      <div class="muted small">Deletes your profile, every repository you own (also the ones in Recently deleted), your snippets, and the issues, pull requests and comments you wrote. This can't be undone.</div></div>
+      <button class="btn danger" id="del-me">${icon('trash', 'sm')} Delete account</button></div></div></div>
+  </div>`;
+}
+
+function exportBox(e) {
+  if (!e) return html`<div class="row"><button class="btn" data-export>${icon('download', 'sm')} Export your data</button></div>`;
+  if (e.status === 'running') {
+    return html`<div class="box"><div class="box-body row">${icon('clock', 'muted')}<span class="grow"><b>Preparing your export…</b> <span class="muted small">Started ${timeEl(e.created_at)}. This page updates when it's ready.</span></span></div></div>`;
+  }
+  if (e.status === 'ready') {
+    return html`<div class="box"><div class="box-body row wrap-ok">${icon('check', 'c-green')}<span class="grow"><b>Your export is ready</b> <span class="muted small">${bytes(e.size)} · can be downloaded until ${timeEl(e.expires_at)}</span></span>
+      <a class="btn primary" href="/api/me/export/download" download>${icon('download', 'sm')} Download</a><button class="btn" data-export>Make a new one</button></div></div>`;
+  }
+  return html`<div class="box"><div class="box-body row">${icon('x', 'c-red')}<span class="grow"><b>The export didn't finish</b> <span class="muted small">${e.error}</span></span><button class="btn" data-export>Try again</button></div></div>`;
+}
+
+function reposTab(tr, trash) {
+  const incoming = tr.incoming.map((t) => html`<div class="list-row" data-offer="${t.id}">${icon('repo', 'muted')}
+    <div class="grow"><b>${t.repo}</b>${t.private ? html` <span class="tag-private">Private</span>` : ''}
+      <div class="small muted">${t.from} offered it to you · the offer ends ${timeEl(t.expires_at)}</div></div>
+    <button class="btn sm" data-decline>Decline</button><button class="btn sm primary" data-accept>Accept</button></div>`);
+  const outgoing = tr.outgoing.map((t) => html`<div class="list-row">${icon('repo', 'muted')}
+    <div class="grow"><b>${t.repo}</b><div class="small muted">Offered to ${t.to} · the offer ends ${timeEl(t.expires_at)}</div></div>
+    <a class="btn sm" href="/${t.repo}/settings">Manage</a></div>`);
+  const deleted = trash.repos.map((r) => html`<div class="list-row" data-trash="${r.id}">${icon('trash', 'muted')}
+    <div class="grow"><b>${r.name}</b>${r.private ? html` <span class="tag-private">Private</span>` : ''}
+      <div class="small muted">Deleted ${timeEl(r.deleted_at)} · gone for good ${timeEl(r.purge_at)}${r.name_taken ? ` · you have another repository named ${r.name}: rename it to restore this one` : ''}</div></div>
+    <button class="btn sm" data-restore ${r.name_taken ? 'disabled' : ''}>Restore</button></div>`);
+  return html`<div class="stack settings-form">
+    <h2>Transfers</h2>
+    <p class="muted">Repositories someone offered to you. Accepting makes you the owner: issues, pull requests, stars and history come with it, and its old address leads to its new one. Offers end after 7 days.</p>
+    ${incoming.length ? html`<div class="box list">${incoming}</div>` : html`<p class="muted small">No offers waiting for you.</p>`}
+    ${outgoing.length ? html`<h3 class="section-title">Offers you made</h3><div class="box list">${outgoing}</div>` : ''}
+    <h2 style="margin-top:18px">Recently deleted</h2>
+    <p class="muted">Deleted repositories stay here for 7 days, then they're gone for good. Until then they still count toward your storage.</p>
+    ${deleted.length ? html`<div class="box list">${deleted}</div>` : html`<p class="muted small">Nothing deleted lately.</p>`}
+  </div>`;
 }
 
 const SCOPES = { read: 'Read only', write: 'Read and write', all: 'Full access' };
@@ -150,11 +196,15 @@ function appearanceTab() {
 export default async function (ctx) {
   if (!state.me) return { redirect: '/login?next=' + encodeURIComponent(ctx.path) };
   const tab = TABS.some(([k]) => k === ctx.params.tab) ? ctx.params.tab : 'profile';
-  let inner;
+  let inner, exp = null, timer;
   if (tab === 'profile') { const m = await get('/me', { fresh: true }); inner = profileTab(m.profile, m.storage); }
   else if (tab === 'tokens') inner = tokensTab((await get('/me/tokens', { fresh: true })).tokens);
   else if (tab === 'signing') inner = signingTab((await get('/me/signing-keys', { fresh: true })).keys);
-  else if (tab === 'account') inner = accountTab();
+  else if (tab === 'account') { exp = (await get('/me/export', { fresh: true })).export; inner = accountTab(exp); }
+  else if (tab === 'repositories') {
+    const [tr, trash] = await Promise.all([get('/me/transfers', { fresh: true }), get('/me/trash', { fresh: true })]);
+    inner = reposTab(tr, trash);
+  }
   else if (tab === 'security') {
     const [sec, log] = await Promise.all([get('/me/security', { fresh: true }), get('/me/audit', { fresh: true })]);
     inner = securityTab(sec, log);
@@ -246,10 +296,50 @@ export default async function (ctx) {
         });
       }
       if (tab === 'security') mountSecurity(el);
+      if (tab === 'repositories') mountRepos(el);
+      if (tab === 'account') {
+        // Check back until a running export is ready.
+        if (exp?.status === 'running') timer = setTimeout(() => refresh(), 2000);
+        el.querySelectorAll('[data-export]').forEach((b) => b.addEventListener('click', action(b, async () => {
+          await send('POST', '/me/export');
+          toast('Preparing your export');
+          refresh();
+        })));
+        const del = $('#del-me', el);
+        del.addEventListener('click', action(del, async () => {
+          const name = state.me.username;
+          const ok = await confirmDialog({ title: 'Delete your account?', text: `This deletes ${name}, every repository you own and everything you wrote. It can't be undone.`, ok: 'Delete my account', danger: true, typed: name });
+          if (!ok) return;
+          await send('DELETE', '/me', { confirm: name });
+          location.href = '/';
+        }));
+      }
       el.querySelectorAll('input[name=theme]').forEach((r) => r.addEventListener('change', () => { setTheme(r.value); toast(`Theme: ${r.closest('label').textContent.trim()}`); }));
       el.querySelectorAll('input[name=skin]').forEach((r) => r.addEventListener('change', () => { setSkin(r.value); toast(`Theme: ${SKINS.find((x) => x.id === r.value).name}`); }));
     },
+    unmount() { clearTimeout(timer); },
   };
+}
+
+function mountRepos(el) {
+  $('.settings-body', el).addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-accept], [data-decline], [data-restore]');
+    if (!b) return;
+    const row = b.closest('.list-row');
+    await action(b, async () => {
+      if (b.matches('[data-accept]')) {
+        const r = await send('POST', `/me/transfers/${row.dataset.offer}/accept`);
+        toast(`You now own ${r.owner}/${r.name}`);
+      } else if (b.matches('[data-decline]')) {
+        await send('POST', `/me/transfers/${row.dataset.offer}/decline`);
+        toast('Offer declined');
+      } else {
+        const r = await send('POST', `/me/trash/${row.dataset.trash}/restore`);
+        toast(`Restored ${r.owner}/${r.name}`);
+      }
+      refresh();
+    })();
+  });
 }
 
 function mountSecurity(el) {

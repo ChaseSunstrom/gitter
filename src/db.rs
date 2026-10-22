@@ -336,8 +336,149 @@ const MIGRATIONS: &[&str] = &[
         last_minute INTEGER NOT NULL DEFAULT 0
     );
     "#,
-    // v12: signing keys. A key belongs to one account (the fingerprint is unique), so a
-    // good signature names exactly one owner. kind is 'ssh' or 'gpg'.
+    // v10: organizations and collaborators. An org is a users row that can't sign in.
+    r#"
+    ALTER TABLE users ADD COLUMN is_org INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE orgs (
+        id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        -- What members get on every org repository: none, read or write.
+        base_role TEXT NOT NULL DEFAULT 'read',
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE org_members (
+        org_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL DEFAULT 'member',
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (org_id, user_id)
+    );
+    CREATE INDEX org_members_user ON org_members(user_id);
+    CREATE TABLE repo_collaborators (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, user_id)
+    );
+    CREATE INDEX repo_collaborators_user ON repo_collaborators(user_id);
+    "#,
+    // v11: releases. Asset files live in GITTER_DATA/releases/<release id>/<asset id>;
+    // AUTOINCREMENT so a new row never reuses the folder of a deleted one.
+    r#"
+    CREATE TABLE releases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        tag TEXT NOT NULL,
+        -- A draft's new tag is made at this branch or commit when it's published ('' once the tag exists).
+        target TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        draft INTEGER NOT NULL DEFAULT 0,
+        prerelease INTEGER NOT NULL DEFAULT 0,
+        author_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at INTEGER NOT NULL,
+        published_at INTEGER,
+        UNIQUE(repo_id, tag)
+    );
+    CREATE TABLE release_assets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        release_id INTEGER NOT NULL REFERENCES releases(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+        sha256 TEXT NOT NULL DEFAULT '',
+        downloads INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        UNIQUE(release_id, name)
+    );
+    "#,
+    // v12: webhooks
+    r#"
+    CREATE TABLE webhooks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        url TEXT NOT NULL,
+        -- Sealed with GITTER_DATA/secret.key.
+        secret BLOB NOT NULL,
+        -- Comma-separated event names, or '*' for all.
+        events TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        -- Set by a site admin only: may reach loopback and private addresses.
+        allow_private INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX webhooks_repo ON webhooks(repo_id);
+    -- The queue and the delivery log in one: next_at is when to try next (NULL once delivered or given up).
+    CREATE TABLE webhook_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hook_id INTEGER NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+        guid TEXT NOT NULL,
+        event TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        redelivery INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_at INTEGER,
+        request_headers TEXT NOT NULL DEFAULT '{}',
+        response_code INTEGER,
+        response_body TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        duration_ms INTEGER,
+        created_at INTEGER NOT NULL,
+        tried_at INTEGER
+    );
+    CREATE INDEX webhook_deliveries_due ON webhook_deliveries(next_at) WHERE next_at IS NOT NULL;
+    CREATE INDEX webhook_deliveries_hook ON webhook_deliveries(hook_id, id);
+    -- A finished run whose finished_at differs from hooked_at hasn't been announced yet
+    -- (a re-run finishes again with a new time).
+    ALTER TABLE ci_runs ADD COLUMN hooked_at INTEGER;
+    UPDATE ci_runs SET hooked_at = finished_at;
+    CREATE INDEX ci_runs_unhooked ON ci_runs(id) WHERE finished_at IS NOT hooked_at;
+    "#,
+    // v13: redirects, transfers, trash, exports
+    r#"
+    -- A trashed repository keeps its row (and its folder in GITTER_DATA/trash) for a week.
+    -- Its name moves to deleted_name and `name` becomes '~<id>', which no real name can
+    -- equal, so the name is free for a new repository meanwhile.
+    ALTER TABLE repos ADD COLUMN deleted_at INTEGER;
+    ALTER TABLE repos ADD COLUMN deleted_name TEXT;
+    -- Old names of renamed or transferred repositories. Ids, not names, so a redirect
+    -- follows the repository through later renames and leaves with a deleted account.
+    CREATE TABLE repo_redirects (
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL COLLATE NOCASE,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(owner_id, name)
+    );
+    CREATE INDEX repo_redirects_repo ON repo_redirects(repo_id);
+    -- One open offer per repository.
+    CREATE TABLE repo_transfers (
+        repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+        from_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        to_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX repo_transfers_to ON repo_transfers(to_id);
+    -- One account data export per account: GITTER_DATA/exports/<user id>-<id>.tar.gz.
+    CREATE TABLE exports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'running',
+        error TEXT NOT NULL DEFAULT '',
+        size INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        expires_at INTEGER
+    );
+    "#,
+    // v14: signing keys. kind is 'ssh' or 'gpg'. A fingerprint is unique per account, not
+    // across accounts: registering someone else's public key gains nothing (a signature
+    // only verifies for the account whose email is the committer's), and can't lock them out.
     r#"
     CREATE TABLE signing_keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -345,9 +486,11 @@ const MIGRATIONS: &[&str] = &[
         kind TEXT NOT NULL,
         title TEXT NOT NULL DEFAULT '',
         key TEXT NOT NULL,
-        fingerprint TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL
+        fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(user_id, fingerprint)
     );
+    CREATE INDEX signing_keys_fingerprint ON signing_keys(fingerprint);
     CREATE INDEX signing_keys_user ON signing_keys(user_id);
     "#,
 ];

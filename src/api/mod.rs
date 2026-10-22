@@ -1,18 +1,22 @@
 pub mod account;
 pub mod admin;
 pub mod ci;
+pub mod orgs;
 pub mod code;
 pub mod discussions;
 pub mod issues;
+pub mod lifecycle;
 pub mod moderation;
+pub mod releases;
 pub mod repos;
 pub mod security;
 pub mod snippets;
+pub mod webhooks;
 pub mod wiki;
 
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts};
 use axum::http::request::Parts;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
@@ -44,7 +48,16 @@ pub fn router() -> Router<AppState> {
         .route("/me/2fa/recovery", post(security::new_codes))
         .route("/me/sessions/revoke-others", post(security::revoke_others))
         .route("/me/sessions/{id}", delete(security::revoke))
-        .route("/me", get(account::me).patch(account::update_me))
+        .route("/me", get(account::me).patch(account::update_me).delete(lifecycle::delete_me))
+        .route("/me/transfers", get(lifecycle::my_transfers))
+        .route("/me/transfers/{id}/accept", post(lifecycle::accept))
+        .route("/me/transfers/{id}/decline", post(lifecycle::decline))
+        .route("/me/trash", get(lifecycle::my_trash))
+        .route("/me/trash/{id}/restore", post(lifecycle::restore))
+        .route("/me/export", get(lifecycle::export_status).post(lifecycle::start_export))
+        .route("/me/export/download", get(lifecycle::download_export))
+        .route("/admin/trash", get(lifecycle::all_trash))
+        .route("/admin/trash/{id}", delete(lifecycle::purge_now))
         .route("/me/password", post(account::change_password))
         .route(
             "/me/tokens",
@@ -66,6 +79,10 @@ pub fn router() -> Router<AppState> {
         .route("/admin/audit", get(security::admin_log))
         .route("/admin/invites", get(admin::invites).post(admin::create_invite))
         .route("/admin/invites/{id}", delete(admin::delete_invite))
+        .route("/orgs", post(orgs::create))
+        .route("/orgs/{org}", get(orgs::show).patch(orgs::update).delete(orgs::delete))
+        .route("/orgs/{org}/members/{user}", put(orgs::set_member).delete(orgs::remove_member))
+        .route("/me/orgs", get(orgs::mine))
         .route("/admin/runners", get(ci::runners).post(ci::create_runner))
         .route("/admin/runners/{id}", delete(ci::delete_runner))
         .route("/admin/reports", get(moderation::queue))
@@ -89,6 +106,10 @@ pub fn router() -> Router<AppState> {
             post(repos::star).delete(repos::unstar),
         )
         .route(&format!("{repo}/fork"), post(repos::fork))
+        .route(
+            &format!("{repo}/transfer"),
+            get(lifecycle::offer).post(lifecycle::offer_transfer).delete(lifecycle::cancel_transfer),
+        )
         .route(
             &format!("{repo}/deploy-tokens"),
             get(repos::deploy_tokens).post(repos::create_deploy_token),
@@ -143,6 +164,8 @@ pub fn router() -> Router<AppState> {
             &format!("{repo}/pulls/{{n}}/merge"),
             post(issues::merge_pull),
         )
+        .route(&format!("{repo}/collaborators"), get(orgs::collaborators))
+        .route(&format!("{repo}/collaborators/{{user}}"), put(orgs::set_collaborator).delete(orgs::remove_collaborator))
         .route(&format!("{repo}/ci/runs"), get(ci::runs).post(ci::start))
         .route(&format!("{repo}/ci/runs/{{n}}"), get(ci::run))
         .route(&format!("{repo}/ci/runs/{{n}}/cancel"), post(ci::cancel))
@@ -153,6 +176,26 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/status"), get(ci::statuses))
         .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
         .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
+        .route(&format!("{repo}/hooks"), get(webhooks::list).post(webhooks::create))
+        .route(
+            &format!("{repo}/hooks/{{id}}"),
+            get(webhooks::show).patch(webhooks::update).delete(webhooks::remove),
+        )
+        .route(&format!("{repo}/hooks/{{id}}/ping"), post(webhooks::ping))
+        .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}"), get(webhooks::delivery))
+        .route(&format!("{repo}/hooks/{{id}}/deliveries/{{did}}/redeliver"), post(webhooks::redeliver))
+        .route(&format!("{repo}/releases"), get(releases::list).post(releases::create))
+        .route(&format!("{repo}/releases/latest"), get(releases::latest))
+        .route(
+            &format!("{repo}/releases/{{id}}"),
+            get(releases::show).patch(releases::update).delete(releases::delete),
+        )
+        // Release files stream in (up to the Git LFS file limit), past the API's 40 MB cap.
+        .route(&format!("{repo}/releases/{{id}}/assets"), post(releases::upload).layer(DefaultBodyLimit::disable()))
+        .route(
+            &format!("{repo}/releases/{{id}}/assets/{{asset}}"),
+            get(releases::download).delete(releases::delete_asset),
+        )
         .route(&format!("{repo}/wiki"), get(wiki::pages).post(wiki::create))
         .route(
             &format!("{repo}/wiki/{{page}}"),
@@ -220,38 +263,31 @@ async fn in_its_repo(st: &AppState, l: &crate::auth::Limits, parts: &Parts) -> b
     }
     let segs: Vec<String> = parts.uri.path().trim_matches('/').split('/').map(String::from).collect();
     let (Some(o), Some(n)) = (segs.get(1).cloned(), segs.get(2).cloned()) else { return false };
-    let id: Option<i64> = st
-        .db
-        .call(move |c| {
-            use rusqlite::OptionalExtension;
-            Ok(c.query_row(
-                "SELECT r.id FROM repos r JOIN users u ON u.id = r.owner_id WHERE u.username = ?1 AND r.name = ?2",
-                [o, n],
-                |r| r.get(0),
-            )
-            .optional()?)
-        })
-        .await
-        .unwrap_or(None);
-    id == Some(want)
+    // Through the same lookup as `Repo::load`, so a write to a renamed repo's old path gets its redirect.
+    let found = st.db.call(move |c| Ok(crate::repo::lookup(c, &o, &n)?)).await.unwrap_or(None);
+    found.is_some_and(|(r, _)| r.id == want)
 }
 
 /// Account-level routes no limited token may touch, even to read.
-const ACCOUNT_ROUTES: &[&str] = &["/admin", "/me/tokens", "/me/security", "/me/audit", "/me/2fa", "/me/sessions", "/me/password", "/auth"];
+const ACCOUNT_ROUTES: &[&str] = &["/admin", "/me/tokens", "/me/security", "/me/audit", "/me/2fa", "/me/sessions", "/me/password", "/me/export", "/me/trash", "/me/transfers", "/auth"];
 
 fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -> bool {
     if ACCOUNT_ROUTES.iter().any(|p| path == *p || path.starts_with(&format!("{p}/"))) {
+        return false;
+    }
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // Webhooks are the repository's configuration, and their URLs can hold credentials.
+    if segs.len() >= 4 && segs[0] == "repos" && segs[3] == "hooks" {
         return false;
     }
     if matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
         return true;
     }
     // Writes: only inside a repository (/repos/{owner}/{repo}/{thing}...), never forking it.
-    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
     l.scope != crate::auth::Scope::Read
         && segs.len() >= 4
         && segs[0] == "repos"
-        && !matches!(segs[3], "fork" | "deploy-tokens")
+        && !matches!(segs[3], "fork" | "deploy-tokens" | "transfer")
 }
 
 /// Per-address limits on all API requests, and per-account limits on changes
@@ -330,19 +366,24 @@ pub struct RepoCard {
 
 pub const CARD_SELECT: &str = "SELECT u.username, r.name, r.description, r.is_private, r.language,
     (SELECT count(*) FROM stars s WHERE s.repo_id = r.id) AS stars,
-    (SELECT count(*) FROM repos f WHERE f.forked_from = r.id) AS forks,
+    (SELECT count(*) FROM repos f WHERE f.forked_from = r.id AND f.deleted_at IS NULL) AS forks,
     r.updated_at,
-    (SELECT pu.username || '/' || p.name FROM repos p JOIN users pu ON pu.id = p.owner_id WHERE p.id = r.forked_from AND p.is_private = 0 AND p.hidden = 0)
+    (SELECT pu.username || '/' || p.name FROM repos p JOIN users pu ON pu.id = p.owner_id
+     WHERE p.id = r.forked_from AND p.is_private = 0 AND p.hidden = 0 AND p.deleted_at IS NULL)
     FROM repos r JOIN users u ON u.id = r.owner_id";
 
-/// SQL condition: repo `r` is visible to the viewer. Binds one parameter (viewer id, or -1).
-pub const VISIBLE: &str = "((r.is_private = 0 AND r.hidden = 0) OR r.owner_id = ? OR EXISTS (SELECT 1 FROM users a WHERE a.id = ? AND a.is_admin = 1))";
+/// Repositories `r` the viewer can see (the same rule as `repo::access`, and never
+/// while in the trash); takes `visible_params`.
+pub const VISIBLE: &str = "(r.deleted_at IS NULL AND ((r.is_private = 0 AND r.hidden = 0) OR r.owner_id = ? OR EXISTS (SELECT 1 FROM users a WHERE a.id = ? AND a.is_admin = 1)
+    OR EXISTS (SELECT 1 FROM repo_collaborators rc WHERE rc.repo_id = r.id AND rc.user_id = ? AND (r.hidden = 0 OR rc.role = 'admin'))
+    OR EXISTS (SELECT 1 FROM org_members om JOIN orgs o ON o.id = om.org_id WHERE om.org_id = r.owner_id AND om.user_id = ?
+        AND (om.role = 'owner' OR (r.hidden = 0 AND o.base_role IN ('read', 'write'))))))";
 
-pub fn visible_params(viewer: Option<&crate::auth::User>) -> [Value; 2] {
+pub fn visible_params(viewer: Option<&crate::auth::User>) -> [Value; 4] {
     // A deploy token lists repositories as if signed out (it's for one repo only).
     let viewer = viewer.filter(|u| u.limits.as_ref().is_none_or(|l| l.repo_id.is_none()));
-    let id = viewer.map(|u| u.id).unwrap_or(-1);
-    [Value::Integer(id), Value::Integer(id)]
+    let id = Value::Integer(viewer.map(|u| u.id).unwrap_or(-1));
+    [id.clone(), id.clone(), id.clone(), id]
 }
 
 pub fn repo_cards(

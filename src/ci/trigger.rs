@@ -19,7 +19,7 @@ pub async fn enabled(st: &AppState, owner_id: i64) -> bool {
         "everyone" => true,
         "admins" => st
             .db
-            .call(move |c| Ok(c.query_row("SELECT is_admin FROM users WHERE id = ?1", [owner_id], |r| r.get::<_, bool>(0))?))
+            .call(move |c| Ok(c.query_row(&format!("SELECT {} FROM users u WHERE u.id = ?1", super::queue::ADMIN_OWNED), [owner_id], |r| r.get::<_, bool>(0))?))
             .await
             .unwrap_or(false),
         _ => false,
@@ -227,7 +227,7 @@ pub async fn tick(st: &AppState, now: i64) -> R<()> {
     for id in due {
         let found = st
             .db
-            .call(move |c| Ok(c.query_row(&format!("{REPO_SELECT} WHERE r.id = ?1"), [id], row_to_repo).optional()?))
+            .call(move |c| Ok(c.query_row(&format!("{REPO_SELECT} WHERE r.id = ?1 AND r.deleted_at IS NULL"), [id], row_to_repo).optional()?))
             .await?;
         let Some(repo) = found.map(|r| Repo::with_access(st, r, None)) else { continue };
         if repo.hidden || !enabled(st, repo.owner_id).await {
