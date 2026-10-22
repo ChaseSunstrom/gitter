@@ -739,7 +739,7 @@ async fn bundle(st: &AppState, repo: &FsPath, out: &FsPath) -> R<bool> {
 type ExportData = (Vec<(&'static str, Vec<u8>)>, Vec<(i64, String)>, Vec<String>);
 
 // ponytail: each JSON file is built in memory; stream rows to the tar if accounts write gigabytes of issues.
-fn export_json(c: &Connection, uid: i64) -> R<ExportData> {
+pub fn export_json(c: &Connection, uid: i64) -> R<ExportData> {
     let repo_name = "ou.username || '/' || COALESCE(r.deleted_name, r.name)";
     let mut profile = rows(c, "SELECT username, display_name, email, bio, location, website, is_admin, created_at FROM users WHERE id = ?1", [uid])?
         .pop()
@@ -761,7 +761,8 @@ fn export_json(c: &Connection, uid: i64) -> R<ExportData> {
         c,
         &format!(
             "SELECT {repo_name} AS repo, i.number, CASE WHEN i.is_pr = 1 THEN 'pull request' ELSE 'issue' END AS kind,
-                i.title, i.body, i.state, i.created_at, i.updated_at, i.closed_at
+                i.title, i.body, i.state, i.created_at, i.updated_at, i.closed_at,
+                (SELECT title FROM milestones WHERE id = i.milestone_id) AS milestone
              FROM issues i JOIN repos r ON r.id = i.repo_id JOIN users ou ON ou.id = r.owner_id WHERE i.author_id = ?1 ORDER BY i.id"
         ),
         [uid],
@@ -798,6 +799,15 @@ fn export_json(c: &Connection, uid: i64) -> R<ExportData> {
              JOIN users ou ON ou.id = r.owner_id WHERE dc.author_id = ?1 ORDER BY dc.id"
         ), [uid])?,
     });
+    // The milestones of your repositories (issues name theirs by title).
+    let milestones = rows(
+        c,
+        &format!(
+            "SELECT {repo_name} AS repo, m.number, m.title, m.description, m.due_on, m.state, m.created_at, m.closed_at
+             FROM milestones m JOIN repos r ON r.id = m.repo_id JOIN users ou ON ou.id = r.owner_id WHERE r.owner_id = ?1 ORDER BY m.id"
+        ),
+        [uid],
+    )?;
     let snippets = rows(c, "SELECT id, title, is_secret AS secret, files, created_at, updated_at FROM snippets WHERE owner_id = ?1 ORDER BY created_at", [uid])?;
     // Like the security page: someone else's address (an admin acting on the account) is left out.
     let log = rows(
@@ -819,6 +829,7 @@ fn export_json(c: &Connection, uid: i64) -> R<ExportData> {
         ("profile.json", pretty(&profile)),
         ("issues.json", pretty(&json!(issues))),
         ("comments.json", pretty(&json!(comments))),
+        ("milestones.json", pretty(&json!(milestones))),
         ("discussions.json", pretty(&discussions)),
         ("reviews.json", pretty(&reviews)),
         ("snippets.json", pretty(&json!(snippets))),

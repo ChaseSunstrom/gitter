@@ -675,6 +675,32 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE pulls ADD COLUMN auto_merge TEXT;
     ALTER TABLE pulls ADD COLUMN auto_merge_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
     "#,
+    // v20: milestones (numbered per repository; due_on is a YYYY-MM-DD date) and
+    // assignees on issues and pull requests.
+    r#"
+    CREATE TABLE milestones (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        number INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        due_on TEXT,
+        state TEXT NOT NULL DEFAULT 'open',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        closed_at INTEGER,
+        UNIQUE(repo_id, number),
+        UNIQUE(repo_id, title)
+    );
+    ALTER TABLE issues ADD COLUMN milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL;
+    CREATE INDEX issues_milestone ON issues(milestone_id);
+    CREATE TABLE issue_assignees (
+        issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        PRIMARY KEY (issue_id, user_id)
+    );
+    CREATE INDEX issue_assignees_user ON issue_assignees(user_id);
+    "#,
 ];
 
 impl Db {

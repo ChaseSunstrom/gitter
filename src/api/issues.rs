@@ -43,6 +43,10 @@ pub struct IssueRow {
     agent: Option<String>,
     /// Pull requests: "approved" or "changes_requested" by reviewers' latest decisions.
     review_state: Option<String>,
+    /// { number, title } of its milestone, if it has one.
+    milestone: Option<serde_json::Value>,
+    /// Usernames, only of assignees who can still write.
+    assignees: Vec<String>,
 }
 
 const ISSUE_SELECT: &str = "SELECT i.id, i.number, i.title, i.body, i.state, i.is_pr, u.username, i.author_id, i.created_at,
@@ -53,8 +57,8 @@ const ISSUE_SELECT: &str = "SELECT i.id, i.number, i.title, i.body, i.state, i.i
         SELECT 1 FROM reviews x WHERE x.issue_id = v.issue_id AND x.author_id = v.author_id AND x.state IN ('approved', 'changes_requested')
         AND (x.submitted_at > v.submitted_at OR (x.submitted_at = v.submitted_at AND x.id > v.id)))) THEN 'changes_requested'
     WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.issue_id = i.id AND v.state = 'approved') THEN 'approved' END,
-    i.agent
-    FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id";
+    i.agent, ms.number, ms.title
+    FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id LEFT JOIN milestones ms ON ms.id = i.milestone_id";
 
 fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
     Ok(IssueRow {
@@ -76,7 +80,23 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
         hidden: r.get::<_, i64>(14)? != 0,
         review_state: r.get(15)?,
         agent: r.get(16)?,
+        milestone: r
+            .get::<_, Option<i64>>(17)?
+            .map(|n| r.get::<_, String>(18).map(|t| json!({ "number": n, "title": t })))
+            .transpose()?,
+        assignees: vec![],
     })
+}
+
+/// Fill in the labels and assignees of `items`.
+fn decorate(c: &rusqlite::Connection, items: &mut [IssueRow]) -> rusqlite::Result<()> {
+    let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
+    let (mut labels, mut people) = (labels_for(c, &ids)?, super::milestones::assignees_for(c, &ids)?);
+    for i in items {
+        i.labels = labels.remove(&i.id).unwrap_or_default();
+        i.assignees = people.remove(&i.id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 fn labels_for(
@@ -115,6 +135,10 @@ pub struct ListQ {
     q: Option<String>,
     label: Option<String>,
     author: Option<String>,
+    /// A milestone's title, or "none".
+    milestone: Option<String>,
+    /// A username, or "none".
+    assignee: Option<String>,
     page: Option<usize>,
 }
 
@@ -161,15 +185,33 @@ pub async fn list(
                 cond.push_str(" AND u.username = ?");
                 params.push(Value::Text(a.to_string()));
             }
+            match q.milestone.as_deref().filter(|s| !s.is_empty()) {
+                Some("none") => cond.push_str(" AND i.milestone_id IS NULL"),
+                Some(m) => {
+                    cond.push_str(" AND ms.title = ?");
+                    params.push(Value::Text(m.to_string()));
+                }
+                None => {}
+            }
+            if let Some(a) = q.assignee.as_deref().filter(|s| !s.is_empty()) {
+                let who = if a == "none" { "" } else { " AND au.username = ?" };
+                let neg = if a == "none" { "NOT " } else { "" };
+                cond.push_str(&format!(
+                    " AND {neg}EXISTS (SELECT 1 FROM issue_assignees ia JOIN users au ON au.id = ia.user_id JOIN repos r ON r.id = i.repo_id
+                     WHERE ia.issue_id = i.id{who} AND {})",
+                    super::milestones::writer_sql("ia.user_id")
+                ));
+                if a != "none" {
+                    params.push(Value::Text(a.to_string()));
+                }
+            }
             let per = 30;
             let mut s = c.prepare(&format!("{ISSUE_SELECT} WHERE {cond} ORDER BY i.number DESC LIMIT {} OFFSET {}", per + 1, (page - 1) * per))?;
             let mut items: Vec<IssueRow> = s.query_map(rusqlite::params_from_iter(params), issue_row)?.collect::<Result<_, _>>()?;
             let more = items.len() > per;
             items.truncate(per);
-            let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
-            let mut labels = labels_for(c, &ids)?;
+            decorate(c, &mut items)?;
             for i in &mut items {
-                i.labels = labels.remove(&i.id).unwrap_or_default();
                 i.body = String::new();
             }
             let count = |state: &str| -> rusqlite::Result<i64> {
@@ -192,6 +234,9 @@ pub struct CreateReq {
     body: String,
     #[serde(default)]
     labels: Vec<i64>,
+    /// The issue template it was opened from (a file in .gitter/ISSUE_TEMPLATE):
+    /// its labels apply whoever opens it, like GitHub.
+    template: Option<String>,
 }
 
 pub(super) fn check_text(title: &str, body: &str) -> R<()> {
@@ -247,6 +292,18 @@ pub async fn create(
     let (rid, uid, can_label) = (r.id, u.id, r.can_write);
     let agent = u.agent().map(|a| a.name.clone());
     let title = req.title.clone();
+    // Looked up among the templates there are, so the name never reaches git.
+    let template_labels = match &req.template {
+        Some(f) => super::milestones::load_templates(&st, &r)
+            .await
+            .map(|t| t.0)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|t| t.file == *f)
+            .map(|t| t.labels)
+            .unwrap_or_default(),
+        None => vec![],
+    };
     let num = st
         .db
         .call(move |c| {
@@ -256,6 +313,12 @@ pub async fn create(
                 for l in req.labels {
                     tx.execute("INSERT OR IGNORE INTO issue_labels(issue_id, label_id) SELECT ?1, id FROM labels WHERE id = ?2 AND repo_id = ?3", [id, l, rid])?;
                 }
+            }
+            for name in template_labels {
+                tx.execute(
+                    "INSERT OR IGNORE INTO issue_labels(issue_id, label_id) SELECT ?1, id FROM labels WHERE repo_id = ?2 AND name = ?3",
+                    rusqlite::params![id, rid, name],
+                )?;
             }
             tx.commit()?;
             Ok(num)
@@ -282,12 +345,13 @@ pub(super) async fn load_issue(st: &AppState, r: &Repo, number: i64, viewer: Opt
     let (vid, admin) = (viewer.map(|u| u.id).unwrap_or(-1), viewer.is_some_and(|u| u.is_admin));
     let i = st.db
         .call(move |c| {
-            let mut i = c.query_row(
+            let mut i = [c.query_row(
                 &format!("{ISSUE_SELECT} WHERE i.repo_id = ?1 AND i.number = ?2"),
                 [rid, number],
                 issue_row,
-            )?;
-            i.labels = labels_for(c, &[i.id])?.remove(&i.id).unwrap_or_default();
+            )?];
+            decorate(c, &mut i)?;
+            let [i] = i;
             Ok(i)
         })
         .await?;
@@ -468,7 +532,13 @@ pub struct UpdateReq {
     body: Option<String>,
     state: Option<String>,
     labels: Option<Vec<i64>>,
+    /// A milestone number, or 0 for none.
+    milestone: Option<i64>,
+    /// Usernames (replacing the current ones): up to 10 people who can write.
+    assignees: Option<Vec<String>>,
 }
+
+const MAX_ASSIGNEES: usize = 10;
 
 pub async fn update(
     State(st): State<AppState>,
@@ -482,8 +552,17 @@ pub async fn update(
     if !(is_author || r.can_write) {
         return Err(AppError::forbidden());
     }
-    if req.labels.is_some() && !r.can_write {
+    // Labels, milestones and assignees are the maintainers' to set, not the author's.
+    if (req.labels.is_some() || req.milestone.is_some() || req.assignees.is_some()) && !r.can_write {
         return Err(AppError::forbidden());
+    }
+    let assignees = req.assignees.clone().map(|mut a| {
+        a.sort();
+        a.dedup();
+        a
+    });
+    if assignees.as_ref().is_some_and(|a| a.len() > MAX_ASSIGNEES) {
+        return Err(AppError::bad(format!("Assign up to {MAX_ASSIGNEES} people")));
     }
     if let Some(t) = &req.title {
         check_text(t, req.body.as_deref().unwrap_or(""))?;
@@ -498,7 +577,7 @@ pub async fn update(
         Some(_) => return Err(AppError::bad("Unknown state")),
     };
     let (iid, rid, uid) = (issue.id, r.id, u.id);
-    let edited = req.title.is_some() || req.body.is_some() || req.labels.is_some();
+    let edited = req.title.is_some() || req.body.is_some() || req.labels.is_some() || req.milestone.is_some() || assignees.is_some();
     st.db
         .call(move |c| {
             let tx = c.transaction()?;
@@ -522,6 +601,28 @@ pub async fn update(
                 tx.execute("DELETE FROM issue_labels WHERE issue_id = ?1", [iid])?;
                 for l in ls {
                     tx.execute("INSERT OR IGNORE INTO issue_labels(issue_id, label_id) SELECT ?1, id FROM labels WHERE id = ?2 AND repo_id = ?3", [iid, l, rid])?;
+                }
+            }
+            if let Some(m) = req.milestone {
+                let id: Option<i64> = if m == 0 {
+                    None
+                } else {
+                    let found = tx.query_row("SELECT id FROM milestones WHERE repo_id = ?1 AND number = ?2", [rid, m], |r| r.get(0)).optional()?;
+                    Some(found.ok_or_else(|| AppError::bad("That milestone doesn't exist"))?)
+                };
+                tx.execute("UPDATE issues SET milestone_id = ?1 WHERE id = ?2", rusqlite::params![id, iid])?;
+            }
+            if let Some(names) = assignees {
+                tx.execute("DELETE FROM issue_assignees WHERE issue_id = ?1", [iid])?;
+                let sql = format!(
+                    "SELECT u.id FROM users u JOIN repos r ON r.id = ?2 WHERE u.username = ?1 AND {}",
+                    super::milestones::writer_sql("u.id")
+                );
+                for name in names {
+                    let who: Option<i64> = tx.query_row(&sql, rusqlite::params![name, rid], |r| r.get(0)).optional()?;
+                    let shown: String = name.chars().take(39).collect();
+                    let who = who.ok_or_else(|| AppError::bad(format!("{shown} can't be assigned: only people with write access can")))?;
+                    tx.execute("INSERT INTO issue_assignees(issue_id, user_id) VALUES (?1, ?2)", [iid, who])?;
                 }
             }
             tx.execute("UPDATE issues SET updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid])?;

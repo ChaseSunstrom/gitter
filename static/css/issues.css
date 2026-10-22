@@ -163,3 +163,16 @@ a.branch-name:hover { text-decoration: underline; }
 tr.rsel > td { background: color-mix(in srgb, var(--accent) 12%, transparent) !important; }
 .review-bar { margin-bottom: 10px; min-height: 32px; }
 .review-form textarea { min-height: 90px; }
+
+/* Milestones and assignees */
+.ms-progress { display: grid; gap: 4px; min-width: 200px; }
+.ms-progress progress { width: 100%; height: 8px; appearance: none; border: 0; border-radius: 99px; overflow: hidden; background: var(--line); accent-color: var(--green, var(--accent)); }
+.ms-progress progress::-webkit-progress-bar { background: var(--line); }
+.ms-progress progress::-webkit-progress-value { background: var(--green, var(--accent)); }
+.ms-progress progress::-moz-progress-bar { background: var(--green, var(--accent)); }
+.ms-row { align-items: flex-start; }
+.ms-side { display: grid; gap: 6px; justify-items: end; }
+.ms-desc { margin: 4px 0 0; }
+.assignee-list { display: grid; gap: 6px; }
+.assignee-stack { display: flex; }
+.assignee-stack a + a { margin-left: -6px; }

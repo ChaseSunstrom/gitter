@@ -519,6 +519,57 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   await page.close();
 }
 
+// Milestones, assignees and templates: a milestone with progress, set from the issue sidebar
+// with an assignee; the template chooser fills a new issue; the PR template starts a PR.
+{
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+  const api = (method, path, data) => ctx.request.fetch(`${BASE}/api/repos/alice/hello${path}`, { method, headers: { Origin: BASE }, data });
+  const seen = {};
+  try {
+    const made = await api('POST', '/milestones', { title: 'UI milestone', due_on: '2099-12-31', description: 'For the UI check' });
+    if (!made.ok()) throw new Error('milestone: ' + made.status());
+    const ms = (await made.json()).number;
+    const files = [
+      { path: '.gitter/ISSUE_TEMPLATE/bug.md', content: '---\nname: UI bug report\nabout: Tell us what broke\ntitle: "[bug] "\nlabels: [bug]\n---\n## What happened\n' },
+      { path: '.gitter/pull_request_template.md', content: '## Checklist for this PR\n' },
+    ];
+    if (!(await api('POST', '/contents', { branch: 'main', message: 'Templates', changes: files })).ok()) throw new Error('templates commit');
+    if (!(await api('POST', '/contents', { branch: 'main', new_branch: 'tpl-branch', message: 'Change', changes: [{ path: 'tpl.txt', content: 'x\n' }] })).ok()) throw new Error('branch commit');
+
+    // The sidebar pickers: a milestone, then an assignee.
+    await page.goto(`${BASE}/alice/hello/issues/1`, { waitUntil: 'networkidle' });
+    await page.click('#edit-milestone');
+    await page.click(`.pop [data-ms="${ms}"]`);
+    await page.waitForSelector('#milestone-block a[href$="/milestone/' + ms + '"]', { timeout: 5000 });
+    await page.click('#edit-assignees');
+    await page.check('.pop input[value="alice"]');
+    await page.waitForFunction(() => document.querySelector('#assignee-list')?.innerText.includes('alice'), null, { timeout: 5000 });
+    seen.sidebar = true;
+
+    await page.goto(`${BASE}/alice/hello/milestones`, { waitUntil: 'networkidle' });
+    seen.list = (await page.locator('#page').innerText()).includes('UI milestone') && (await page.locator('.ms-progress progress').count()) > 0;
+    await page.goto(`${BASE}/alice/hello/milestone/${ms}`, { waitUntil: 'networkidle' });
+    seen.show = (await page.locator('#page').innerText()).includes('Crash on start');
+    await page.goto(`${BASE}/alice/hello/issues?milestone=${encodeURIComponent('UI milestone')}&state=closed&assignee=alice`, { waitUntil: 'networkidle' });
+    seen.filter = (await page.locator('#page').innerText()).includes('Crash on start');
+
+    // The chooser, then the form filled from the template.
+    await page.goto(`${BASE}/alice/hello/issues/new`, { waitUntil: 'networkidle' });
+    await page.click('#template-chooser a.btn');
+    await page.waitForSelector('#issue-title', { timeout: 5000 });
+    seen.template = (await page.inputValue('#issue-title')) === '[bug] ' && (await page.inputValue('#new-issue .mde-input')).includes('What happened');
+
+    await page.goto(`${BASE}/alice/hello/compare/main...tpl-branch`, { waitUntil: 'networkidle' });
+    seen.pr = (await page.inputValue('#pr-body')).includes('Checklist for this PR');
+  } catch (e) { errors.push(String(e)); }
+  if (errors.length || !(seen.sidebar && seen.list && seen.show && seen.filter && seen.template && seen.pr)) { failed++; console.log('✗ milestones, assignees and templates', { seen, errors }); }
+  else console.log('  ok milestone and assignee set from the sidebar; milestones list, page and filter; template chooser and PR template prefill');
+  await page.close();
+}
+
 // Branch rules: added from settings, they show in the merge box; badges are SVG and public links unfurl.
 {
   const page = await ctx.newPage();
