@@ -166,6 +166,8 @@ async fn runner(url: String, token: String, extra: Vec<String>, jobs: usize, wor
 
 #[tokio::main]
 async fn serve(mut cfg: gitter::Config) -> anyhow::Result<()> {
+    // The git hook links to this binary: take its path now, while it still names this file.
+    let _ = gitter::protect::HOOK_EXE.set(std::env::current_exe()?);
     for d in ["repos", "home"] {
         std::fs::create_dir_all(cfg.data_dir.join(d))?;
     }

@@ -520,6 +520,9 @@ async fn steps(source: Option<(String, &'static str, String)>, l: &Lease, ws: &P
     }
     let env = job_env(l, ws, home);
     let docker_ok = l.job.image.is_none() || Command::new("docker").arg("version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.is_ok_and(|s| s.success());
+    if l.job.image.is_none() && !(l.limits.network && l.job.network) {
+        note(tx, "33", "This job names no image, so it runs as a plain process on the runner: turning the network off only applies to containers.").await;
+    }
     let mut failed: Option<i32> = None;
     for (i, step) in l.job.steps.iter().enumerate() {
         if failed.is_some() || halted(stop) {

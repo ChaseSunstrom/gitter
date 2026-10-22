@@ -63,6 +63,7 @@ README Code review bullet
 - 2026-10-22T01:52:55Z focused
 - 2026-10-22T02:09:59Z scope: security fix from the automated review — API tokens (even full-access) can't add or change collaborators (persistent access beyond the token); set_collaborator needs a fresh sign-in (Sudo)
 - 2026-10-22T02:22:04Z done
+- 2026-10-22T02:22:04Z committed 982e7c7 (53 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses: the comments/events/audit flow in src/api/issues.rs (review submissions show in the timeline as comment kinds), the markdown renderer and editor (static/js/md.js, mdeditor.js), diffview.js rows (data-n line numbers per side) for anchors, Git::run for reading file lines at a commit (outdated detection), and the web-edit commit path in src/api/code.rs (expected head sha) for applying suggestions. The diff view's viewed checkboxes already exist (per browser, reset when the head moves), so they stay. New: reviews and review_comments tables.

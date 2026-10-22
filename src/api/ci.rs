@@ -167,6 +167,10 @@ pub async fn cancel(State(st): State<AppState>, Authed(u): Authed, Path((o, n, n
 /// Let a run that waits for approval (one an agent's changes started) go to
 /// the runners. It still gets no secrets and never runs on the server itself.
 pub async fn approve(State(st): State<AppState>, Authed(u): Authed, Path((o, n, number)): Path<(String, String, i64)>) -> J<Value> {
+    // A person reads the changes: never an agent (tokens for agents only reach /mcp anyway).
+    if u.agent().is_some() {
+        return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "A person has to approve this run"));
+    }
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
     let id = run_id(&st, &r, number).await?;
     let uid = u.id;

@@ -259,7 +259,7 @@ async fn trust_the_builtin_runner_takes_only_runs_admins_started() {
     app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
     assert_eq!(app.req(&admin, "PUT", "/api/repos/root1/r/collaborators/bob", Some(json!({ "role": "write" }))).await.0, StatusCode::OK);
     set_ci(&app, "admins", 0).await;
-    let config = "on:\n  push: {}\n  schedule: [\"*/5 * * * *\"]\njobs:\n  a:\n    steps: [echo]\n";
+    let config = "on:\n  push: {}\n  pull_request: {}\n  schedule: [\"*/5 * * * *\"]\njobs:\n  a:\n    steps: [echo]\n";
     commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", config).await;
     commit(&app, &bob, "root1/r", "main", None, "bob.txt", "b").await;
     let runner = |builtin: bool| {
@@ -290,6 +290,17 @@ async fn trust_the_builtin_runner_takes_only_runs_admins_started() {
     assert_eq!(r.last().map(|r| r.0.as_str()), Some("schedule"), "{r:?}");
     assert_eq!(claim(builtin, true).await, None, "bob last pushed main");
     assert_eq!(claim(other, false).await, Some(3));
+    // An admin opening a pull request from bob's branch doesn't vouch for bob's code.
+    commit(&app, &bob, "root1/r", "main", Some("feat"), "f.txt", "f").await;
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Bob's", "head": "feat", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let actor: Option<String> = app
+        .state
+        .db
+        .call(|c| Ok(c.query_row("SELECT u.username FROM ci_runs r JOIN users u ON u.id = r.actor_id WHERE r.event = 'pull_request' ORDER BY r.id DESC LIMIT 1", [], |r| r.get(0))?))
+        .await
+        .ok();
+    assert_eq!(actor.as_deref(), Some("bob"), "the run is on behalf of the branch's last pusher");
 }
 
 #[tokio::test]

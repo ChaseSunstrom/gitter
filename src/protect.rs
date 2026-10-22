@@ -47,7 +47,7 @@ fn yes() -> bool {
     true
 }
 
-pub const MAX_RULES: i64 = 50;
+pub const MAX_RULES: i64 = 20;
 
 impl Rule {
     pub fn validate(&self) -> R<()> {
@@ -84,9 +84,16 @@ pub fn load(c: &Connection, repo_id: i64) -> rusqlite::Result<Vec<Rule>> {
     .collect()
 }
 
+/// Whether a rule's pattern covers `branch`: `*` within one part of the name,
+/// `**` across parts, and a pattern without `/` only names without one (`main`
+/// is not `fix/main`).
+pub fn covers(pattern: &str, branch: &str) -> bool {
+    glob(pattern, branch) && (pattern.contains('/') || pattern.contains("**") || !branch.contains('/'))
+}
+
 /// Every rule matching `branch` at once: the strictest of each setting.
 pub fn effective(rules: &[Rule], branch: &str) -> Option<Rule> {
-    let mut m = rules.iter().filter(|r| glob(&r.pattern, branch));
+    let mut m = rules.iter().filter(|r| covers(&r.pattern, branch));
     let first = m.next()?.clone();
     Some(m.fold(first, |mut a, r| {
         a.pattern = format!("{}, {}", a.pattern, r.pattern);
@@ -145,11 +152,15 @@ pub struct Check {
 pub fn checks(c: &Connection, repo_id: i64, sha: &str, repo_url: &str) -> rusqlite::Result<Vec<Check>> {
     let mut out: Vec<Check> = Vec::new();
     let mut q = c.prepare_cached(
-        "SELECT j.name, j.status, r.number, r.approval FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 ORDER BY j.id",
+        "SELECT j.name, j.status, r.number, r.approval, j.reason FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 ORDER BY j.id",
     )?;
-    for row in q.query_map(params![repo_id, sha], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?)))? {
-        let (name, status, number, approval) = row?;
+    for row in q.query_map(params![repo_id, sha], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?))
+    })? {
+        let (name, status, number, approval, reason) = row?;
         let state = match status.as_str() {
+            // Skipped because a job it needs failed: that's a failure, not a pass.
+            "skipped" if reason == "needs" => "failure",
             "success" | "skipped" => "success",
             "failure" | "error" | "cancelled" => "failure",
             _ => "pending",
@@ -165,7 +176,19 @@ pub fn checks(c: &Connection, repo_id: i64, sha: &str, repo_url: &str) -> rusqli
     for row in q.query_map(params![repo_id, sha], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))? {
         let (name, state, description, url) = row?;
         let state = if state == "error" { "failure".to_string() } else { state };
-        out.retain(|x| x.name != name);
+        // Any writer can post a status, so one named like a CI job here can only
+        // make that check worse, never pass a job that didn't.
+        if let Some(ci) = out.iter_mut().find(|x| x.name == name) {
+            let rank = |s: &str| match s {
+                "failure" => 2,
+                "pending" => 1,
+                _ => 0,
+            };
+            if rank(&state) > rank(&ci.state) {
+                *ci = Check { name, state, description, url, kind: "status" };
+            }
+            continue;
+        }
         out.push(Check { name, state, description, url, kind: "status" });
     }
     Ok(out)
@@ -215,7 +238,7 @@ pub async fn gate(st: &AppState, repo: &Repo, issue_id: i64, base_branch: &str, 
                     }
                 }
                 if rule.approvals > 0 {
-                    let (approved, changes) = reviews(c, &r2, issue_id)?;
+                    let (approved, changes) = reviews(c, &r2, issue_id, &sha)?;
                     if approved < rule.approvals {
                         missing.push(format!("{} of {} approving reviews from people with write access", approved, rule.approvals));
                     }
@@ -234,24 +257,25 @@ fn repo_admin_passes(repo: &Repo, rule: Option<&Rule>) -> bool {
     repo.can_admin && rule.is_some_and(|r| !r.enforce_admins)
 }
 
-/// Approvals from people with write access (each reviewer's latest decision),
-/// and the names of writers whose latest decision asks for changes.
-fn reviews(c: &Connection, repo: &Repo, issue_id: i64) -> rusqlite::Result<(i64, Vec<String>)> {
+/// Approvals of the current head (`sha`) from people with write access (each
+/// reviewer's latest decision; a push after an approval needs a new one), and
+/// the names of writers whose latest decision asks for changes.
+fn reviews(c: &Connection, repo: &Repo, issue_id: i64, sha: &str) -> rusqlite::Result<(i64, Vec<String>)> {
     let mut q = c.prepare_cached(
-        "SELECT v.author_id, u.username, v.state FROM reviews v JOIN users u ON u.id = v.author_id
+        "SELECT v.author_id, u.username, v.state, v.commit_sha FROM reviews v JOIN users u ON u.id = v.author_id
          WHERE v.issue_id = ?1 AND v.state IN ('approved', 'changes_requested') AND NOT EXISTS (
              SELECT 1 FROM reviews x WHERE x.issue_id = v.issue_id AND x.author_id = v.author_id AND x.state IN ('approved', 'changes_requested')
              AND (x.submitted_at > v.submitted_at OR (x.submitted_at = v.submitted_at AND x.id > v.id)))
          ORDER BY u.username",
     )?;
-    let rows: Vec<(i64, String, String)> = q.query_map([issue_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let rows: Vec<(i64, String, String, Option<String>)> = q.query_map([issue_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
     let (mut approved, mut changes) = (0, Vec::new());
-    for (uid, name, state) in rows {
+    for (uid, name, state, at) in rows {
         if !crate::repo::writes(c, repo, uid)? {
             continue;
         }
         if state == "approved" {
-            approved += 1;
+            approved += i64::from(at.as_deref() == Some(sha));
         } else {
             changes.push(name);
         }
@@ -271,18 +295,27 @@ pub async fn push_hook(st: &AppState, repo: &Repo) -> R<Option<(PathBuf, String)
     if rules.is_empty() {
         return Ok(None);
     }
+    let json = serde_json::to_string(&rules).map_err(AppError::internal)?;
+    // An environment variable has room for this many (MAX_RULES keeps it so).
+    if json.len() > 100_000 {
+        return Err(AppError::internal("too many branch rules to check this push"));
+    }
     let dir = st.cfg.data_dir.join("hooks");
+    // Set at startup (`main`): once the binary is replaced in place, current_exe() names a deleted file.
     let exe = HOOK_EXE.get().cloned().or_else(|| std::env::current_exe().ok()).ok_or_else(|| AppError::internal("can't find the server binary for the git hook"))?;
+    // Git skips a hook it can't run, so a missing binary refuses the push instead.
+    if !exe.is_file() {
+        return Err(AppError::internal("the server binary moved: restart it so pushes can be checked against branch rules"));
+    }
     let link = dir.join("pre-receive");
     // A link to this binary, not a script: nothing to quote, and it works on a noexec data volume.
     if std::fs::read_link(&link).ok() != Some(exe.clone()) {
         std::fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!(".pre-receive.{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
+        let tmp = dir.join(format!(".pre-receive.{}.{:x}", std::process::id(), rand::random::<u64>()));
         std::os::unix::fs::symlink(&exe, &tmp)?;
         std::fs::rename(&tmp, &link)?;
     }
-    Ok(Some((dir, serde_json::to_string(&rules).map_err(AppError::internal)?)))
+    Ok(Some((dir, json)))
 }
 
 /// Run as git's pre-receive hook: "old new ref" lines on stdin; refuse the
@@ -343,22 +376,31 @@ pub async fn auto_merge(st: &AppState, repo_id: i64, sha: Option<String>) {
 }
 
 async fn try_auto_merge(st: &AppState, repo_id: i64, sha: Option<String>) -> R<()> {
-    let waiting: Vec<(i64, String, String, i64, String)> = st
+    type Armed = (i64, String, String, i64, Option<String>, Option<i64>);
+    let (waiting, names): (Vec<Armed>, Option<(String, String)>) = st
         .db
         .call(move |c| {
             let mut q = c.prepare(
-                "SELECT i.number, p.head_branch, p.auto_merge, p.auto_merge_by, p.base_branch FROM pulls p JOIN issues i ON i.id = p.issue_id
+                "SELECT i.number, p.head_branch, p.auto_merge, p.auto_merge_by, p.auto_merge_sha,
+                        (SELECT b.user_id FROM branch_pushers b WHERE b.repo_id = i.repo_id AND b.branch = p.head_branch)
+                 FROM pulls p JOIN issues i ON i.id = p.issue_id
                  WHERE i.repo_id = ?1 AND i.state = 'open' AND p.auto_merge IS NOT NULL AND p.auto_merge_by IS NOT NULL",
             )?;
-            Ok(q.query_map([repo_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?)
+            let armed = q.query_map([repo_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<_, _>>()?;
+            let names = c
+                .query_row("SELECT u.username, r.name FROM repos r JOIN users u ON u.id = r.owner_id WHERE r.id = ?1", [repo_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            Ok((armed, names))
         })
         .await?;
-    for (number, head, method, by, _base) in waiting {
-        let Some(user) = crate::auth::user_by_id(&st.db, by).await? else { continue };
-        let found = st.db.call(move |c| Ok(c.query_row("SELECT u.username, r.name FROM repos r JOIN users u ON u.id = r.owner_id WHERE r.id = ?1", [repo_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).optional()?)).await?;
-        let Some((owner, name)) = found else { return Ok(()) };
+    let Some((owner, name)) = names else { return Ok(()) };
+    for (number, head, method, by, armed_at, pusher) in waiting {
+        // Whoever asked was suspended, or can't merge any more: the request lapses.
+        let Some(user) = crate::auth::user_by_id(&st.db, by).await? else {
+            clear(st, repo_id, number).await?;
+            continue;
+        };
         let Ok(repo) = Repo::writable(st, Some(&user), &owner, &name).await else {
-            // Whoever asked can't merge any more: the request lapses.
             clear(st, repo_id, number).await?;
             continue;
         };
@@ -366,7 +408,19 @@ async fn try_auto_merge(st: &AppState, repo_id: i64, sha: Option<String>) -> R<(
         if sha.as_ref().is_some_and(|s| *s != head_sha) {
             continue;
         }
-        match crate::api::issues::merge(st, &repo, &user, number, &method).await {
+        // Armed for one commit: someone else's newer push needs a new go-ahead
+        // (their code would otherwise merge as the person who armed it).
+        if armed_at.as_deref() != Some(head_sha.as_str()) {
+            if pusher != Some(by) {
+                clear(st, repo_id, number).await?;
+                continue;
+            }
+            let (h, n) = (head_sha.clone(), number);
+            st.db
+                .call(move |c| Ok(c.execute("UPDATE pulls SET auto_merge_sha = ?1 WHERE issue_id = (SELECT id FROM issues WHERE repo_id = ?2 AND number = ?3)", params![h, repo_id, n])?))
+                .await?;
+        }
+        match crate::api::issues::merge(st, &repo, &user, number, &method, &head_sha).await {
             Ok(_) => {}
             // Not yet (checks pending, approvals missing, conflicts): it stays armed.
             Err(e) if e.status == axum::http::StatusCode::CONFLICT => {}
@@ -383,7 +437,7 @@ async fn clear(st: &AppState, repo_id: i64, number: i64) -> R<()> {
     st.db
         .call(move |c| {
             Ok(c.execute(
-                "UPDATE pulls SET auto_merge = NULL, auto_merge_by = NULL WHERE issue_id = (SELECT id FROM issues WHERE repo_id = ?1 AND number = ?2)",
+                "UPDATE pulls SET auto_merge = NULL, auto_merge_by = NULL, auto_merge_sha = NULL WHERE issue_id = (SELECT id FROM issues WHERE repo_id = ?1 AND number = ?2)",
                 params![repo_id, number],
             )?)
         })
@@ -413,6 +467,7 @@ mod tests {
         assert_eq!((e.approvals, e.checks.len(), e.allow_force_push, e.allow_deletion), (2, 2, false, false));
         assert_eq!(effective(&rules, "main").unwrap().checks, ["build", "lint"]);
         assert!(effective(&[rule("release/*")], "release/1/x").is_none(), "* stays within a part");
+        assert!(!covers("main", "fix/main") && !covers("*", "fix/x") && covers("*", "main") && covers("**", "fix/x") && covers("fix/**", "fix/a/b"));
         assert!(rule("a b").validate().is_err() && rule("x//y").validate().is_err() && rule("feat/**").validate().is_ok());
     }
 }

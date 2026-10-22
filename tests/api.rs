@@ -4246,9 +4246,55 @@ async fn protection_merges_wait_for_checks_and_approvals_and_auto_merge() {
     assert_eq!(app.req(&carol, "POST", &format!("/api/repos/alice/p/pulls/{one}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::OK);
     let (s, e) = app.req(&bob, "POST", &merge(one), Some(json!({}))).await;
     assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("0 of 1"), "readers' approvals don't count: {e}");
+    // A status can't pass a CI job of the same name that failed, and a job skipped
+    // because the one it needs failed doesn't count as passed.
+    let jobs = |sha: String, rows: &'static [(&'static str, &'static str, &'static str)]| {
+        let st = app.state.clone();
+        async move {
+            st.db
+                .call(move |c| {
+                    c.execute("INSERT INTO ci_runs (repo_id, number, event, ref, sha, status, created_at) VALUES (1, 900, 'push', 'refs/heads/one', ?1, 'failure', 0)", [&sha])?;
+                    let run = c.last_insert_rowid();
+                    for (name, status, reason) in rows {
+                        c.execute("INSERT INTO ci_jobs (run_id, name, key, spec, status, reason, created_at) VALUES (?1, ?2, ?2, '{}', ?3, ?4, 0)", rusqlite::params![run, name, status, reason])?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap()
+        }
+    };
+    jobs(sha.clone(), &[("build", "failure", ""), ("deploy", "skipped", "needs")]).await;
+    let (_, ch) = app.req(&carol, "GET", &format!("/api/repos/alice/p/checks/{sha}"), None).await;
+    let state = |n: &str| ch["checks"].as_array().unwrap().iter().find(|c| c["name"] == n).map(|c| c["state"].as_str().unwrap().to_string());
+    assert_eq!((state("build"), state("deploy")), (Some("failure".into()), Some("failure".into())), "{ch}");
+    app.state.db.call(|c| Ok(c.execute_batch("DELETE FROM ci_jobs; DELETE FROM ci_runs WHERE number = 900;")?)).await.unwrap();
     // The owner may merge past rules not enforced on admins, but must say so.
     assert_eq!(app.req(&bob, "POST", &merge(one), Some(json!({ "bypass_rules": true }))).await.0, StatusCode::CONFLICT);
     assert_eq!(app.req(&alice, "POST", &merge(one), Some(json!({ "bypass_rules": true }))).await.0, StatusCode::OK);
+
+    // An approval is for the commit it saw: a later push needs a new one.
+    let (three, _) = pr("three").await;
+    let ok_status = |s: String| {
+        let (app, bob) = (&app, bob.clone());
+        async move { app.req(&bob, "POST", &format!("/api/repos/alice/p/statuses/{s}"), Some(json!({ "state": "success", "context": "build" }))).await.0 }
+    };
+    assert_eq!(app.req(&alice, "POST", &format!("/api/repos/alice/p/pulls/{three}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::OK);
+    let more = json!({ "branch": "three", "message": "more", "changes": [{ "path": "three.txt", "content": "y\n" }] });
+    let (_, v) = app.req(&bob, "POST", "/api/repos/alice/p/contents", Some(more)).await;
+    assert_eq!(ok_status(v["sha"].as_str().unwrap().to_string()).await, StatusCode::OK);
+    let (s, e) = app.req(&bob, "POST", &merge(three), Some(json!({}))).await;
+    assert!(s == StatusCode::CONFLICT && e["error"].as_str().unwrap().contains("0 of 1"), "a stale approval: {e}");
+    // Auto-merge armed by the owner lapses when someone else pushes to the branch.
+    assert_eq!(app.req(&alice, "PUT", &format!("/api/repos/alice/p/pulls/{three}/auto-merge"), Some(json!({ "method": "merge" }))).await.0, StatusCode::OK);
+    let again = json!({ "branch": "three", "message": "sneaky", "changes": [{ "path": "three.txt", "content": "z\n" }] });
+    let (_, v) = app.req(&bob, "POST", "/api/repos/alice/p/contents", Some(again)).await;
+    let head3 = v["sha"].as_str().unwrap().to_string();
+    assert_eq!(app.req(&alice, "POST", &format!("/api/repos/alice/p/pulls/{three}/reviews"), Some(json!({ "event": "approve" }))).await.0, StatusCode::OK);
+    assert_eq!(ok_status(head3).await, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (_, i) = app.req(&bob, "GET", &format!("/api/repos/alice/p/issues/{three}"), None).await;
+    assert_eq!((i["issue"]["state"].as_str(), i["pull"]["auto_merge"].is_null()), (Some("open"), true), "bob's push disarmed it: {i}");
 
     // Auto-merge: armed by a writer, it merges once the last requirement is met.
     let (two, sha2) = pr("two").await;
@@ -4283,7 +4329,7 @@ async fn protection_merges_wait_for_checks_and_approvals_and_auto_merge() {
     assert!(svg.contains("ci: unknown"), "{svg}");
     // Link previews for public pages only.
     let (_, page, _) = raw_get(&app, &format!("/alice/p/pull/{two}")).await;
-    assert!(page.contains(r#"<meta property="og:title" content="two · Pull request #2 · alice/p">"#), "{page}");
+    assert!(page.contains(&format!(r#"<meta property="og:title" content="two · Pull request #{two} · alice/p">"#)), "{page}");
     let (_, page, _) = raw_get(&app, "/alice/secret").await;
     assert!(!page.contains("og:title"), "nothing about private repositories");
 }

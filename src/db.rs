@@ -701,6 +701,13 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX issue_assignees_user ON issue_assignees(user_id);
     "#,
+    // v21: auto-merge is armed for one head commit; who last pushed each branch, from the
+    // push history kept so far (so scheduled runs keep their author after the upgrade).
+    r#"
+    ALTER TABLE pulls ADD COLUMN auto_merge_sha TEXT;
+    INSERT OR IGNORE INTO branch_pushers (repo_id, branch, user_id, at)
+        SELECT repo_id, title, user_id, max(created_at) FROM events WHERE kind = 'push' AND repo_id IS NOT NULL AND title != '' GROUP BY repo_id, title;
+    "#,
 ];
 
 impl Db {

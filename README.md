@@ -147,14 +147,14 @@ GITTER_RUNNER_TOKEN=grn_… gitter runner --url https://git.example.com --labels
 
 Jobs are leased with a heartbeat. A job whose runner dies goes back to the queue, and a runner that lost its lease can't report over the new attempt. Stopping a runner (Ctrl-C or SIGTERM) kills its running steps, and their jobs go back to the queue.
 
-**Branch rules, checks and auto-merge.** In a repository's **Settings → Branch rules**, admins protect the branches matching a pattern (`main`, `release/*`; `*` stays within one part of the name, `**` spans parts). A rule can:
+**Branch rules, checks and auto-merge.** In a repository's **Settings → Branch rules**, admins protect the branches matching a pattern (`main`, `release/*`; `*` stays within one part of the name, `**` spans parts, and `main` doesn't cover `fix/main`). A rule can:
 
 - require pull requests: no direct pushes or web edits;
-- require approving reviews from people with write access, any of whom can also block by requesting changes;
-- require checks to pass on the pull request's head: CI job names, or contexts of commit statuses that other systems post with `POST /api/repos/OWNER/REPO/statuses/SHA` (`{"state": "success", "context": "deploy", "target_url": "https://…"}`; states are pending, success, failure and error);
+- require approving reviews of the pull request's latest commit (a later push needs a new approval) from people with write access, any of whom can also block by requesting changes;
+- require checks to pass on the pull request's head: CI job names (a job skipped because one it needs failed counts as failed), or contexts of commit statuses that other systems post with `POST /api/repos/OWNER/REPO/statuses/SHA` (`{"state": "success", "context": "deploy", "target_url": "https://…"}`; states are pending, success, failure and error). Anyone with write access can post statuses, so a status named like a CI job can only make that check worse;
 - allow or refuse force-pushes and deleting the branch (refused unless allowed).
 
-Rules apply to git pushes (through a pre-receive hook, before anything moves), web edits, branch deletion and merges. Repository admins may bypass them unless the rule says it applies to admins too, and a bypassed merge has to be asked for. **Merge when ready** on a pull request merges it by itself, with the method chosen, once its checks pass and its reviews are in. A CI badge for a README: `![CI](https://git.example.com/api/repos/OWNER/REPO/ci/badge.svg)` (add `?branch=NAME` for another branch). Links to public repositories, issues and pull requests unfurl in chat apps.
+Rules apply to git pushes (through a pre-receive hook, before anything moves), web edits, branch deletion and merges. Repository admins may bypass them unless the rule says it applies to admins too, and a bypassed merge has to be asked for. Merging past the rules is in the security log. **Merge when ready** on a pull request merges it by itself, with the method chosen, once its checks pass and its reviews are in; a push to the branch by anyone else than whoever asked cancels it. A CI badge for a README: `![CI](https://git.example.com/api/repos/OWNER/REPO/ci/badge.svg)` (add `?branch=NAME` for another branch). Links to public repositories, issues and pull requests unfurl in chat apps.
 
 **Who can run CI** is set in Site administration:
 

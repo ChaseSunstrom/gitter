@@ -991,6 +991,11 @@ pub struct MergeReq {
     /// A repository admin merging past branch rules not enforced on admins.
     #[serde(default)]
     bypass_rules: bool,
+    /// Auto-merge: only if the head is still this commit.
+    #[serde(skip)]
+    expect_head: Option<String>,
+    #[serde(skip)]
+    ip: String,
 }
 
 fn default_method() -> String {
@@ -1000,16 +1005,18 @@ fn default_method() -> String {
 pub async fn merge_pull(
     State(st): State<AppState>,
     Authed(u): Authed,
+    super::ClientIp(ip): super::ClientIp,
     Path((o, n, num)): Path<(String, String, i64)>,
-    Json(req): Json<MergeReq>,
+    Json(mut req): Json<MergeReq>,
 ) -> J<serde_json::Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
+    req.ip = ip;
     merge_with(&st, &r, &u, num, req).await.map(Json)
 }
 
-/// Auto-merge: as `u`, with the method they chose, never past the branch rules.
-pub(crate) async fn merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, method: &str) -> R<serde_json::Value> {
-    let req = MergeReq { method: method.into(), title: None, message: None, delete_branch: false, bypass_rules: false };
+/// Auto-merge: as `u`, with the method they chose, of head `head` only, never past the branch rules.
+pub(crate) async fn merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, method: &str, head: &str) -> R<serde_json::Value> {
+    let req = MergeReq { method: method.into(), title: None, message: None, delete_branch: false, bypass_rules: false, expect_head: Some(head.into()), ip: String::new() };
     merge_with(st, r, u, num, req).await
 }
 
@@ -1035,9 +1042,16 @@ async fn merge_with(st: &AppState, r: &Repo, u: &crate::auth::User, num: i64, re
         .resolve(&r.path, &format!("refs/heads/{base_b}"))
         .await?
         .ok_or_else(|| AppError::conflict("The target branch is gone"))?;
+    if req.expect_head.as_ref().is_some_and(|e| *e != head) {
+        return Err(AppError::conflict("The source branch moved on"));
+    }
     let gate = crate::protect::gate(st, r, issue.id, &base_b, &head).await?;
     if !gate.missing.is_empty() && !(gate.can_bypass && req.bypass_rules) {
         return Err(AppError::conflict(format!("Merging is blocked: {}", gate.missing.join("; "))));
+    }
+    if !gate.missing.is_empty() {
+        let detail = format!("{} merged {}#{num} past its branch rules ({})", u.username, r.full_name(), gate.missing.join("; "));
+        crate::security::record(&st.db, crate::security::Event { actor: Some(u), subject: Some(u.id), action: "branch_rule_bypass", detail, ip: &req.ip }).await;
     }
     let (an, ae) = u.signature();
     let title = req

@@ -295,7 +295,7 @@ export function langOf(path) {
 
 // ---------- security log ----------
 const AUDIT = {
-  signup: 'Created the account', branch_rule: 'Changed a branch rule', login: 'Signed in', password_changed: 'Changed the password',
+  signup: 'Created the account', branch_rule: 'Changed a branch rule', branch_rule_bypass: 'Merged past branch rules', login: 'Signed in', password_changed: 'Changed the password',
   '2fa_enabled': 'Turned on two-factor authentication', '2fa_disabled': 'Turned off two-factor authentication',
   '2fa_reset': 'Two-factor authentication was reset by an admin', '2fa_failed': 'A wrong two-factor code was entered',
   recovery_codes_replaced: 'Replaced the recovery codes', session_revoked: 'Signed out a session',

@@ -190,13 +190,27 @@ pub async fn set_auto_merge(State(st): State<AppState>, Authed(u): Authed, Path(
     if !matches!(req.method.as_str(), "merge" | "squash" | "ff") {
         return Err(AppError::bad("Unknown merge method"));
     }
+    // Armed for the head as it is now: a newer push by someone else disarms it.
     let (id, uid, m) = (r.id, u.id, req.method.clone());
+    let head: Option<String> = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT p.head_branch FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.number = ?2 AND i.is_pr = 1 AND i.state = 'open'",
+                params![id, num],
+                |x| x.get(0),
+            )
+            .optional()?)
+        })
+        .await?;
+    let Some(branch) = head else { return Err(AppError::conflict("That pull request isn't open")) };
+    let sha = st.git.resolve(&r.path, &format!("refs/heads/{branch}")).await?.ok_or_else(|| AppError::conflict("The source branch is gone"))?;
     let n = st
         .db
         .call(move |c| {
             Ok(c.execute(
-                "UPDATE pulls SET auto_merge = ?3, auto_merge_by = ?4 WHERE issue_id = (SELECT id FROM issues WHERE repo_id = ?1 AND number = ?2 AND is_pr = 1 AND state = 'open')",
-                params![id, num, m, uid],
+                "UPDATE pulls SET auto_merge = ?3, auto_merge_by = ?4, auto_merge_sha = ?5 WHERE issue_id = (SELECT id FROM issues WHERE repo_id = ?1 AND number = ?2 AND is_pr = 1 AND state = 'open')",
+                params![id, num, m, uid, sha],
             )?)
         })
         .await?;
@@ -214,7 +228,7 @@ pub async fn clear_auto_merge(State(st): State<AppState>, Authed(u): Authed, Pat
     st.db
         .call(move |c| {
             Ok(c.execute(
-                "UPDATE pulls SET auto_merge = NULL, auto_merge_by = NULL WHERE issue_id = (SELECT id FROM issues WHERE repo_id = ?1 AND number = ?2)",
+                "UPDATE pulls SET auto_merge = NULL, auto_merge_by = NULL, auto_merge_sha = NULL WHERE issue_id = (SELECT id FROM issues WHERE repo_id = ?1 AND number = ?2)",
                 params![id, num],
             )?)
         })
