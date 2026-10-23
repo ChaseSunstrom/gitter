@@ -265,7 +265,7 @@ pub async fn show(
         "empty": branches.is_empty(), "branches": branches, "tags": tags,
         "stars": stars, "starred": starred, "forks": forks, "open_issues": issues, "open_pulls": pulls,
         "releases": releases, "latest_release": latest_release,
-        "fork_of": parent, "mirror": mirror, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "can_transfer": can_transfer, "hidden": r.hidden,
+        "fork_of": parent, "remote_fork": super::federation::remote_fork_json(&st, r.id).await?, "mirror": mirror, "can_write": r.can_write, "can_admin": r.can_admin, "is_owner": r.is_owner, "can_transfer": can_transfer, "hidden": r.hidden,
         "clone_url": format!("{}/{}/{}.git", st.cfg.url.trim_end_matches('/'), r.owner, r.name),
         "ssh_url": st.ssh_url.get().map(|b| format!("{b}{}/{}.git", r.owner, r.name)),
     })))

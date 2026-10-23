@@ -66,6 +66,7 @@ export function repoHeader(meta, tab) {
     </div>
     ${meta.hidden ? html`<div class="mod-banner">${icon('eye', 'sm')} A moderator hid this repository. Only its admins and the site's admins can see it.</div>` : ''}
     ${meta.fork_of ? html`<div class="forked muted small">${icon('fork', 'sm')} forked from <a href="/${meta.fork_of.owner}/${meta.fork_of.name}">${meta.fork_of.owner}/${meta.fork_of.name}</a></div>` : ''}
+    ${meta.remote_fork ? html`<div class="forked muted small">${icon('fork', 'sm')} forked from <a href="${meta.remote_fork.url}" rel="noopener">${meta.remote_fork.host}/${meta.remote_fork.owner}/${meta.remote_fork.name}</a>${meta.can_write && !meta.empty && !meta.mirror ? html` · <a href="#" id="propose-btn" class="c-accent" role="button" aria-haspopup="dialog">Open a pull request there</a>` : ''}</div>` : ''}
     ${meta.mirror ? html`<div class="forked muted small mirror-badge" title="${meta.mirror.once ? 'Read-only until the copy is done' : 'Read-only here: it changes only when it syncs from its remote'}">${icon('download', 'sm')} ${meta.mirror.once ? 'copying from' : 'mirror of'} <span class="mono">${meta.mirror.url}</span>${meta.mirror.last_ok_at ? html` · synced ${timeEl(meta.mirror.last_ok_at)}` : meta.mirror.once ? '' : ' · not synced yet'}</div>` : ''}
     <nav class="tabs repo-tabs" aria-label="Repository">
       ${TABS.filter(([k]) => k !== 'settings' || meta.can_admin).map(([k, ic, label, path]) => html`<a href="${base}${path}" class="${tab === k ? 'on' : ''}" data-tab="${k}">
@@ -204,6 +205,7 @@ export function mountRepoHeader(root, meta) {
   });
   paintCiStatus(root, meta);
   $('#report-btn', root)?.addEventListener('click', () => reportDialog({ kind: 'repo', owner: meta.owner, repo: meta.name }, 'repository'));
+  $('#propose-btn', root)?.addEventListener('click', (e) => { e.preventDefault(); proposeDialog(meta); });
   const base = repoUrl(meta.owner, meta.name);
   $('#watch-btn', root)?.addEventListener('click', async (e) => {
     const anchor = e.currentTarget;
@@ -322,4 +324,35 @@ export function crumbs(meta, rev, path, { last = true } = {}) {
     const sub = parts.slice(0, i + 1).join('/');
     return html`<span class="slash">/</span>${i === parts.length - 1 && last ? html`<b>${p}</b>` : html`<a href="${base}/tree/${encPath(rev)}/${encPath(sub)}">${p}</a>`}`;
   })}${path ? html`<button class="btn ghost sm icon" data-copy="${path}" data-copy-label="Path copied" title="Copy path" aria-label="Copy path">${icon('copy', 'sm')}</button>` : ''}</nav>`;
+}
+
+/** A remote fork's branch, proposed to the repository it was forked from on its server. */
+async function proposeDialog(meta) {
+  const f = meta.remote_fork;
+  const done = await modal({
+    title: `Open a pull request on ${f.host}`,
+    body: html`<div class="stack">
+      <p class="muted small">Into <b>${f.owner}/${f.name}</b> there. ${f.host} copies the branch from here${meta.private ? ', so make this repository public first' : ''}, and later pushes to it here update the pull request.</p>
+      <div class="field"><label for="pp-branch">From this branch</label><select class="select" id="pp-branch">${meta.branches.map((b) => html`<option ${b === meta.default_branch ? 'selected' : ''}>${b}</option>`)}</select></div>
+      <div class="field"><label for="pp-base">Into their branch <span class="muted" style="font-weight:400">(empty: their default)</span></label><input class="input mono" id="pp-base" autocomplete="off"></div>
+      <div class="field"><label for="pp-title">Title</label><input class="input" id="pp-title" maxlength="256" autofocus></div>
+      <div class="field"><label for="pp-body">Description <span class="muted" style="font-weight:400">(optional)</span></label><textarea class="textarea" id="pp-body" rows="4"></textarea></div>
+      <p class="field-err" id="pp-err" role="alert" hidden></p></div>`,
+    foot: html`<button class="btn" data-close>Cancel</button><button class="btn primary" id="pp-go">${icon('pr', 'sm')} Open pull request</button>`,
+    onMount(m, close) {
+      const go = $('#pp-go', m), err = $('#pp-err', m), val = (id) => $(id, m).value.trim();
+      go.addEventListener('click', action(go, async () => {
+        err.hidden = true;
+        if (!val('#pp-title')) return $('#pp-title', m).focus();
+        try {
+          const r = await send('POST', `${repoUrl(meta.owner, meta.name)}/federation/pulls`, { branch: val('#pp-branch'), base: val('#pp-base') || null, title: val('#pp-title'), body: $('#pp-body', m).value });
+          close({ ...r, branch: val('#pp-branch') });
+        } catch (e) { err.textContent = e.message; err.hidden = false; }
+      }));
+    },
+  });
+  if (done) {
+    await modal({ title: 'Pull request opened', body: html`<p>It's <a href="${done.url}" rel="noopener" id="pp-link">#${done.number} on ${f.host}</a>. Pushes to <b>${done.branch}</b> here update it there.</p>`,
+      foot: html`<button class="btn primary" data-close>Done</button>` });
+  }
 }

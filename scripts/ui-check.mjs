@@ -1263,5 +1263,55 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   else console.log(`  ok editing together: ${steps.join(', ')}`);
 }
 
+// Federation: zed on the second server (BASE2) forks alice/hello from here on the new repository
+// page, proposes a branch from the fork's page, and alice sees the pull request here from zed,
+// linked to zed's own server.
+if (process.env.BASE2) {
+  const B = process.env.BASE2;
+  const errors = [], steps = [];
+  const zedCtx = await browser.newContext();
+  const watch = (p) => { p.on('pageerror', (e) => errors.push(String(e))); p.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource: the server responded with a status of 404/.test(m.text())) errors.push(m.text()); }); };
+  try {
+    await zedCtx.request.post(B + '/api/auth/login', { headers: { Origin: B }, data: { login: 'zed', password: 'correct horse' } }); // pragma: allowlist secret
+    const z = await zedCtx.newPage();
+    watch(z);
+    await z.goto(B + '/new', { waitUntil: 'networkidle' });
+    await z.check('input[name=start][value=fork]');
+    // A repository that isn't there: said so, and nothing is made.
+    await z.fill('#fork-url', BASE + '/alice/nope');
+    await z.fill('#repo-name', 'hello-ui');
+    await z.click('#create-btn');
+    await z.locator('#form-err', { hasText: 'no public alice/nope' }).waitFor({ timeout: 10000 });
+    if ((await zedCtx.request.get(B + '/api/repos/zed/hello-ui')).ok()) throw new Error('a repository was made for a fork that came to nothing');
+    await z.fill('#fork-url', BASE + '/alice/hello');
+    await Promise.all([z.waitForURL(B + '/zed/hello-ui', { timeout: 10000 }), z.click('#create-btn')]);
+    steps.push('forked from the new repository page');
+    // The copy fills it in by itself; then the fork's page offers a pull request there.
+    await z.waitForSelector('#propose-btn', { timeout: 30000 });
+    steps.push('the fork says where it came from');
+    const c = await zedCtx.request.post(B + '/api/repos/zed/hello-ui/contents', { headers: { Origin: B }, data: { branch: 'main', message: 'Proposed in the browser', changes: [{ path: 'UI.md', content: 'from the browser\n' }] } });
+    if (!c.ok()) throw new Error(`commit: ${c.status()} ${await c.text()}`);
+    await z.click('#propose-btn');
+    await z.fill('#pp-title', 'Proposed from the other server');
+    await z.click('#pp-go');
+    const href = await (await z.waitForSelector('#pp-link', { timeout: 15000 })).getAttribute('href');
+    if (!href?.startsWith(BASE + '/alice/hello/pull/')) throw new Error(`link: ${href}`);
+    steps.push('opened a pull request there');
+    const a = await ctx.newPage();
+    watch(a);
+    await a.goto(href, { waitUntil: 'networkidle' });
+    await a.locator('#issue-body .tag-private', { hasText: 'Author, from another server' }).waitFor({ timeout: 5000 });
+    const who = await a.$eval('#issue-body .comment-head a.row', (e) => e.getAttribute('href'));
+    if (who !== B + '/zed') throw new Error(`author link: ${who}`);
+    const from = await a.locator('.branch-name', { hasText: 'zed/hello-ui:main' }).count();
+    if (!from) throw new Error('the source branch on the other server is not shown');
+    steps.push("alice sees it from zed, linked to zed's server");
+    await z.close(); await a.close();
+  } catch (e) { errors.push(String(e)); }
+  await zedCtx.close();
+  if (errors.length || steps.length < 4) { failed++; console.log('✗ federation', { steps, errors }); }
+  else console.log(`  ok federation: ${steps.join(', ')}`);
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

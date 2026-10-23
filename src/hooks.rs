@@ -25,6 +25,8 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     crate::mergequeue::kick(st, repo.id);
     // Pull requests from this repository's branches into the one it was forked from (or its forks).
     crate::api::issues::sync_fork_pulls(st, repo, updates).await;
+    // And into the one it was forked from on another server.
+    crate::api::federation::pushed(st, repo, updates).await;
 }
 
 /// Who moved each branch last (a scheduled run counts as theirs). A deleted

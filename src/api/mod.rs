@@ -25,6 +25,7 @@ pub mod notifications;
 pub mod oauth;
 pub mod revert;
 pub mod collab;
+pub mod federation;
 pub mod deploy;
 pub mod preview;
 
@@ -235,6 +236,11 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/flaky"), get(ci_extras::flaky))
         .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
         .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
+        .route(&format!("{repo}/federation/fork"), post(federation::fork))
+        .route(&format!("{repo}/federation/pulls"), get(federation::outgoing).post(federation::propose))
+        .route("/federation/check", post(federation::check))
+        .route("/federation/pulls", post(federation::incoming))
+        .route("/federation/pulls/update", post(federation::update))
         .route(&format!("{repo}/collab"), post(collab::join))
         .route(&format!("{repo}/collab/{{id}}"), get(collab::show))
         .route(&format!("{repo}/collab/{{id}}/ops"), post(collab::change).layer(DefaultBodyLimit::max(8 << 20)))
