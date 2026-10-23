@@ -5174,3 +5174,106 @@ async fn recorded_size_survives_a_folder_moved_away_mid_push() {
     let size: i64 = app.state.db.call(move |c| Ok(c.query_row("SELECT size_bytes FROM repos WHERE id = ?1", [id], |r| r.get(0))?)).await.unwrap();
     assert_eq!(size, 12345);
 }
+
+/// A repository with pull requests #1 (fix → main) and #2 (other → main), each one commit ahead of main.
+async fn hand_merged_setup(app: &App) -> (Client, String, String) {
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let mut shas = vec![];
+    for b in ["fix", "other"] {
+        let change = json!({ "branch": "main", "new_branch": b, "message": b, "changes": [{ "path": format!("{b}.txt"), "content": b }] });
+        let (s, v) = app.req(&alice, "POST", "/api/repos/alice/r/contents", Some(change)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        shas.push(v["sha"].as_str().unwrap().to_string());
+        let (s, v) = app.req(&alice, "POST", "/api/repos/alice/r/pulls", Some(json!({ "title": b, "head": b, "base": "main" }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let other = shas.pop().unwrap();
+    (alice, shas.pop().unwrap(), other)
+}
+
+/// What a read must leave alone: the pull requests' issues, pulls and timeline rows.
+async fn hand_merged_rows(app: &App) -> String {
+    app.state
+        .db
+        .call(|c| {
+            let mut out = String::new();
+            for q in [
+                "SELECT id || state || updated_at || coalesce(closed_at, '') FROM issues ORDER BY id",
+                "SELECT issue_id || coalesce(merged_sha, '') || coalesce(head_sha, '') || coalesce(base_sha, '') || coalesce(merged_at, '') FROM pulls ORDER BY issue_id",
+                "SELECT id || kind || body FROM comments ORDER BY id",
+            ] {
+                let mut s = c.prepare(q)?;
+                let rows: Vec<String> = s.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                out += &rows.join("\n");
+                out += "\n--\n";
+            }
+            Ok(out)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn hand_merged_pull_is_marked_merged_by_the_push_without_a_read() {
+    let app = App::new();
+    let (alice, fix, other) = hand_merged_setup(&app).await;
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["pull_request"], "allow_private": true }); // pragma: allowlist secret
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/r/hooks", Some(hook)).await.0, StatusCode::OK);
+    let path = app.state.git.repo_path(1);
+    let old = insights_git(&path, &["rev-parse", "refs/heads/main"]);
+    // Fast-forward main to #1's head by hand, as a push would.
+    insights_git(&path, &["update-ref", "refs/heads/main", &fix]);
+    let u = gitter::auth::user_by_id(&app.state.db, 1).await.unwrap().unwrap();
+    let r = gitter::repo::Repo::writable(&app.state, Some(&u), "alice", "r").await.unwrap();
+    let upd = [gitter::smart_http::RefUpdate { refname: "refs/heads/main".into(), old: Some(old), new: Some(fix.clone()) }];
+    gitter::hooks::on_push(&app.state, &r, &u, &upd).await;
+    // A second run (or a second push of the same) records nothing more.
+    gitter::hooks::on_push(&app.state, &r, &u, &upd).await;
+
+    let got = app
+        .state
+        .db
+        .call(|c| {
+            let q = "SELECT i.number, i.state, coalesce(p.merged_sha, ''), coalesce(p.merged_by, 0), (SELECT count(*) FROM comments m WHERE m.issue_id = i.id AND m.kind = 'merged')
+                     FROM issues i JOIN pulls p ON p.issue_id = i.id ORDER BY i.number";
+            let mut s = c.prepare(q)?;
+            let rows: Vec<(i64, String, String, i64, i64)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    assert_eq!(got, vec![(1, "merged".into(), fix.clone(), 1, 1), (2, "open".into(), String::new(), 0, 0)], "only the one whose head main now holds");
+    // Announced like a merge in Gitter: one webhook delivery, however many pushes.
+    gitter::webhooks::tick(&app.state).await;
+    let merged: Vec<Value> = rx.seen.lock().unwrap().iter().map(|(_, b)| serde_json::from_str::<Value>(b).unwrap()).filter(|p| p["action"] == "merged").collect();
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert_eq!((merged[0]["pull_request"]["number"].as_i64(), merged[0]["pull_request"]["merged"].as_bool()), (Some(1), Some(true)));
+
+    // A real merge commit by hand brings #2 in too.
+    let merge = insights_git(&path, &["commit-tree", "-p", &fix, "-p", &other, "-m", "merge other", &format!("{other}^{{tree}}")]);
+    insights_git(&path, &["update-ref", "refs/heads/main", &merge]);
+    let upd = [gitter::smart_http::RefUpdate { refname: "refs/heads/main".into(), old: Some(fix.clone()), new: Some(merge) }];
+    gitter::hooks::on_push(&app.state, &r, &u, &upd).await;
+    let state: String = app.state.db.call(|c| Ok(c.query_row("SELECT state FROM issues WHERE number = 2", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(state, "merged");
+}
+
+#[tokio::test]
+async fn hand_merged_reads_write_nothing() {
+    let app = App::new();
+    let (alice, fix, _) = hand_merged_setup(&app).await;
+    // Main merged #1's head, moved without a push hook (as before this check existed), and #2 is untouched.
+    let path = app.state.git.repo_path(1);
+    let merge = insights_git(&path, &["commit-tree", "-p", "main", "-p", &fix, "-m", "merge fix", &format!("{fix}^{{tree}}")]);
+    insights_git(&path, &["update-ref", "refs/heads/main", &merge]);
+    let before = hand_merged_rows(&app).await;
+    for n in [1, 2] {
+        for url in [format!("/api/repos/alice/r/issues/{n}"), format!("/api/repos/alice/r/pulls/{n}/diff")] {
+            let (s, v) = app.req(&alice, "GET", &url, None).await;
+            assert_eq!(s, StatusCode::OK, "{url}: {v}");
+        }
+    }
+    assert_eq!(hand_merged_rows(&app).await, before);
+}

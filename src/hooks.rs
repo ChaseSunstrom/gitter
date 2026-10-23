@@ -21,12 +21,83 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     }
     crate::webhooks::push(st, repo, user.id, updates).await;
     crate::mirrors::changed(st, repo.id).await;
+    hand_merged(st, repo, user, updates).await;
     // A queued pull request's branch, or the branch it's tested against, may have moved.
     crate::mergequeue::kick(st, repo.id);
     // Pull requests from this repository's branches into the one it was forked from (or its forks).
     crate::api::issues::sync_fork_pulls(st, repo, updates).await;
     // And into the one it was forked from on another server.
     crate::api::federation::pushed(st, repo, updates).await;
+}
+
+/// Open pull requests into a moved branch whose head it now holds (merged by hand:
+/// a push, a fast-forward) are recorded as merged by the pusher.
+async fn hand_merged(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpdate]) {
+    for u in updates {
+        let (Some(base), Some(new)) = (u.refname.strip_prefix("refs/heads/"), u.new.as_deref()) else { continue };
+        let (rid, b) = (repo.id, base.to_string());
+        let open: Vec<(i64, i64, String, String)> = match st
+            .db
+            .call(move |c| {
+                let mut q = c.prepare(
+                    "SELECT i.id, i.number, p.head_branch, coalesce(p.from_fork, 0), i.title FROM pulls p JOIN issues i ON i.id = p.issue_id
+                     WHERE i.repo_id = ?1 AND i.state = 'open' AND p.base_branch = ?2",
+                )?;
+                let rows = q.query_map(rusqlite::params![rid, b], |r| {
+                    let (n, branch): (i64, String) = (r.get(1)?, r.get(2)?);
+                    Ok((r.get(0)?, n, crate::api::issues::head_ref(n, &branch, r.get::<_, i64>(3)? != 0), r.get(4)?))
+                })?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("hand merges into {}:{base}: {}", repo.full_name(), e.msg);
+                continue;
+            }
+        };
+        if open.is_empty() {
+            continue;
+        }
+        // One listing for all of them: which of their heads the branch now holds.
+        let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)", "--merged", new];
+        args.extend(open.iter().map(|p| p.2.as_str()));
+        let out = match st.git.run(&repo.path, &args, None, &[]).await {
+            Ok(o) if o.code == 0 => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Ok(o) => {
+                eprintln!("hand merges into {}:{base}: {}", repo.full_name(), String::from_utf8_lossy(&o.stderr).trim());
+                continue;
+            }
+            Err(e) => {
+                eprintln!("hand merges into {}:{base}: {}", repo.full_name(), e.msg);
+                continue;
+            }
+        };
+        let held: std::collections::HashMap<&str, &str> = out.lines().filter_map(|l| l.split_once(' ')).collect();
+        for (iid, number, head_ref, title) in open {
+            let Some(head) = held.get(head_ref.as_str()).map(|s| s.to_string()) else { continue };
+            let (uid, base_sha) = (user.id, new.to_string());
+            // Still open: a second push or a merge landing meanwhile records nothing more.
+            let marked = st
+                .db
+                .call(move |c| {
+                    let tx = c.transaction()?;
+                    let marked = crate::api::issues::mark_merged(&tx, iid, uid, &head, &head, &base_sha)?;
+                    tx.commit()?;
+                    Ok(marked)
+                })
+                .await;
+            let done = match marked {
+                Ok(true) => crate::api::issues::announce_merge(st, repo.id, uid, iid, number, &title).await,
+                Ok(false) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = done {
+                eprintln!("hand merge of {}#{number}: {}", repo.full_name(), e.msg);
+            }
+        }
+    }
 }
 
 /// Who moved each branch last (a scheduled run counts as theirs). A deleted

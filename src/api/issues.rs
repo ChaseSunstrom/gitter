@@ -624,8 +624,8 @@ pub(super) async fn pull_shas(st: &AppState, r: &Repo, issue: &IssueRow) -> R<(S
     Ok(if issue.state == "open" { (head_b, head.or(head0), base.or(base0)) } else { (head_b, head0.or(head), base0.or(base)) })
 }
 
-/// Head/base state of a PR: mergeable, conflicts, or merged. Marks a PR merged
-/// when its head was merged into the base outside Gitter (e.g. a manual push).
+/// Head/base state of a PR: mergeable, conflicts, or merged. Reports a PR merged
+/// when its head is already in the base; it writes nothing.
 pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -> R<serde_json::Value> {
     let iid = issue.id;
     let (head_b, base_b, head_sha0, base_sha0, merged_sha, merged_by, merged_at): PullRow = st
@@ -674,19 +674,11 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
         return Ok(status);
     };
     let mb = st.git.merge_base(&r.path, &h, &b).await?;
-    if mb.as_deref() == Some(h.as_str()) && h != b {
-        // Already contained in the base: someone merged it by hand.
-        let (iid2, hs, bs) = (iid, h.clone(), b.clone());
-        st.db
-            .call(move |c| {
-                let t = now();
-                c.execute("UPDATE pulls SET merged_sha = ?1, head_sha = ?1, base_sha = ?2, merged_at = ?3 WHERE issue_id = ?4", rusqlite::params![hs, bs, t, iid2])?;
-                c.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid2])?;
-                Ok(())
-            })
-            .await?;
+    // open_pull refuses head == base, so a head the base holds was merged (a fast-forward too).
+    if mb.as_deref() == Some(h.as_str()) {
+        // Already contained in the base: someone merged it by hand. The push that did it
+        // records that (hooks::on_push); a read only reports it.
         issue.state = "merged".into();
-        crate::api::deploy::pull_closed(st, r.id, issue.number).await;
         status["merged_sha"] = json!(h);
         return Ok(status);
     }
@@ -1468,6 +1460,34 @@ pub async fn prepare_merge(st: &AppState, r: &Repo, u: &crate::auth::User, num: 
     Ok(MergePlan { issue_id: issue.id, num, title: issue.title, head_b, base_b, head, base, new_sha, from_fork: issue.from_fork })
 }
 
+/// Record open pull request `iid` as merged by `uid`: its state, the shas, and a
+/// timeline entry. False (and nothing written) when it isn't open any more.
+pub(crate) fn mark_merged(c: &rusqlite::Connection, iid: i64, uid: i64, merged: &str, head: &str, base: &str) -> rusqlite::Result<bool> {
+    let t = now();
+    if c.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2 AND state = 'open'", rusqlite::params![t, iid])? == 0 {
+        return Ok(false);
+    }
+    c.execute(
+        "UPDATE pulls SET merged_sha = ?1, merged_by = ?2, merged_at = ?3, head_sha = ?4, base_sha = ?5 WHERE issue_id = ?6",
+        rusqlite::params![merged, uid, t, head, base, iid],
+    )?;
+    c.execute(
+        "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at) VALUES (?1, ?2, 'merged', ?3, ?4, ?4)",
+        rusqlite::params![iid, uid, merged, t],
+    )?;
+    Ok(true)
+}
+
+/// What follows a recorded merge: the activity entry, previews retired, the webhook and the thread's notifications.
+pub(crate) async fn announce_merge(st: &AppState, rid: i64, uid: i64, iid: i64, num: i64, title: &str) -> R<()> {
+    touch(&st.db, rid, true).await?;
+    record_event(&st.db, uid, Some(rid), "merge", title, &num.to_string(), 1).await?;
+    crate::api::deploy::pull_closed(st, rid, num).await;
+    crate::webhooks::issue(st, rid, uid, num, true, "merged").await;
+    notify(st, rid, Thread::Issue(iid), uid, "").await;
+    Ok(())
+}
+
 /// Move the base branch to the plan's commit (only if it's still where the plan
 /// found it) and record the pull request as merged by `u`.
 pub async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: MergePlan, delete_branch: bool) -> R<()> {
@@ -1485,16 +1505,10 @@ pub async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: Me
             .db
             .call(move |c| {
                 let tx = c.transaction()?;
-                let t = now();
-                tx.execute(
-                    "UPDATE pulls SET merged_sha = ?1, merged_by = ?2, merged_at = ?3, head_sha = ?4, base_sha = ?5 WHERE issue_id = ?6",
-                    rusqlite::params![ms2, uid, t, hs, bs2, iid],
-                )?;
-                tx.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid])?;
-                tx.execute(
-                    "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at) VALUES (?1, ?2, 'merged', ?3, ?4, ?4)",
-                    rusqlite::params![iid, uid, ms2, t],
-                )?;
+                if !mark_merged(&tx, iid, uid, &ms2, &hs, &bs2)? {
+                    // Closed or merged meanwhile: nothing to record, so the branch goes back too.
+                    return Err(AppError::conflict("This pull request isn't open any more"));
+                }
                 tx.commit()?;
                 Ok(())
             })
@@ -1511,16 +1525,12 @@ pub async fn land_merge(st: &AppState, r: &Repo, u: &crate::auth::User, plan: Me
     })
     .await
     .map_err(AppError::internal)??;
-    touch(&st.db, r.id, true).await?;
-    record_event(&st.db, u.id, Some(r.id), "merge", &title, &num.to_string(), 1).await?;
+    announce_merge(st, r.id, u.id, issue_id, num, &title).await?;
     let upd = RefUpdate {
         refname: format!("refs/heads/{base_b}"),
         old: Some(base),
         new: Some(new_sha.clone()),
     };
-    crate::api::deploy::pull_closed(st, r.id, num).await;
-    crate::webhooks::issue(st, r.id, u.id, num, true, "merged").await;
-    notify(st, r.id, Thread::Issue(issue_id), u.id, "").await;
     let mut upds = vec![upd];
     if delete_branch && !from_fork && head_b != r.default_branch && crate::protect::direct(st, r, &head_b, true).await.is_ok() {
         // Only the commit merged: a push to the branch meanwhile keeps it. Deleted like a push deletes it (webhook, pusher forgotten).
