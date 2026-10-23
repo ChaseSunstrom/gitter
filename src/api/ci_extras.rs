@@ -56,7 +56,8 @@ fn results(c: &Connection, run: i64) -> rusqlite::Result<Vec<Value>> {
     .collect()
 }
 
-/// GET …/ci/runs/{n}/tests: `{ coverage, jobs: [counts…], results: [failed and flaky tests] }`.
+/// GET …/ci/runs/{n}/tests: `{ coverage, jobs: [counts…], results: [failed and flaky tests], expired }`
+/// (`expired`: a job finished before the retention, so its per-test results were deleted).
 pub async fn run_tests(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n, number)): Path<(String, String, i64)>) -> J<Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let id = r.id;
@@ -67,7 +68,9 @@ pub async fn run_tests(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n
                 return Ok(None);
             };
             let (jobs, coverage) = summary(c, run)?;
-            Ok(Some(json!({ "coverage": coverage, "jobs": jobs, "results": results(c, run)? })))
+            let cutoff = crate::db::now() - crate::ci::jobs::ARTIFACT_DAYS * 86400;
+            let expired: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM ci_jobs WHERE run_id = ?1 AND finished_at < ?2)", [run, cutoff], |r| r.get(0))?;
+            Ok(Some(json!({ "coverage": coverage, "jobs": jobs, "results": results(c, run)?, "expired": expired })))
         })
         .await?;
     out.map(Json).ok_or_else(AppError::not_found)

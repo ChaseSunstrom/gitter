@@ -380,25 +380,30 @@ printf '\\377\\376' > out/b.xml
 }
 
 #[tokio::test]
-async fn retention_sweep_prunes_old_attempts_test_results_but_keeps_each_jobs_latest() {
+async fn retention_sweep_deletes_test_results_of_jobs_finished_before_the_artifact_cutoff() {
     let app = App::new();
     let admin = app.signup("root1").await;
     app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r" }))).await;
     let old = gitter::db::now() - (gitter::ci::jobs::ARTIFACT_DAYS + 1) * 86400;
     let recent = gitter::db::now() - 86400;
-    // Jobs: finished past the retention, finished recently, and an old one being re-run (not finished).
+    // Runs 1-3, one job each: finished past the retention, finished recently, and an old one
+    // being re-run (no finished_at). Each has an earlier attempt's row (current 0) and its latest.
     app.state
         .db
         .call(move |c| {
             let repo: i64 = c.query_row("SELECT id FROM repos WHERE name = 'r'", [], |r| r.get(0))?;
-            c.execute("INSERT INTO ci_runs(repo_id, number, event, ref, sha, status, created_at) VALUES (?1, 1, 'push', 'refs/heads/main', 'abc', 'success', ?2)", rusqlite::params![repo, old])?;
-            let run = c.last_insert_rowid();
-            for (name, status, finished) in [("old", "success", Some(old)), ("recent", "success", Some(recent)), ("rerun", "running", None)] {
+            for (number, (name, status, finished)) in [("old", "success", Some(old)), ("recent", "success", Some(recent)), ("rerun", "running", None)].into_iter().enumerate() {
+                c.execute(
+                    "INSERT INTO ci_runs(repo_id, number, event, ref, sha, status, created_at) VALUES (?1, ?2, 'push', 'refs/heads/main', 'abc', 'success', ?3)",
+                    rusqlite::params![repo, number as i64 + 1, old],
+                )?;
+                let run = c.last_insert_rowid();
                 c.execute(
                     "INSERT INTO ci_jobs(run_id, name, key, spec, status, created_at, finished_at) VALUES (?1, ?2, ?2, '{}', ?3, ?4, ?5)",
                     rusqlite::params![run, name, status, old, finished],
                 )?;
                 let job = c.last_insert_rowid();
+                c.execute("INSERT INTO ci_job_reports(job_id, tests, failed, skipped, flaky) VALUES (?1, 1, 1, 0, 0)", [job])?;
                 for current in [0, 1] {
                     c.execute(
                         "INSERT INTO ci_test_results(job_id, current, repo_id, sha, job, suite, name, status) VALUES (?1, ?2, ?3, 'abc', ?4, 's', ?5, 'failed')",
@@ -422,5 +427,13 @@ async fn retention_sweep_prunes_old_attempts_test_results_but_keeps_each_jobs_la
         })
         .await
         .unwrap();
-    assert_eq!(names, ["old1", "recent0", "recent1", "rerun0", "rerun1"], "only the old job's earlier attempt goes");
+    assert_eq!(names, ["recent0", "recent1", "rerun0", "rerun1"], "the old job's rows go, its latest included");
+    // The old run keeps its counts and says its per-test results are gone; the others list theirs.
+    let (s, t) = app.req(&admin, "GET", "/api/repos/root1/r/ci/runs/1/tests", None).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    assert_eq!((t["jobs"][0]["failed"].as_i64(), t["results"].as_array().map(Vec::len), &t["expired"]), (Some(1), Some(0), &json!(true)), "{t}");
+    for n in [2, 3] {
+        let (_, t) = app.req(&admin, "GET", &format!("/api/repos/root1/r/ci/runs/{n}/tests"), None).await;
+        assert_eq!((t["results"].as_array().map(Vec::len), &t["expired"]), (Some(1), &json!(false)), "run {n}: {t}");
+    }
 }
