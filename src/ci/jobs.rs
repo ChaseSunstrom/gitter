@@ -147,8 +147,8 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
 }
 
 /// Hourly: delete logs and artifacts whose job is gone (its repository was
-/// deleted), artifacts past ARTIFACT_DAYS, and artifact rows whose file is missing
-/// (backups don't carry CI files).
+/// deleted), artifacts and per-test results past ARTIFACT_DAYS, and
+/// artifact rows whose file is missing (backups don't carry CI files).
 pub async fn sweep(st: &AppState) -> R<usize> {
     crate::api::preview::sweep(st).await;
     let data = st.cfg.data_dir.clone();
@@ -162,6 +162,22 @@ pub async fn sweep(st: &AppState) -> R<usize> {
             Ok(ids)
         })
         .await?;
+    // Per-test results expire with the artifacts (the counts in ci_job_reports stay). A job
+    // in flight has no finished_at, so its earlier failures stay for spotting flaky tests.
+    // Each hourly sweep scans the rows left; batches, each its own call, keep the first
+    // sweep after an upgrade from holding the DB thread.
+    const BATCH: usize = 5000;
+    while st
+        .db
+        .call(move |c| {
+            Ok(c.execute(
+                "DELETE FROM ci_test_results WHERE rowid IN (SELECT t.rowid FROM ci_test_results t JOIN ci_jobs j ON j.id = t.job_id WHERE j.finished_at < ?1 LIMIT ?2)",
+                [cutoff, BATCH as i64],
+            )?)
+        })
+        .await?
+        == BATCH
+    {}
     let mut gone = 0;
     for id in old {
         gone += tokio::fs::remove_file(artifact_path(&data, id)).await.is_ok() as usize;

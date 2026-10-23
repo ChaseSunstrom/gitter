@@ -175,7 +175,7 @@ Rules apply to git pushes (through a pre-receive hook, before anything moves), w
 
 Turning CI off stops new runs, re-runs and queued jobs.
 
-**Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts are deleted 30 days after their job, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
+**Storage.** Logs and artifacts live under `GITTER_DATA/ci`. Artifacts and per-test results (the failed and flaky tests a run lists) are deleted 30 days after their job, its counts and coverage staying, and files of deleted repositories within the hour. Backups don't include CI logs and artifacts; they do include the key for secrets.
 
 **Caches.** A job can keep folders between runs:
 

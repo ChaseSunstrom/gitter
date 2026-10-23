@@ -36,7 +36,8 @@ export function prReport(el, { api, base, prBase, sha, tab, files }) {
         ${r.tests ? html`<span>${plural(r.tests, 'test')}</span>${r.failed ? html`<span class="c-red">${r.failed} failed</span>` : html`<span class="c-green">all passed</span>`}` : ''}
         ${r.flaky ? html`<span class="badge ci-flaky">${r.flaky} flaky</span>` : ''}
         ${r.coverage != null ? html`<span class="pill ci-cov" title="Lines covered by the tests">${r.coverage}% coverage</span>` : ''}
-        ${r.annotations.length && tab !== 'files' ? html`<a href="${prBase}/files">See the failures in the changed files</a>` : ''}</div>`.s;
+        ${r.annotations.length && tab !== 'files' ? html`<a href="${prBase}/files">See the failures in the changed files</a>` : ''}
+        ${r.expired && r.failed && !r.annotations.length ? html`<span class="muted">Failure details are deleted ${r.retention_days} days after their job.</span>` : ''}</div>`.s;
     }
     holder.list = r.annotations || [];
     const diff = el.querySelector('.diff');

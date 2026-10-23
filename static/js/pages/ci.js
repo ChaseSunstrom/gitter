@@ -181,7 +181,7 @@ function testsBox(base, run, t) {
       ${sum('skipped') ? html`<span class="small muted">${sum('skipped')} skipped</span>` : ''}
       ${sum('flaky') ? html`<span class="badge ci-flaky">${sum('flaky')} flaky</span>` : ''}
       ${t.coverage != null ? html`<span class="pill ci-cov" title="Lines covered by the tests">${t.coverage}% coverage</span>` : ''}</div>
-    ${rows}</section>`;
+    ${rows}${t.expired && t.results.length < sum('failed') + sum('flaky') ? html`<p class="small muted">Test details are deleted ${t.retention_days} days after their job.</p>` : ''}</section>`;
 }
 const SKIPPED = { paths: 'no matching file changed', needs: "a job it needs didn't pass" };
 
