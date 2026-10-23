@@ -3729,6 +3729,32 @@ async fn registry_pushes_and_pulls_images_with_chunked_and_monolithic_uploads() 
 }
 
 #[tokio::test]
+async fn registry_refuses_repository_names_oci_cannot_use() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    let pw = basic("alice", "correct horse");
+    for name in ["a-.b", "a_.b"] {
+        app.req(&alice, "POST", "/api/repos", Some(json!({ "name": name }))).await;
+        let (s, _, b) = reg(&app, "POST", &format!("/v2/alice/{name}/blobs/uploads/"), Some(&pw), &[], vec![]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(oci_code(&b), "NAME_INVALID");
+        assert!(String::from_utf8_lossy(&b).contains("registry"), "a reason: {}", String::from_utf8_lossy(&b));
+        let (s, _, _) = reg(&app, "GET", &format!("/v2/alice/{name}/tags/list"), Some(&pw), &[], vec![]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{name} pull");
+        let (_, d) = app.req(&alice, "GET", &format!("/api/repos/alice/{name}/packages"), None).await;
+        assert!(d["registry_unavailable"].as_str().is_some_and(|r| !r.is_empty()), "{d}");
+        assert_eq!(d["image"], "");
+    }
+    // A repository's `.git` form is git's name for it, not the registry's.
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "foo" }))).await;
+    let (s, _, b) = reg(&app, "GET", "/v2/alice/foo.git/tags/list", Some(&pw), &[], vec![]).await;
+    assert_eq!((s, oci_code(&b).as_str()), (StatusCode::BAD_REQUEST, "NAME_INVALID"));
+    assert_eq!(reg(&app, "GET", "/v2/alice/foo/tags/list", Some(&pw), &[], vec![]).await.0, StatusCode::OK);
+    let (_, d) = app.req(&alice, "GET", "/api/repos/alice/foo/packages", None).await;
+    assert!(d["registry_unavailable"].is_null());
+}
+
+#[tokio::test]
 async fn registry_never_serves_pushed_bytes_as_a_page() {
     let app = App::new();
     let alice = app.signup("alice").await;
