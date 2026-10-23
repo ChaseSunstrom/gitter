@@ -51,6 +51,13 @@ pub struct Settings {
     /// Days a transfer offer waits for an answer.
     #[serde(default = "default_week")]
     pub transfer_offer_days: u32,
+    /// Whether this server works with other Gitter servers: forks of their repositories, and
+    /// pull requests from forks on them.
+    #[serde(default)]
+    pub federation: bool,
+    /// Whether those servers may be at private addresses (a LAN, or several on one machine).
+    #[serde(default)]
+    pub federation_private: bool,
 }
 
 fn default_week() -> u32 {
@@ -108,6 +115,8 @@ impl Settings {
             ci_network: true,
             trash_days: 7,
             transfer_offer_days: 7,
+            federation: false,
+            federation_private: false,
         }
     }
 

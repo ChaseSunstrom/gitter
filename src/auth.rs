@@ -431,7 +431,7 @@ pub async fn password_login(db: &Db, name: &str, pw: &str) -> R<Option<User>> {
     let row = db
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT id, username, display_name, email, is_admin, pass_hash FROM users WHERE (username = ?1 OR (email = ?1 AND email != '')) AND suspended = 0 AND is_org = 0",
+                "SELECT id, username, display_name, email, is_admin, pass_hash FROM users WHERE (username = ?1 OR (email = ?1 AND email != '')) AND suspended = 0 AND is_org = 0 AND remote IS NULL",
                 [&n],
                 |r| Ok((User::from_row(r)?, r.get::<_, String>("pass_hash")?)),
             )

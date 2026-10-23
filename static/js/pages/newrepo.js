@@ -52,7 +52,14 @@ export default async function (ctx) {
             <span class="vis-icon">${icon('repo')}</span><span><b>Nothing</b><span class="muted small">An empty repository to push an existing project into.</span></span></label>
           <label class="vis-card"><input type="radio" name="start" value="copy">
             <span class="vis-icon">${icon('download')}</span><span><b>A copy of another repository</b><span class="muted small">From GitHub, GitLab or any git server, by its URL.</span></span></label>
+          ${state.instance?.federation ? html`<label class="vis-card"><input type="radio" name="start" value="fork">
+            <span class="vis-icon">${icon('fork')}</span><span><b>A fork from another Gitter server</b><span class="muted small">A public repository there, copied here; you can open pull requests back to it.</span></span></label>` : ''}
         </fieldset>
+        <div class="stack copy-fields" id="fork-fields" hidden>
+          <div class="field"><label for="fork-url">Repository on the other server</label>
+            <input class="input mono" id="fork-url" type="url" placeholder="https://git.example.com/owner/project" spellcheck="false" autocomplete="off">
+            <p class="hint small">That server has to work with other servers too (its admin turns federation on).</p></div>
+        </div>
         <div class="stack copy-fields" id="copy-fields" hidden>
           <div class="field"><label for="copy-url">Repository URL</label>
             <input class="input mono" id="copy-url" name="copy_url" type="url" placeholder="https://github.com/owner/project" spellcheck="false" autocomplete="off"></div>
@@ -101,24 +108,31 @@ export default async function (ctx) {
       };
       name.addEventListener('input', check);
       const fields = $('#copy-fields', el);
-      const copyUrl = $('#copy-url', el);
+      const copyUrl = $('#copy-url', el), forkUrl = $('#fork-url', el), forkFields = $('#fork-fields', el);
       form.addEventListener('change', (e) => {
-        if (e.target.name === 'start') fields.hidden = e.target.value !== 'copy';
+        if (e.target.name === 'start') { fields.hidden = e.target.value !== 'copy'; forkFields.hidden = e.target.value !== 'fork'; }
       });
       // A pasted URL suggests the name: https://host/owner/project.git -> project.
-      copyUrl.addEventListener('input', () => {
-        const last = copyUrl.value.trim().replace(/\/+$/, '').split('/').pop().replace(/\.git$/i, '');
-        if (!name.value.trim() && last) { name.value = suggest(last); check(); }
-      });
+      for (const input of [copyUrl, forkUrl]) {
+        input.addEventListener('input', () => {
+          const last = input.value.trim().replace(/\/+$/, '').split('/').pop().replace(/\.git$/i, '');
+          if (!name.value.trim() && last) { name.value = suggest(last); check(); }
+        });
+      }
       form.addEventListener('submit', action(btn, async () => {
         err.hidden = true;
         const f = new FormData(form);
-        const copying = f.get('start') === 'copy';
-        const url = copyUrl.value.trim();
-        if (copying && !/^https?:\/\/[^/]+\/./i.test(url)) {
+        const copying = f.get('start') === 'copy', forking = f.get('start') === 'fork';
+        const input = forking ? forkUrl : copyUrl;
+        const url = input.value.trim();
+        if ((copying || forking) && !/^https?:\/\/[^/]+\/./i.test(url)) {
           err.textContent = 'Give the repository URL, starting with https:// or http://';
           err.hidden = false;
-          return copyUrl.focus();
+          return input.focus();
+        }
+        // A fork is checked first, so nothing is made when the other server says no.
+        if (forking) {
+          try { await send('POST', '/federation/check', { url }); } catch (e) { err.textContent = e.message; err.hidden = false; return forkUrl.focus(); }
         }
         let r;
         try {
@@ -134,6 +148,11 @@ export default async function (ctx) {
             // The repository exists; the copy can be set up again where mirrors live.
             toast(`Created ${r.owner}/${r.name}, but the copy couldn't start: ${e.message}`, 'err');
             return navigate(`/${r.owner}/${r.name}/settings/mirrors`);
+          }
+        }
+        if (forking) {
+          try { await send('POST', `/repos/${r.owner}/${r.name}/federation/fork`, { url }); } catch (e) {
+            toast(`Created ${r.owner}/${r.name}, but it couldn't become that fork: ${e.message}`, 'err');
           }
         }
         navigate(`/${r.owner}/${r.name}`);

@@ -1066,6 +1066,36 @@ const MIGRATIONS: &[&str] = &[
         expires_at INTEGER NOT NULL
     );
     "#,
+    // v34: federation. People from other servers (users.remote: their profile there; they can't
+    // sign in here), repositories forked from another server, pull requests here from forks
+    // there, and pull requests this server's forks opened there.
+    r#"
+    ALTER TABLE users ADD COLUMN remote TEXT;
+    CREATE TABLE remote_forks (
+        repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+        server TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        name TEXT NOT NULL
+    );
+    CREATE TABLE remote_pulls (
+        issue_id INTEGER PRIMARY KEY REFERENCES issues(id) ON DELETE CASCADE,
+        server TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        branch TEXT NOT NULL
+    );
+    CREATE INDEX remote_pulls_source ON remote_pulls(server, repo, branch);
+    CREATE TABLE outgoing_pulls (
+        id INTEGER PRIMARY KEY,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        -- The fork's "owner/name" when it asked (the other server knows it by that).
+        fork TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (repo_id, branch, number)
+    );
+    "#,
 ];
 
 impl Db {

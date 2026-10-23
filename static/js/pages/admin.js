@@ -230,6 +230,10 @@ async function settings() {
       <label class="check" style="margin-top:26px"><input type="checkbox" id="s-net" ${s.ci_network ? 'checked' : ''}> Jobs may use the network</label>
     </div>
     <p class="hint">Limits apply to jobs that run in a container (they name an <code>image</code>). Containers never get the host's docker socket or new privileges.</p>
+    <div class="field"><span class="label">Federation</span>
+      <label class="check"><input type="checkbox" id="s-fed" ${s.federation ? 'checked' : ''}> Work with other Gitter servers</label>
+      <span class="hint">People here can fork public repositories from other Gitter servers that do too, and open pull requests back to them; people there can do the same with this server's public repositories. Requests between servers are signed with this server's key, published at <code>/.well-known/gitter</code>.</span>
+      <label class="check small"><input type="checkbox" id="s-fed-private" ${s.federation_private ? 'checked' : ''}> Those servers may be at private addresses (your own network)</label></div>
     <div class="field"><label for="s-ann">Announcement</label><input id="s-ann" class="input" value="${s.announcement}" maxlength="280" placeholder="e.g. Maintenance on Sunday 10:00 UTC">
       <span class="hint">Shown at the top of every page. Leave empty to hide it.</span></div>
     <div><button class="btn primary" id="s-save">Save settings</button></div>
@@ -390,9 +394,11 @@ export default async function (ctx) {
           trash_days: +$('#s-trash', el).value,
           transfer_offer_days: +$('#s-offer', el).value,
           announcement: $('#s-ann', el).value.trim(),
+          federation: $('#s-fed', el).checked,
+          federation_private: $('#s-fed-private', el).checked,
         };
         const saved = await send('PUT', '/admin/settings', body);
-        state.instance = { ...state.instance, name: saved.instance_name, announcement: saved.announcement, trash_days: saved.trash_days, transfer_offer_days: saved.transfer_offer_days };
+        state.instance = { ...state.instance, name: saved.instance_name, announcement: saved.announcement, trash_days: saved.trash_days, transfer_offer_days: saved.transfer_offer_days, federation: saved.federation };
         state.signup = saved.signup === 'open';
         state.signupMode = saved.signup;
         renderTopbar();

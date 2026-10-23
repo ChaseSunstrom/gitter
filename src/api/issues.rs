@@ -38,8 +38,11 @@ pub struct IssueRow {
     labels: Vec<Label>,
     head: Option<String>,
     base: Option<String>,
-    /// From a fork: "owner/name" of that fork (null once it's gone, or for a same-repository PR).
+    /// From a fork: "owner/name" of that fork (null once it's gone, or for a same-repository PR);
+    /// from a fork on another server, its address there (`https://b.example/bob/notes`).
     head_repo: Option<String>,
+    /// For someone from another server (`bob@b.example`), their profile there.
+    author_url: Option<String>,
     /// Where the head is here: refs/heads/<branch>, or refs/pull/<n>/head for a PR from a fork.
     #[serde(skip)]
     pub(crate) head_ref: Option<String>,
@@ -67,8 +70,9 @@ const ISSUE_SELECT: &str = "SELECT i.id, i.number, i.title, i.body, i.state, i.i
     WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.issue_id = i.id AND v.state = 'approved') THEN 'approved' END,
     i.agent, ms.number, ms.title,
     CASE WHEN p.from_fork = 1 THEN 'refs/pull/' || i.number || '/head' ELSE 'refs/heads/' || p.head_branch END,
-    (SELECT hu.username || '/' || hr.name FROM repos hr JOIN users hu ON hu.id = hr.owner_id WHERE hr.id = p.head_repo_id AND p.from_fork = 1),
-    coalesce(p.from_fork, 0)
+    coalesce((SELECT hu.username || '/' || hr.name FROM repos hr JOIN users hu ON hu.id = hr.owner_id WHERE hr.id = p.head_repo_id AND p.from_fork = 1),
+        (SELECT rp.server || '/' || rp.repo FROM remote_pulls rp WHERE rp.issue_id = i.id)),
+    coalesce(p.from_fork, 0), u.remote
     FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id LEFT JOIN milestones ms ON ms.id = i.milestone_id";
 
 fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
@@ -99,6 +103,7 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<IssueRow> {
         head_ref: r.get(19)?,
         head_repo: r.get(20)?,
         from_fork: r.get::<_, i64>(21)? != 0,
+        author_url: r.get(22)?,
     })
 }
 
@@ -111,18 +116,42 @@ pub fn head_ref(number: i64, head_branch: &str, from_fork: bool) -> String {
 /// Copy a fork's branch into repository `base_id` as `dest` (a pull request's head, or a ref of
 /// the moment), within its owner's storage. Some(sha) when the branch is there.
 pub async fn fetch_branch(st: &AppState, base_id: i64, fork: &std::path::Path, branch: &str, dest: &str) -> R<Option<String>> {
+    let cmd = st.git.command(Some(&st.git.repo_path(base_id)));
+    copy_branch(st, base_id, cmd, &fork.to_string_lossy(), branch, dest, None).await
+}
+
+/// The same from a repository on another server (`remote.url`), fetched as mirrors fetch.
+/// At most `REMOTE_MAX` bytes come in at a time.
+pub async fn fetch_remote_branch(st: &AppState, base_id: i64, remote: &crate::mirrors::Remote, branch: &str, dest: &str) -> R<Option<String>> {
+    let mut cmd = crate::mirrors::git(st, &st.git.repo_path(base_id), remote).await.map_err(AppError::bad)?;
+    // Checked as pushed objects are: another server's could be malformed on purpose.
+    cmd.args(["-c", "fetch.fsckObjects=true"]);
+    copy_branch(st, base_id, cmd, &remote.url, branch, dest, Some(REMOTE_MAX)).await
+}
+
+/// The most one fetch from another server's fork brings in.
+const REMOTE_MAX: u64 = 256 << 20;
+
+async fn copy_branch(st: &AppState, base_id: i64, mut cmd: tokio::process::Command, from: &str, branch: &str, dest: &str, most: Option<u64>) -> R<Option<String>> {
     let base = st.git.repo_path(base_id);
     let owner: i64 = st.db.call(move |c| Ok(c.query_row("SELECT owner_id FROM repos WHERE id = ?1", [base_id], |r| r.get(0))?)).await?;
     let left = crate::repo::storage_left(st, owner).await?;
     if left == Some(0) {
         return Err(AppError::bad("This repository's owner is out of storage, so nothing more is copied in"));
     }
-    let mut cmd = st.git.command(Some(&base));
-    cmd.args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", &fork.to_string_lossy(), &format!("+refs/heads/{branch}:{dest}")]);
-    match crate::mirrors::exec(st, cmd, left.map(|l| (base.as_path(), l))).await {
+    cmd.args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", from, &format!("+refs/heads/{branch}:{dest}")]);
+    let cap = match (left, most) {
+        (Some(l), Some(m)) => Some(l.min(m)),
+        (l, m) => l.or(m),
+    };
+    match crate::mirrors::exec(st, cmd, cap.map(|l| (base.as_path(), l))).await {
         Ok(()) => {}
         // ponytail: exec reports its own stop (storage, time) as text starting "Stopped"; any other failure is a missing branch.
         Err(e) if e.starts_with("Stopped") => return Err(AppError::bad(e)),
+        // From another server, why it failed (it can't be reached, it refused) is worth saying.
+        Err(e) if most.is_some() && !e.contains("couldn't find remote ref") => {
+            return Err(AppError::bad(format!("Couldn't fetch {branch}: {}", e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("git failed"))));
+        }
         Err(_) => return Ok(None),
     }
     crate::hooks::refresh_size(st, base_id).await;
@@ -154,6 +183,9 @@ async fn may_copy(st: &AppState, issue_id: i64) -> bool {
 
 /// A reopened pull request from a fork catches up with its branch (it stops following while closed).
 async fn refresh_fork_head(st: &AppState, r: &Repo, issue: &IssueRow) {
+    if issue.from_fork && issue.head_repo.as_deref().is_some_and(|h| h.contains("://")) {
+        return super::federation::reopened(st, r, issue.id, issue.number).await;
+    }
     if !issue.from_fork || !may_copy(st, issue.id).await {
         return;
     }
@@ -384,7 +416,7 @@ pub struct CreateReq {
     template: Option<String>,
 }
 
-pub(super) fn check_text(title: &str, body: &str) -> R<()> {
+pub(crate) fn check_text(title: &str, body: &str) -> R<()> {
     if title.trim().is_empty() {
         return Err(AppError::bad("Add a title"));
     }
@@ -1064,17 +1096,17 @@ pub async fn delete_label(
 
 #[derive(Deserialize)]
 pub struct PullReq {
-    title: String,
+    pub(crate) title: String,
     #[serde(default)]
-    body: String,
-    head: String,
-    base: String,
+    pub(crate) body: String,
+    pub(crate) head: String,
+    pub(crate) base: String,
     /// "owner/name" of a fork (or the repository this one was forked from) the head branch is in.
     #[serde(default)]
-    head_repo: Option<String>,
+    pub(crate) head_repo: Option<String>,
     /// From a fork: people with write access here may push to that branch of the fork.
     #[serde(default)]
-    maintainer_can_modify: bool,
+    pub(crate) maintainer_can_modify: bool,
 }
 
 /// The repository a pull request's head comes from, when it isn't this one: readable by `u`,
@@ -1123,7 +1155,7 @@ pub async fn create_pull(
             Some(f) => fetch_branch(&st2, r2.id, &f.path, &req.head, &pending).await,
             None => st2.git.resolve(&r2.path, &format!("refs/heads/{}", req.head)).await,
         };
-        let opened = open_pull(&st2, &r2, &u2, req, fork.as_ref(), head, &base).await;
+        let opened = open_pull(&st2, &r2, &u2, req, fork.as_ref(), None, head, &base).await;
         if fork.is_some() {
             let _ = st2.git.delete_ref(&r2.path, &pending).await;
         }
@@ -1132,18 +1164,7 @@ pub async fn create_pull(
     .await
     .map_err(AppError::internal)?;
     let (id, num, title, body, head_branch, base_branch, from_fork) = opened?;
-    record_event(
-        &st.db,
-        u.id,
-        Some(r.id),
-        "pull",
-        &title,
-        &num.to_string(),
-        1,
-    )
-    .await?;
-    crate::webhooks::issue(&st, r.id, u.id, num, true, "opened").await;
-    notify(&st, r.id, Thread::Issue(id), u.id, &body).await;
+    announce_pull(&st, &r, &u, id, num, &title, &body).await?;
     // A fork's code doesn't run here on its own (it would get this repository's secrets).
     if !from_fork && let Err(e) = crate::ci::trigger::on_pull_opened(&st, &r, u.id, num, &head_branch, &base_branch).await {
         eprintln!("ci: {}#{num}: {}", r.full_name(), e.msg);
@@ -1151,10 +1172,19 @@ pub async fn create_pull(
     Ok(Json(json!({ "number": num })))
 }
 
-type Opened = (i64, i64, String, String, String, String, bool);
+pub(crate) type Opened = (i64, i64, String, String, String, String, bool);
+
+/// A new pull request is on the activity feed, sent to webhooks, and notifies who it mentions.
+pub(crate) async fn announce_pull(st: &AppState, r: &Repo, u: &crate::auth::User, id: i64, num: i64, title: &str, body: &str) -> R<()> {
+    record_event(&st.db, u.id, Some(r.id), "pull", title, &num.to_string(), 1).await?;
+    crate::webhooks::issue(st, r.id, u.id, num, true, "opened").await;
+    notify(st, r.id, Thread::Issue(id), u.id, body).await;
+    Ok(())
+}
 
 /// The pull request's row (and, from a fork, its head ref), once its head is known.
-async fn open_pull(st: &AppState, r: &Repo, u: &crate::auth::User, req: PullReq, fork: Option<&Repo>, head: R<Option<String>>, base: &str) -> R<Opened> {
+/// `remote`: (server, "owner/name") of a fork on another server the head branch came from.
+pub(crate) async fn open_pull(st: &AppState, r: &Repo, u: &crate::auth::User, req: PullReq, fork: Option<&Repo>, remote: Option<(&str, &str)>, head: R<Option<String>>, base: &str) -> R<Opened> {
     let head = head?.ok_or_else(|| AppError::bad("The source branch doesn't exist"))?;
     if st.git.count(&r.path, &format!("{base}..{head}")).await? == 0 {
         return Err(AppError::bad(format!(
@@ -1163,7 +1193,8 @@ async fn open_pull(st: &AppState, r: &Repo, u: &crate::auth::User, req: PullReq,
         )));
     }
     let (rid, uid) = (r.id, u.id);
-    let (from_fork, fork_id, edits) = (fork.is_some(), fork.map(|f| f.id), fork.is_some_and(|f| f.can_write) && req.maintainer_can_modify);
+    let (from_fork, fork_id, edits) = (fork.is_some() || remote.is_some(), fork.map(|f| f.id), fork.is_some_and(|f| f.can_write) && req.maintainer_can_modify);
+    let (server, source) = remote.map(|(s, r)| (s.to_string(), r.to_string())).unzip();
     let agent = u.agent().map(|a| a.name.clone());
     let (title, body) = (req.title.clone(), req.body.clone());
     let (head_branch, base_branch) = (req.head.clone(), req.base.clone());
@@ -1173,9 +1204,10 @@ async fn open_pull(st: &AppState, r: &Repo, u: &crate::auth::User, req: PullReq,
             let tx = c.transaction()?;
             let dup: Option<i64> = tx
                 .query_row(
-                    "SELECT i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE i.repo_id = ?1 AND i.state = 'open' AND p.head_branch = ?2 AND p.base_branch = ?3
-                     AND p.from_fork = ?4 AND p.head_repo_id IS ?5",
-                    rusqlite::params![rid, req.head, req.base, from_fork, fork_id],
+                    "SELECT i.number FROM pulls p JOIN issues i ON i.id = p.issue_id LEFT JOIN remote_pulls rp ON rp.issue_id = i.id
+                     WHERE i.repo_id = ?1 AND i.state = 'open' AND p.head_branch = ?2 AND p.base_branch = ?3
+                     AND p.from_fork = ?4 AND p.head_repo_id IS ?5 AND rp.server IS ?6 AND rp.repo IS ?7",
+                    rusqlite::params![rid, req.head, req.base, from_fork, fork_id, server, source],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -1187,6 +1219,9 @@ async fn open_pull(st: &AppState, r: &Repo, u: &crate::auth::User, req: PullReq,
                 "INSERT INTO pulls(issue_id, head_branch, base_branch, from_fork, head_repo_id, maintainer_can_modify) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![id, req.head, req.base, from_fork, fork_id, edits],
             )?;
+            if let (Some(server), Some(source)) = (&server, &source) {
+                tx.execute("INSERT INTO remote_pulls(issue_id, server, repo, branch) VALUES (?1, ?2, ?3, ?4)", rusqlite::params![id, server, source, req.head])?;
+            }
             tx.commit()?;
             Ok((id, num))
         })

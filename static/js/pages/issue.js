@@ -92,8 +92,10 @@ function header(meta, data, pd) {
   let line;
   if (issue.is_pr) {
     // A pull request's head can be a branch in a fork: shown and linked there as owner:branch.
+    // From a fork on another server: its address there (https://b.example/bob/notes).
+    const remote = /^https?:\/\//.test(pull.head_repo || '');
     const branch = (b, exists, head = false) => (head && pull.from_fork
-      ? html`<a class="branch-name" href="${pull.head_repo ? `/${pull.head_repo}/tree/${encPath(b)}` : '#'}" title="${pull.head_repo || 'a deleted fork'}">${(pull.head_repo || 'deleted fork').split('/')[0]}:${b}</a>`
+      ? html`<a class="branch-name" href="${pull.head_repo ? `${remote ? '' : '/'}${pull.head_repo}/tree/${encPath(b)}` : '#'}" title="${pull.head_repo || 'a deleted fork'}">${remote ? pull.head_repo.replace(/^https?:\/\//, '') : (pull.head_repo || 'deleted fork').split('/')[0]}:${b}</a>`
       : html`<a class="branch-name" href="${exists ? `${base}/tree/${encPath(b)}` : '#'}">${b}</a>`);
     const count = plural(pd.commits.length, 'commit');
     line = issue.state === 'merged'
@@ -134,12 +136,14 @@ function mountHeader(el, api, issue) {
 
 // ---------------------------------------------------------------- conversation
 
-function card({ id, author, time, edited, bodyHtml, actions, tag = '', agent = null }) {
+/** `url`: where the author's profile is (someone from another server has theirs there). */
+function card({ id, author, time, edited, bodyHtml, actions, tag = '', agent = null, url = '' }) {
+  const href = url || `/${author}`;
   return html`<div class="tl-item tl-comment" id="${id}">
-    <a href="/${author}" class="tl-avatar hide-sm">${avatar(author, 36)}</a>
+    <a href="${href}" class="tl-avatar hide-sm">${avatar(author, 36)}</a>
     <div class="comment-card">
       <div class="comment-head">
-        <a href="/${author}" class="row"><span class="show-sm">${avatar(author, 20)}</span><b>${author}</b></a>${agentBadge(agent, author)}
+        <a href="${href}" class="row" ${url ? html`title="Their profile on their own server"` : ''}><span class="show-sm">${avatar(author, 20)}</span><b>${author}</b></a>${agentBadge(agent, author)}
         <span class="muted small">commented <a href="#${id}">${timeEl(time)}</a>${edited ? ' · edited' : ''}</span>
         ${tag ? html`<span class="tag-private">${tag}</span>` : ''}
         <span class="grow"></span>
@@ -276,7 +280,7 @@ function conversation(meta, data, pd, mdCtx, rv) {
     ...reviewItems(rv, mdCtx),
   ].sort((a, b) => a.time - b.time);
   const items = [
-    card({ id: 'issue-body', author: issue.author, time: issue.created_at, tag: 'Author', agent: issue.agent,
+    card({ id: 'issue-body', author: issue.author, url: issue.author_url || '', time: issue.created_at, tag: issue.author_url ? 'Author, from another server' : 'Author', agent: issue.agent,
       bodyHtml: issue.body.trim() ? raw(renderMarkdown(issue.body, mdCtx)) : html`<p class="muted"><em>No description provided.</em></p>` }),
     ...timeline.map((x) => x.node),
   ];

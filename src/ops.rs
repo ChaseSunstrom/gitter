@@ -147,6 +147,9 @@ fn sha256_file(p: &Path) -> Result<String> {
 
 /// Write `<out>` (`-` for stdout): a .tar.gz holding a consistent copy of the
 /// database, every repository and Git LFS file it lists and a manifest. Safe to run while the server is up.
+/// Key files in the data folder that a backup carries.
+const KEYS: [&str; 2] = ["secret.key", "federation_ed25519"];
+
 pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
     let db_path = cfg.data_dir.join("gitter.db");
     if !db_path.exists() {
@@ -190,10 +193,13 @@ pub fn backup(cfg: &Config, out: &Path) -> Result<()> {
         tar.follow_symlinks(false);
         tar.append_path_with_name(tmp.join("manifest.json"), "manifest.json")?;
         tar.append_path_with_name(&snap, "gitter.db")?;
-        // The key CI secrets are encrypted with: without it a restore can't read them.
-        let key = cfg.data_dir.join("secret.key");
-        if key.is_file() {
-            tar.append_path_with_name(&key, "secret.key")?;
+        // The key CI secrets are encrypted with (without it a restore can't read them), and the
+        // server's identity to other servers.
+        for name in KEYS {
+            let key = cfg.data_dir.join(name);
+            if key.is_file() {
+                tar.append_path_with_name(&key, name)?;
+            }
         }
         // Only the folders in the snapshot, so one created meanwhile can't show up as an orphan.
         for (s, names) in STORES.iter().zip(&stores) {
@@ -330,7 +336,7 @@ fn inspect_archive(archive: &Path) -> Result<serde_json::Value> {
         let name = path.to_string_lossy().into_owned();
         let known = name == "manifest.json"
             || name == "gitter.db"
-            || name == "secret.key"
+            || KEYS.contains(&name.as_str())
             || name == "lfs"
             || name.starts_with("lfs/")
             || name == "releases"
@@ -481,11 +487,13 @@ fn restore_from(cfg: &Config, data: &Path, archive: &Path, occupied: bool) -> Re
         std::fs::rename(stage.join(name), data.join(name))
             .with_context(|| format!("couldn't move the restored {name} into place"))?;
     }
-    let key = stage.join("secret.key");
-    if key.is_file() {
-        #[cfg(unix)]
-        std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        std::fs::rename(&key, data.join("secret.key")).context("couldn't move the restored secret.key into place")?;
+    for name in KEYS {
+        let key = stage.join(name);
+        if key.is_file() {
+            #[cfg(unix)]
+            std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            std::fs::rename(&key, data.join(name)).with_context(|| format!("couldn't move the restored {name} into place"))?;
+        }
     }
     std::fs::remove_dir_all(&stage)?;
     std::fs::create_dir_all(data.join("home"))?;
@@ -978,6 +986,7 @@ mod tests {
         std::fs::write(&obj, &body).unwrap();
         std::fs::create_dir_all(data.join("lfs/tmp")).unwrap();
         std::fs::write(data.join("lfs/tmp/half-upload"), b"x").unwrap();
+        std::fs::write(data.join("federation_ed25519"), [7u8; 32]).unwrap();
 
         let good = root.path().join("good.tar.gz");
         backup(&cfg_for(&data), &good).unwrap();
@@ -986,6 +995,7 @@ mod tests {
         restore(&cfg_for(&fresh), &good, false).unwrap();
         assert_eq!(std::fs::read(crate::lfs::object_path(&fresh, &oid)).unwrap(), body);
         assert!(!fresh.join("lfs/tmp").exists(), "unfinished uploads aren't backed up");
+        assert_eq!(std::fs::read(fresh.join("federation_ed25519")).unwrap(), [7u8; 32], "the server keeps its identity");
 
         std::fs::write(&obj, b"bit rot").unwrap();
         let bad = root.path().join("bad.tar.gz");

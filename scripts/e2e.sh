@@ -18,7 +18,7 @@ cargo build -q
 GITTER_DATA="$TMP/data" GITTER_ADDR="127.0.0.1:$PORT" GITTER_SSH_ADDR="127.0.0.1:$SSH_PORT" GITTER_URL="$BASE" ./target/debug/gitter >"$LOG" 2>&1 &
 PID=$!
 # Let the server finish shutting down (its CI jobs write into the data folder) before cleaning up.
-trap 'st=$?; kill $PID ${HOOK_PID:-} 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$TMP" 2>/dev/null || { sleep 1; rm -rf "$TMP"; }; exit $st' EXIT
+trap 'st=$?; kill $PID ${HOOK_PID:-} ${PID2:-} 2>/dev/null; wait $PID ${PID2:-} 2>/dev/null; rm -rf "$TMP" 2>/dev/null || { sleep 1; rm -rf "$TMP"; }; exit $st' EXIT
 for _ in $(seq 50); do curl -sf "$BASE/robots.txt" >/dev/null && break; sleep 0.1; done
 SETUP=$(grep -o 'setup=[A-Za-z0-9_-]*' "$LOG" | head -1 | cut -d= -f2)
 [ -n "$SETUP" ] || fail "first boot should print a setup link"
@@ -637,10 +637,38 @@ curl -sI "$BASE/" | grep -qi "content-security-policy: default-src 'self'" || fa
 ok "app shell served with CSP"
 node --no-warnings scripts/ot-check.mjs || fail "editing together: the browser's operations"
 
+# Federation: a second server; zed there forks alice/hello from here and opens a pull request back.
+PORT2=$((PORT + 2))
+BASE2="http://127.0.0.1:$PORT2"
+JAR2="$TMP/jar2"
+GITTER_DATA="$TMP/data2" GITTER_ADDR="127.0.0.1:$PORT2" GITTER_SSH_ADDR="127.0.0.1:$((PORT + 3))" GITTER_URL="$BASE2" ./target/debug/gitter >"$TMP/server2.log" 2>&1 &
+PID2=$!
+for _ in $(seq 50); do curl -sf "$BASE2/robots.txt" >/dev/null && break; sleep 0.1; done
+SETUP2=$(grep -o 'setup=[A-Za-z0-9_-]*' "$TMP/server2.log" | head -1 | cut -d= -f2)
+federate() { # base jar: turn federation on there (private addresses: both are on this machine)
+  local s
+  curl -sf -b "$2" -H "Origin: $1" -H 'Content-Type: application/json' -X POST "$1/api/auth/reauth" --data '{"password":"correct horse"}' >/dev/null # pragma: allowlist secret
+  s=$(curl -sf -b "$2" "$1/api/admin/settings" | python3 -c 'import json,sys; s=json.load(sys.stdin); s["federation"]=True; s["federation_private"]=True; print(json.dumps(s))')
+  curl -sf -b "$2" -H "Origin: $1" -H 'Content-Type: application/json' -X PUT "$1/api/admin/settings" --data "$s" >/dev/null || fail "federation setting on $1"
+}
+BASE="$BASE2" JAR="$JAR2" api POST /auth/signup "{\"username\":\"zed\",\"email\":\"zed@example.com\",\"password\":\"correct horse\",\"setup\":\"$SETUP2\"}"
+federate "$BASE" "$JAR"
+federate "$BASE2" "$JAR2"
+curl -sf "$BASE/.well-known/gitter" | grep -q "\"url\":\"$BASE\"" || fail "federation: the well-known identity"
+BASE="$BASE2" JAR="$JAR2" api POST /repos '{"name":"hello"}'
+BASE="$BASE2" JAR="$JAR2" api POST /repos/zed/hello/federation/fork "{\"url\":\"$BASE/alice/hello\"}"
+for _ in $(seq 100); do curl -sf -b "$JAR2" "$BASE2/api/repos/zed/hello" | grep -q '"empty":false' && break; sleep 0.2; done
+BASE="$BASE2" JAR="$JAR2" api POST /repos/zed/hello/contents '{"branch":"main","message":"An idea from afar","changes":[{"path":"FAR.md","content":"from the other server\n"}]}'
+BASE="$BASE2" JAR="$JAR2" api POST /repos/zed/hello/federation/pulls '{"branch":"main","title":"An idea from the other server"}'
+NUM2=$(echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])')
+api GET "/repos/alice/hello/issues/$NUM2"
+echo "$BODY" | grep -q "\"author\":\"zed@127.0.0.1:$PORT2\"" || fail "federation: the pull request on this server is from zed on the other: $BODY"
+ok "federation: a fork on another server opened a pull request here, from zed there"
+
 if [ "${SKIP_UI:-}" = 1 ]; then
   echo "· UI check skipped (SKIP_UI=1)"
 elif [ -d scripts/node_modules/playwright-core ]; then
-  BASE="$BASE" GITTER_DB="$TMP/data/gitter.db" node scripts/ui-check.mjs || fail "UI check"
+  BASE="$BASE" BASE2="$BASE2" GITTER_DB="$TMP/data/gitter.db" node scripts/ui-check.mjs || fail "UI check"
   ok "UI pages render without console errors"
 else
   fail "UI check needs Playwright: run 'cd scripts && npm install' (or SKIP_UI=1 to skip)"
