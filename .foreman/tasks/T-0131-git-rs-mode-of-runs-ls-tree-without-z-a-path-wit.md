@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: discovered
 created: 2026-10-23T01:42:01Z
-updated: 2026-10-23T02:03:21Z
+updated: 2026-10-23T02:03:41Z
 base: c46da8615ab942ef8b8ae00079a55f359768782c
 base_tree: 55ec9151954f2221b5a4fec3650fd429fa535a68
 plan0_at: 2026-10-23T01:57:26Z
@@ -44,6 +44,8 @@ verified: strong
 - 2026-10-23T01:57:26Z focused
 - 2026-10-23T01:57:44Z criterion 1 verify: `cargo test -q --test api contents_keep` → `cargo test -q --test api web_commits_keep_exec_bits`
 - 2026-10-23T02:03:21Z done
+- 2026-10-23T02:03:22Z committed b0684a8 (4 files)
+- 2026-10-23T02:03:41Z correction: the audit's 'no other' was wrong — log --name-only (code.rs:196) and diff --name-only (reviews.rs:168) also parse quoted names; fixed in a follow-up
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

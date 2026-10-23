@@ -166,7 +166,8 @@ pub async fn comment(State(st): State<AppState>, Authed(u): Authed, Path((o, n, 
             }
             // Only files the pull request changes (a comment elsewhere would never show in its diff).
             let changed = st.git.run(&r.path, &["diff", "--name-only", "--no-renames", &mb, &head], None, &[]).await?;
-            if !String::from_utf8_lossy(&changed.stdout).lines().any(|l| l == path) {
+            // git quotes odd names in this listing.
+            if !String::from_utf8_lossy(&changed.stdout).lines().any(|l| crate::diff::unquote(l) == path) {
                 return Err(AppError::bad("That file isn't in this pull request"));
             }
             let lines = lines_at(&st, &r, &sha, &path).await?.ok_or_else(|| AppError::bad("That file isn't in this pull request"))?;

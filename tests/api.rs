@@ -5102,3 +5102,17 @@ async fn releases_follow_collaborator_and_org_access_and_org_deletion_removes_fi
     let left = app.state.db.call(move |c| Ok(c.query_row("SELECT count(*) FROM releases WHERE id = ?1", [rid], |r| r.get::<_, i64>(0))?)).await.unwrap();
     assert_eq!(left, 0);
 }
+
+#[tokio::test]
+async fn review_comments_on_quoted_names() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let name = "say \"hi\".txt";
+    put_file(&app, &alice, "main", None, name, "one\n").await;
+    put_file(&app, &alice, "main", Some("feat"), name, "one\ntwo\n").await;
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/r/pulls", Some(json!({ "title": "More", "head": "feat", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, c) = app.req(&alice, "POST", "/api/repos/alice/r/pulls/1/comments", Some(json!({ "path": name, "side": "new", "line": 2, "body": "Nice" }))).await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+}
