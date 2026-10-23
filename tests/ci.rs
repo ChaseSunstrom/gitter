@@ -99,6 +99,96 @@ async fn pushes_and_pull_requests_queue_runs() {
 }
 
 #[tokio::test]
+async fn pull_request_opened_once_even_when_the_push_hook_runs_late() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", CONFIG).await;
+    commit(&app, &admin, "root1/r", "main", Some("feature"), "src.txt", "x").await;
+    let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Feature", "head": "feature", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let number = v["number"].as_i64().unwrap();
+    // The push's hook finds the pull request opened meanwhile, and the opening runs again: still one run.
+    let u = gitter::auth::user_by_id(&app.state.db, 1).await.unwrap().unwrap();
+    let repo = gitter::repo::Repo::writable(&app.state, Some(&u), "root1", "r").await.unwrap();
+    let head = app.state.git.resolve(&repo.path, "refs/heads/feature").await.unwrap().unwrap();
+    let update = gitter::smart_http::RefUpdate { refname: "refs/heads/feature".into(), old: None, new: Some(head.clone()) };
+    gitter::ci::trigger::on_push(&app.state, &repo, u.id, &[update]).await;
+    gitter::ci::trigger::on_pull_opened(&app.state, &repo, u.id, number, "feature", "main").await.unwrap();
+    let prs: Vec<_> = runs(&app).await.into_iter().filter(|r| r.0 == "pull_request").collect();
+    assert_eq!(prs.len(), 1, "{prs:?}");
+    // A new commit on the branch is a new run.
+    commit(&app, &admin, "root1/r", "feature", None, "src.txt", "y").await;
+    assert_eq!(runs(&app).await.iter().filter(|r| r.0 == "pull_request").count(), 2);
+}
+
+/// How many notifications `user` has about CI run `run`.
+async fn run_notes(app: &App, user: i64, run: i64) -> i64 {
+    app.state
+        .db
+        .call(move |c| Ok(c.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND run_id = ?2", [user, run], |r| r.get(0))?))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn failed_run_follow_ups_a_broken_config_tells_whoever_pushed() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", "jobs:\n  a:\n    stepz: [x]\n").await;
+    let (run, status): (i64, String) = app.state.db.call(|c| Ok(c.query_row("SELECT id, status FROM ci_runs", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).await.unwrap();
+    assert_eq!(status, "failure");
+    assert_eq!(run_notes(&app, 1, run).await, 1, "the run that never started still says it failed");
+}
+
+#[tokio::test]
+async fn failed_run_follow_ups_a_lost_job_takes_its_pull_request_out_of_the_merge_queue() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    set_ci(&app, "everyone", 0).await;
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", "on:\n  pull_request:\njobs:\n  test:\n    steps: [echo]\n").await;
+    let rule = json!({ "pattern": "main", "require_pr": false, "checks": ["test"], "merge_queue": true });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/branch-rules", Some(rule)).await.0, StatusCode::OK);
+    commit(&app, &admin, "root1/r", "main", Some("feature"), "src.txt", "x").await;
+    let (_, p) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Feature", "head": "feature", "base": "main" }))).await;
+    let number = p["number"].as_i64().unwrap();
+    // The pull request's own run passed; the queue then tests its merged commit.
+    app.state.db.call(|c| Ok(c.execute("UPDATE ci_jobs SET status = 'success'", [])?)).await.unwrap();
+    let (s, v) = app.req(&admin, "POST", &format!("/api/repos/root1/r/pulls/{number}/queue"), Some(json!({ "method": "merge" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let runner: i64 = app
+        .state
+        .db
+        .call(|c| {
+            c.execute("INSERT INTO ci_runners(name, labels, created_at) VALUES ('box', '[]', 0)", [])?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
+        .unwrap();
+    // Its runner goes quiet on every attempt, so the job fails as lost (no jobs::finish).
+    let mut run = 0;
+    for _ in 0..3 {
+        let lease = gitter::ci::jobs::claim(&app.state, runner, vec![], false).await.unwrap().expect("the queue's job");
+        assert_eq!(lease.event, "merge_queue");
+        run = lease.run_id;
+        app.state.db.call(|c| Ok(c.execute("UPDATE ci_jobs SET lease_until = 0 WHERE status = 'running'", [])?)).await.unwrap();
+        gitter::ci::jobs::requeue_expired(&app.state).await.unwrap();
+    }
+    assert_eq!(job_status(&app).await.last().map(String::as_str), Some("error"));
+    for _ in 0..50 {
+        let left: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT count(*) FROM merge_queue", [], |r| r.get(0))?)).await.unwrap();
+        if left == 0 {
+            assert_eq!(run_notes(&app, 1, run).await, 1, "whoever pushed hears it failed");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the failed run left its pull request in the merge queue");
+}
+
+#[tokio::test]
 async fn only_admins_repositories_run_ci_by_default() {
     let app = App::new();
     let _admin = app.signup("root1").await;

@@ -71,14 +71,15 @@ pub fn create_run(c: &mut Connection, r: &NewRun, jobs: &[Job], skip: &[bool]) -
     Ok((run, number))
 }
 
-/// Record a run that couldn't start (its config is broken). Returns its number.
-pub fn create_failed_run(c: &mut Connection, r: &NewRun, error: &str) -> rusqlite::Result<i64> {
+/// Record a run that couldn't start (its config is broken). Returns (run id, run number);
+/// it ended at once, so its follow-ups are due (`jobs::run_ended`).
+pub fn create_failed_run(c: &mut Connection, r: &NewRun, error: &str) -> rusqlite::Result<(i64, i64)> {
     let (run, number) = create_run(c, r, &[], &[])?;
     c.execute(
         "UPDATE ci_runs SET status = 'failure', error = ?2, finished_at = ?3 WHERE id = ?1",
         params![run, error, now()],
     )?;
-    Ok(number)
+    Ok((run, number))
 }
 
 /// What a runner needs to run a claimed job.
@@ -226,35 +227,52 @@ pub fn finish(c: &mut Connection, job_id: i64, token: &str, success: bool, exit_
     Ok(n == 1)
 }
 
+/// What `requeue_expired` did: how many jobs went back in the queue, the jobs failed
+/// as lost, and the runs that ended with them (their follow-ups: `jobs::after_lost`).
+#[derive(Debug, Default)]
+pub struct Lost {
+    pub requeued: usize,
+    pub failed: Vec<i64>,
+    pub ended: Vec<i64>,
+}
+
 /// Put jobs whose runner stopped heartbeating back in the queue, or fail them
-/// after MAX_ATTEMPTS. Returns how many were requeued.
-pub fn requeue_expired(c: &mut Connection) -> rusqlite::Result<usize> {
+/// after MAX_ATTEMPTS.
+pub fn requeue_expired(c: &mut Connection) -> rusqlite::Result<Lost> {
     let tx = c.transaction()?;
     let t = now();
     let runs: Vec<i64> = {
         let mut q = tx.prepare("SELECT DISTINCT run_id FROM ci_jobs WHERE status = 'running' AND lease_until < ?1")?;
         q.query_map([t], |r| r.get(0))?.collect::<Result<_, _>>()?
     };
-    tx.execute(
-        "UPDATE ci_jobs SET status = 'error', finished_at = ?1, lease_until = NULL, token_hash = NULL
-         WHERE status = 'running' AND lease_until < ?1 AND attempt >= ?2",
-        params![t, MAX_ATTEMPTS],
-    )?;
-    let n = tx.execute(
+    let failed: Vec<i64> = {
+        let mut q = tx.prepare(
+            "UPDATE ci_jobs SET status = 'error', finished_at = ?1, lease_until = NULL, token_hash = NULL
+             WHERE status = 'running' AND lease_until < ?1 AND attempt >= ?2 RETURNING id",
+        )?;
+        q.query_map(params![t, MAX_ATTEMPTS], |r| r.get(0))?.collect::<Result<_, _>>()?
+    };
+    let requeued = tx.execute(
         "UPDATE ci_jobs SET status = 'queued', lease_until = NULL, token_hash = NULL, runner_id = NULL
          WHERE status = 'running' AND lease_until < ?1",
         [t],
     )?;
+    // A run with a running job wasn't over, so each one that is now ended here.
+    let mut ended = Vec::new();
     for run in runs {
         advance(&tx, run)?;
+        let status: String = tx.query_row("SELECT status FROM ci_runs WHERE id = ?1", [run], |r| r.get(0))?;
+        if terminal(&status) {
+            ended.push(run);
+        }
     }
     tx.commit()?;
-    Ok(n)
+    Ok(Lost { requeued, failed, ended })
 }
 
 /// A runner was removed: its running jobs go back to the queue now (or fail
 /// if they've been lost too often), as if their leases had run out.
-pub fn release_runner(c: &mut Connection, runner_id: i64) -> rusqlite::Result<usize> {
+pub fn release_runner(c: &mut Connection, runner_id: i64) -> rusqlite::Result<Lost> {
     c.execute("UPDATE ci_jobs SET lease_until = 0 WHERE runner_id = ?1 AND status = 'running'", [runner_id])?;
     requeue_expired(c)
 }
@@ -422,7 +440,7 @@ mod tests {
             assert_eq!(jobs(c).iter().map(|j| j.1.as_str()).collect::<Vec<_>>(), ["queued", "skipped", "waiting"], "docs had no matching change");
             // A removed runner's job goes straight back to the queue.
             let again = claim(c, r1, &[], false, false).unwrap().unwrap();
-            assert_eq!(release_runner(c, r1).unwrap(), 1);
+            assert_eq!(release_runner(c, r1).unwrap().requeued, 1);
             assert!(!heartbeat(c, again.job_id, &again.token).unwrap());
             assert_eq!(jobs(c)[0].1, "queued");
             Ok(())
@@ -440,7 +458,8 @@ mod tests {
             let first = claim(c, r1, &[], false, false).unwrap().unwrap();
             assert!(heartbeat(c, first.job_id, &first.token).unwrap());
             c.execute("UPDATE ci_jobs SET lease_until = 0", []).unwrap();
-            assert_eq!(requeue_expired(c).unwrap(), 1);
+            let lost = requeue_expired(c).unwrap();
+            assert_eq!((lost.requeued, lost.failed.len(), lost.ended.len()), (1, 0, 0), "back in the queue, the run goes on");
             let second = claim(c, r2, &[], false, false).unwrap().unwrap();
             assert_eq!(second.attempt, 2);
             assert!(!heartbeat(c, first.job_id, &first.token).unwrap(), "the old attempt must stop");
@@ -451,12 +470,15 @@ mod tests {
             assert_eq!(status(c, "SELECT status FROM ci_runs"), "success");
             // A job lost on every attempt fails instead of looping forever.
             run(c, "jobs:\n  z:\n    steps: [echo z]\n");
+            let mut lost = Lost::default();
             for _ in 0..MAX_ATTEMPTS {
                 claim(c, r1, &[], false, false).unwrap().unwrap();
                 c.execute("UPDATE ci_jobs SET lease_until = 0 WHERE status = 'running'", []).unwrap();
-                requeue_expired(c).unwrap();
+                lost = requeue_expired(c).unwrap();
             }
             assert_eq!(jobs(c)[1].1, "error");
+            let (job, run): (i64, i64) = c.query_row("SELECT id, run_id FROM ci_jobs ORDER BY id DESC", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!((lost.requeued, lost.failed, lost.ended), (0, vec![job], vec![run]), "the lost job ended its run");
             assert_eq!(status(c, "SELECT status FROM ci_runs ORDER BY id DESC"), "failure");
             Ok(())
         })

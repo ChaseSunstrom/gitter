@@ -177,12 +177,31 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
     // pushed to it), is marked: no secrets, never the built-in runner (`jobs::claim`).
     let (agent, repo_id) = (crate::auth::acting_agent(), repo.id);
     let branch = run.refname.strip_prefix("refs/heads/").unwrap_or_default().to_string();
-    let number = st
+    let (number, failed) = st
         .db
         .call(move |c| {
-            let n = match pipeline {
-                Ok(p) => queue::create_run(c, &run, &p.jobs, &skip)?.1,
-                Err(e) => queue::create_failed_run(c, &run, &e)?,
+            // The push hook and the opening of a pull request can both start its run for the same
+            // commit (one database call, so nothing slips in between): the second keeps the first.
+            // A run that broke on its config ended at once, and would break the same way again.
+            if run.event == "pull_request" {
+                let same: Option<i64> = c
+                    .query_row(
+                        "SELECT number FROM ci_runs WHERE repo_id = ?1 AND event = 'pull_request' AND pr_number = ?2 AND sha = ?3
+                         AND (status IN ('queued', 'running') OR error != '') ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![run.repo_id, run.pr_number, run.sha],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(n) = same {
+                    return Ok((n, None));
+                }
+            }
+            let (n, failed) = match pipeline {
+                Ok(p) => (queue::create_run(c, &run, &p.jobs, &skip)?.1, None),
+                Err(e) => {
+                    let (id, n) = queue::create_failed_run(c, &run, &e)?;
+                    (n, Some(id))
+                }
             };
             // An agent's run also waits for a person to approve it (they read what it will run).
             c.execute(
@@ -193,10 +212,14 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
                 rusqlite::params![agent, repo_id, n, branch],
             )?;
             c.execute("UPDATE ci_runs SET approval = 'needed' WHERE repo_id = ?1 AND number = ?2 AND agent IS NOT NULL AND status = 'queued'", rusqlite::params![repo_id, n])?;
-            Ok(n)
+            Ok((n, failed))
         })
         .await?;
     st.ci_wake.notify_waiters();
+    // A run whose config broke ended without a job to finish it.
+    if let Some(run) = failed {
+        super::jobs::run_ended(st, run).await?;
+    }
     Ok(number)
 }
 

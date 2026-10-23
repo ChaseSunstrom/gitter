@@ -468,19 +468,20 @@ pub async fn create_runner(State(st): State<AppState>, Admin(u): Admin, _s: Sudo
 }
 
 pub async fn delete_runner(State(st): State<AppState>, Admin(u): Admin, _s: Sudo, ip: ClientIp, Path(id): Path<i64>) -> J<Value> {
-    let name: Option<String> = st
+    let found: Option<(String, queue::Lost)> = st
         .db
         .call(move |c| {
             let Some(name) = c.query_row("SELECT name FROM ci_runners WHERE id = ?1 AND builtin = 0", [id], |r| r.get(0)).optional()? else {
                 return Ok(None);
             };
             // Its running jobs go back to the queue at once.
-            queue::release_runner(c, id)?;
+            let lost = queue::release_runner(c, id)?;
             c.execute("DELETE FROM ci_runners WHERE id = ?1", [id])?;
-            Ok(Some(name))
+            Ok(Some((name, lost)))
         })
         .await?;
-    let name = name.ok_or_else(AppError::not_found)?;
+    let (name, lost) = found.ok_or_else(AppError::not_found)?;
+    crate::ci::jobs::after_lost(&st, lost).await?;
     st.ci_wake.notify_waiters();
     record(&st.db, Event { actor: Some(&u), subject: None, action: "ci_runner_deleted", detail: name, ip: &ip.0 }).await;
     ok()

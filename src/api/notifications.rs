@@ -357,21 +357,14 @@ fn review_mentions(c: &rusqlite::Connection, issue_id: i64, review_id: i64, summ
     Ok(names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(" "))
 }
 
-/// A CI job finished: if that made its run fail, tell whoever started the run.
-pub async fn ci_finished(st: &AppState, job: i64) {
-    let run: Option<(i64, i64, Option<i64>)> = st
+/// A CI run ended: if it failed, tell whoever started it.
+pub async fn ci_finished(st: &AppState, run: i64) {
+    let found: Option<(i64, Option<i64>)> = st
         .db
-        .call(move |c| {
-            Ok(c.query_row(
-                "SELECT r.id, r.repo_id, r.actor_id FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE j.id = ?1 AND r.status = 'failure'",
-                [job],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?)
-        })
+        .call(move |c| Ok(c.query_row("SELECT repo_id, actor_id FROM ci_runs WHERE id = ?1 AND status = 'failure'", [run], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))
         .await
         .unwrap_or(None);
-    if let Some((run, repo, Some(actor))) = run {
+    if let Some((repo, Some(actor))) = found {
         tell(st, repo, Thread::Run(run), None, vec![actor], "ci").await;
     }
 }
