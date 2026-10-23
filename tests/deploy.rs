@@ -280,12 +280,12 @@ async fn preview_files_count_toward_the_owners_storage() {
     let root = app.signup("root").await;
     assert_eq!(app.req(&root, "POST", "/api/repos", Some(json!({ "name": "site", "readme": true }))).await.0, StatusCode::OK);
     tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
-    // A preview of 1.2 MB, built slowly enough to change the owner's limits while it runs.
+    // A preview of 1.2 MB.
     let config = "on: [pull_request]
 jobs:
   web:
     preview: public
-    steps: [\"sleep 2 && mkdir -p public && head -c 1200000 /dev/zero > public/big.bin && echo hi > public/index.html\"]
+    steps: [\"mkdir -p public && head -c 1200000 /dev/zero > public/big.bin && echo hi > public/index.html\"]
 ";
     commit(&app, &root, "root/site", "main", None, ".gitter/ci.yml", config).await;
     commit(&app, &root, "root/site", "main", Some("feature"), "f.txt", "one\n").await;
@@ -299,19 +299,26 @@ jobs:
     let with = used().await;
     assert!(with >= before + 1_200_000, "the preview counts: {before} -> {with}");
 
-    // Past the space left (a 1 MB quota, the account no longer unlimited), a preview is refused.
+    // Past the space left (a 1 MB quota, the account no longer unlimited), a preview is refused:
+    // the same job's preview again, as a second deployment that's just finished building.
     let mut set = app.state.settings.get();
     set.max_storage_mb = 1;
     app.state.settings.save(&app.state.db, set).await.unwrap();
-    commit(&app, &root, "root/site", "feature", None, "f.txt", "two\n").await;
-    for _ in 0..200 {
-        if previews(&app, &root).await.iter().any(|d| d["status"] == "in_progress") {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    app.state.db.call(|c| Ok(c.execute("UPDATE users SET is_admin = 0 WHERE id = 1", [])?)).await.unwrap();
-    settle(&app).await;
+    let job: i64 = app
+        .state
+        .db
+        .call(|c| {
+            c.execute("UPDATE users SET is_admin = 0 WHERE id = 1", [])?;
+            c.execute(
+                "INSERT INTO deployments (repo_id, environment_id, ref, sha, creator_id, job_id, pr_number, status, created_at, updated_at)
+                 SELECT repo_id, environment_id, ref, sha, creator_id, job_id, pr_number, 'in_progress', created_at, updated_at + 1 FROM deployments WHERE preview IS NOT NULL",
+                [],
+            )?;
+            Ok(c.query_row("SELECT job_id FROM deployments WHERE status = 'in_progress'", [], |r| r.get(0))?)
+        })
+        .await
+        .unwrap();
+    gitter::api::deploy::job_finished(&app.state, job, true).await;
     app.state.db.call(|c| Ok(c.execute("UPDATE users SET is_admin = 1 WHERE id = 1", [])?)).await.unwrap();
     let list = previews(&app, &root).await;
     assert_eq!((list[0]["status"].as_str(), &list[0]["preview"]), (Some("failure"), &Value::Null), "{list:?}");
