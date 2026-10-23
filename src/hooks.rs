@@ -21,12 +21,80 @@ pub async fn on_push(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     }
     crate::webhooks::push(st, repo, user.id, updates).await;
     crate::mirrors::changed(st, repo.id).await;
+    hand_merged(st, repo, user, updates).await;
     // A queued pull request's branch, or the branch it's tested against, may have moved.
     crate::mergequeue::kick(st, repo.id);
     // Pull requests from this repository's branches into the one it was forked from (or its forks).
     crate::api::issues::sync_fork_pulls(st, repo, updates).await;
     // And into the one it was forked from on another server.
     crate::api::federation::pushed(st, repo, updates).await;
+}
+
+/// Open pull requests into a moved branch whose head it now holds (merged by hand:
+/// a push, a fast-forward) are recorded as merged by the pusher.
+async fn hand_merged(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpdate]) {
+    for u in updates {
+        let (Some(base), Some(new)) = (u.refname.strip_prefix("refs/heads/"), u.new.as_deref()) else { continue };
+        let (rid, b) = (repo.id, base.to_string());
+        let open: Vec<(i64, i64, String, bool)> = st
+            .db
+            .call(move |c| {
+                let mut q = c.prepare(
+                    "SELECT i.id, i.number, p.head_branch, coalesce(p.from_fork, 0) FROM pulls p JOIN issues i ON i.id = p.issue_id
+                     WHERE i.repo_id = ?1 AND i.state = 'open' AND p.base_branch = ?2",
+                )?;
+                Ok(q.query_map(rusqlite::params![rid, b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)))?.collect::<Result<_, _>>()?)
+            })
+            .await
+            .unwrap_or_default();
+        if open.is_empty() {
+            continue;
+        }
+        // One listing for all of them: the heads the branch now holds.
+        let args = ["for-each-ref", "--format=%(refname) %(objectname)", "--merged", new, "refs/heads", "refs/pull"];
+        let out = match st.git.run(&repo.path, &args, None, &[]).await {
+            Ok(o) if o.code == 0 => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Ok(o) => {
+                eprintln!("hand merges into {}:{base}: {}", repo.full_name(), String::from_utf8_lossy(&o.stderr).trim());
+                continue;
+            }
+            Err(e) => {
+                eprintln!("hand merges into {}:{base}: {}", repo.full_name(), e.msg);
+                continue;
+            }
+        };
+        let held: std::collections::HashMap<&str, &str> = out.lines().filter_map(|l| l.split_once(' ')).collect();
+        for (iid, number, head_b, from_fork) in open {
+            let Some(head) = held.get(crate::api::issues::head_ref(number, &head_b, from_fork).as_str()).map(|s| s.to_string()) else { continue };
+            let (uid, base_sha) = (user.id, new.to_string());
+            let marked = st
+                .db
+                .call(move |c| {
+                    let tx = c.transaction()?;
+                    let t = crate::db::now();
+                    // Still open: a second push or a merge landing meanwhile records nothing more.
+                    if tx.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2 AND state = 'open'", rusqlite::params![t, iid])? == 0 {
+                        return Ok(false);
+                    }
+                    tx.execute(
+                        "UPDATE pulls SET merged_sha = ?1, merged_by = ?2, merged_at = ?3, head_sha = ?1, base_sha = ?4 WHERE issue_id = ?5",
+                        rusqlite::params![head, uid, t, base_sha, iid],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at) VALUES (?1, ?2, 'merged', ?3, ?4, ?4)",
+                        rusqlite::params![iid, uid, head, t],
+                    )?;
+                    tx.commit()?;
+                    Ok(true)
+                })
+                .await;
+            match marked {
+                Ok(true) => crate::api::deploy::pull_closed(st, repo.id, number).await,
+                Ok(false) => {}
+                Err(e) => eprintln!("hand merge of {}#{number}: {}", repo.full_name(), e.msg),
+            }
+        }
+    }
 }
 
 /// Who moved each branch last (a scheduled run counts as theirs). A deleted

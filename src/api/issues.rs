@@ -624,8 +624,8 @@ pub(super) async fn pull_shas(st: &AppState, r: &Repo, issue: &IssueRow) -> R<(S
     Ok(if issue.state == "open" { (head_b, head.or(head0), base.or(base0)) } else { (head_b, head0.or(head), base0.or(base)) })
 }
 
-/// Head/base state of a PR: mergeable, conflicts, or merged. Marks a PR merged
-/// when its head was merged into the base outside Gitter (e.g. a manual push).
+/// Head/base state of a PR: mergeable, conflicts, or merged. Reports a PR merged
+/// when its head is already in the base; it writes nothing.
 pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -> R<serde_json::Value> {
     let iid = issue.id;
     let (head_b, base_b, head_sha0, base_sha0, merged_sha, merged_by, merged_at): PullRow = st
@@ -675,18 +675,9 @@ pub(super) async fn pull_status(st: &AppState, r: &Repo, issue: &mut IssueRow) -
     };
     let mb = st.git.merge_base(&r.path, &h, &b).await?;
     if mb.as_deref() == Some(h.as_str()) && h != b {
-        // Already contained in the base: someone merged it by hand.
-        let (iid2, hs, bs) = (iid, h.clone(), b.clone());
-        st.db
-            .call(move |c| {
-                let t = now();
-                c.execute("UPDATE pulls SET merged_sha = ?1, head_sha = ?1, base_sha = ?2, merged_at = ?3 WHERE issue_id = ?4", rusqlite::params![hs, bs, t, iid2])?;
-                c.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2", rusqlite::params![t, iid2])?;
-                Ok(())
-            })
-            .await?;
+        // Already contained in the base: someone merged it by hand. The push that did it
+        // records that (hooks::on_push); a read only reports it.
         issue.state = "merged".into();
-        crate::api::deploy::pull_closed(st, r.id, issue.number).await;
         status["merged_sha"] = json!(h);
         return Ok(status);
     }
