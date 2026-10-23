@@ -143,7 +143,9 @@ fn repo_json(c: &Connection, base: &str, id: i64) -> rusqlite::Result<Value> {
 fn issue_json(c: &Connection, repo: &Value, repo_id: i64, number: i64) -> rusqlite::Result<Option<(bool, Value)>> {
     let row = c
         .query_row(
-            "SELECT i.id, i.title, i.body, i.state, i.is_pr, u.username, i.created_at, i.updated_at, i.closed_at, p.head_branch, p.base_branch, p.merged_sha
+            "SELECT i.id, i.title, i.body, i.state, i.is_pr, u.username, i.created_at, i.updated_at, i.closed_at, p.head_branch, p.base_branch, p.merged_sha,
+                    (SELECT hu.username || '/' || hr.name FROM repos hr JOIN users hu ON hu.id = hr.owner_id WHERE hr.id = p.head_repo_id),
+                    (SELECT rp.server || char(10) || rp.repo FROM remote_pulls rp WHERE rp.issue_id = i.id)
              FROM issues i JOIN users u ON u.id = i.author_id LEFT JOIN pulls p ON p.issue_id = i.id WHERE i.repo_id = ?1 AND i.number = ?2",
             [repo_id, number],
             |r| {
@@ -159,6 +161,17 @@ fn issue_json(c: &Connection, repo: &Value, repo_id: i64, number: i64) -> rusqli
                     v["base"] = json!(r.get::<_, Option<String>>(10)?);
                     v["merged"] = json!(state == "merged");
                     v["merge_commit_sha"] = json!(r.get::<_, Option<String>>(11)?);
+                    // Where the head branch lives: a fork here, a repository on another server, or this repository.
+                    let (url, full) = (repo["url"].as_str().unwrap_or_default(), repo["full_name"].as_str().unwrap_or_default());
+                    let base = url.strip_suffix(&format!("/{full}")).unwrap_or(url);
+                    v["head_repo"] = match (r.get::<_, Option<String>>(12)?, r.get::<_, Option<String>>(13)?) {
+                        (Some(fork), _) => json!({ "full_name": fork, "clone_url": format!("{base}/{fork}.git") }),
+                        (_, Some(far)) => {
+                            let (server, name) = far.split_once('\n').unwrap_or_default();
+                            json!({ "full_name": format!("{}/{name}", crate::federation::host(server)), "clone_url": format!("{server}/{name}.git") })
+                        }
+                        _ => json!({ "full_name": full, "clone_url": repo["clone_url"] }),
+                    };
                 }
                 Ok((r.get::<_, i64>(0)?, is_pr, v))
             },
