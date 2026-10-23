@@ -120,30 +120,61 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
     let t = token.to_string();
     let done = st.db.call(move |c| Ok(queue::finish(c, job, &t, success, code)?)).await?;
     st.ci_wake.notify_waiters();
+    // A fenced-off report changed nothing, so it has nothing to follow up.
     if done {
         crate::api::deploy::job_finished(st, job, success).await;
-        crate::api::notifications::ci_finished(st, job).await;
-    }
-    // A finished run may be the last check a pull request waited on to merge itself.
-    let finished: Option<(i64, String)> = st
-        .db
-        .call(move |c| {
-            Ok(c.query_row(
-                "SELECT r.repo_id, r.sha FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id WHERE j.id = ?1 AND r.status IN ('success', 'failure', 'cancelled', 'skipped')",
-                [job],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
-        })
-        .await?;
-    if let Some((repo, sha)) = finished {
-        let st = st.clone();
-        tokio::spawn(async move {
-            crate::protect::auto_merge(&st, repo, Some(sha)).await;
-            crate::mergequeue::advance(&st, repo).await;
-        });
+        let run: i64 = st.db.call(move |c| Ok(c.query_row("SELECT run_id FROM ci_jobs WHERE id = ?1", [job], |r| r.get(0))?)).await?;
+        run_ended(st, run).await?;
     }
     Ok(done)
+}
+
+/// Every way a run can end comes here (its last job reported, its config broke, its
+/// jobs were lost): a failed run tells whoever started it, and a run may
+/// be the last check a pull request waited on to merge itself or leave the merge queue.
+/// Nothing happens while the run is still going.
+pub async fn run_ended(st: &AppState, run: i64) -> R<()> {
+    let ended: Option<(i64, String)> = st
+        .db
+        .call(move |c| {
+            Ok(c.query_row("SELECT repo_id, sha FROM ci_runs WHERE id = ?1 AND status IN ('success', 'failure', 'cancelled', 'skipped')", [run], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?)
+        })
+        .await?;
+    let Some((repo, sha)) = ended else { return Ok(()) };
+    crate::api::notifications::ci_finished(st, run).await;
+    tokio::spawn(merges(st.clone(), repo, sha));
+    Ok(())
+}
+
+/// Auto-merge and the merge queue after a run ended. Boxed: the merge queue starts runs,
+/// and a run that ends at once comes back here (an async cycle needs a named type).
+fn merges(st: AppState, repo: i64, sha: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        crate::protect::auto_merge(&st, repo, Some(sha)).await;
+        crate::mergequeue::advance(&st, repo).await;
+    })
+}
+
+/// Put jobs whose runner went quiet back in the queue (or fail them as lost).
+pub async fn requeue_expired(st: &AppState) -> R<()> {
+    let lost = st.db.call(|c| Ok(queue::requeue_expired(c)?)).await?;
+    after_lost(st, lost).await
+}
+
+/// The follow-ups of `queue::requeue_expired`: wake runners for the requeued jobs, and
+/// settle the jobs failed as lost and the runs they ended, as `finish` would have.
+pub async fn after_lost(st: &AppState, lost: queue::Lost) -> R<()> {
+    if lost.requeued > 0 {
+        st.ci_wake.notify_waiters();
+    }
+    for job in lost.failed {
+        crate::api::deploy::job_finished(st, job, false).await;
+    }
+    for run in lost.ended {
+        run_ended(st, run).await?;
+    }
+    Ok(())
 }
 
 /// Hourly: delete logs and artifacts whose job is gone (its repository was

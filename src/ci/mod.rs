@@ -19,10 +19,8 @@ use crate::AppState;
 pub async fn upkeep(st: AppState) {
     let (mut minute, mut hour) = (0, 0);
     loop {
-        match st.db.call(|c| Ok(queue::requeue_expired(c)?)).await {
-            Ok(n) if n > 0 => st.ci_wake.notify_waiters(),
-            Ok(_) => {}
-            Err(e) => eprintln!("ci requeue: {}", e.msg),
+        if let Err(e) = jobs::requeue_expired(&st).await {
+            eprintln!("ci requeue: {}", e.msg);
         }
         let now = crate::db::now();
         if now / 3600 != hour {

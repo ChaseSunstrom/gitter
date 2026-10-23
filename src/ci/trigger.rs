@@ -13,6 +13,8 @@ use crate::smart_http::RefUpdate;
 
 /// More changed files than this and path filters treat the push as touching everything.
 const MAX_CHANGED: usize = 5000;
+/// A pull request run for the same commit started this recently is the same run, finished or not.
+const SAME_RUN_SECS: i64 = 30;
 
 /// May this repository run CI under the site's setting?
 pub async fn enabled(st: &AppState, owner_id: i64) -> bool {
@@ -177,12 +179,32 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
     // pushed to it), is marked: no secrets, never the built-in runner (`jobs::claim`).
     let (agent, repo_id) = (crate::auth::acting_agent(), repo.id);
     let branch = run.refname.strip_prefix("refs/heads/").unwrap_or_default().to_string();
-    let number = st
+    let (number, failed) = st
         .db
         .call(move |c| {
-            let n = match pipeline {
-                Ok(p) => queue::create_run(c, &run, &p.jobs, &skip)?.1,
-                Err(e) => queue::create_failed_run(c, &run, &e)?,
+            // The push hook and the opening of a pull request can both start its run for the same
+            // commit (one database call, so nothing slips in between): the second keeps the first,
+            // even one that already finished moments ago. A run that broke on its config ended at
+            // once, and would break the same way again.
+            if run.event == "pull_request" {
+                let same: Option<i64> = c
+                    .query_row(
+                        "SELECT number FROM ci_runs WHERE repo_id = ?1 AND event = 'pull_request' AND pr_number = ?2 AND sha = ?3
+                         AND (status IN ('queued', 'running') OR error != '' OR created_at >= ?4) ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![run.repo_id, run.pr_number, run.sha, crate::db::now() - SAME_RUN_SECS],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(n) = same {
+                    return Ok((n, None));
+                }
+            }
+            let (n, failed) = match pipeline {
+                Ok(p) => (queue::create_run(c, &run, &p.jobs, &skip)?.1, None),
+                Err(e) => {
+                    let (id, n) = queue::create_failed_run(c, &run, &e)?;
+                    (n, Some(id))
+                }
             };
             // An agent's run also waits for a person to approve it (they read what it will run).
             c.execute(
@@ -193,10 +215,17 @@ pub async fn start(st: &AppState, repo: &Repo, pipeline: Result<Pipeline, String
                 rusqlite::params![agent, repo_id, n, branch],
             )?;
             c.execute("UPDATE ci_runs SET approval = 'needed' WHERE repo_id = ?1 AND number = ?2 AND agent IS NOT NULL AND status = 'queued'", rusqlite::params![repo_id, n])?;
-            Ok(n)
+            Ok((n, failed))
         })
         .await?;
     st.ci_wake.notify_waiters();
+    // A run whose config broke ended without a job to finish it.
+    // The run is recorded either way: a follow-up's error mustn't fail whoever started it.
+    if let Some(run) = failed
+        && let Err(e) = super::jobs::run_ended(st, run).await
+    {
+        eprintln!("ci: {} run {number}: follow-ups: {}", repo.full_name(), e.msg);
+    }
     Ok(number)
 }
 
@@ -246,10 +275,11 @@ async fn on_branch(st: &AppState, repo: &Repo, actor_id: i64, u: &RefUpdate, bra
         })
         .await?;
     for (number, base) in prs {
+        let files = pull_files(st, &repo.path, &base, new).await?;
         if wants(&f, &base, &files)
             && let Some(p) = pick(pipeline.clone(), "pull_request", &base, &files)
         {
-            let s = Start { event: "pull_request", refname: u.refname.clone(), sha: new.into(), pr_number: Some(number), actor_id: Some(actor_id), files: files.clone() };
+            let s = Start { event: "pull_request", refname: u.refname.clone(), sha: new.into(), pr_number: Some(number), actor_id: Some(actor_id), files };
             start(st, repo, p, s).await?;
         }
     }
@@ -270,12 +300,7 @@ pub async fn on_pull_opened(st: &AppState, repo: &Repo, _opener: i64, number: i6
         Err(_) => Some(Filter::default()),
     };
     let Some(f) = wanted else { return Ok(()) };
-    let base_sha = st.git.resolve(&repo.path, &format!("refs/heads/{base}")).await?;
-    let from = match base_sha {
-        Some(b) => st.git.merge_base(&repo.path, &b, &head_sha).await?,
-        None => None,
-    };
-    let files = changed(st, &repo.path, from.as_deref(), &head_sha).await;
+    let files = pull_files(st, &repo.path, base, &head_sha).await?;
     if wants(&f, base, &files)
         && let Some(pipeline) = pick(pipeline, "pull_request", base, &files)
     {
@@ -285,6 +310,16 @@ pub async fn on_pull_opened(st: &AppState, repo: &Repo, _opener: i64, number: i6
         start(st, repo, pipeline, s).await?;
     }
     Ok(())
+}
+
+/// The files a pull request onto `base` changes at `head`: since where it left the
+/// base branch, not since the last push (both starters must build the same run).
+async fn pull_files(st: &AppState, repo: &Path, base: &str, head: &str) -> R<Option<Vec<String>>> {
+    let from = match st.git.resolve(repo, &format!("refs/heads/{base}")).await? {
+        Some(b) => st.git.merge_base(repo, &b, head).await?,
+        None => None,
+    };
+    Ok(changed(st, repo, from.as_deref(), head).await)
 }
 
 /// Who last pushed `branch` (its runs are on their behalf).
