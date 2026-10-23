@@ -132,7 +132,8 @@ async function treeView(meta, rev, path, rootTree) {
           const again = () => setTimeout(async () => {
             if (!el.isConnected) return;
             const now = await get(repoUrl(meta.owner, meta.name), { fresh: true }).catch(() => null);
-            if (now && (!now.empty || now.mirror?.error !== meta.mirror.error)) {
+            // A one-time copy is done once its mirror is gone (it has files a moment before that).
+            if (now && ((!now.empty && !now.mirror?.once) || now.mirror?.error !== meta.mirror.error)) {
               // What was cached while it was empty (its file list) is stale now.
               invalidate(repoUrl(meta.owner, meta.name));
               refresh();

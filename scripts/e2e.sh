@@ -635,6 +635,7 @@ code=$(curl -s -o "$TMP/index.html" -w '%{http_code}' "$BASE/alice/hello/blob/ma
 [ "$code" = 200 ] && grep -q '<html' "$TMP/index.html" || fail "SPA route"
 curl -sI "$BASE/" | grep -qi "content-security-policy: default-src 'self'" || fail "CSP header"
 ok "app shell served with CSP"
+node --no-warnings scripts/ot-check.mjs || fail "editing together: the browser's operations"
 
 if [ "${SKIP_UI:-}" = 1 ]; then
   echo "· UI check skipped (SKIP_UI=1)"

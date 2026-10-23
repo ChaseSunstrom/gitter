@@ -2,14 +2,14 @@
 id: T-0121
 type: FEATURE
 tier: M
-status: captured
+status: done
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T23:06:24Z
-updated: 2026-10-22T23:11:59Z
-batched_in: T-0122
+updated: 2026-10-22T23:34:38Z
+done_in: T-0122
 ---
 # --help` always prints the global usage, not the command's own
 ## Raw request
@@ -29,4 +29,5 @@ batched_in: T-0122
 ## Log
 - 2026-10-22T23:06:24Z created
 - 2026-10-22T23:11:59Z batched into T-0122
+- 2026-10-22T23:34:38Z done in T-0122 (batch)
 ## Follow-ups captured

@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-22T00:51:49Z
 updated: 2026-10-22T00:51:49Z
+group: storage quota accounting gaps
 ---
 # - hooks.rs:21 `refresh_size` can zero `size_bytes` for a repo trashed mid-push, which woul
 ## Raw request

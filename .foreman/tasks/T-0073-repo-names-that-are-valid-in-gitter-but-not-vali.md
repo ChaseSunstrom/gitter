@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-22T02:35:00Z
 updated: 2026-10-22T02:35:00Z
+group: container registry follow-ups
 ---
 # Repo names that are valid in Gitter but not valid OCI components (`a..b`, `a-.b`) cannot u
 ## Raw request

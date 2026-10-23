@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod notifications;
 pub mod oauth;
 pub mod revert;
+pub mod collab;
 pub mod deploy;
 pub mod preview;
 
@@ -234,6 +235,12 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/ci/flaky"), get(ci_extras::flaky))
         .route(&format!("{repo}/ci/secrets"), get(ci::secrets))
         .route(&format!("{repo}/ci/secrets/{{name}}"), put(ci::set_secret).delete(ci::delete_secret))
+        .route(&format!("{repo}/collab"), post(collab::join))
+        .route(&format!("{repo}/collab/{{id}}"), get(collab::show))
+        .route(&format!("{repo}/collab/{{id}}/ops"), post(collab::change).layer(DefaultBodyLimit::max(8 << 20)))
+        .route(&format!("{repo}/collab/{{id}}/presence"), post(collab::presence))
+        .route(&format!("{repo}/collab/{{id}}/committed"), post(collab::committed))
+        .route(&format!("{repo}/collab/{{id}}/events"), get(collab::events))
         .route(&format!("{repo}/environments"), get(deploy::environments).put(deploy::put_environment))
         .route(&format!("{repo}/environments/{{id}}"), delete(deploy::delete_environment))
         .route(&format!("{repo}/environments/{{id}}/secrets"), get(deploy::env_secrets))
@@ -405,6 +412,12 @@ fn token_may(l: &crate::auth::Limits, method: &axum::http::Method, path: &str) -
         && !matches!(segs[3], "fork" | "deploy-tokens" | "transfer" | "collaborators")
 }
 
+/// POST /repos/{owner}/{repo}/collab/{id}/ops or /presence: typing together, which has its own budget.
+fn is_collab_typing(method: &axum::http::Method, path: &str) -> bool {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    *method == axum::http::Method::POST && segs.len() == 6 && segs[0] == "repos" && segs[3] == "collab" && matches!(segs[5], "ops" | "presence")
+}
+
 /// POST /repos/{owner}/{repo}/traffic/view: counting a page view, which browsing mustn't
 /// pay for out of the write allowance. Exactly that route, nothing that merely ends like it.
 fn is_view_count(method: &axum::http::Method, path: &str) -> bool {
@@ -452,7 +465,8 @@ pub async fn rate_limit(
     }
     // A page-view count isn't a change: browsing mustn't use up the write allowance.
     let mutating = !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS)
-        && !is_view_count(&parts.method, parts.uri.path());
+        && !is_view_count(&parts.method, parts.uri.path())
+        && !is_collab_typing(&parts.method, parts.uri.path());
     if mutating && s.write_rate_per_min > 0 {
         let v = crate::auth::Viewer::from_request_parts(&mut parts, &st).await.ok().and_then(|v| v.0);
         let key = match &v {

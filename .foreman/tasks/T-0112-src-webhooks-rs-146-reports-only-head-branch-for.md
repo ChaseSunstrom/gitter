@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-22T21:34:05Z
 updated: 2026-10-22T21:34:05Z
+group: fork-related gaps
 ---
 # Src/webhooks.rs:146` reports only `head_branch` for fork PRs, so the payload has no head r
 ## Raw request

@@ -52,6 +52,7 @@ none: markup and a hidden toggle; the README already says only someone who can p
 - 2026-10-22T23:08:34Z scope: also T-0115 (same issue page: hide the 'Allow edits from maintainers' toggle from an author who can't push to the fork), one e2e run for both
 - 2026-10-22T23:17:25Z criterion 1 verify: `node scripts/ui-check.mjs is covered by bash scripts/e2e.sh` → `grep -q 'ok markup' /tmp/claude-1000/-home-chase-projects-gitter/2e122f62-61e6-4fe5-b944-f5546ee8dfc9/scratchpad/e2e-t0085.log && grep -q '^exit 0' /tmp/claude-1000/-home-chase-projects-gitter/2e122f62-61e6-4fe5-b944-f5546ee8dfc9/scratchpad/e2e-t0085.log`
 - 2026-10-22T23:18:24Z done
+- 2026-10-22T23:18:24Z committed 713cf0e (17 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

@@ -117,11 +117,10 @@ impl User {
     }
     /// Name and email used for commits made through the web.
     pub fn signature(&self) -> (String, String) {
-        let name = if self.display_name.trim().is_empty() {
-            self.username.clone()
-        } else {
-            self.display_name.clone()
-        };
+        // A name that fits on one line of a commit: no line breaks or other controls (which could
+        // add trailer lines), no angle brackets (which end it early).
+        let clean: String = self.display_name.chars().filter(|c| !matches!(c, '<' | '>')).map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let name = if clean.trim().is_empty() { self.username.clone() } else { clean.trim().to_string() };
         // The account email stays private: web commits use a stable no-reply address.
         (
             name,

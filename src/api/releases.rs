@@ -325,10 +325,8 @@ async fn check_target(st: &AppState, r: &Repo, raw: &str) -> R<(String, String)>
 /// Point `refs/tags/<tag>` at a new annotated tag of commit `sha`, unless the tag appears meanwhile. Returns the tag object; `announce_tag` it once kept.
 pub async fn make_tag(st: &AppState, r: &Repo, u: &User, tag: &str, sha: &str, title: &str) -> R<String> {
     crate::mirrors::refuse_writes(r)?;
+    // mktag checks the object strictly; the signature has no angle brackets or line breaks.
     let (name, email) = u.signature();
-    // mktag checks the object strictly: no angle brackets or line breaks in the name, no NULs.
-    let name: String = name.chars().filter(|c| !matches!(c, '<' | '>' | '\n' | '\r' | '\0')).collect();
-    let name = if name.trim().is_empty() { u.username.clone() } else { name.trim().to_string() };
     let obj = format!("object {sha}\ntype commit\ntag {tag}\ntagger {name} <{email}> {} +0000\n\n{}\n", now(), title.replace('\0', ""));
     let oid = st.git.ok_env(&r.path, &["mktag"], Some(obj.as_bytes()), &[]).await?;
     let refname = format!("refs/tags/{tag}");

@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-22T22:55:46Z
 updated: 2026-10-22T22:55:46Z
+group: issues status read path
 ---
 # - `issues.rs:625-648`: a read-only status GET writes merged state, so the hand-merge path
 ## Raw request

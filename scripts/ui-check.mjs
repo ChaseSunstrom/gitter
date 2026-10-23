@@ -1213,5 +1213,55 @@ if ((await (await ctx.request.get(BASE + '/api/me/signing-keys')).json()).keys.l
   else console.log('  ok markup: the Labels block is its own, the Star button has aria-pressed');
 }
 
+// Editing together: alice and nina open one file with ?together=1, type at once at both ends, end
+// with the same text and see each other; alice commits it, and the commit credits nina.
+{
+  const errors = [], steps = [];
+  const ninaCtx = await browser.newContext();
+  const watch = (p) => { p.on('pageerror', (e) => errors.push(String(e))); p.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); }); };
+  try {
+    const api = (path, method, data) => ctx.request.fetch(BASE + path, { method, headers: { Origin: BASE }, data });
+    await api('/api/repos/alice/hello/collaborators/nina', 'PUT', { role: 'write' });
+    await api('/api/repos/alice/hello/contents', 'POST', { branch: 'main', message: 'Start notes', changes: [{ path: 'TOGETHER.md', content: 'notes\n' }] });
+    await ninaCtx.request.post(BASE + '/api/auth/login', { headers: { Origin: BASE }, data: { login: 'nina', password: 'nina horse battery' } }); // pragma: allowlist secret
+    const a = await ctx.newPage(), n = await ninaCtx.newPage();
+    watch(a); watch(n);
+    const url = BASE + '/alice/hello/edit/main/TOGETHER.md?together=1';
+    // The session's event stream stays open, so the network never goes quiet.
+    await a.goto(url, { waitUntil: 'load' });
+    // nina starts typing alone, then joins: what she typed is kept and reaches alice.
+    await n.goto(url.replace('?together=1', ''), { waitUntil: 'load' });
+    await n.click('#ed-text'); await n.keyboard.press('Control+Home'); await n.keyboard.type('draft ');
+    await n.click('#ed-together');
+    for (const p of [a, n]) await p.waitForFunction(() => document.querySelectorAll('#ed-people .ed-who').length === 2 && !document.querySelector('#ed-text').readOnly, null, { timeout: 8000 });
+    await a.waitForFunction(() => document.querySelector('#ed-text').value.startsWith('draft notes'), null, { timeout: 8000 });
+    if (!await a.$('#ed-people [aria-label="nina"]')) throw new Error('no named avatar for nina');
+    steps.push('both joined, keeping what nina typed first');
+    await a.click('#ed-text'); await a.keyboard.press('Control+Home');
+    await n.click('#ed-text'); await n.keyboard.press('Control+End');
+    await Promise.all([a.keyboard.type('alice was here ', { delay: 15 }), n.keyboard.type('and nina too 😀', { delay: 15 })]);
+    const both = () => { const v = document.querySelector('#ed-text').value; return v.includes('alice was here') && v.includes('and nina too 😀'); };
+    await a.waitForFunction(both, null, { timeout: 8000 });
+    await n.waitForFunction(both, null, { timeout: 8000 });
+    await a.waitForTimeout(500);
+    const [ta, tn] = await Promise.all([a.$eval('#ed-text', (e) => e.value), n.$eval('#ed-text', (e) => e.value)]);
+    if (ta !== tn) throw new Error(`different texts: ${JSON.stringify(ta)} vs ${JSON.stringify(tn)}`);
+    steps.push('typed at once and ended the same');
+    await n.click('#ed-text');
+    await a.locator('.ed-peers .ed-peer[data-name="nina"]').waitFor({ state: 'attached', timeout: 5000 });
+    steps.push("saw nina's cursor");
+    await a.waitForFunction(() => document.querySelector('#cm-credit')?.textContent.includes('nina'), null, { timeout: 5000 });
+    await a.fill('#cm-msg', 'Written together');
+    await Promise.all([a.waitForURL(/\/blob\//, { timeout: 10000 }), a.click('#cm-go')]);
+    const log = await (await ctx.request.get(BASE + '/api/repos/alice/hello/commits?rev=main')).json();
+    if (!String(log.commits[0].body).includes('Co-authored-by: nina')) throw new Error(`no co-author: ${JSON.stringify(log.commits[0])}`);
+    steps.push('committed, crediting nina');
+    await a.close(); await n.close();
+  } catch (e) { errors.push(String(e)); }
+  await ninaCtx.close();
+  if (errors.length || steps.length < 4) { failed++; console.log('✗ editing together', { steps, errors }); }
+  else console.log(`  ok editing together: ${steps.join(', ')}`);
+}
+
 await browser.close();
 if (failed) { console.log(`${failed} page check(s) failed`); process.exit(1); }

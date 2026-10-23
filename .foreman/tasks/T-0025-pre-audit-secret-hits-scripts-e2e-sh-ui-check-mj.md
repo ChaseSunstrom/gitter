@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-21T18:07:05Z
 updated: 2026-10-21T18:07:05Z
+group: storage quota accounting gaps
 ---
 # Pre-audit "secret" hits (scripts/e2e.sh, ui-check.mjs) are test credentials, so dismiss th
 ## Raw request

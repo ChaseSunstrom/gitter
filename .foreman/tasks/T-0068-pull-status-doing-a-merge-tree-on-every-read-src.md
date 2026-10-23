@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-22T02:17:11Z
 updated: 2026-10-22T02:17:11Z
+group: issues status read path
 ---
 # Pull_status` doing a `merge_tree` on every read (src/api/issues.rs:417) is a general hot-p
 ## Raw request

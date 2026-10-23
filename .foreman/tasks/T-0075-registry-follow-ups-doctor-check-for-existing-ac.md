@@ -9,6 +9,7 @@ depends_on: []
 source: discovered
 created: 2026-10-22T03:19:50Z
 updated: 2026-10-22T22:55:47Z
+group: container registry follow-ups
 ---
 # Registry follow-ups: doctor check for existing accounts named v2 or mcp (shadowed by route
 ## Raw request

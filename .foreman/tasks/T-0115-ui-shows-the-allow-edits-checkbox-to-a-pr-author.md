@@ -2,13 +2,13 @@
 id: T-0115
 type: FEATURE
 tier: L
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T21:52:46Z
-updated: 2026-10-22T21:52:46Z
+updated: 2026-10-22T23:18:34Z
 ---
 # UI shows the "Allow edits" checkbox to a PR author who no longer has write access to the f
 ## Raw request
@@ -27,4 +27,5 @@ updated: 2026-10-22T21:52:46Z
 ## Verification evidence
 ## Log
 - 2026-10-22T21:52:46Z created
+- 2026-10-22T23:18:34Z dropped: fixed in T-0085: the PR JSON has can_allow_edits (author who can push to the fork) and the page shows the toggle only then
 ## Follow-ups captured
