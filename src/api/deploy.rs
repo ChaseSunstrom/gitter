@@ -210,10 +210,10 @@ async fn settle(st: &AppState, job: i64, success: bool) -> R<()> {
     let Some((id, spec, closed)) = open else { return Ok(()) };
     // A pull request that's closed (or merged) by now gets no preview.
     let folder = serde_json::from_str::<crate::ci::config::Job>(&spec).ok().and_then(|j| j.preview).filter(|_| !closed);
-    let (mut status, mut why, mut token) = (if success { "success" } else { "failure" }, String::new(), None);
+    let (mut status, mut why, mut token, mut bytes) = (if success { "success" } else { "failure" }, String::new(), None, 0);
     if let (true, Some(folder)) = (success, folder) {
         match super::preview::publish(st, job, id, &folder).await {
-            Ok(t) => token = Some(t),
+            Ok((t, b)) => (token, bytes) = (Some(t), b),
             Err(e) => (status, why) = ("failure", e),
         }
     }
@@ -226,7 +226,7 @@ async fn settle(st: &AppState, job: i64, success: bool) -> R<()> {
             let (closed, preview_env) = pull_state(c, id)?;
             let token = token.filter(|_| !closed);
             if token.is_some() || !why.is_empty() {
-                c.execute("UPDATE deployments SET preview = ?2, description = ?3 WHERE id = ?1", params![id, token, why])?;
+                c.execute("UPDATE deployments SET preview = ?2, description = ?3, preview_bytes = ?4 WHERE id = ?1", params![id, token, why, bytes])?;
             }
             let mut gone = set_status(c, id, if closed && preview_env { "inactive" } else { status }, None)?;
             if published && token.is_none() {

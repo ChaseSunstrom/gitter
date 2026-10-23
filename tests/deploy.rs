@@ -274,6 +274,56 @@ async fn pull_requests_get_sandboxed_previews_that_go_away_with_them() {
     assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0), 0, "its files are gone");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preview_files_count_toward_the_owners_storage() {
+    let app = App::new();
+    let root = app.signup("root").await;
+    assert_eq!(app.req(&root, "POST", "/api/repos", Some(json!({ "name": "site", "readme": true }))).await.0, StatusCode::OK);
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    // A preview of 1.2 MB, built slowly enough to change the owner's limits while it runs.
+    let config = "on: [pull_request]
+jobs:
+  web:
+    preview: public
+    steps: [\"sleep 2 && mkdir -p public && head -c 1200000 /dev/zero > public/big.bin && echo hi > public/index.html\"]
+";
+    commit(&app, &root, "root/site", "main", None, ".gitter/ci.yml", config).await;
+    commit(&app, &root, "root/site", "main", Some("feature"), "f.txt", "one\n").await;
+    let used = || async { app.state.db.call(|c| Ok(gitter::repo::usage(c, 1)?.0)).await.unwrap() };
+    let before = used().await;
+    assert!(before < 1_000_000, "{before}");
+    let (s, v) = app.req(&root, "POST", "/api/repos/root/site/pulls", Some(json!({ "title": "F", "body": "", "head": "feature", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(settle(&app).await, "success");
+    assert_eq!(previews(&app, &root).await[0]["status"], "success");
+    let with = used().await;
+    assert!(with >= before + 1_200_000, "the preview counts: {before} -> {with}");
+
+    // Past the space left (a 1 MB quota, the account no longer unlimited), a preview is refused.
+    let mut set = app.state.settings.get();
+    set.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, set).await.unwrap();
+    commit(&app, &root, "root/site", "feature", None, "f.txt", "two\n").await;
+    for _ in 0..200 {
+        if previews(&app, &root).await.iter().any(|d| d["status"] == "in_progress") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    app.state.db.call(|c| Ok(c.execute("UPDATE users SET is_admin = 0 WHERE id = 1", [])?)).await.unwrap();
+    settle(&app).await;
+    app.state.db.call(|c| Ok(c.execute("UPDATE users SET is_admin = 1 WHERE id = 1", [])?)).await.unwrap();
+    let list = previews(&app, &root).await;
+    assert_eq!((list[0]["status"].as_str(), &list[0]["preview"]), (Some("failure"), &Value::Null), "{list:?}");
+    assert!(list[0]["description"].as_str().unwrap_or_default().contains("storage"), "{list:?}");
+    assert_eq!(std::fs::read_dir(app.state.cfg.data_dir.join("ci/previews")).unwrap().count(), 1, "only the first one's files");
+
+    // Closed, its preview's bytes are released.
+    assert_eq!(app.req(&root, "PATCH", "/api/repos/root/site/issues/1", Some(json!({ "state": "closed" }))).await.0, StatusCode::OK);
+    let after = used().await;
+    assert!(after < 1_000_000, "released: {with} -> {after}");
+}
+
 #[tokio::test]
 async fn a_run_an_agent_started_gets_no_environment_secrets() {
     let World { app, alice, .. } = world().await;

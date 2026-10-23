@@ -1066,6 +1066,10 @@ const MIGRATIONS: &[&str] = &[
         expires_at INTEGER NOT NULL
     );
     "#,
+    // v34: the bytes of a deployment's preview files, counted in its owner's storage while it has one.
+    r#"
+    ALTER TABLE deployments ADD COLUMN preview_bytes INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Db {

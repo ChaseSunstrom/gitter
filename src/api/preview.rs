@@ -26,17 +26,24 @@ pub async fn remove(st: &AppState, ids: Vec<i64>) {
     }
 }
 
-/// Publish `folder` of job `job`'s artifacts as deployment `id`'s preview: its new token.
-pub async fn publish(st: &AppState, job: i64, id: i64, folder: &str) -> Result<String, String> {
+/// Publish `folder` of job `job`'s artifacts as deployment `id`'s preview, within the space its
+/// repository's owner has left: its new token and how many bytes its files take.
+pub async fn publish(st: &AppState, job: i64, id: i64, folder: &str) -> Result<(String, i64), String> {
+    let owner: i64 = st
+        .db
+        .call(move |c| Ok(c.query_row("SELECT r.owner_id FROM deployments d JOIN repos r ON r.id = d.repo_id WHERE d.id = ?1", [id], |r| r.get(0))?))
+        .await
+        .map_err(|e| e.msg)?;
+    let room = crate::repo::storage_left(st, owner).await.map_err(|e| e.msg)?.unwrap_or(u64::MAX);
     let tgz = crate::ci::jobs::artifact_path(&st.cfg.data_dir, job);
     let dest = dir(&st.cfg.data_dir, id);
     let tmp = dest.with_extension("new");
     let f = folder.to_string();
-    let n = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+    let (n, bytes) = tokio::task::spawn_blocking(move || -> std::io::Result<(usize, u64)> {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
-        let n = extract(&tgz, &f, &tmp);
-        if !matches!(n, Ok(1..)) {
+        let n = extract(&tgz, &f, &tmp, room);
+        if !matches!(n, Ok((1.., _))) {
             let _ = std::fs::remove_dir_all(&tmp);
             return n;
         }
@@ -50,12 +57,12 @@ pub async fn publish(st: &AppState, job: i64, id: i64, folder: &str) -> Result<S
     if n == 0 {
         return Err(format!("{folder} had no files to preview"));
     }
-    Ok(crate::auth::new_secret("").0)
+    Ok((crate::auth::new_secret("").0, bytes as i64))
 }
 
 /// Copy the regular files under `folder/` in the .tar.gz at `tgz` into `dest`, up to the
-/// artifacts' own size cap. How many.
-fn extract(tgz: &FsPath, folder: &str, dest: &FsPath) -> std::io::Result<usize> {
+/// artifacts' own size cap and `room` bytes. How many, and their bytes.
+fn extract(tgz: &FsPath, folder: &str, dest: &FsPath, room: u64) -> std::io::Result<(usize, u64)> {
     let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(tgz)?));
     let (mut n, mut total) = (0, 0u64);
     for e in ar.entries()? {
@@ -72,6 +79,9 @@ fn extract(tgz: &FsPath, folder: &str, dest: &FsPath) -> std::io::Result<usize> 
         if total > crate::ci::jobs::ARTIFACT_CAP {
             return Err(std::io::Error::other("the folder is over 1 GB"));
         }
+        if total > room {
+            return Err(std::io::Error::other("this account is out of storage"));
+        }
         let out = dest.join(rel);
         if let Some(p) = out.parent() {
             std::fs::create_dir_all(p)?;
@@ -79,7 +89,7 @@ fn extract(tgz: &FsPath, folder: &str, dest: &FsPath) -> std::io::Result<usize> 
         std::io::copy(&mut e, &mut std::fs::File::create(&out)?)?;
         n += 1;
     }
-    Ok(n)
+    Ok((n, total))
 }
 
 /// `/preview/<token>`: the folder's address ends with a slash, so its relative links work.
@@ -203,7 +213,10 @@ mod tests {
         b.into_inner().unwrap().finish().unwrap();
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
-        assert_eq!(extract(&tgz, "dist", &out).unwrap(), 2);
+        assert!(extract(&tgz, "dist", &out, 3).unwrap_err().to_string().contains("out of storage"), "4 bytes don't fit in 3");
+        std::fs::remove_dir_all(&out).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        assert_eq!(extract(&tgz, "dist", &out, 4).unwrap(), (2, 4));
         assert!(out.join("index.html").is_file() && out.join("css/a.css").is_file());
         assert!(std::fs::symlink_metadata(out.join("link")).is_err(), "no symlinks");
         assert!(!tmp.path().join("out/../distant.txt").exists() && std::fs::read_dir(&out).unwrap().count() == 2);
