@@ -274,6 +274,104 @@ async fn pull_requests_get_sandboxed_previews_that_go_away_with_them() {
     assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0), 0, "its files are gone");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preview_files_count_toward_the_owners_storage() {
+    let app = App::new();
+    let root = app.signup("root").await;
+    assert_eq!(app.req(&root, "POST", "/api/repos", Some(json!({ "name": "site", "readme": true }))).await.0, StatusCode::OK);
+    tokio::spawn(gitter::ci::runner::builtin(app.state.clone()));
+    // A preview of 1.2 MB.
+    let config = "on: [pull_request]
+jobs:
+  web:
+    preview: public
+    steps: [\"mkdir -p public && head -c 1200000 /dev/zero > public/big.bin && echo hi > public/index.html\"]
+";
+    commit(&app, &root, "root/site", "main", None, ".gitter/ci.yml", config).await;
+    commit(&app, &root, "root/site", "main", Some("feature"), "f.txt", "one\n").await;
+    let used = || async { app.state.db.call(|c| Ok(gitter::repo::usage(c, 1)?.0)).await.unwrap() };
+    let before = used().await;
+    assert!(before < 1_000_000, "{before}");
+    let (s, v) = app.req(&root, "POST", "/api/repos/root/site/pulls", Some(json!({ "title": "F", "body": "", "head": "feature", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(settle(&app).await, "success");
+    assert_eq!(previews(&app, &root).await[0]["status"], "success");
+    let with = used().await;
+    assert!(with >= before + 1_200_000, "the preview counts: {before} -> {with}");
+
+    // Room for one preview but not two: 2 MB, the account no longer unlimited (the built-in
+    // runner only runs an admin's jobs, so from here on previews are published directly).
+    let mut set = app.state.settings.get();
+    set.max_storage_mb = 2;
+    app.state.settings.save(&app.state.db, set).await.unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE users SET is_admin = 0 WHERE id = 1", [])?)).await.unwrap();
+
+    // The same job's preview again, as a second deployment of the pull request that's just
+    // finished building.
+    let again = || async {
+        let job: i64 = app
+            .state
+            .db
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO deployments (repo_id, environment_id, ref, sha, creator_id, job_id, pr_number, status, created_at, updated_at)
+                     SELECT repo_id, environment_id, ref, sha, creator_id, job_id, pr_number, 'in_progress', created_at, updated_at + 1 FROM deployments WHERE preview IS NOT NULL",
+                    [],
+                )?;
+                Ok(c.query_row("SELECT job_id FROM deployments WHERE status = 'in_progress'", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        gitter::api::deploy::job_finished(&app.state, job, true).await;
+        previews(&app, &root).await
+    };
+    // A replacement isn't blocked by the preview it replaces.
+    let list = again().await;
+    assert_eq!((list[0]["status"].as_str(), list[1]["status"].as_str(), &list[1]["preview"]), (Some("success"), Some("inactive"), &Value::Null), "{list:?}");
+    let with = used().await;
+    assert!(with < 2_000_000, "counted once: {with}");
+
+    // Past the space left (1 MB now), a preview is refused.
+    let mut set = app.state.settings.get();
+    set.max_storage_mb = 1;
+    app.state.settings.save(&app.state.db, set).await.unwrap();
+    let list = again().await;
+    assert_eq!((list[0]["status"].as_str(), &list[0]["preview"]), (Some("failure"), &Value::Null), "{list:?}");
+    assert!(list[0]["description"].as_str().unwrap_or_default().contains("storage"), "{list:?}");
+    assert_eq!(std::fs::read_dir(app.state.cfg.data_dir.join("ci/previews")).unwrap().count(), 1, "only the live one's files");
+
+    // Closed, its preview's bytes are released.
+    assert_eq!(app.req(&root, "PATCH", "/api/repos/root/site/issues/1", Some(json!({ "state": "closed" }))).await.0, StatusCode::OK);
+    let after = used().await;
+    assert!(after < 1_000_000, "released: {with} -> {after}");
+}
+
+#[tokio::test]
+async fn the_sweep_stops_counting_a_preview_whose_files_are_gone() {
+    let app = App::new();
+    let root = app.signup("root").await;
+    assert_eq!(app.req(&root, "POST", "/api/repos", Some(json!({ "name": "site" }))).await.0, StatusCode::OK);
+    let used = || async { app.state.db.call(|c| Ok(gitter::repo::usage(c, 1)?.0)).await.unwrap() };
+    app.state
+        .db
+        .call(|c| {
+            c.execute("INSERT INTO environments (repo_id, name, created_at) VALUES (1, 'preview/pr-1', 0)", [])?;
+            c.execute(
+                "INSERT INTO deployments (repo_id, environment_id, ref, sha, status, preview, preview_bytes, created_at, updated_at)
+                 VALUES (1, 1, 'f', 'x', 'success', 'tok', 5000000, 0, ?1)",
+                [gitter::db::now()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(used().await >= 5_000_000);
+    gitter::api::preview::sweep(&app.state).await;
+    let preview: Option<String> = app.state.db.call(|c| Ok(c.query_row("SELECT preview FROM deployments", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(preview, None);
+    assert!(used().await < 5_000_000);
+}
+
 #[tokio::test]
 async fn a_run_an_agent_started_gets_no_environment_secrets() {
     let World { app, alice, .. } = world().await;

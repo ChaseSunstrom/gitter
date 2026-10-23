@@ -2322,6 +2322,23 @@ async fn rename_transfer_redirects_old_urls_and_needs_acceptance() {
     app.state.db.call(|c| Ok(c.execute("UPDATE repos SET size_bytes = 2000000 WHERE name = 'renamed'", [])?)).await.unwrap();
     let (s, e) = app.req(&bob, "POST", &accept, None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "over the storage quota: {e}");
+    // Its live pull request previews move with it and count too.
+    app.state
+        .db
+        .call(|c| {
+            c.execute("UPDATE repos SET size_bytes = 1000 WHERE name = 'renamed'", [])?;
+            c.execute("INSERT INTO environments (repo_id, name, created_at) SELECT id, 'preview/pr-1', 0 FROM repos WHERE name = 'renamed'", [])?;
+            c.execute(
+                "INSERT INTO deployments (repo_id, environment_id, ref, sha, status, preview, preview_bytes, created_at, updated_at)
+                 SELECT repo_id, id, 'f', 'x', 'success', 'tok', 2000000, 0, 0 FROM environments WHERE name = 'preview/pr-1'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (s, e) = app.req(&bob, "POST", &accept, None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "its preview is over the storage quota: {e}");
     set.max_storage_mb = 0;
     app.state.settings.save(&app.state.db, set).await.unwrap();
     let (s, e) = app.req(&bob, "POST", &accept, None).await;

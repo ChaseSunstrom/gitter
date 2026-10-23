@@ -219,7 +219,7 @@ pub async fn accept(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp,
         .call(move |c| {
             let tx = c.transaction()?;
             // Offered to you, or to an organization you own. Its size there: the folder,
-            // the wiki, release files and the LFS files that account doesn't hold yet.
+            // the wiki, release files, live previews and the LFS files that account doesn't hold yet.
             let row: Option<(i64, String, i64, String, String, i64)> = tx
                 .query_row(
                     "SELECT r.owner_id, fu.username, t.to_id, tu.username, r.name, r.size_bytes + r.wiki_bytes
@@ -228,6 +228,7 @@ pub async fn accept(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp,
                         + COALESCE((SELECT sum(a.size) FROM release_assets a JOIN releases rl ON rl.id = a.release_id WHERE rl.repo_id = r.id), 0)
                         + COALESCE((SELECT sum(size) FROM registry_blobs
                             WHERE repo_id = r.id AND digest NOT IN (SELECT b.digest FROM registry_blobs b JOIN repos x ON x.id = b.repo_id WHERE x.owner_id = t.to_id)), 0)
+                        + COALESCE((SELECT sum(preview_bytes) FROM deployments WHERE repo_id = r.id AND preview IS NOT NULL), 0)
                      FROM repo_transfers t JOIN repos r ON r.id = t.repo_id JOIN users fu ON fu.id = r.owner_id JOIN users tu ON tu.id = t.to_id
                      WHERE t.repo_id = ?1 AND t.expires_at > ?3 AND r.deleted_at IS NULL AND r.owner_id = t.from_id
                        AND (t.to_id = ?2 OR t.to_id IN (SELECT org_id FROM org_members WHERE user_id = ?2 AND role = 'owner'))",

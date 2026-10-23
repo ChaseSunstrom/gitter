@@ -1096,6 +1096,11 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE (repo_id, branch, number)
     );
     "#,
+    // v35: the bytes of a deployment's preview files, counted in its owner's storage while it has one.
+    // Previews already live count 0 until their next publish replaces them.
+    r#"
+    ALTER TABLE deployments ADD COLUMN preview_bytes INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Db {
