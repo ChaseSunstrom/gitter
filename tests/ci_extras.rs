@@ -393,9 +393,10 @@ async fn retention_sweep_deletes_test_results_of_jobs_finished_before_the_artifa
         .call(move |c| {
             let repo: i64 = c.query_row("SELECT id FROM repos WHERE name = 'r'", [], |r| r.get(0))?;
             for (number, (name, status, finished)) in [("old", "success", Some(old)), ("recent", "success", Some(recent)), ("rerun", "running", None)].into_iter().enumerate() {
+                let sha = ["a", "b", "c"][number].repeat(40);
                 c.execute(
-                    "INSERT INTO ci_runs(repo_id, number, event, ref, sha, status, created_at) VALUES (?1, ?2, 'push', 'refs/heads/main', 'abc', 'success', ?3)",
-                    rusqlite::params![repo, number as i64 + 1, old],
+                    "INSERT INTO ci_runs(repo_id, number, event, ref, sha, status, created_at) VALUES (?1, ?2, 'push', 'refs/heads/main', ?4, 'success', ?3)",
+                    rusqlite::params![repo, number as i64 + 1, old, sha],
                 )?;
                 let run = c.last_insert_rowid();
                 c.execute(
@@ -408,6 +409,14 @@ async fn retention_sweep_deletes_test_results_of_jobs_finished_before_the_artifa
                     c.execute(
                         "INSERT INTO ci_test_results(job_id, current, repo_id, sha, job, suite, name, status) VALUES (?1, ?2, ?3, 'abc', ?4, 's', ?5, 'failed')",
                         rusqlite::params![job, current, repo, name, format!("{name}{current}")],
+                    )?;
+                }
+                if name == "old" {
+                    // More rows than one sweep batch holds.
+                    c.execute(
+                        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6000)
+                         INSERT INTO ci_test_results(job_id, current, repo_id, sha, job, suite, name, status) SELECT ?1, 0, ?2, 'abc', 'old', 's', 'bulk' || i, 'failed' FROM n",
+                        rusqlite::params![job, repo],
                     )?;
                 }
             }
@@ -432,6 +441,12 @@ async fn retention_sweep_deletes_test_results_of_jobs_finished_before_the_artifa
     let (s, t) = app.req(&admin, "GET", "/api/repos/root1/r/ci/runs/1/tests", None).await;
     assert_eq!(s, StatusCode::OK, "{t}");
     assert_eq!((t["jobs"][0]["failed"].as_i64(), t["results"].as_array().map(Vec::len), &t["expired"]), (Some(1), Some(0), &json!(true)), "{t}");
+    assert_eq!(t["retention_days"].as_i64(), Some(gitter::ci::jobs::ARTIFACT_DAYS), "{t}");
+    // The pull request box's report says the same for the old commit, and not for a recent one.
+    let (_, r) = app.req(&admin, "GET", &format!("/api/repos/root1/r/ci/report?sha={}", "a".repeat(40)), None).await;
+    assert_eq!((r["failed"].as_i64(), r["annotations"].as_array().map(Vec::len), &r["expired"]), (Some(1), Some(0), &json!(true)), "{r}");
+    let (_, r) = app.req(&admin, "GET", &format!("/api/repos/root1/r/ci/report?sha={}", "b".repeat(40)), None).await;
+    assert_eq!(r["expired"], json!(false), "{r}");
     for n in [2, 3] {
         let (_, t) = app.req(&admin, "GET", &format!("/api/repos/root1/r/ci/runs/{n}/tests"), None).await;
         assert_eq!((t["results"].as_array().map(Vec::len), &t["expired"]), (Some(1), &json!(false)), "run {n}: {t}");

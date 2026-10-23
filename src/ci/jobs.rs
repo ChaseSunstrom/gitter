@@ -159,16 +159,25 @@ pub async fn sweep(st: &AppState) -> R<usize> {
             let mut q = c.prepare("SELECT a.job_id FROM ci_artifacts a JOIN ci_jobs j ON j.id = a.job_id WHERE coalesce(j.finished_at, a.created_at) < ?1")?;
             let ids: Vec<i64> = q.query_map([cutoff], |r| r.get(0))?.collect::<Result<_, _>>()?;
             c.execute("DELETE FROM ci_artifacts WHERE job_id IN (SELECT a.job_id FROM ci_artifacts a JOIN ci_jobs j ON j.id = a.job_id WHERE coalesce(j.finished_at, a.created_at) < ?1)", [cutoff])?;
-            // Per-test results expire with the artifacts (the counts in ci_job_reports stay).
-            // A job in flight has no finished_at, so its earlier failures stay for spotting
-            // flaky tests. Scans only the rows left, which are at most ARTIFACT_DAYS old.
-            c.execute(
-                "DELETE FROM ci_test_results WHERE EXISTS (SELECT 1 FROM ci_jobs j WHERE j.id = ci_test_results.job_id AND j.finished_at < ?1)",
-                [cutoff],
-            )?;
             Ok(ids)
         })
         .await?;
+    // Per-test results expire with the artifacts (the counts in ci_job_reports stay). A job
+    // in flight has no finished_at, so its earlier failures stay for spotting flaky tests.
+    // Each hourly sweep scans the rows left; batches, each its own call, keep the first
+    // sweep after an upgrade from holding the DB thread.
+    const BATCH: usize = 5000;
+    while st
+        .db
+        .call(move |c| {
+            Ok(c.execute(
+                "DELETE FROM ci_test_results WHERE rowid IN (SELECT t.rowid FROM ci_test_results t JOIN ci_jobs j ON j.id = t.job_id WHERE j.finished_at < ?1 LIMIT ?2)",
+                [cutoff, BATCH as i64],
+            )?)
+        })
+        .await?
+        == BATCH
+    {}
     let mut gone = 0;
     for id in old {
         gone += tokio::fs::remove_file(artifact_path(&data, id)).await.is_ok() as usize;

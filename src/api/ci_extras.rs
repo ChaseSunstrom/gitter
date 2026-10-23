@@ -56,8 +56,13 @@ fn results(c: &Connection, run: i64) -> rusqlite::Result<Vec<Value>> {
     .collect()
 }
 
-/// GET …/ci/runs/{n}/tests: `{ coverage, jobs: [counts…], results: [failed and flaky tests], expired }`
-/// (`expired`: a job finished before the retention, so its per-test results were deleted).
+/// Whether a job of the run finished before the retention, so its per-test results were deleted.
+fn expired(c: &Connection, run: i64) -> rusqlite::Result<bool> {
+    let cutoff = crate::db::now() - crate::ci::jobs::ARTIFACT_DAYS * 86400;
+    c.query_row("SELECT EXISTS(SELECT 1 FROM ci_jobs WHERE run_id = ?1 AND finished_at < ?2)", [run, cutoff], |r| r.get(0))
+}
+
+/// GET …/ci/runs/{n}/tests: `{ coverage, jobs: [counts…], results: [failed and flaky tests], expired, retention_days }`.
 pub async fn run_tests(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n, number)): Path<(String, String, i64)>) -> J<Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     let id = r.id;
@@ -68,9 +73,7 @@ pub async fn run_tests(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n
                 return Ok(None);
             };
             let (jobs, coverage) = summary(c, run)?;
-            let cutoff = crate::db::now() - crate::ci::jobs::ARTIFACT_DAYS * 86400;
-            let expired: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM ci_jobs WHERE run_id = ?1 AND finished_at < ?2)", [run, cutoff], |r| r.get(0))?;
-            Ok(Some(json!({ "coverage": coverage, "jobs": jobs, "results": results(c, run)?, "expired": expired })))
+            Ok(Some(json!({ "coverage": coverage, "jobs": jobs, "results": results(c, run)?, "expired": expired(c, run)?, "retention_days": crate::ci::jobs::ARTIFACT_DAYS })))
         })
         .await?;
     out.map(Json).ok_or_else(AppError::not_found)
@@ -82,7 +85,8 @@ pub struct ReportQ {
 }
 
 /// GET …/ci/report?sha=: the newest run of a commit: its counts, coverage, and
-/// the failed tests that name a file and line (annotations for its diff).
+/// the failed tests that name a file and line (annotations for its diff), and whether
+/// they expired (`expired`, `retention_days`).
 pub async fn report(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n)): Path<(String, String)>, Query(q): Query<ReportQ>) -> J<Value> {
     let r = Repo::readable(&st, v.as_ref(), &o, &n).await?;
     if !validate::sha(&q.sha) {
@@ -107,7 +111,7 @@ pub async fn report(State(st): State<AppState>, Viewer(v): Viewer, Path((o, n)):
                     json!({ "path": t["file"], "line": t["line"], "title": title, "message": t["message"], "job": t["job"], "job_id": t["job_id"] })
                 })
                 .collect();
-            Ok(json!({ "run": number, "coverage": coverage, "tests": sum("tests"), "failed": sum("failed"), "flaky": sum("flaky"), "annotations": annotations }))
+            Ok(json!({ "run": number, "coverage": coverage, "tests": sum("tests"), "failed": sum("failed"), "flaky": sum("flaky"), "annotations": annotations, "expired": expired(c, run)?, "retention_days": crate::ci::jobs::ARTIFACT_DAYS }))
         })
         .await?;
     Ok(Json(out))
