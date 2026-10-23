@@ -8,6 +8,7 @@ pub mod demo;
 pub mod deps;
 pub mod diff;
 pub mod error;
+pub mod federation;
 pub mod git;
 pub mod hooks;
 pub mod langs;
@@ -170,6 +171,7 @@ pub fn router(st: AppState) -> Router {
         .route("/favicon.svg", get(web::favicon))
         .route("/favicon.ico", get(web::favicon))
         .route("/robots.txt", get(web::robots))
+        .route("/.well-known/gitter", get(api::federation::well_known))
         .route("/manifest.webmanifest", get(web::manifest))
         .route("/healthz", get(api::admin::healthz))
         .fallback(get(web::index))

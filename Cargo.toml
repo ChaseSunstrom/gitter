@@ -9,6 +9,8 @@ argon2 = "0.5"
 axum = "0.8"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
+# Server identity for federation (already in the tree through russh).
+ed25519-dalek = "3.0.0"
 flate2 = "1"
 futures-util = "0.3.34"
 hex = "0.4.3"

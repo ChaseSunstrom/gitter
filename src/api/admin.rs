@@ -331,6 +331,11 @@ pub async fn put_settings(
     s.instance_name = s.instance_name.trim().to_string();
     s.announcement = s.announcement.trim().to_string();
     let before = st.settings.get();
+    // Other servers reach this one at its public address, not at one that only means "here".
+    let local = crate::federation::origin(&st.cfg.url).is_none_or(|o| crate::federation::host(&o).split(':').next() == Some("localhost"));
+    if s.federation && !before.federation && local {
+        return Err(AppError::bad("Set GITTER_URL to this server's public address before it works with other servers"));
+    }
     let changed = changed_fields(&before, &s);
     st.settings.save(&st.db, s).await?;
     if !changed.is_empty() {

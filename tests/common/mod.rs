@@ -23,6 +23,11 @@ pub struct Client(pub Option<String>);
 
 impl App {
     pub fn new() -> App {
+        App::with_url(ORIGIN)
+    }
+
+    /// A server whose public address is `url` (one that listens there, for other servers).
+    pub fn with_url(url: &str) -> App {
         // Git runs the built binary as the pre-receive hook (branch rules).
         let _ = gitter::protect::HOOK_EXE.set(env!("CARGO_BIN_EXE_gitter").into());
         let dir = tempfile::tempdir().unwrap();
@@ -32,7 +37,7 @@ impl App {
         let cfg = Config {
             data_dir: dir.path().to_path_buf(),
             addr: String::new(),
-            url: ORIGIN.into(),
+            url: url.into(),
             secure_cookies: false,
             trust_proxy: false,
             signup: SignupMode::Open,
