@@ -147,8 +147,8 @@ pub async fn finish(st: &AppState, job: i64, token: &str, success: bool, code: O
 }
 
 /// Hourly: delete logs and artifacts whose job is gone (its repository was
-/// deleted), artifacts past ARTIFACT_DAYS, and artifact rows whose file is missing
-/// (backups don't carry CI files).
+/// deleted), artifacts and earlier attempts' test results past ARTIFACT_DAYS, and
+/// artifact rows whose file is missing (backups don't carry CI files).
 pub async fn sweep(st: &AppState) -> R<usize> {
     crate::api::preview::sweep(st).await;
     let data = st.cfg.data_dir.clone();
@@ -159,6 +159,13 @@ pub async fn sweep(st: &AppState) -> R<usize> {
             let mut q = c.prepare("SELECT a.job_id FROM ci_artifacts a JOIN ci_jobs j ON j.id = a.job_id WHERE coalesce(j.finished_at, a.created_at) < ?1")?;
             let ids: Vec<i64> = q.query_map([cutoff], |r| r.get(0))?.collect::<Result<_, _>>()?;
             c.execute("DELETE FROM ci_artifacts WHERE job_id IN (SELECT a.job_id FROM ci_artifacts a JOIN ci_jobs j ON j.id = a.job_id WHERE coalesce(j.finished_at, a.created_at) < ?1)", [cutoff])?;
+            // Earlier attempts' test results expire with the artifacts; each job's latest
+            // (current) results stay, since run pages show them. A job in flight has no
+            // finished_at, so its earlier failures stay for spotting flaky tests.
+            c.execute(
+                "DELETE FROM ci_test_results WHERE current = 0 AND job_id IN (SELECT id FROM ci_jobs WHERE finished_at < ?1)",
+                [cutoff],
+            )?;
             Ok(ids)
         })
         .await?;

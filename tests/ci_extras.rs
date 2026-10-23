@@ -378,3 +378,49 @@ printf '\\377\\376' > out/b.xml
     let id2: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM ci_caches", [], |r| r.get(0))?)).await.unwrap();
     assert!(id2 != id && cache::path(&app.state.cfg.data_dir, id2).exists(), "saved again under a new id");
 }
+
+#[tokio::test]
+async fn retention_sweep_prunes_old_attempts_test_results_but_keeps_each_jobs_latest() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r" }))).await;
+    let old = gitter::db::now() - (gitter::ci::jobs::ARTIFACT_DAYS + 1) * 86400;
+    let recent = gitter::db::now() - 86400;
+    // Jobs: finished past the retention, finished recently, and an old one being re-run (not finished).
+    app.state
+        .db
+        .call(move |c| {
+            let repo: i64 = c.query_row("SELECT id FROM repos WHERE name = 'r'", [], |r| r.get(0))?;
+            c.execute("INSERT INTO ci_runs(repo_id, number, event, ref, sha, status, created_at) VALUES (?1, 1, 'push', 'refs/heads/main', 'abc', 'success', ?2)", rusqlite::params![repo, old])?;
+            let run = c.last_insert_rowid();
+            for (name, status, finished) in [("old", "success", Some(old)), ("recent", "success", Some(recent)), ("rerun", "running", None)] {
+                c.execute(
+                    "INSERT INTO ci_jobs(run_id, name, key, spec, status, created_at, finished_at) VALUES (?1, ?2, ?2, '{}', ?3, ?4, ?5)",
+                    rusqlite::params![run, name, status, old, finished],
+                )?;
+                let job = c.last_insert_rowid();
+                for current in [0, 1] {
+                    c.execute(
+                        "INSERT INTO ci_test_results(job_id, current, repo_id, sha, job, suite, name, status) VALUES (?1, ?2, ?3, 'abc', ?4, 's', ?5, 'failed')",
+                        rusqlite::params![job, current, repo, name, format!("{name}{current}")],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // A second sweep finds nothing more to drop.
+    gitter::ci::jobs::sweep(&app.state).await.unwrap();
+    gitter::ci::jobs::sweep(&app.state).await.unwrap();
+    let names: Vec<String> = app
+        .state
+        .db
+        .call(|c| {
+            let mut q = c.prepare("SELECT name FROM ci_test_results ORDER BY name")?;
+            Ok(q.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(names, ["old1", "recent0", "recent1", "rerun0", "rerun1"], "only the old job's earlier attempt goes");
+}
