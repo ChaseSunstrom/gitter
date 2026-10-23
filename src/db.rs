@@ -1101,6 +1101,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE deployments ADD COLUMN preview_bytes INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v36: an import keeps the source repository's default branch.
+    r#"
+    ALTER TABLE import_items ADD COLUMN default_branch TEXT NOT NULL DEFAULT '';
+    "#,
 ];
 
 impl Db {

@@ -2,13 +2,13 @@
 id: T-0056
 type: FEATURE
 tier: L
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T00:34:21Z
-updated: 2026-10-22T00:34:21Z
+updated: 2026-10-23T13:44:05Z
 ---
 # - The dashboard "mine" list (src/api/account.rs:696) only shows repos you own, so repos sh
 ## Raw request
@@ -27,4 +27,5 @@ updated: 2026-10-22T00:34:21Z
 ## Verification evidence
 ## Log
 - 2026-10-22T00:34:21Z created
+- 2026-10-23T13:44:05Z dropped: done: the dashboard query (src/api/account.rs, repo_cards) lists owned, collaborator and org-member repositories through VISIBLE
 ## Follow-ups captured

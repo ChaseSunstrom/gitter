@@ -198,6 +198,7 @@ struct Listed {
     private: bool,
     description: String,
     remote_id: String,
+    default_branch: String,
 }
 
 /// The source's repositories (at most MAX_REPOS, and whether there were more): a user's own
@@ -236,6 +237,7 @@ async fn list(src: &Source, source: &str) -> Result<(Vec<Listed>, bool), String>
                     private: r["private"] == true,
                     description: text(&r["description"]),
                     remote_id: String::new(),
+                    default_branch: text(&r["default_branch"]),
                 },
                 Kind::GitLab => Listed {
                     path: text(&r["path_with_namespace"]),
@@ -243,6 +245,7 @@ async fn list(src: &Source, source: &str) -> Result<(Vec<Listed>, bool), String>
                     private: r["visibility"] != "public",
                     description: text(&r["description"]),
                     remote_id: r["id"].as_i64().map(|n| n.to_string()).unwrap_or_default(),
+                    default_branch: text(&r["default_branch"]),
                 },
             };
             if !l.path.is_empty() && out.len() < MAX_REPOS {
@@ -337,6 +340,8 @@ struct Item {
     base_url: String,
     token: Option<String>,
     allow_private: bool,
+    /// The source's default branch ('' when it didn't say).
+    default_branch: String,
 }
 
 enum Flow {
@@ -358,7 +363,7 @@ fn claim(c: &mut rusqlite::Connection) -> rusqlite::Result<Option<Item>> {
     let item = tx
         .query_row(
             "SELECT i.id, i.job_id, j.user_id, i.source, i.remote_id, i.name, i.private, i.description, j.owner_id, i.repo_id, i.stage, i.cursor,
-                    i.number_offset, j.kind, j.base_url, j.token, j.allow_private, i.pages, i.tries
+                    i.number_offset, j.kind, j.base_url, j.token, j.allow_private, i.pages, i.tries, i.default_branch
              FROM import_items i JOIN import_jobs j ON j.id = i.job_id
              WHERE j.state = 'running' AND i.stage NOT IN ('done', 'failed') AND i.next_at <= ?1 AND i.running_until < ?1
              ORDER BY j.updated_at, i.next_at, i.id LIMIT 1",
@@ -383,6 +388,7 @@ fn claim(c: &mut rusqlite::Connection) -> rusqlite::Result<Option<Item>> {
                     token: r.get(15)?,
                     allow_private: r.get(16)?,
                     pages: r.get(17)?,
+                    default_branch: r.get(19)?,
                     tries: r.get(18)?,
                 })
             },
@@ -537,7 +543,10 @@ async fn advance(st: &AppState, item: &Item, src: &Source) -> Result<Flow, Strin
             };
             let remote = src.remote(&item.path);
             match crate::mirrors::pull(st, repo, &remote, extra).await {
-                Ok(()) => Ok(Flow::Next),
+                Ok(()) => {
+                    keep_default(st, repo, &item.default_branch).await;
+                    Ok(Flow::Next)
+                }
                 // A dropped connection or a stall may go next time; mirrors' errors don't say which.
                 Err(e) => Ok(Flow::Retry(crate::mirrors::clean(&e, &remote))),
             }
@@ -1016,11 +1025,11 @@ pub async fn start(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp, 
         return Err(AppError::conflict("You have an import running. Wait for it to finish, or cancel it."));
     }
     let (listed, _) = list(&src, &source).await.map_err(|e| listing_error(&src, e))?;
-    let mut picked: Vec<(String, String, String, bool, String)> = vec![];
+    let mut picked: Vec<(String, String, String, bool, String, String)> = vec![];
     for want in &req.repos {
         let l = listed.iter().find(|l| l.path.eq_ignore_ascii_case(want.trim())).ok_or_else(|| AppError::bad(format!("{} isn't among {source}'s repositories", short(want, 100))))?;
         if !picked.iter().any(|p| p.0 == l.path) {
-            picked.push((l.path.clone(), l.remote_id.clone(), l.name.clone(), l.private, l.description.clone()));
+            picked.push((l.path.clone(), l.remote_id.clone(), l.name.clone(), l.private, l.description.clone(), l.default_branch.clone()));
         }
     }
     let sealed = seal_text(&st.key, &src.token);
@@ -1040,10 +1049,10 @@ pub async fn start(State(st): State<AppState>, Authed(u): Authed, ip: ClientIp, 
                 _ => e.into(),
             })?;
             let job = tx.last_insert_rowid();
-            for (path, rid, name, private, description) in picked {
+            for (path, rid, name, private, description, default) in picked {
                 tx.execute(
-                    "INSERT INTO import_items(job_id, source, remote_id, name, private, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![job, path, rid, name, private, description],
+                    "INSERT INTO import_items(job_id, source, remote_id, name, private, description, default_branch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![job, path, rid, name, private, description, default],
                 )?;
             }
             tx.commit()?;
@@ -1129,4 +1138,18 @@ mod tests {
         let a = attributed(Kind::GitHub, "oc`to @x", 0, "", "hi @alice");
         assert!(a.starts_with("*Imported from GitHub: by `octox` on 1970-01-01.*") && a.ends_with("hi @alice"), "{a}");
     }
+}
+
+/// After the copy: the source's default branch (when it has one here) is this repository's too.
+async fn keep_default(st: &AppState, repo_id: i64, branch: &str) {
+    let path = st.git.repo_path(repo_id);
+    if !crate::validate::ref_name(branch) || !matches!(st.git.resolve(&path, &format!("refs/heads/{branch}")).await, Ok(Some(_))) {
+        return;
+    }
+    if let Err(e) = st.git.set_head(&path, branch).await {
+        eprintln!("imports: HEAD of repository {repo_id}: {}", e.msg);
+        return;
+    }
+    let b = branch.to_string();
+    let _ = st.db.call(move |c| Ok(c.execute("UPDATE repos SET default_branch = ?1 WHERE id = ?2", rusqlite::params![b, repo_id])?)).await;
 }

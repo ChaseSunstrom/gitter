@@ -38,6 +38,8 @@ struct Mock {
     loop_next: bool,
     /// The next this many API calls answer 502.
     flaky: u32,
+    /// The source repository's default branch (main when empty).
+    default: String,
     /// Issue #4 (with a comment) exists at the source.
     extra: bool,
 }
@@ -91,7 +93,8 @@ async fn gh(State(m): State<M>, h: HeaderMap, Path(rest): Path<String>, Query(q)
     }
     let g = m.lock().unwrap();
     let api = format!("{}/api/v3", g.base);
-    let repo = json!({ "full_name": "octo/hello", "name": "hello", "private": false, "description": "Hi there", "default_branch": "main" });
+    let default = if g.default.is_empty() { "main".to_string() } else { g.default.clone() };
+    let repo = json!({ "full_name": "octo/hello", "name": "hello", "private": false, "description": "Hi there", "default_branch": default });
     if g.loop_next && rest != "user" {
         let here = format!("{api}/{rest}?per_page=100&page=1");
         return reply(json!([]), Some(here));
@@ -576,4 +579,14 @@ async fn importing_again_into_an_organization_repository_needs_its_admin() {
     drain(app).await;
     let err = text(app, "SELECT stage || ': ' || error FROM import_items ORDER BY id DESC LIMIT 1").await;
     assert!(err.starts_with("failed") && err.contains("only its admins"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sources_default_branch_stays_the_default() {
+    let w = world().await;
+    w.m.lock().unwrap().default = "feature".into();
+    start(&w, job(&w, "github", "octo", &["octo/hello"])).await;
+    drain(&w.dst).await;
+    let (_, r) = w.dst.req(&w.alice, "GET", "/api/repos/alice/hello", None).await;
+    assert_eq!(r["default_branch"].as_str(), Some("feature"), "{r}");
 }
