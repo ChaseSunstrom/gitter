@@ -778,3 +778,40 @@ async fn merge_queue_broken_config_never_lands() {
     }
     panic!("stayed in the queue");
 }
+
+#[tokio::test]
+async fn cancel_runs_follow_ups_once() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    set_ci(&app, "everyone", 0).await;
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", "on:\n  pull_request:\njobs:\n  test:\n    steps: [echo]\n").await;
+    let rule = json!({ "pattern": "main", "require_pr": false, "checks": ["test"], "merge_queue": true });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/branch-rules", Some(rule)).await.0, StatusCode::OK);
+    commit(&app, &admin, "root1/r", "main", Some("feature"), "src.txt", "x").await;
+    let (_, p) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Feature", "head": "feature", "base": "main" }))).await;
+    let number = p["number"].as_i64().unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE ci_jobs SET status = 'success'", [])?)).await.unwrap();
+    assert_eq!(app.req(&admin, "POST", &format!("/api/repos/root1/r/pulls/{number}/queue"), Some(json!({ "method": "merge" }))).await.0, StatusCode::OK);
+    let run: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT number FROM ci_runs WHERE event = 'merge_queue'", [], |r| r.get(0))?)).await.unwrap();
+    // Someone cancels the queue's test run: the queue moves on now, not at its next tick.
+    assert_eq!(app.req(&admin, "POST", &format!("/api/repos/root1/r/ci/runs/{run}/cancel"), None).await.0, StatusCode::OK);
+    let mut left = 1;
+    for _ in 0..30 {
+        left = app.state.db.call(|c| Ok(c.query_row("SELECT count(*) FROM merge_queue", [], |r| r.get(0))?)).await.unwrap();
+        if left == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(left, 0, "the cancelled run took its pull request out of the queue");
+    // Cancelling it again changes nothing and tells no one again.
+    let before = all_notes(&app).await;
+    app.req(&admin, "POST", &format!("/api/repos/root1/r/ci/runs/{run}/cancel"), None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(all_notes(&app).await, before);
+}
+
+async fn all_notes(app: &App) -> i64 {
+    app.state.db.call(|c| Ok(c.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0))?)).await.unwrap()
+}

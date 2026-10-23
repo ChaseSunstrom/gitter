@@ -278,15 +278,19 @@ pub fn release_runner(c: &mut Connection, runner_id: i64) -> rusqlite::Result<Lo
 }
 
 /// Cancel a run's unfinished jobs; a running one stops at its next heartbeat.
-pub fn cancel(c: &mut Connection, run_id: i64) -> rusqlite::Result<()> {
+/// Whether this ended the run (it was still going).
+pub fn cancel(c: &mut Connection, run_id: i64) -> rusqlite::Result<bool> {
     let tx = c.transaction()?;
+    let was: String = tx.query_row("SELECT status FROM ci_runs WHERE id = ?1", [run_id], |r| r.get(0))?;
     tx.execute(
         "UPDATE ci_jobs SET status = 'cancelled', finished_at = ?2, lease_until = NULL, token_hash = NULL
          WHERE run_id = ?1 AND status IN ('waiting', 'queued', 'running')",
         params![run_id, now()],
     )?;
     advance(&tx, run_id)?;
-    tx.commit()
+    let now_status: String = tx.query_row("SELECT status FROM ci_runs WHERE id = ?1", [run_id], |r| r.get(0))?;
+    tx.commit()?;
+    Ok(!terminal(&was) && terminal(&now_status))
 }
 
 /// Queue the failed, cancelled and lost jobs of a finished run again (and the

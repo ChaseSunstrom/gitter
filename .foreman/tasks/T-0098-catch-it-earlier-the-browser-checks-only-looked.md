@@ -2,13 +2,13 @@
 id: T-0098
 type: FEATURE
 tier: S
-status: captured
+status: dropped
 priority: normal
 scope: []
 depends_on: []
 source: followup
 created: 2026-10-22T18:06:17Z
-updated: 2026-10-22T18:06:17Z
+updated: 2026-10-23T04:43:25Z
 ---
 # Catch it earlier: the browser checks only looked for console errors and expected text, nev
 ## Raw request
@@ -26,4 +26,5 @@ updated: 2026-10-22T18:06:17Z
 ## Verification evidence
 ## Log
 - 2026-10-22T18:06:17Z created
+- 2026-10-23T04:43:25Z dropped: done: scripts/ui-check.mjs's layout block measures the main column and tabs at four widths with long content (added with T-0095)
 ## Follow-ups captured

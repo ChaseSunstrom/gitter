@@ -163,7 +163,12 @@ async fn run_id(st: &AppState, r: &Repo, number: i64) -> R<i64> {
 pub async fn cancel(State(st): State<AppState>, Authed(u): Authed, Path((o, n, number)): Path<(String, String, i64)>) -> J<Value> {
     let r = Repo::writable(&st, Some(&u), &o, &n).await?;
     let id = run_id(&st, &r, number).await?;
-    st.db.call(move |c| Ok(queue::cancel(c, id)?)).await?;
+    // Ending a run moves on what waits for it (the merge queue, auto-merge), once.
+    if st.db.call(move |c| Ok(queue::cancel(c, id)?)).await?
+        && let Err(e) = crate::ci::jobs::run_ended(&st, id).await
+    {
+        eprintln!("ci: after cancelling run {id}: {}", e.msg);
+    }
     ok()
 }
 
