@@ -36,7 +36,7 @@
 The brief lists none. I checked against the README claims:
 - Matching by provider id, not email: met (src/api/oauth.rs:656).
 - Linking and unlinking need a recent confirmation: met.
-- Provider confirmation "for accounts without a password": **not met** (see the first finding).
+- Provider confirmation "for accounts without a password": [REDACTED] met** (see the first finding).
 - State works once, expires after 10 minutes, bound to the browser: met.
 - OIDC issuer, audience, expiry and nonce checks: met.
 

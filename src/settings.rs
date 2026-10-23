@@ -58,6 +58,12 @@ pub struct Settings {
     /// Whether those servers may be at private addresses (a LAN, or several on one machine).
     #[serde(default)]
     pub federation_private: bool,
+    /// Servers (`git.example.com`, or with a port) this one never works with.
+    #[serde(default)]
+    pub federation_block: Vec<String>,
+    /// When not empty, the only servers this one works with.
+    #[serde(default)]
+    pub federation_allow: Vec<String>,
 }
 
 fn default_week() -> u32 {
@@ -117,6 +123,8 @@ impl Settings {
             transfer_offer_days: 7,
             federation: false,
             federation_private: false,
+            federation_block: vec![],
+            federation_allow: vec![],
         }
     }
 
@@ -171,6 +179,17 @@ impl Settings {
         }
         if self.announcement.chars().count() > 280 {
             return Err(AppError::bad("Keep the announcement under 280 characters"));
+        }
+        for list in [&self.federation_block, &self.federation_allow] {
+            // A host, host:port, or an address with nothing after it (a pasted repository address would match nothing).
+            let host_only = |h: &str| {
+                let h = h.trim().trim_end_matches('/');
+                let rest = h.split_once("://").map_or(h, |x| x.1);
+                !rest.is_empty() && h.len() <= 255 && !rest.contains(['/', '?', '#', '@', ' ', '\t'])
+            };
+            if list.len() > 500 || !list.iter().all(|h| host_only(h)) {
+                return Err(AppError::bad("Name servers one per line, as host or host:port, like git.example.com (up to 500)"));
+            }
         }
         Ok(())
     }
@@ -265,5 +284,24 @@ mod tests {
             max_push_bytes: 1 << 20,
             max_repos_per_user: 10,
         }
+    }
+}
+
+impl Settings {
+    /// Whether this server works with the one at `origin` (`https://git.example.com`), by the lists.
+    /// An entry names a host and port, or (without a port) a host on any port.
+    pub fn federates_with(&self, origin: &str) -> bool {
+        let here = crate::federation::host(origin);
+        let bare = here.rsplit_once(':').map_or(here, |x| x.0);
+        let named = |list: &[String]| {
+            list.iter().any(|e| {
+                // Written as an address, it's read as one (so a default port means none).
+                let e = e.trim().trim_end_matches('/').to_ascii_lowercase();
+                let e = if e.contains("://") { crate::federation::origin(&e).map(|o| crate::federation::host(&o).to_string()).unwrap_or(e) } else { e };
+                let e = e.trim_end_matches('.');
+                if e.contains(':') { e == here } else { e == bare }
+            })
+        };
+        !named(&self.federation_block) && (self.federation_allow.is_empty() || named(&self.federation_allow))
     }
 }

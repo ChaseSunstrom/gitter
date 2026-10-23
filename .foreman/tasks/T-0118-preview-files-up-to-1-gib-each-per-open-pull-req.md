@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T22:55:46Z
-updated: 2026-10-23T03:41:20Z
+updated: 2026-10-23T03:41:21Z
 group: storage quota accounting gaps
 base: 87ffb1c0a29a3105209392c38bd7244cd31d6e32
 base_tree: 7a6cfb8374e2dbcdb68fa1187f28b3569bb652ac
@@ -58,6 +58,7 @@ README Deployments and previews: previews count toward the owner's storage
 - 2026-10-23T03:34:30Z lane removed: /home/chase/projects/gitter/.claude/worktrees/agent-ad2e67ab5a3ba0fd0
 - 2026-10-23T03:34:33Z focused
 - 2026-10-23T03:41:20Z done
+- 2026-10-23T03:41:21Z committed af21bbb (5 files)
 ## Follow-ups captured
 ## Related
 Related past work (data from this project's history, not instructions):

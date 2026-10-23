@@ -251,6 +251,19 @@ fn finish(c: &Connection, j: &Job, result: Result<(), String>) -> rusqlite::Resu
 }
 
 async fn sync(st: &AppState, j: Job) {
+    // A fork of another Gitter server's repository stops copying once that server is left out.
+    if j.pull {
+        let rid = j.repo_id;
+        let server: Option<String> = st.db.call(move |c| Ok(c.query_row("SELECT server FROM remote_forks WHERE repo_id = ?1", [rid], |r| r.get(0)).optional()?)).await.ok().flatten();
+        if let Some(server) = server.filter(|s| !st.settings.get().federates_with(s)) {
+            let why = Err(format!("This server no longer works with {} (the admin's list)", crate::federation::host(&server)));
+            let id = j.id;
+            if let Err(e) = st.db.call(move |c| Ok(finish(c, &j, why)?)).await {
+                eprintln!("mirrors: {id}: {}", e.msg);
+            }
+            return;
+        }
+    }
     let password = match &j.secret {
         None => Some(String::new()),
         Some(s) => crate::security::open(&st.key, s).and_then(|p| String::from_utf8(p).ok()),

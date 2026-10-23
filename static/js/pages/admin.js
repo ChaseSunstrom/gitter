@@ -200,6 +200,8 @@ async function invitesBox() {
 
 async function settings() {
   const s = await get('/admin/settings', { fresh: true });
+  const fed = s.federation ? await get('/admin/federation', { fresh: true }).catch(() => null) : null;
+  const mb = (b) => (b >= 1048576 ? `${Math.round(b / 1048576)} MB` : `${Math.ceil(b / 1024)} KB`);
   return html`<form class="box" id="site-settings"><div class="box-body settings-sec" style="max-width:640px">
     <div class="field"><label for="s-name">Instance name</label><input id="s-name" class="input" value="${s.instance_name}" maxlength="40" required>
       <span class="hint">Shown in the browser tab and the top bar.</span></div>
@@ -233,7 +235,17 @@ async function settings() {
     <div class="field"><span class="label">Federation</span>
       <label class="check"><input type="checkbox" id="s-fed" ${s.federation ? 'checked' : ''}> Work with other Gitter servers</label>
       <span class="hint">People here can fork public repositories from other Gitter servers that do too, and open pull requests back to them; people there can do the same with this server's public repositories. Requests between servers are signed with this server's key, published at <code>/.well-known/gitter</code>.</span>
-      <label class="check small"><input type="checkbox" id="s-fed-private" ${s.federation_private ? 'checked' : ''}> Those servers may be at private addresses (your own network)</label></div>
+      <label class="check small"><input type="checkbox" id="s-fed-private" ${s.federation_private ? 'checked' : ''}> Those servers may be at private addresses (your own network)</label>
+      <div class="row wrap-ok" style="gap:12px;align-items:flex-start">
+        <div class="field grow"><label for="s-fed-allow">Only these servers <span class="muted" style="font-weight:400">(empty: any)</span></label>
+          <textarea id="s-fed-allow" class="textarea mono" rows="3" placeholder="git.example.com">${s.federation_allow.join('\n')}</textarea></div>
+        <div class="field grow"><label for="s-fed-block">Never these servers</label>
+          <textarea id="s-fed-block" class="textarea mono" rows="3" placeholder="spam.example">${s.federation_block.join('\n')}</textarea></div>
+      </div>
+      <span class="hint">One per line, as host or host:port. A server left out can't open pull requests here, and people here can't fork from it or propose to it.</span>
+      ${fed?.servers.length ? html`<div class="box" id="fed-servers"><div class="box-head"><b>Servers with something here</b><span class="grow"></span><span class="muted small">each may bring in ${mb(fed.daily_budget)} a day</span></div>
+        ${fed.servers.map((r) => html`<div class="list-row"><span class="mono grow">${r.host}${r.allowed ? '' : html` <span class="pill">left out</span>`}</span>
+          <span class="muted small">${r.open_pulls} open pull request${r.open_pulls === 1 ? '' : 's'} · ${r.forks} fork${r.forks === 1 ? '' : 's'} from it · ${mb(r.fetched_today)} today</span></div>`)}</div>` : ''}</div>
     <div class="field"><label for="s-ann">Announcement</label><input id="s-ann" class="input" value="${s.announcement}" maxlength="280" placeholder="e.g. Maintenance on Sunday 10:00 UTC">
       <span class="hint">Shown at the top of every page. Leave empty to hide it.</span></div>
     <div><button class="btn primary" id="s-save">Save settings</button></div>
@@ -396,6 +408,8 @@ export default async function (ctx) {
           announcement: $('#s-ann', el).value.trim(),
           federation: $('#s-fed', el).checked,
           federation_private: $('#s-fed-private', el).checked,
+          federation_allow: $('#s-fed-allow', el).value.split('\n').map((x) => x.trim()).filter(Boolean),
+          federation_block: $('#s-fed-block', el).value.split('\n').map((x) => x.trim()).filter(Boolean),
         };
         const saved = await send('PUT', '/admin/settings', body);
         state.instance = { ...state.instance, name: saved.instance_name, announcement: saved.announcement, trash_days: saved.trash_days, transfer_offer_days: saved.transfer_offer_days, federation: saved.federation };

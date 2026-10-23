@@ -239,6 +239,7 @@ pub fn router() -> Router<AppState> {
         .route(&format!("{repo}/federation/fork"), post(federation::fork))
         .route(&format!("{repo}/federation/pulls"), get(federation::outgoing).post(federation::propose))
         .route("/federation/check", post(federation::check))
+        .route("/admin/federation", get(federation::servers))
         .route("/federation/pulls", post(federation::incoming))
         .route("/federation/pulls/update", post(federation::update))
         .route(&format!("{repo}/collab"), post(collab::join))

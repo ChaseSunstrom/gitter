@@ -1306,10 +1306,15 @@ if (process.env.BASE2) {
     const from = await a.locator('.branch-name', { hasText: 'zed/hello-ui:main' }).count();
     if (!from) throw new Error('the source branch on the other server is not shown');
     steps.push("alice sees it from zed, linked to zed's server");
+    // alice, an admin here, sees zed's server among those with pull requests open.
+    await a.goto(BASE + '/admin/settings', { waitUntil: 'networkidle' });
+    await a.locator('#fed-servers .list-row', { hasText: B.replace(/^https?:\/\//, '') }).waitFor({ timeout: 5000 });
+    if (!await a.$('#s-fed-block')) throw new Error('no block list on the settings page');
+    steps.push('the admin page lists the other server');
     await z.close(); await a.close();
   } catch (e) { errors.push(String(e)); }
   await zedCtx.close();
-  if (errors.length || steps.length < 4) { failed++; console.log('✗ federation', { steps, errors }); }
+  if (errors.length || steps.length < 5) { failed++; console.log('✗ federation', { steps, errors }); }
   else console.log(`  ok federation: ${steps.join(', ')}`);
 }
 

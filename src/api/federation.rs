@@ -33,10 +33,66 @@ use crate::validate;
 const KEY_TTL: Duration = Duration::from_secs(3600);
 /// Open pull requests one other server may have in a repository here.
 const MAX_OPEN: i64 = 10;
+/// What one server's forks may bring in a day (an admin's repositories have no storage quota).
+const DAILY: u64 = 2 << 30;
 
 /// This server's address, as other servers know it.
 pub fn me(st: &AppState) -> String {
     federation::origin(&st.cfg.url).unwrap_or_else(|| st.cfg.url.trim_end_matches('/').to_string())
+}
+
+fn not_with(origin: &str) -> AppError {
+    AppError::new(StatusCode::FORBIDDEN, format!("This server doesn't work with {} (its admin's list says so)", federation::host(origin)))
+}
+
+/// Refuse a server the admin's lists leave out.
+fn listed(st: &AppState, origin: &str) -> R<()> {
+    if st.settings.get().federates_with(origin) { Ok(()) } else { Err(not_with(origin)) }
+}
+
+// ponytail: kept in memory (a restart starts the day again); a table if that's ever too generous.
+static FETCHED: LazyLock<Mutex<HashMap<String, (i64, u64)>>> = LazyLock::new(Default::default);
+
+fn today() -> i64 {
+    now().div_euclid(86_400)
+}
+
+/// What came from `server` on `day`.
+fn spent(server: &str, day: i64) -> u64 {
+    lock(&FETCHED).get(server).filter(|(d, _)| *d == day).map_or(0, |(_, b)| *b)
+}
+
+fn charge(server: &str, day: i64, bytes: u64) {
+    let mut all = lock(&FETCHED);
+    all.retain(|_, (d, _)| *d == day);
+    let e = all.entry(server.to_string()).or_insert((day, 0));
+    if e.0 != day {
+        *e = (day, 0);
+    }
+    e.1 = e.1.saturating_add(bytes);
+}
+
+/// Count `bytes` against `server`'s day now (fetches do; so can tools).
+pub fn charge_today(server: &str, bytes: u64) {
+    charge(server, today(), bytes);
+}
+
+/// Fetch a branch from a fork on `server` into `dest`, counted against that server's day.
+/// Every fetch from another server comes through here, so the lists are checked here too.
+async fn fetch_from(st: &AppState, r: &Repo, server: &str, remote: &crate::mirrors::Remote, branch: &str, dest: &str) -> R<Option<String>> {
+    listed(st, server)?;
+    let day = today();
+    if spent(server, day) >= DAILY {
+        return Err(AppError::slow_down(format!("What {} may bring in today is used up", federation::host(server)), 86_400 - now().rem_euclid(86_400)));
+    }
+    let objects = r.path.join("objects");
+    let size = |p: std::path::PathBuf| async move { tokio::task::spawn_blocking(move || crate::api::admin::dir_size(&p)).await.unwrap_or(0) };
+    let before = size(objects.clone()).await;
+    let got = super::issues::fetch_remote_branch(st, r.id, remote, branch, dest).await;
+    // ponytail: growth of the objects folder, so anything else written meanwhile counts too (capped
+    // at one fetch's most); concurrent fetches can each pass the check. Fine for a daily budget.
+    charge(server, day, size(objects).await.saturating_sub(before).min(512 << 20));
+    got
 }
 
 fn off() -> AppError {
@@ -129,6 +185,8 @@ async fn signer(st: &AppState, ip: &str, headers: &HeaderMap, path: &str, body: 
         return Err(unsigned("That request's time is too far from this server's"));
     }
     lock(&SEEN).retain(|_, at| t.abs_diff(*at) <= 2 * SKEW as u64);
+    // A server left out isn't even looked up.
+    listed(st, &h.server)?;
     let cant = |e: AppError| {
         eprintln!("federation: checking a request from {}: {}", h.server, e.msg);
         unsigned("Couldn't check the signature")
@@ -217,6 +275,7 @@ async fn look_up(st: &AppState, url: &str) -> R<(String, String, String)> {
     if server == me(st) {
         return Err(AppError::bad("That repository is on this server: fork it from its page"));
     }
+    listed(st, &server)?;
     // Asked afresh: whether it works with other servers may have changed.
     if !identity(st, &server, true).await?.federation {
         return Err(AppError::new(StatusCode::FORBIDDEN, format!("{} doesn't work with other servers", federation::host(&server))));
@@ -278,6 +337,7 @@ pub async fn propose(State(st): State<AppState>, Authed(u): Authed, Path((o, n))
         return Err(off());
     }
     let (server, owner, name) = remote_fork(&st, r.id).await?.ok_or_else(|| AppError::bad("This repository isn't a fork of one on another server"))?;
+    listed(&st, &server)?;
     if r.private {
         // The other server fetches the branch from here, as anyone would.
         return Err(AppError::bad("Make the fork public first: the other server copies the branch from it"));
@@ -327,6 +387,9 @@ pub async fn pushed(st: &AppState, repo: &Repo, updates: &[crate::smart_http::Re
     }
     let rid = repo.id;
     let Ok(Some((server, owner, name))) = remote_fork(st, rid).await else { return };
+    if listed(st, &server).is_err() {
+        return;
+    }
     let rows: Vec<(i64, String, String, i64)> = st
         .db
         .call(move |c| {
@@ -434,7 +497,7 @@ pub async fn incoming(State(st): State<AppState>, ip: super::ClientIp, headers: 
     }
     let remote = source(&server, &req.fork, &st)?;
     if let Some(number) = open_from(&st, &r, &server, &req.fork, &req.branch, Some(&base), None).await? {
-        refetch(&st, &r, &remote, &req.branch, number).await?;
+        refetch(&st, &r, &server, &remote, &req.branch, number).await?;
         return Ok(Json(json!({ "number": number })));
     }
     let base_sha = st.git.resolve(&r.path, &format!("refs/heads/{base}")).await?.ok_or_else(|| AppError::bad("The target branch doesn't exist"))?;
@@ -460,7 +523,7 @@ pub async fn incoming(State(st): State<AppState>, ip: super::ClientIp, headers: 
     let opened = tokio::spawn(async move {
         let pending = format!("refs/pull/new-{}/head", crate::auth::new_secret("").0.replace(['-', '_'], "x"));
         let opened = async {
-            let head = super::issues::fetch_remote_branch(&st2, r2.id, &remote, &pull.head, &pending).await?;
+            let head = fetch_from(&st2, &r2, &server, &remote, &pull.head, &pending).await?;
             if head.is_none() {
                 return Err(AppError::bad("The source branch doesn't exist"));
             }
@@ -496,8 +559,8 @@ async fn open_from(st: &AppState, r: &Repo, server: &str, fork: &str, branch: &s
         .await
 }
 
-async fn refetch(st: &AppState, r: &Repo, remote: &crate::mirrors::Remote, branch: &str, number: i64) -> R<String> {
-    let sha = super::issues::fetch_remote_branch(st, r.id, remote, branch, &format!("refs/pull/{number}/head"))
+async fn refetch(st: &AppState, r: &Repo, server: &str, remote: &crate::mirrors::Remote, branch: &str, number: i64) -> R<String> {
+    let sha = fetch_from(st, r, server, remote, branch, &format!("refs/pull/{number}/head"))
         .await?
         .ok_or_else(|| AppError::bad("That branch isn't in the fork"))?;
     crate::mergequeue::kick(st, r.id);
@@ -513,7 +576,7 @@ pub(crate) async fn reopened(st: &AppState, r: &Repo, issue_id: i64, number: i64
     if let Ok(Some((server, fork, branch))) = found {
         let r2 = source(&server, &fork, st).map(|remote| (remote, branch));
         if let Ok((remote, branch)) = r2
-            && let Err(e) = refetch(st, r, &remote, &branch, number).await
+            && let Err(e) = refetch(st, r, &server, &remote, &branch, number).await
         {
             eprintln!("federation: {}#{number} from {server}: {}", r.full_name(), e.msg);
         }
@@ -535,13 +598,65 @@ pub async fn update(State(st): State<AppState>, ip: super::ClientIp, headers: He
     let req: Update = parse(&body)?;
     let r = target(&st, &req.repo).await?;
     let number = open_from(&st, &r, &server, &req.fork, &req.branch, None, Some(req.number)).await?.ok_or_else(AppError::not_found)?;
-    let sha = refetch(&st, &r, &source(&server, &req.fork, &st)?, &req.branch, number).await?;
+    let sha = refetch(&st, &r, &server, &source(&server, &req.fork, &st)?, &req.branch, number).await?;
     Ok(Json(json!({ "number": number, "sha": sha })))
+}
+
+/// GET /api/admin/federation: the servers this one works with, by what's here from each.
+pub async fn servers(State(st): State<AppState>, super::admin::Admin(_): super::admin::Admin) -> J<Value> {
+    let rows: Vec<(String, i64, i64)> = st
+        .db
+        .call(|c| {
+            let mut q = c.prepare(
+                "SELECT server, sum(open), sum(forks) FROM (
+                   SELECT rp.server AS server, (i.state = 'open') AS open, 0 AS forks FROM remote_pulls rp JOIN issues i ON i.id = rp.issue_id
+                   UNION ALL SELECT server, 0, 1 FROM remote_forks) GROUP BY server ORDER BY server",
+            )?;
+            Ok(q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?)
+        })
+        .await?;
+    let (s, day) = (st.settings.get(), today());
+    let list: Vec<Value> = rows
+        .into_iter()
+        .map(|(server, open, forks)| {
+            json!({ "server": server, "host": federation::host(&server), "open_pulls": open, "forks": forks,
+                "fetched_today": spent(&server, day), "allowed": s.federates_with(&server) })
+        })
+        .collect();
+    Ok(Json(json!({ "servers": list, "daily_budget": DAILY })))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_servers_day_is_counted_apart_and_starts_again() {
+        let (a, b) = ("https://budget-a.example", "https://budget-b.example");
+        charge(a, 10, DAILY - 1);
+        assert!(spent(a, 10) < DAILY);
+        charge(a, 10, 5);
+        assert!(spent(a, 10) >= DAILY, "past its budget");
+        assert_eq!(spent(b, 10), 0, "another server's day is its own");
+        assert_eq!(spent(a, 11), 0, "a new day");
+        charge(a, 11, 3);
+        assert_eq!(spent(a, 11), 3);
+    }
+
+    #[test]
+    fn lists_name_servers_by_host() {
+        let mut s = crate::settings::Settings::from_config(&crate::Config {
+            data_dir: "/x".into(), addr: String::new(), url: String::new(), secure_cookies: false, trust_proxy: false,
+            signup: crate::SignupMode::Open, max_push_bytes: 1, max_repos_per_user: 1,
+        });
+        assert!(s.federates_with("https://a.example"));
+        s.federation_block = vec!["A.example".into()];
+        assert!(!s.federates_with("https://a.example") && s.federates_with("https://b.example"));
+        s.federation_block = vec![];
+        s.federation_allow = vec!["https://b.example/".into(), "c.example:8443".into()];
+        assert!(!s.federates_with("https://a.example") && s.federates_with("https://b.example") && s.federates_with("https://c.example:8443"));
+        assert!(!s.federates_with("https://c.example"), "the port is part of the name");
+    }
 
     #[test]
     fn repository_addresses_name_a_server_and_a_repository() {

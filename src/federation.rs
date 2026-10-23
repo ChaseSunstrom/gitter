@@ -54,7 +54,8 @@ pub fn parse_key(s: &str) -> Option<VerifyingKey> {
     VerifyingKey::from_bytes(&b).ok()
 }
 
-/// A server's address as servers name each other: `scheme://host[:port]`, lower case, nothing after.
+/// A server's address as servers name each other: `scheme://host[:port]`, lower case, nothing
+/// after, without the scheme's default port or a trailing dot (so one server has one name).
 pub fn origin(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     let (scheme, rest) = url.split_once("://")?;
@@ -62,7 +63,14 @@ pub fn origin(url: &str) -> Option<String> {
     if !matches!(scheme.as_str(), "http" | "https") || rest.is_empty() || rest.contains(['/', '?', '#', '@', '\\', ' ']) {
         return None;
     }
-    Some(format!("{scheme}://{}", rest.to_ascii_lowercase()))
+    let rest = rest.to_ascii_lowercase();
+    let default = if scheme == "https" { ":443" } else { ":80" };
+    let rest = rest.strip_suffix(default).unwrap_or(&rest);
+    let rest = match rest.rsplit_once(':') {
+        Some((h, p)) if !h.ends_with(']') || p.is_empty() => format!("{}:{p}", h.trim_end_matches('.')),
+        _ => rest.trim_end_matches('.').to_string(),
+    };
+    (!rest.is_empty() && !rest.starts_with(':')).then(|| format!("{scheme}://{rest}"))
 }
 
 /// The host (and port) part of an origin: `a.example`, `127.0.0.1:8080`.
@@ -161,5 +169,10 @@ mod tests {
             assert!(origin(bad).is_none(), "{bad}");
         }
         assert_eq!(host("https://a.example"), "a.example");
+        // One server, one name: default ports and a trailing dot don't make another.
+        assert_eq!(origin("https://a.example:443").as_deref(), Some("https://a.example"));
+        assert_eq!(origin("http://a.example.:80").as_deref(), Some("http://a.example"));
+        assert_eq!(origin("https://a.example:8443").as_deref(), Some("https://a.example:8443"));
+        assert_eq!(origin("http://a.example:443").as_deref(), Some("http://a.example:443"));
     }
 }

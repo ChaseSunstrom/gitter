@@ -342,3 +342,114 @@ async fn federation_needs_the_servers_public_address() {
     assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
     assert!(v["error"].as_str().unwrap().contains("GITTER_URL"), "{v}");
 }
+
+async fn set_lists(app: &App, allow: &[&str], block: &[&str]) {
+    let mut s = app.state.settings.get();
+    s.federation_allow = allow.iter().map(|x| x.to_string()).collect();
+    s.federation_block = block.iter().map(|x| x.to_string()).collect();
+    app.state.settings.save(&app.state.db, s).await.unwrap();
+}
+
+#[tokio::test]
+async fn listed_servers_are_refused_both_ways_and_admins_see_whos_here() {
+    let (a, a_url, alice, b, b_url, bob) = forked().await;
+    commit(&b, &bob, "bob/notes", "main", "idea.md", "an idea\n").await;
+    let (s, v) = b.req(&bob, "POST", "/api/repos/bob/notes/federation/pulls", Some(json!({ "branch": "main", "title": "t" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // The admin page says who has pull requests open here, and what came from each today.
+    let (s, fed) = a.req(&alice, "GET", "/api/admin/federation", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "admins only: {fed}");
+    let (_, list) = a.req(&a_admin(&a).await, "GET", "/api/admin/federation", None).await;
+    let row = list["servers"].as_array().unwrap().iter().find(|r| r["server"] == b_url).cloned().unwrap_or_default();
+    assert_eq!(row["open_pulls"].as_i64(), Some(1), "{list}");
+    assert!(row["fetched_today"].as_u64().unwrap_or(0) > 0, "{list}");
+    let ask = json!({ "repo": "alice/none", "fork": "bob/notes", "branch": "main", "title": "t", "body": "", "author": { "username": "bob", "name": "" } });
+    let path = "/api/federation/pulls";
+    let host_b = gitter::federation::host(&b_url).to_string();
+    // Blocked here: B's requests are refused (after its signature checks out), whatever they ask.
+    set_lists(&a, &[], &[&host_b]).await;
+    assert_eq!(signed(&a, &b, &b_url, path, &ask, now()).await.0, StatusCode::FORBIDDEN);
+    // Not on a non-empty allow list: the same.
+    set_lists(&a, &["other.example"], &[]).await;
+    assert_eq!(signed(&a, &b, &b_url, path, &ask, now()).await.0, StatusCode::FORBIDDEN);
+    // On it: through (to the missing repository).
+    set_lists(&a, &[&host_b], &[]).await;
+    assert_eq!(signed(&a, &b, &b_url, path, &ask, now()).await.0, StatusCode::NOT_FOUND);
+    // And B, blocking A, neither forks from it nor proposes to it.
+    set_lists(&b, &[], &[gitter::federation::host(&a_url)]).await;
+    b.req(&bob, "POST", "/api/repos", Some(json!({ "name": "more" }))).await;
+    let (s, _) = b.req(&bob, "POST", "/api/repos/bob/more/federation/fork", Some(json!({ "url": format!("{a_url}/alice/notes") }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = b.req(&bob, "POST", "/api/repos/bob/notes/federation/pulls", Some(json!({ "branch": "main", "title": "again" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+/// The first account on `app` (an admin), signed in again.
+async fn a_admin(app: &App) -> Client {
+    let (_, _, cookie) = app.call(&Client::default(), "POST", "/api/auth/login", Some(json!({ "login": "root", "password": "correct horse" })), Some(common::ORIGIN)).await; // pragma: allowlist secret
+    Client(cookie)
+}
+
+#[tokio::test]
+async fn listed_servers_get_nothing_from_here_and_budgets_hold() {
+    let (a, a_url, alice, b, b_url, bob) = forked().await;
+    commit(&b, &bob, "bob/notes", "main", "idea.md", "an idea\n").await;
+    b.req(&bob, "POST", "/api/repos/bob/notes/federation/pulls", Some(json!({ "branch": "main", "title": "t" }))).await;
+    let before = pr_head(&a, &alice).await;
+    // A blocks B (written with the default port, which names the same server).
+    let host_b = gitter::federation::host(&b_url).to_string();
+    set_lists(&a, &[], &[&host_b]).await;
+    // A pull request reopened here doesn't fetch from it.
+    let ip = "/api/repos/alice/notes/issues/1";
+    a.req(&alice, "PATCH", ip, Some(json!({ "state": "closed" }))).await;
+    commit(&b, &bob, "bob/notes", "main", "idea.md", "while blocked\n").await;
+    a.req(&alice, "PATCH", ip, Some(json!({ "state": "open" }))).await;
+    assert_eq!(pr_head(&a, &alice).await, before, "nothing fetched from a blocked server");
+    set_lists(&a, &[], &[]).await;
+    // B, blocking A, doesn't tell it about pushes.
+    let (_, out) = b.req(&bob, "GET", "/api/repos/bob/notes/federation/pulls", None).await;
+    assert_eq!(out["pulls"].as_array().map(Vec::len), Some(1));
+    set_lists(&b, &[], &[gitter::federation::host(&a_url)]).await;
+    commit(&b, &bob, "bob/notes", "main", "idea.md", "still blocked\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(pr_head(&a, &alice).await, before, "B told A nothing");
+    set_lists(&b, &[], &[]).await;
+    // Past its budget for the day, B's updates aren't fetched.
+    gitter::api::federation::charge_today(&b_url, 3 << 30);
+    let upd = json!({ "repo": "alice/notes", "number": 1, "fork": "bob/notes", "branch": "main" });
+    assert_eq!(signed(&a, &b, &b_url, "/api/federation/pulls/update", &upd, now()).await.0, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_fork_waiting_to_copy_stops_once_its_server_is_blocked() {
+    let (a, a_url) = server(true).await;
+    a.signup("root").await;
+    let alice = a.signup("alice").await;
+    a.req(&alice, "POST", "/api/repos", Some(json!({ "name": "notes", "readme": true }))).await;
+    let (b, _) = server(true).await;
+    b.signup("root").await;
+    let bob = b.signup("bob").await;
+    b.req(&bob, "POST", "/api/repos", Some(json!({ "name": "notes" }))).await;
+    let (s, v) = b.req(&bob, "POST", "/api/repos/bob/notes/federation/fork", Some(json!({ "url": format!("{a_url}/alice/notes") }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    set_lists(&b, &[], &[gitter::federation::host(&a_url)]).await;
+    gitter::mirrors::tick(&b.state).await;
+    let (_, repo) = b.req(&bob, "GET", "/api/repos/bob/notes", None).await;
+    assert_eq!(repo["empty"].as_bool(), Some(true), "nothing copied from a blocked server: {repo}");
+}
+
+#[tokio::test]
+async fn server_lists_take_hosts_only() {
+    let app = App::new();
+    let root = app.signup("root").await;
+    let (_, mut s) = app.req(&root, "GET", "/api/admin/settings", None).await;
+    s["federation_block"] = json!(["https://spam.example/alice/notes"]);
+    let (code, v) = app.req(&root, "PUT", "/api/admin/settings", Some(s.clone())).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "a pasted repository address would block nothing: {v}");
+    s["federation_block"] = json!(["https://spam.example/", "Other.example:8443"]);
+    assert_eq!(app.req(&root, "PUT", "/api/admin/settings", Some(s)).await.0, StatusCode::OK);
+}
+
+async fn pr_head(a: &App, alice: &Client) -> String {
+    a.req(alice, "GET", "/api/repos/alice/notes/issues/1", None).await.1["pull"]["head_sha"].as_str().unwrap_or_default().to_string()
+}
