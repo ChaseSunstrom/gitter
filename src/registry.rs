@@ -162,6 +162,18 @@ fn image(name: &str) -> Option<Image> {
     Some(Image { full: name.to_string(), owner: segs[0].into(), repo: segs[1].into(), sub: segs[2..].join("/") })
 }
 
+/// Why the registry can't serve a repository: its name (lowercased, as images are
+/// named) isn't an OCI path component, or ends in `.git`, which lookups strip.
+fn unusable(owner: &str, repo: &str) -> Option<String> {
+    let (o, r) = (owner.to_ascii_lowercase(), repo.to_ascii_lowercase());
+    if r.ends_with(".git") {
+        return Some(format!("The registry doesn't take '{repo}': a name ending in .git is git's form of the repository name"));
+    }
+    (!component(&o) || !component(&r)).then(|| {
+        format!("The registry can't serve '{owner}/{repo}': image names allow only lowercase letters and digits, separated by single '.', '_', '__' or dashes (no '..' and no separator before a '.')")
+    })
+}
+
 enum Op {
     Blob(String),
     StartUpload,
@@ -383,7 +395,16 @@ async fn route(st: AppState, req: Request) -> O<Response> {
     let Some((name, op)) = parse(&path) else {
         return Err(oci(StatusCode::NOT_FOUND, "UNSUPPORTED", "There's no such registry endpoint"));
     };
-    let img = image(&name).ok_or_else(|| oci(StatusCode::BAD_REQUEST, "NAME_INVALID", "Image names are owner/repository[/name], in lowercase"))?;
+    let Some(img) = image(&name) else {
+        let why = match name.split('/').collect::<Vec<_>>()[..] {
+            [o, r, ..] => unusable(o, r),
+            _ => None,
+        };
+        return Err(oci(StatusCode::BAD_REQUEST, "NAME_INVALID", why.unwrap_or_else(|| "Image names are owner/repository[/name], in lowercase, each part following the OCI name rules".into())));
+    };
+    if let Some(why) = unusable(&img.owner, &img.repo) {
+        return Err(oci(StatusCode::BAD_REQUEST, "NAME_INVALID", why));
+    }
     let (repo, user) = open(&st, &headers, &ip, &img.owner, &img.repo).await?;
     match (method, op) {
         (m @ (Method::GET | Method::HEAD), Op::Blob(d)) => get_blob(&st, &repo, &d, m == Method::HEAD, &ip).await,
@@ -516,6 +537,7 @@ async fn start_upload(st: &AppState, repo: &Repo, user: &Option<User>, img: &Ima
     if let (Some(d), Some(from)) = (q.get("mount"), q.get("from"))
         && valid_digest(d)
         && let Some(src) = image(from)
+        && unusable(&src.owner, &src.repo).is_none()
         && let Ok(src) = Repo::find(st, user.as_ref(), &src.owner, &src.repo).await
         && src.can_read
         && let Some(size) = held(st, src.id, d).await?
@@ -931,7 +953,8 @@ pub async fn list(State(st): State<AppState>, Viewer(v): Viewer, UrlPath((o, n))
             a.push(t);
         }
     }
-    let images: Vec<Value> = images.into_values().collect();
+    let unavailable = unusable(&r.owner, &r.name);
+    let images: Vec<Value> = if unavailable.is_some() { vec![] } else { images.into_values().collect() };
     let mut packages: Vec<Value> = Vec::new();
     for (name, version, f) in files {
         if packages.last().is_none_or(|p| p["name"] != name.as_str() || p["version"] != version.as_str()) {
@@ -941,7 +964,7 @@ pub async fn list(State(st): State<AppState>, Viewer(v): Viewer, UrlPath((o, n))
             a.push(f);
         }
     }
-    Ok(Json(json!({ "registry": host, "image": format!("{host}/{base}"), "can_write": r.can_write, "images": images, "packages": packages })))
+    Ok(Json(json!({ "registry": host, "image": if unavailable.is_some() { String::new() } else { format!("{host}/{base}") }, "registry_unavailable": unavailable, "can_write": r.can_write, "images": images, "packages": packages })))
 }
 
 #[derive(serde::Deserialize)]
