@@ -5217,7 +5217,10 @@ async fn hand_merged_rows(app: &App) -> String {
 #[tokio::test]
 async fn hand_merged_pull_is_marked_merged_by_the_push_without_a_read() {
     let app = App::new();
-    let (_alice, fix, other) = hand_merged_setup(&app).await;
+    let (alice, fix, other) = hand_merged_setup(&app).await;
+    let rx = Receiver::new();
+    let hook = json!({ "url": rx.url, "secret": "k", "events": ["pull_request"], "allow_private": true }); // pragma: allowlist secret
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/r/hooks", Some(hook)).await.0, StatusCode::OK);
     let path = app.state.git.repo_path(1);
     let old = insights_git(&path, &["rev-parse", "refs/heads/main"]);
     // Fast-forward main to #1's head by hand, as a push would.
@@ -5242,6 +5245,11 @@ async fn hand_merged_pull_is_marked_merged_by_the_push_without_a_read() {
         .await
         .unwrap();
     assert_eq!(got, vec![(1, "merged".into(), fix.clone(), 1, 1), (2, "open".into(), String::new(), 0, 0)], "only the one whose head main now holds");
+    // Announced like a merge in Gitter: one webhook delivery, however many pushes.
+    gitter::webhooks::tick(&app.state).await;
+    let merged: Vec<Value> = rx.seen.lock().unwrap().iter().map(|(_, b)| serde_json::from_str::<Value>(b).unwrap()).filter(|p| p["action"] == "merged").collect();
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert_eq!((merged[0]["pull_request"]["number"].as_i64(), merged[0]["pull_request"]["merged"].as_bool()), (Some(1), Some(true)));
 
     // A real merge commit by hand brings #2 in too.
     let merge = insights_git(&path, &["commit-tree", "-p", &fix, "-p", &other, "-m", "merge other", &format!("{other}^{{tree}}")]);

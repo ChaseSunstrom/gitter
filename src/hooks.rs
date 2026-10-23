@@ -36,22 +36,33 @@ async fn hand_merged(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
     for u in updates {
         let (Some(base), Some(new)) = (u.refname.strip_prefix("refs/heads/"), u.new.as_deref()) else { continue };
         let (rid, b) = (repo.id, base.to_string());
-        let open: Vec<(i64, i64, String, bool)> = st
+        let open: Vec<(i64, i64, String, String)> = match st
             .db
             .call(move |c| {
                 let mut q = c.prepare(
-                    "SELECT i.id, i.number, p.head_branch, coalesce(p.from_fork, 0) FROM pulls p JOIN issues i ON i.id = p.issue_id
+                    "SELECT i.id, i.number, p.head_branch, coalesce(p.from_fork, 0), i.title FROM pulls p JOIN issues i ON i.id = p.issue_id
                      WHERE i.repo_id = ?1 AND i.state = 'open' AND p.base_branch = ?2",
                 )?;
-                Ok(q.query_map(rusqlite::params![rid, b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)))?.collect::<Result<_, _>>()?)
+                let rows = q.query_map(rusqlite::params![rid, b], |r| {
+                    let (n, branch): (i64, String) = (r.get(1)?, r.get(2)?);
+                    Ok((r.get(0)?, n, crate::api::issues::head_ref(n, &branch, r.get::<_, i64>(3)? != 0), r.get(4)?))
+                })?;
+                Ok(rows.collect::<Result<_, _>>()?)
             })
             .await
-            .unwrap_or_default();
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("hand merges into {}:{base}: {}", repo.full_name(), e.msg);
+                continue;
+            }
+        };
         if open.is_empty() {
             continue;
         }
-        // One listing for all of them: the heads the branch now holds.
-        let args = ["for-each-ref", "--format=%(refname) %(objectname)", "--merged", new, "refs/heads", "refs/pull"];
+        // One listing for all of them: which of their heads the branch now holds.
+        let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)", "--merged", new];
+        args.extend(open.iter().map(|p| p.2.as_str()));
         let out = match st.git.run(&repo.path, &args, None, &[]).await {
             Ok(o) if o.code == 0 => String::from_utf8_lossy(&o.stdout).into_owned(),
             Ok(o) => {
@@ -64,34 +75,26 @@ async fn hand_merged(st: &AppState, repo: &Repo, user: &User, updates: &[RefUpda
             }
         };
         let held: std::collections::HashMap<&str, &str> = out.lines().filter_map(|l| l.split_once(' ')).collect();
-        for (iid, number, head_b, from_fork) in open {
-            let Some(head) = held.get(crate::api::issues::head_ref(number, &head_b, from_fork).as_str()).map(|s| s.to_string()) else { continue };
+        for (iid, number, head_ref, title) in open {
+            let Some(head) = held.get(head_ref.as_str()).map(|s| s.to_string()) else { continue };
             let (uid, base_sha) = (user.id, new.to_string());
+            // Still open: a second push or a merge landing meanwhile records nothing more.
             let marked = st
                 .db
                 .call(move |c| {
                     let tx = c.transaction()?;
-                    let t = crate::db::now();
-                    // Still open: a second push or a merge landing meanwhile records nothing more.
-                    if tx.execute("UPDATE issues SET state = 'merged', closed_at = ?1, updated_at = ?1 WHERE id = ?2 AND state = 'open'", rusqlite::params![t, iid])? == 0 {
-                        return Ok(false);
-                    }
-                    tx.execute(
-                        "UPDATE pulls SET merged_sha = ?1, merged_by = ?2, merged_at = ?3, head_sha = ?1, base_sha = ?4 WHERE issue_id = ?5",
-                        rusqlite::params![head, uid, t, base_sha, iid],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO comments(issue_id, author_id, kind, body, created_at, updated_at) VALUES (?1, ?2, 'merged', ?3, ?4, ?4)",
-                        rusqlite::params![iid, uid, head, t],
-                    )?;
+                    let marked = crate::api::issues::mark_merged(&tx, iid, uid, &head, &head, &base_sha)?;
                     tx.commit()?;
-                    Ok(true)
+                    Ok(marked)
                 })
                 .await;
-            match marked {
-                Ok(true) => crate::api::deploy::pull_closed(st, repo.id, number).await,
-                Ok(false) => {}
-                Err(e) => eprintln!("hand merge of {}#{number}: {}", repo.full_name(), e.msg),
+            let done = match marked {
+                Ok(true) => crate::api::issues::announce_merge(st, repo.id, uid, iid, number, &title).await,
+                Ok(false) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = done {
+                eprintln!("hand merge of {}#{number}: {}", repo.full_name(), e.msg);
             }
         }
     }
