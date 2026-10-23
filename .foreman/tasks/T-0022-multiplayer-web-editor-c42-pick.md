@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T17:01:54Z
-updated: 2026-10-23T01:57:00Z
+updated: 2026-10-23T01:57:01Z
 base: 2c2b6b04cfa858c42e12f2854ab9b6df50969268
 base_tree: 507b792bd6d63259efa7ed2912c5a6d344139a85
 plan0_at: 2026-10-22T23:25:31Z
@@ -81,6 +81,7 @@ README Editing bullet: credits after leaving, pre-join edits, branch moving unde
 - 2026-10-23T01:25:15Z scope: static/js/pages/repo.js — a one-time copy's page refreshed between its first fetch and the removal of its mirror row, showing the badge on an ordinary repository; it made the e2e (criterion 3) flaky, so fixed inline: keep waiting while a once-mirror row remains
 - 2026-10-23T01:32:25Z reviews: 4 lenses back; fixing in T-0022: co-author credit kept after leaving, sanitised trailer names, join race, presence budget and members only, history size cap and op body limit, count overflow, ghost people, access re-check on the stream, per-user session cap and existing files only, stale base refresh and committed parent check, ls-tree -z; client: surrogate-safe diff, ack by user and fresh client id, edits before joining kept, cursors follow local edits, IME queue, stream errors end the session cleanly, a11y list, name labels briefly, co-authors shown, leave button, repaint per frame
 - 2026-10-23T01:57:00Z done
+- 2026-10-23T01:57:01Z committed b4324b7 (49 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses the contents API commit path (expected_sha, new_branch), the SSE pattern from CI logs, the editor page, Repo::writable. New: an in-memory session map (like the OAuth pending map) and a small transform function with unit tests. No new crate.

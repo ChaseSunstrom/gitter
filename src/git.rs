@@ -401,9 +401,10 @@ impl Git {
 
     /// The tree-entry mode of `path` at `sha` (100644, 100755, 120000...), if it exists.
     pub async fn mode_of(&self, repo: &Path, sha: &str, path: &str) -> R<Option<String>> {
-        let out = self.ok(repo, &["ls-tree", sha, "--", path]).await?;
+        // -z: names as they are (without it git quotes odd ones), each entry ended by a NUL.
+        let out = self.ok(repo, &["ls-tree", "-z", sha, "--", path]).await?;
         let t = String::from_utf8_lossy(&out);
-        Ok(t.lines()
+        Ok(t.split('\0')
             .find(|l| l.split_once('\t').is_some_and(|(_, p)| p == path))
             .and_then(|l| l.split_whitespace().next())
             .map(String::from))

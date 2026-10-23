@@ -301,10 +301,11 @@ async fn web_commits_keep_exec_bits_and_hide_account_email() {
     );
     let head = git(&["rev-parse", "main"], None);
     let readme = git(&["rev-parse", "main:README.md"], None);
+    // Also one whose name git quotes in its listings.
     let tree = git(
-        &["mktree"],
+        &["mktree", "-z"],
         Some(&format!(
-            "100644 blob {readme}\tREADME.md\n100755 blob {blob}\trun.sh\n"
+            "100644 blob {readme}\tREADME.md\0100755 blob {blob}\trun.sh\0100755 blob {blob}\tsay \"hi\".sh\0"
         )),
     );
     let commit = git(
@@ -334,6 +335,16 @@ async fn web_commits_keep_exec_bits_and_hide_account_email() {
         git(&["ls-tree", "main", "run.sh"], None).starts_with("100755"),
         "exec bit kept"
     );
+    let (s, e) = app
+        .req(&alice, "POST", "/api/repos/alice/tools/contents", Some(json!({
+            "branch": "main", "message": "Tweak", "changes": [{ "path": "say \"hi\".sh", "content": "#!/bin/sh\necho hey\n" }]
+        })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert!(
+        git(&["ls-tree", "main", "--", "say \"hi\".sh"], None).starts_with("100755"),
+        "exec bit kept on a quoted name"
+    );
     let email = git(&["log", "-1", "--format=%ae", "main"], None);
     assert!(
         email.ends_with("@users.noreply.gitter"),
@@ -357,7 +368,7 @@ async fn web_commits_keep_exec_bits_and_hide_account_email() {
         })))
         .await;
     assert_eq!(s, StatusCode::OK, "{e}");
-    assert_eq!(git(&["ls-tree", "--name-only", "main"], None), "README.md");
+    assert!(!git(&["ls-tree", "--name-only", "main"], None).contains("run.sh"));
 }
 
 #[tokio::test]
