@@ -350,3 +350,48 @@ async fn maintainers_push_to_the_fork_branch_only_when_allowed_and_only_that_bra
     let out = git(&w, &["push", "origin", "feature"]);
     assert!(!out.status.success(), "{state} {}", String::from_utf8_lossy(&out.stderr));
 }
+
+/// The `pull_request` payload of the newest delivery for the pull request `n`.
+async fn delivered_pull(app: &App, n: i64) -> Value {
+    let p: String = app
+        .state
+        .db
+        .call(move |c| Ok(c.query_row("SELECT payload FROM webhook_deliveries WHERE event = 'pull_request' AND json_extract(payload, '$.pull_request.number') = ?1 ORDER BY id DESC LIMIT 1", [n], |r| r.get(0))?))
+        .await
+        .unwrap();
+    serde_json::from_str::<Value>(&p).unwrap()["pull_request"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_pull_request_payloads_say_where_the_head_comes_from() {
+    let World { app, alice, bob } = world().await;
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/hello/hooks", Some(json!({ "url": "https://example.com/hook", "secret": "s3cret", "events": ["pull_request"] }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = app.req(&bob, "POST", "/api/repos/alice/hello/pulls", Some(open("feature", "bob/hello", json!({})))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let fork = delivered_pull(&app, v["number"].as_i64().unwrap()).await["head_repo"].clone();
+    assert_eq!((fork["full_name"].as_str(), fork["clone_url"].as_str().map(|u| u.ends_with("/bob/hello.git"))), (Some("bob/hello"), Some(true)), "{fork}");
+    // Within the repository: this repository.
+    assert_eq!(app.req(&alice, "POST", "/api/repos/alice/hello/branches", Some(json!({ "name": "own", "from": "main" }))).await.0, StatusCode::OK);
+    commit(&app, &alice, "alice/hello", "own", "o.txt", "o\n").await;
+    let (s, v) = app.req(&alice, "POST", "/api/repos/alice/hello/pulls", Some(json!({ "title": "Own", "head": "own", "base": "main" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let n = v["number"].as_i64().unwrap();
+    let own = delivered_pull(&app, n).await["head_repo"].clone();
+    assert_eq!(own["full_name"].as_str(), Some("alice/hello"), "{own}");
+    // From another server: its address.
+    app.state
+        .db
+        .call(move |c| Ok(c.execute("INSERT INTO remote_pulls(issue_id, server, repo, branch) SELECT id, 'https://other.example:8443', 'zed/lib', 'own' FROM issues WHERE number = ?1", [n])?))
+        .await
+        .unwrap();
+    assert_eq!(app.req(&alice, "PATCH", &format!("/api/repos/alice/hello/issues/{n}"), Some(json!({ "title": "Own again" }))).await.0, StatusCode::OK);
+    let far = delivered_pull(&app, n).await["head_repo"].clone();
+    assert_eq!((far["full_name"].as_str(), far["clone_url"].as_str()), (Some("other.example:8443/zed/lib"), Some("https://other.example:8443/zed/lib.git")), "{far}");
+    // A purged fork leaves no head repository (not this one).
+    let fork_n: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE p.from_fork = 1 AND p.head_repo_id IS NOT NULL", [], |r| r.get(0))?)).await.unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE pulls SET head_repo_id = NULL WHERE from_fork = 1", [])?)).await.unwrap();
+    assert_eq!(app.req(&alice, "PATCH", &format!("/api/repos/alice/hello/issues/{fork_n}"), Some(json!({ "title": "Renamed" }))).await.0, StatusCode::OK);
+    let gone = delivered_pull(&app, fork_n).await;
+    assert!(gone["head_repo"].is_null() && gone["title"] == "Renamed", "{gone}");
+}
