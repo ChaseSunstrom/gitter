@@ -43,11 +43,11 @@ export default async function (ctx) {
   const [meta, d] = await Promise.all([loadRepo(owner, repo), get(`${repoUrl(owner, repo)}/packages`)]);
   const host = d.registry;
   const how = html`<div class="box"><div class="box-head"><h2 style="font-size:15px">Publish an image</h2></div><div class="box-body stack">
-    <p class="muted">Sign in with your username and password (or an access token), tag an image under this repository, and push it.
+    ${d.registry_unavailable ? html`<p class="muted">${d.registry_unavailable}</p>` : html`<p class="muted">Sign in with your username and password (or an access token), tag an image under this repository, and push it.
       ${meta.private ? 'Only people who can read this repository can pull it.' : 'Anyone can pull it; only people who can push to the repository can publish.'}</p>
     <pre class="setup-cmd" style="text-align:left">docker login ${host}
 docker tag my-image ${d.image}:latest
-docker push ${d.image}:latest</pre>
+docker push ${d.image}:latest</pre>`}
     <p class="muted">Generic packages: upload any file under a name and version.</p>
     <pre class="setup-cmd" style="text-align:left">curl -H "Authorization: Bearer $TOKEN" --upload-file ./tool.tar.gz \\
   ${location.origin}/api${repoUrl(meta.owner, meta.name)}/packages/generic/tool/1.0.0/tool.tar.gz</pre>
