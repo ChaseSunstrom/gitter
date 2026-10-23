@@ -481,7 +481,10 @@ pub async fn delete_runner(State(st): State<AppState>, Admin(u): Admin, _s: Sudo
         })
         .await?;
     let (name, lost) = found.ok_or_else(AppError::not_found)?;
-    crate::ci::jobs::after_lost(&st, lost).await?;
+    // The runner is gone either way: a follow-up's error is logged, not the request's.
+    if let Err(e) = crate::ci::jobs::after_lost(&st, lost).await {
+        eprintln!("ci: runner {id} removed: follow-ups: {}", e.msg);
+    }
     st.ci_wake.notify_waiters();
     record(&st.db, Event { actor: Some(&u), subject: None, action: "ci_runner_deleted", detail: name, ip: &ip.0 }).await;
     ok()

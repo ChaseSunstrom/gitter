@@ -108,6 +108,8 @@ async fn pull_request_opened_once_even_when_the_push_hook_runs_late() {
     let (s, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Feature", "head": "feature", "base": "main" }))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let number = v["number"].as_i64().unwrap();
+    // The first run was quick: it's over before the other starter gets there.
+    app.state.db.call(|c| Ok(c.execute_batch("UPDATE ci_jobs SET status = 'success'; UPDATE ci_runs SET status = 'success';")?)).await.unwrap();
     // The push's hook finds the pull request opened meanwhile, and the opening runs again: still one run.
     let u = gitter::auth::user_by_id(&app.state.db, 1).await.unwrap().unwrap();
     let repo = gitter::repo::Repo::writable(&app.state, Some(&u), "root1", "r").await.unwrap();
@@ -120,6 +122,30 @@ async fn pull_request_opened_once_even_when_the_push_hook_runs_late() {
     // A new commit on the branch is a new run.
     commit(&app, &admin, "root1/r", "feature", None, "src.txt", "y").await;
     assert_eq!(runs(&app).await.iter().filter(|r| r.0 == "pull_request").count(), 2);
+}
+
+#[tokio::test]
+async fn pull_request_opened_once_the_push_hook_builds_the_same_run() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    commit(&app, &admin, "root1/r", "main", None, ".gitter/ci.yml", CONFIG).await;
+    // The branch's first commit touches docs/, the one pushed last doesn't.
+    commit(&app, &admin, "root1/r", "main", Some("feature"), "docs/guide.md", "# Guide").await;
+    let u = gitter::auth::user_by_id(&app.state.db, 1).await.unwrap().unwrap();
+    let repo = gitter::repo::Repo::writable(&app.state, Some(&u), "root1", "r").await.unwrap();
+    let first = app.state.git.resolve(&repo.path, "refs/heads/feature").await.unwrap().unwrap();
+    commit(&app, &admin, "root1/r", "feature", None, "src.txt", "x").await;
+    let head = app.state.git.resolve(&repo.path, "refs/heads/feature").await.unwrap().unwrap();
+    let (_, v) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Feature", "head": "feature", "base": "main" }))).await;
+    assert_eq!(pairs(&last_jobs(&app).await), [("test", "queued"), ("docs", "queued")], "the opening counts the whole pull request");
+    // Had the last push's hook won instead, its run is the same.
+    app.state.db.call(|c| Ok(c.execute_batch("DELETE FROM ci_jobs; DELETE FROM ci_runs;")?)).await.unwrap();
+    let update = gitter::smart_http::RefUpdate { refname: "refs/heads/feature".into(), old: Some(first), new: Some(head) };
+    gitter::ci::trigger::on_push(&app.state, &repo, u.id, &[update]).await;
+    gitter::ci::trigger::on_pull_opened(&app.state, &repo, u.id, v["number"].as_i64().unwrap(), "feature", "main").await.unwrap();
+    assert_eq!(runs(&app).await.len(), 1);
+    assert_eq!(pairs(&last_jobs(&app).await), [("test", "queued"), ("docs", "queued")], "the push hook counts the whole pull request too");
 }
 
 /// How many notifications `user` has about CI run `run`.
