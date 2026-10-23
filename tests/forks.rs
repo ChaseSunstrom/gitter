@@ -388,4 +388,10 @@ async fn webhook_pull_request_payloads_say_where_the_head_comes_from() {
     assert_eq!(app.req(&alice, "PATCH", &format!("/api/repos/alice/hello/issues/{n}"), Some(json!({ "title": "Own again" }))).await.0, StatusCode::OK);
     let far = delivered_pull(&app, n).await["head_repo"].clone();
     assert_eq!((far["full_name"].as_str(), far["clone_url"].as_str()), (Some("other.example:8443/zed/lib"), Some("https://other.example:8443/zed/lib.git")), "{far}");
+    // A purged fork leaves no head repository (not this one).
+    let fork_n: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT i.number FROM pulls p JOIN issues i ON i.id = p.issue_id WHERE p.from_fork = 1 AND p.head_repo_id IS NOT NULL", [], |r| r.get(0))?)).await.unwrap();
+    app.state.db.call(|c| Ok(c.execute("UPDATE pulls SET head_repo_id = NULL WHERE from_fork = 1", [])?)).await.unwrap();
+    assert_eq!(app.req(&alice, "PATCH", &format!("/api/repos/alice/hello/issues/{fork_n}"), Some(json!({ "title": "Renamed" }))).await.0, StatusCode::OK);
+    let gone = delivered_pull(&app, fork_n).await;
+    assert!(gone["head_repo"].is_null() && gone["title"] == "Renamed", "{gone}");
 }
