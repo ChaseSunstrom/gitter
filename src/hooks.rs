@@ -68,6 +68,10 @@ pub async fn forget_branches(st: &AppState, repo_id: i64, branches: Vec<String>)
 /// Record how much disk a repository uses (for storage quotas and the admin page).
 pub async fn refresh_size(st: &AppState, repo_id: i64) {
     let path = st.git.repo_path(repo_id);
+    // Moved to the trash meanwhile: its size stays what it was (a restore brings it back).
+    if !path.is_dir() {
+        return;
+    }
     let Ok(size) = tokio::task::spawn_blocking(move || crate::api::admin::dir_size(&path)).await else { return };
     let _ = st
         .db

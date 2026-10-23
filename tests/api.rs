@@ -5116,3 +5116,18 @@ async fn review_comments_on_quoted_names() {
     let (s, c) = app.req(&alice, "POST", "/api/repos/alice/r/pulls/1/comments", Some(json!({ "path": name, "side": "new", "line": 2, "body": "Nice" }))).await;
     assert_eq!(s, StatusCode::OK, "{c}");
 }
+
+#[tokio::test]
+async fn recorded_size_survives_a_folder_moved_away_mid_push() {
+    let app = App::new();
+    let alice = app.signup("alice").await;
+    app.req(&alice, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    let id: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT id FROM repos WHERE name = 'r'", [], |r| r.get(0))?)).await.unwrap();
+    app.state.db.call(move |c| Ok(c.execute("UPDATE repos SET size_bytes = 12345 WHERE id = ?1", [id])?)).await.unwrap();
+    // The folder is moved to the trash while a push finishes.
+    let path = app.state.git.repo_path(id);
+    std::fs::rename(&path, path.with_extension("trashed")).unwrap();
+    gitter::hooks::refresh_size(&app.state, id).await;
+    let size: i64 = app.state.db.call(move |c| Ok(c.query_row("SELECT size_bytes FROM repos WHERE id = ?1", [id], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(size, 12345);
+}

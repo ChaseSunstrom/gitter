@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: followup
 created: 2026-10-21T17:01:55Z
-updated: 2026-10-23T03:11:03Z
+updated: 2026-10-23T03:11:04Z
 base: 6d58556833b5d9e8174ee5d6cead8a8d00059f31
 base_tree: 19349ab6e6c5ad7d06cc81187bbb51ad52194726
 plan0_at: 2026-10-23T02:10:49Z
@@ -91,6 +91,7 @@ README: new Federation between Gitter servers bullet (switch, fork, propose, sig
 - 2026-10-23T02:10:46Z set approved=True
 - 2026-10-23T02:10:49Z focused
 - 2026-10-23T03:11:03Z done
+- 2026-10-23T03:11:04Z committed 5263ac9 (40 files)
 ## Follow-ups captured
 ## Build vs reuse
 Reuses net::check_url/pin/fetch/post (SSRF-safe HTTP, research T-0023-recon), mirrors::git + mirrors::exec (pinned, storage-capped git fetch), api::mirrors once-copy import for the fork, issues::open_pull and refs/pull/N/head for the pull request, hooks::on_push for updates, settings::Live for the switch; ed25519-dalek is already in Cargo.lock. New: src/federation.rs (keys, signing, verification) and src/api/federation.rs (endpoints).

@@ -8,7 +8,7 @@ scope: []
 depends_on: []
 source: discovered
 created: 2026-10-22T16:05:35Z
-updated: 2026-10-23T03:04:41Z
+updated: 2026-10-23T03:15:29Z
 builder: 2026-10-23T03:01:43Z
 builder_proc: archbox-hardened|pid:[4026531836]|16446|602195
 lane: /home/chase/projects/gitter/.claude/worktrees/agent-aba65f0568f396924
@@ -38,6 +38,7 @@ Options: (1) prune in the existing CI sweep by age, using the artifact retention
 ## Docs impact
 ## Verification evidence
 - (step 1) `cargo test -q --test ci_extras retention` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.64s [ran] [tree b1e8b469b1b6] (2026-10-23T03:04:41Z)
+- (step 1) `cargo test -q --test ci_extras retention` → exit 0 · . / test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.72s [ran] [tree 8af993edd4e0] (2026-10-23T03:15:29Z)
 ## Log
 - 2026-10-22T16:05:35Z created
 - 2026-10-23T03:01:15Z planned from capture
