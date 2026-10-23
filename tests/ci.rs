@@ -752,3 +752,29 @@ mr only:
     let last = runs(&app).await.pop().unwrap();
     assert!(last.3 == "failure" && last.4.contains("stage 'nope'"), "{last:?}");
 }
+
+#[tokio::test]
+async fn merge_queue_broken_config_never_lands() {
+    let app = App::new();
+    let admin = app.signup("root1").await;
+    app.req(&admin, "POST", "/api/repos", Some(json!({ "name": "r", "readme": true }))).await;
+    set_ci(&app, "everyone", 0).await;
+    // A queue, but no required checks.
+    let rule = json!({ "pattern": "main", "require_pr": false, "checks": [], "merge_queue": true });
+    assert_eq!(app.req(&admin, "POST", "/api/repos/root1/r/branch-rules", Some(rule)).await.0, StatusCode::OK);
+    commit(&app, &admin, "root1/r", "main", Some("feature"), ".gitter/ci.yml", "jobs:\n  a:\n    stepz: [x]\n").await;
+    let (_, p) = app.req(&admin, "POST", "/api/repos/root1/r/pulls", Some(json!({ "title": "Feature", "head": "feature", "base": "main" }))).await;
+    let number = p["number"].as_i64().unwrap();
+    let (s, v) = app.req(&admin, "POST", &format!("/api/repos/root1/r/pulls/{number}/queue"), Some(json!({ "method": "merge" }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for _ in 0..50 {
+        let (_, i) = app.req(&admin, "GET", &format!("/api/repos/root1/r/issues/{number}"), None).await;
+        assert_ne!(i["issue"]["state"], "merged", "a commit whose CI couldn't even start was landed: {i}");
+        let left: i64 = app.state.db.call(|c| Ok(c.query_row("SELECT count(*) FROM merge_queue", [], |r| r.get(0))?)).await.unwrap();
+        if left == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("stayed in the queue");
+}

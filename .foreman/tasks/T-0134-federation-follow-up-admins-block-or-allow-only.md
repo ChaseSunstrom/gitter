@@ -69,6 +69,7 @@ README federation bullet: only/never lists, the servers list, the daily budget f
 - 2026-10-23T03:47:03Z paused: focus moved to T-0073
 - 2026-10-23T03:51:16Z focused
 - 2026-10-23T04:19:43Z done
+- 2026-10-23T04:19:43Z committed cb6ca2f (18 files)
 ## Follow-ups captured
 ## Build vs reuse
 settings::Live (Settings JSON + validate), api::federation::signer/look_up/propose/pushed, api::admin::dir_size for the pack growth, the admin settings page's Federation box.

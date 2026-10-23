@@ -358,6 +358,13 @@ async fn verdict(st: &AppState, repo: &Repo, base: &str, sha: &str) -> R<Verdict
             if let Some(f) = wanted.iter().find(|x| x.state == "failure") {
                 return Ok(Verdict::Fail(format!("{} failed on the merged commit", f.name)));
             }
+            // A run that couldn't even start (a broken config) has no checks to fail, but it failed.
+            let broken: Option<String> = c
+                .query_row("SELECT error FROM ci_runs WHERE repo_id = ?1 AND sha = ?2 AND status = 'failure' AND error != '' ORDER BY id DESC LIMIT 1", rusqlite::params![rid, sha], |r| r.get(0))
+                .optional()?;
+            if let Some(why) = broken {
+                return Ok(Verdict::Fail(format!("CI couldn't start on the merged commit: {why}")));
+            }
             let all_in = required.iter().all(|n| checks.iter().any(|x| &x.name == n));
             Ok(if all_in && wanted.iter().all(|x| x.state == "success") { Verdict::Pass } else { Verdict::Wait })
         })
